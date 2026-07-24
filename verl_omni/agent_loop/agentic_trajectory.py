@@ -115,7 +115,11 @@ def agentic_trajectory_from_dict(d: dict[str, Any]) -> AgenticTrajectory:
             tool_call = ToolCall(**t["tool_call"])
         tool_output = None
         if t.get("tool_output") is not None:
-            tool_output = ToolOutput(**t["tool_output"])
+            to_dict = dict(t["tool_output"])
+            if "output_data_shape" in to_dict:
+                shape = to_dict.pop("output_data_shape")
+                to_dict["output_data"] = torch.zeros(shape)
+            tool_output = ToolOutput(**to_dict)
         turns.append(AgenticTurn(
             turn_idx=t["turn_idx"],
             agent_tokens=t["agent_tokens"],
