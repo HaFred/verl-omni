@@ -797,30 +797,49 @@ class BaseRayDiffusionTrainer(ABC):
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
 
     def _update_actor(self, batch: DataProto) -> DataProto:
+        is_agentic = self.config.algorithm.adv_estimator == "agentic_grpo"
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-        # update actor
-        batch_td = batch.to_tensordict()
-        # step 2: convert from padding to no-padding
-        batch_td = embeds_padding_2_no_padding(batch_td)
-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
-        ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
-        seed = self.config.actor_rollout_ref.actor.data_loader_seed
-        shuffle = self.config.actor_rollout_ref.actor.shuffle
-        tu.assign_non_tensor(
-            batch_td,
-            global_batch_size=ppo_mini_batch_size,
-            mini_batch_size=ppo_mini_batch_size,
-            epochs=ppo_epochs,
-            seed=seed,
-            dataloader_kwargs={"shuffle": shuffle},
-            height=self.config.actor_rollout_ref.model.pipeline.height,
-            width=self.config.actor_rollout_ref.model.pipeline.width,
-            vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
-        )
 
-        actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        if is_agentic:
+            from tensordict import TensorDict as TD
+
+            batch_td = TD(
+                {
+                    "agent_tokens": batch.batch["agent_tokens"],
+                    "agent_logprobs": batch.batch["agent_logprobs"],
+                    "loss_mask": batch.batch["loss_mask"],
+                    "advantages": batch.batch["advantages"],
+                    "returns": batch.batch["returns"],
+                },
+                batch_size=len(batch),
+            )
+            tu.assign_non_tensor(batch_td, compute_loss=True)
+            actor_output = self.actor_rollout_wg.update_actor(batch_td)
+        else:
+            # update actor
+            batch_td = batch.to_tensordict()
+            # step 2: convert from padding to no-padding
+            batch_td = embeds_padding_2_no_padding(batch_td)
+            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+            ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
+            seed = self.config.actor_rollout_ref.actor.data_loader_seed
+            shuffle = self.config.actor_rollout_ref.actor.shuffle
+            tu.assign_non_tensor(
+                batch_td,
+                global_batch_size=ppo_mini_batch_size,
+                mini_batch_size=ppo_mini_batch_size,
+                epochs=ppo_epochs,
+                seed=seed,
+                dataloader_kwargs={"shuffle": shuffle},
+                height=self.config.actor_rollout_ref.model.pipeline.height,
+                width=self.config.actor_rollout_ref.model.pipeline.width,
+                vae_scale_factor=self.config.actor_rollout_ref.model.get("vae_scale_factor", 8),
+            )
+
+            actor_output = self.actor_rollout_wg.update_actor(batch_td)
+
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
         if (actor_mfu := actor_output.pop("actor/mfu", None)) is not None:
@@ -1022,22 +1041,29 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
 
                     # Bypass mode: skip old_log_prob recompute (2 policies).
                     # Decoupled mode: recompute old_log_probs as proximal anchor (3 policies).
-                    rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
-                    bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
-                    if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
-                        apply_bypass_mode_to_diffusion_batch(batch)
-                    else:  # Recompute old_log_probs
-                        with marked_timer("old_log_prob", timing_raw, color="blue"):
-                            old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
-                            if old_log_prob_mfu is not None:
-                                metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
-                            batch = batch.union(old_log_prob)
+                    is_agentic = self.config.algorithm.adv_estimator == "agentic_grpo"
+
+                    if is_agentic:
+                        # Rollout logprobs ARE the old-policy logprobs for agentic
+                        if "agent_logprobs" in batch.batch:
+                            batch.batch["old_log_probs"] = batch.batch["agent_logprobs"]
+                    else:
+                        rollout_corr_config = self.config.algorithm.get("rollout_correction", None)
+                        bypass_recomputing_logprobs = rollout_corr_config and rollout_corr_config.get("bypass_mode", False)
+                        if bypass_recomputing_logprobs:  # Use `rollout_log_probs`
+                            apply_bypass_mode_to_diffusion_batch(batch)
+                        else:  # Recompute old_log_probs
+                            with marked_timer("old_log_prob", timing_raw, color="blue"):
+                                old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
+                                if old_log_prob_mfu is not None:
+                                    metrics.update({"perf/mfu/actor_infer": old_log_prob_mfu})
+                                batch = batch.union(old_log_prob)
 
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     # Consistency monitoring (needs calculate_log_probs=true); in bypass
                     # mode old == rollout so there is nothing to compare.
-                    if not bypass_recomputing_logprobs and "rollout_log_probs" in batch.batch:
+                    if not is_agentic and not bypass_recomputing_logprobs and "rollout_log_probs" in batch.batch:
                         metrics.update(
                             compute_rollout_corr_metrics_from_logprobs(
                                 batch.batch["old_log_probs"],
@@ -1048,14 +1074,14 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
 
                     # Decoupled-mode rollout correction (old vs rollout).
                     # In bypass mode old == rollout, so correction runs per-step in ``diffusion_loss``.
-                    if not bypass_recomputing_logprobs and rollout_correction_enabled(rollout_corr_config):
+                    if not is_agentic and not bypass_recomputing_logprobs and rollout_correction_enabled(rollout_corr_config):
                         with marked_timer("rollout_corr", timing_raw, color="cyan"):
                             batch, rollout_corr_metrics = apply_rollout_correction_to_diffusion_batch(
                                 batch, rollout_corr_config
                             )
                             metrics.update(rollout_corr_metrics)
 
-                    if self.use_reference_policy:
+                    if not is_agentic and self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
                             ref_log_prob = self._compute_ref_log_prob(batch)
@@ -1069,10 +1095,15 @@ class PolicyGradientRayTrainer(BaseRayDiffusionTrainer):
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        num_timesteps = batch.batch["old_log_probs"].shape[1]
-                        batch.batch["sample_level_rewards"] = batch.batch["sample_level_scores"].expand(
-                            -1, num_timesteps
-                        )
+                        is_agentic = self.config.algorithm.adv_estimator == "agentic_grpo"
+
+                        if is_agentic:
+                            batch.batch["sample_level_rewards"] = batch.batch["sample_level_scores"]
+                        else:
+                            num_timesteps = batch.batch["old_log_probs"].shape[1]
+                            batch.batch["sample_level_rewards"] = batch.batch["sample_level_scores"].expand(
+                                -1, num_timesteps
+                            )
 
                         # compute advantages, executed on the driver process
                         norm_adv_by_std_in_grpo = self.config.algorithm.get(

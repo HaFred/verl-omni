@@ -150,6 +150,7 @@ class DiffusionAdvantageEstimator(str, Enum):
 
     FLOW_GRPO = "flow_grpo"
     DANCE_GRPO = "dance_grpo"
+    AGENTIC_GRPO = "agentic_grpo"
 
 
 DIFFUSION_ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -261,6 +262,55 @@ def compute_flow_grpo_outcome_advantage(
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
+
+    return scores, scores
+
+
+@register_diffusion_adv_est(DiffusionAdvantageEstimator.AGENTIC_GRPO)
+def compute_token_level_grpo_advantage(
+    sample_level_rewards: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-4,
+    norm_adv_by_std_in_grpo: bool = True,
+    global_std: bool = True,
+    config: Optional[DictConfig] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """GRPO advantage for agentic token-level trajectories.
+
+    Each trajectory has a single scalar reward; the advantage is broadcast
+    across all agent token positions via loss_mask multiplication in the engine.
+    """
+    scores = sample_level_rewards.clone()
+    assert scores.ndim == 2
+
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+
+    with torch.no_grad():
+        batch_std = torch.std(scores) if global_std else None
+
+        for i in range(len(scores)):
+            idx = index[i]
+            id2score[idx].append(scores[i, 0].item())
+
+        for idx, s_list in id2score.items():
+            if len(s_list) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.ones(1)
+                continue
+            s_tensor = torch.tensor(s_list, dtype=torch.float32)
+            id2mean[idx] = torch.mean(s_tensor)
+            id2std[idx] = torch.std(s_tensor)
+
+        for i in range(len(scores)):
+            idx = index[i]
+            mu = id2mean[idx]
+            if norm_adv_by_std_in_grpo:
+                std = id2std[idx] if not global_std else (batch_std if batch_std is not None else id2std[idx])
+            else:
+                std = torch.ones(1)
+            scores[i, :] = (scores[i, 0] - mu) / (std + epsilon)
 
     return scores, scores
 

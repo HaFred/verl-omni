@@ -29,9 +29,19 @@ from verl_omni.utils.fs import resolve_model_local_dir
 
 from .rollout import DiffusionPipelineConfig, DiffusionRolloutAlgoConfig
 
-__all__ = ["DiffusionModelConfig"]
+__all__ = ["AgenticConfig", "DiffusionModelConfig"]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AgenticConfig(BaseConfig):
+    """Configuration for agentic RL (Mode 2a)."""
+
+    enabled: bool = False
+    max_turns: int = 5
+    early_termination: bool = True
+    observation_token_length: int = 128
 
 
 @dataclass
@@ -102,6 +112,9 @@ class DiffusionModelConfig(BaseConfig):
     pipeline: DiffusionPipelineConfig = field(default_factory=DiffusionPipelineConfig)
 
     algo: Optional[DiffusionRolloutAlgoConfig] = field(default_factory=DiffusionRolloutAlgoConfig)
+
+    agentic: AgenticConfig = field(default_factory=AgenticConfig)
+    freeze: list[str] = field(default_factory=list)
 
     fsdp_layer_prefixes: list[str] = field(default_factory=lambda: ["transformer_blocks."])
 
