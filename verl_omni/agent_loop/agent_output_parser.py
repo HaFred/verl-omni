@@ -29,7 +29,7 @@ You MUST respond in the following format:
 [The exact prompt to send to the diffusion model]
 </prompt>
 <decision>
-[continue or terminate]
+[continue or stop]
 </decision>
 """
 
@@ -38,12 +38,12 @@ def parse_agent_output(text: str) -> dict[str, str | None]:
     """Parse structured agent output into reasoning, prompt, and decision.
 
     On parse failure, returns None for missing fields and defaults
-    decision to "terminate" (fail-safe).
+    decision to "stop" (fail-safe).
     """
     result: dict[str, Any] = {
         "reasoning": None,
         "prompt": None,
-        "decision": "terminate",
+        "decision": "stop",
         "raw_text": text,
     }
 
@@ -58,6 +58,6 @@ def parse_agent_output(text: str) -> dict[str, str | None]:
     decision_match = re.search(r"<decision>\s*(.*?)\s*</decision>", text, re.DOTALL)
     if decision_match:
         raw_decision = decision_match.group(1).strip().lower()
-        result["decision"] = "continue" if "continue" in raw_decision else "terminate"
+        result["decision"] = "continue" if "continue" in raw_decision else "stop"
 
     return result

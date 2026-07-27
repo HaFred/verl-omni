@@ -38,7 +38,7 @@ class TestTrajectoryRoundTrip:
         t0 = _make_turn(0, [1, 2, 3], [0.1, 0.2, 0.3], "text0", "continue",
                         ToolCall("t2i", {"prompt": "p0"}),
                         ToolOutput("image", torch.zeros(3, 64, 64)))
-        t1 = _make_turn(1, [4, 5], [0.4, 0.5], "text1", "terminate",
+        t1 = _make_turn(1, [4, 5], [0.4, 0.5], "text1", "stop",
                         ToolCall("t2i", {"prompt": "p1 rewritten"}),
                         ToolOutput("image", torch.ones(3, 64, 64)))
         traj = AgenticTrajectory("test", [t0, t1], 0.8, AgenticMetadata(2, True, "agent_stop"))
@@ -53,7 +53,7 @@ class TestTrajectoryRoundTrip:
         assert restored.turns[1].tool_call.params["prompt"] == "p1 rewritten"
 
     def test_round_trip_minimal(self):
-        t0 = _make_turn(0, [1], [0.1], "text", "terminate")
+        t0 = _make_turn(0, [1], [0.1], "text", "stop")
         traj = AgenticTrajectory("minimal", [t0])
         d = agentic_trajectory_to_dict(traj)
         restored = agentic_trajectory_from_dict(d)
@@ -66,7 +66,7 @@ class TestLossMasking:
         t0 = _make_turn(0, [1, 2, 3], [0.1, 0.2, 0.3], "t0", "continue",
                         ToolCall("t2i", {"prompt": "p0"}),
                         ToolOutput("image", torch.zeros(3, 512, 512)))
-        t1 = _make_turn(1, [4, 5, 6], [0.4, 0.5, 0.6], "t1", "terminate",
+        t1 = _make_turn(1, [4, 5, 6], [0.4, 0.5, 0.6], "t1", "stop",
                         None, ToolOutput("image", torch.ones(3, 512, 512)))
         traj = AgenticTrajectory("p", [t0, t1], metadata=AgenticMetadata(2, True, "agent_stop"))
 
@@ -75,7 +75,7 @@ class TestLossMasking:
         assert loss_mask.sum().item() == 6, f"Expected 6, got {loss_mask.sum()}"
 
     def test_loss_mask_single_turn(self):
-        t0 = _make_turn(0, [1, 2], [0.1, 0.2], "t", "terminate")
+        t0 = _make_turn(0, [1, 2], [0.1, 0.2], "t", "stop")
         traj = AgenticTrajectory("p", [t0])
         result = serialize_trajectories([traj], 256, 128, 1024)
         mask = result["loss_mask"][0]
@@ -86,7 +86,7 @@ class TestLossMasking:
         t0 = _make_turn(0, [1, 2], [0.1, 0.2], "t0", "continue",
                         ToolCall("t2i", {"prompt": "original prompt"}),
                         ToolOutput("image", torch.zeros(3, 64, 64)))
-        t1 = _make_turn(1, [3, 4], [0.3, 0.4], "t1", "terminate",
+        t1 = _make_turn(1, [3, 4], [0.3, 0.4], "t1", "stop",
                         ToolCall("t2i", {"prompt": "rewritten prompt v2"}),
                         ToolOutput("image", torch.ones(3, 64, 64)))
         traj = AgenticTrajectory("p", [t0, t1])
@@ -106,11 +106,11 @@ class TestAgentOutputParser:
     def test_terminate(self):
         text = "<reasoning>done</reasoning>\n<prompt></prompt>\n<decision>terminate</decision>"
         r = parse_agent_output(text)
-        assert r["decision"] == "terminate"
+        assert r["decision"] == "stop"
 
     def test_malformed(self):
         r = parse_agent_output("garbage text")
-        assert r["decision"] == "terminate"
+        assert r["decision"] == "stop"
         assert r["reasoning"] is None
 
 

@@ -11,7 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Agentic multi-turn trajectory data structures for Mode (2a) agentic RL."""
+"""Agentic multi-turn trajectory data structures for Mode (2a) agentic RL.
+
+Defines two layers:
+
+1. **SFT layer** (aligned with #295): ``VisualReflectionTrajectory`` and its
+   constituent types (``ImageRef``, ``ReflectionStep``).  These are the
+   canonical format for multi-turn visual-reflection data produced by SFT
+   cold-start training (#295) and by offline dataset adapters.
+
+2. **RL layer**: ``AgenticTrajectory`` and its constituent types
+   (``AgenticTurn``, ``ToolCall``, ``ToolOutput``, ``AgenticMetadata``).
+   This is a superset of the SFT format that adds rollout-specific fields
+   (token IDs, logprobs, loss masks, tool outputs, reward scores).
+
+Conversion: ``visual_reflection_to_agentic()`` lifts a
+``VisualReflectionTrajectory`` to an ``AgenticTrajectory``, filling RL
+fields with sensible defaults so that SFT checkpoints can serve as
+cold-start initialization for agentic RL training.
+"""
 
 from __future__ import annotations
 
@@ -20,6 +38,55 @@ from typing import Any, Literal
 
 import torch
 
+
+# ---------------------------------------------------------------------------
+# SFT layer — aligned with #295 (Multi-Turn Visual Reflection SFT for BAGEL)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ImageRef:
+    """Reference to an image by URI and content hash."""
+
+    uri: str
+    sha256: str = ""
+
+
+@dataclass
+class ReflectionStep:
+    """One step of the visual-reflection loop.
+
+    Decision vocabulary matches #295: ``"continue"`` or ``"stop"``.
+    """
+
+    reflection: str
+    action: Literal["continue", "stop"]
+    edit: str  # non-empty for "continue", empty for "stop"
+
+
+@dataclass
+class VisualReflectionTrajectory:
+    """Canonical SFT trajectory format — aligned with #295.
+
+    For a trajectory with *N* images:
+    - ``len(images) == len(steps) == N``
+    - the first *N-1* steps are ``"continue"`` with non-empty ``edit``
+    - the final step is ``"stop"`` with empty ``edit``
+    """
+
+    trajectory_id: str
+    prompt: str
+    images: list[ImageRef]
+    steps: list[ReflectionStep]
+    # provenance
+    manifest_id: str = ""
+    source_dataset: str = ""
+    source_record_id: str = ""
+    pipeline_variant: Literal["direct_parse", "pair_0_1_turn", "prompt_k_turn"] = "direct_parse"
+
+
+# ---------------------------------------------------------------------------
+# RL layer — superset of the SFT format
+# ---------------------------------------------------------------------------
 
 @dataclass
 class ToolCall:
@@ -41,6 +108,8 @@ class ToolOutput:
 class AgenticTurn:
     """One turn of the multi-turn agentic interaction.
 
+    Decision vocabulary aligned with #295: ``"continue"`` or ``"stop"``.
+
     Prompt rewriting is captured via:
       - turn[i].tool_call.params["prompt"]  — prompt at turn i
       - turn[i+1].tool_call.params["prompt"] — rewritten prompt at turn i+1
@@ -50,9 +119,9 @@ class AgenticTurn:
     agent_tokens: list[int]      # full agent text tokens (loss_mask=1)
     agent_logprobs: list[float]  # per-token logprobs from rollout
     agent_text: str              # decoded text: reasoning + prompt + decision
-    tool_call: ToolCall | None = None      # None on termination turn
-    tool_output: ToolOutput | None = None  # None on termination turn
-    decision: Literal["continue", "terminate"] = "terminate"
+    tool_call: ToolCall | None = None      # None on stop turn
+    tool_output: ToolOutput | None = None  # None on stop turn
+    decision: Literal["continue", "stop"] = "stop"
 
 
 @dataclass
@@ -66,18 +135,80 @@ class AgenticMetadata:
 
 @dataclass
 class AgenticTrajectory:
-    """Full multi-turn agentic trajectory with prompt rewriting captured per turn."""
+    """Full multi-turn agentic trajectory — RL superset of VisualReflectionTrajectory.
+
+    RL-specific fields (``turns``, ``reward_score``, ``metadata``) are added
+    on top of the SFT provenance fields shared with #295.
+    """
 
     prompt: str
     turns: list[AgenticTurn]
     reward_score: float | None = None
     metadata: AgenticMetadata = field(default_factory=lambda: AgenticMetadata(0, False, ""))
+    # provenance — aligned with VisualReflectionTrajectory
+    trajectory_id: str = ""
+    source_dataset: str = ""
 
+
+# ---------------------------------------------------------------------------
+# SFT → RL conversion
+# ---------------------------------------------------------------------------
+
+def visual_reflection_to_agentic(
+    sft_traj: VisualReflectionTrajectory,
+) -> AgenticTrajectory:
+    """Convert a #295 VisualReflectionTrajectory to an RL AgenticTrajectory.
+
+    RL-specific fields (agent_tokens, agent_logprobs, tool_output tensors)
+    are initialised to sensible defaults.  The resulting trajectory is
+    suitable as cold-start input for agentic RL training.
+    """
+    turns: list[AgenticTurn] = []
+    for i, step in enumerate(sft_traj.steps):
+        has_image = (i < len(sft_traj.images))
+        tc = ToolCall("t2i", {"prompt": step.edit}) if step.action == "continue" and step.edit else None
+        to = ToolOutput("image", torch.empty(0)) if has_image else None
+
+        turns.append(AgenticTurn(
+            turn_idx=i,
+            agent_tokens=[],
+            agent_logprobs=[],
+            agent_text=(
+                f"Reflection: {step.reflection}\n"
+                f"Action: {step.action}\n"
+                f"Edit: {step.edit}"
+            ),
+            tool_call=tc,
+            tool_output=to,
+            decision=step.action,
+        ))
+
+    metadata = AgenticMetadata(
+        num_turns=len(turns),
+        terminated=(sft_traj.steps[-1].action == "stop") if sft_traj.steps else False,
+        termination_reason="agent_stop" if (sft_traj.steps and sft_traj.steps[-1].action == "stop") else "max_turns",
+    )
+
+    return AgenticTrajectory(
+        prompt=sft_traj.prompt,
+        turns=turns,
+        reward_score=None,
+        metadata=metadata,
+        trajectory_id=sft_traj.trajectory_id,
+        source_dataset=sft_traj.source_dataset,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Serialization helpers
+# ---------------------------------------------------------------------------
 
 def agentic_trajectory_to_dict(traj: AgenticTrajectory) -> dict[str, Any]:
     """Serialize an AgenticTrajectory to a JSON-serializable dict for non_tensor_batch."""
     return {
         "prompt": traj.prompt,
+        "trajectory_id": traj.trajectory_id,
+        "source_dataset": traj.source_dataset,
         "turns": [
             {
                 "turn_idx": t.turn_idx,
@@ -134,4 +265,6 @@ def agentic_trajectory_from_dict(d: dict[str, Any]) -> AgenticTrajectory:
         turns=turns,
         reward_score=d.get("reward_score"),
         metadata=AgenticMetadata(**d["metadata"]),
+        trajectory_id=d.get("trajectory_id", ""),
+        source_dataset=d.get("source_dataset", ""),
     )

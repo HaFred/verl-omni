@@ -1,0 +1,23 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - omni_trainer
+  - _self_
+
+# Override model_type so the agentic engine (AgenticLLMFSDPEngine) is selected.
+# The omni_config YAML inherits from ppo_trainer and uses FSDPEngineWithLMHead
+# for token-level data; agentic training reuses the same infrastructure with
+# selective freezing of the generation path.
+actor_rollout_ref:
+  model:
+    model_type: agentic_llm
+    agentic:
+      enabled: True

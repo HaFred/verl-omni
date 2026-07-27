@@ -28,9 +28,19 @@ from verl.workers.config.model import MtpConfig
 
 from verl_omni.utils.fs import resolve_model_local_dir
 
-__all__ = ["OmniModelConfig"]
+__all__ = ["AgenticConfig", "OmniModelConfig"]
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AgenticConfig(BaseConfig):
+    """Configuration for agentic RL (Mode 2a) — multi-turn rollout with prompt rewriting."""
+
+    enabled: bool = False
+    max_turns: int = 5
+    early_termination: bool = True
+    observation_token_length: int = 128
 
 
 @dataclass
@@ -72,6 +82,10 @@ class OmniModelConfig(BaseConfig):
     model_stage: str = "thinker"
     # sub-config key for the trainable component (e.g. "thinker_config", "talker_config")
     hf_config_name: Optional[str] = None
+
+    # agentic RL configuration (Mode 2a)
+    agentic: AgenticConfig = field(default_factory=AgenticConfig)
+    freeze: list[str] = field(default_factory=list)  # param name prefixes to freeze
 
     hf_config: Any = None
     generation_config: Any = None

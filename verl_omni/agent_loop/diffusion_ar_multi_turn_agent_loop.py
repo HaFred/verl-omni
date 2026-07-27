@@ -43,7 +43,7 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
     """Agent loop for multi-turn agentic RL (Mode 2a).
 
     Executes: agent reasons -> rewrites prompt -> frozen tool generates image ->
-    agent reflects -> continue/terminate -> repeat.
+    agent reflects -> continue/stop -> repeat.
     Each turn's rewritten prompt is captured explicitly in AgenticTrajectory.
     """
 
@@ -65,7 +65,7 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
         metrics = {}
         final_diffusion_output = None
         final_logprobs = None
-        decision = "terminate"
+        decision = "stop"
 
         for turn_idx in range(max_turns):
             # 1. Tokenize multimodal chat
@@ -95,11 +95,11 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
             decision = parsed["decision"]
             rewritten_prompt = parsed["prompt"] or raw_prompt
 
-            if decision == "terminate":
+            if decision == "stop":
                 turn = AgenticTurn(
                     turn_idx=turn_idx, agent_tokens=agent_tokens,
                     agent_logprobs=agent_logprobs, agent_text=agent_text,
-                    tool_call=None, tool_output=None, decision="terminate",
+                    tool_call=None, tool_output=None, decision="stop",
                 )
                 turns.append(turn)
                 break
@@ -144,8 +144,8 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
         # Build trajectory
         meta = AgenticMetadata(
             num_turns=len(turns),
-            terminated=decision == "terminate",
-            termination_reason="agent_stop" if decision == "terminate" else "max_turns",
+            terminated=decision == "stop",
+            termination_reason="agent_stop" if decision == "stop" else "max_turns",
         )
         trajectory = AgenticTrajectory(prompt=raw_prompt, turns=turns, metadata=meta)
 

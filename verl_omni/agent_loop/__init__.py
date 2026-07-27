@@ -16,8 +16,12 @@ from .agentic_trajectory import (
     AgenticMetadata,
     AgenticTrajectory,
     AgenticTurn,
+    ImageRef,
+    ReflectionStep,
     ToolCall,
     ToolOutput,
+    VisualReflectionTrajectory,
+    visual_reflection_to_agentic,
 )
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
 from .diffusion_ar_multi_turn_agent_loop import DiffusionARMultiTurnAgentLoop
@@ -31,6 +35,10 @@ __all__ = [
     "DiffusionAgentLoopWorker",
     "DiffusionSingleTurnAgentLoop",
     "DiffusionARMultiTurnAgentLoop",
+    "ImageRef",
+    "ReflectionStep",
     "ToolCall",
     "ToolOutput",
+    "VisualReflectionTrajectory",
+    "visual_reflection_to_agentic",
 ]

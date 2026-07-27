@@ -1,0 +1,129 @@
+# Lance-3B Agentic GRPO training config (FSDP + vLLM-Omni multi-turn rollout).
+#
+# Mode (2a): trains the Lance understanding path (LLM_UND) via token-level GRPO
+# with a frozen diffusion tool (LLM_GEN).  The agent learns to reason, rewrite
+# prompts, reflect on tool outputs, and decide when to stop.
+#
+# Inherits verl's default ppo_trainer config.  Volatile values (data/model
+# paths, GPU/node counts, vLLM-Omni stage config path) are set via CLI in the
+# run script.
+#
+# Launch with:
+#   python3 -m verl.trainer.main_ppo \
+#     --config-path=<this dir> --config-name=lance_agentic_grpo <CLI overrides>
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+data:
+  train_batch_size: 4
+  max_prompt_length: 512
+  max_response_length: 4096
+  val_max_samples: 200
+  validation_shuffle: true
+  filter_overlong_prompts: true
+  truncation: left
+
+actor_rollout_ref:
+
+  model:
+    # model_type triggers AgenticLLMFSDPEngine (inherits FSDPEngineWithLMHead)
+    model_type: agentic_llm
+    override_config:
+      attn_implementation: sdpa
+    lora_rank: 64
+    lora_alpha: 32
+    target_modules: "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    use_remove_padding: true
+    enable_gradient_checkpointing: true
+
+    # Agentic RL configuration
+    agentic:
+      enabled: True
+      max_turns: 5
+      early_termination: True
+      observation_token_length: 128
+
+    # Freeze Lance generation path (LLM_GEN) — only understanding path trains
+    freeze:
+      - moe_gen
+
+  actor:
+    optim:
+      lr: 1e-6
+      lr_warmup_steps: 10
+      weight_decay: 0.1
+      clip_grad: 1.0
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 1
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+    entropy_coeff: 0
+    strategy: fsdp
+    fsdp_config:
+      param_offload: true
+      optimizer_offload: true
+      model_dtype: bf16
+      use_orig_params: true
+      wrap_policy:
+        min_num_params: 100000000
+    policy_loss:
+      loss_mode: vanilla     # standard PPO clipped loss (GSPO loss_mode not needed for agentic)
+    clip_ratio_low: 0.1
+    clip_ratio_high: 0.3
+    loss_agg_mode: seq-mean-token-mean
+
+  rollout:
+    name: vllm_omni
+    mode: async
+    n: 8
+    temperature: 0.8
+    top_p: 0.9
+    top_k: -1
+    tensor_model_parallel_size: 2
+    calculate_log_probs: true
+    load_format: safetensors
+    layered_summon: true
+    log_prob_micro_batch_size_per_gpu: 2
+    engine_kwargs:
+      vllm_omni:
+        output_mode: ar     # auto-regressive for agent text; image gen switched by agent loop
+
+    agent:
+      default_agent_loop: diffusion_ar_multi_turn_agent
+      agent_loop_config_path: null  # registered via @register decorator
+
+  ref:
+    log_prob_micro_batch_size_per_gpu: 2
+    strategy: fsdp
+    fsdp_config:
+      param_offload: true
+      model_dtype: bf16
+      use_orig_params: true
+      wrap_policy:
+        min_num_params: 100000000
+
+algorithm:
+  adv_estimator: grpo          # verl's standard GRPO (group-relative on scalar rewards)
+  use_kl_in_reward: false
+
+reward:
+  reward_manager:
+    name: dapo                 # single scalar reward; replace with multi-dim in PR2
+
+trainer:
+  val_before_train: false
+  critic_warmup: 0
+  logger: ["console", "wandb"]
+  project_name: lance_agentic_rl
+  experiment_name: agentic_grpo_multiturn
+  nnodes: 1
+  save_freq: 50
+  test_freq: 50
+  total_epochs: 5
