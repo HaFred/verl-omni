@@ -38,6 +38,35 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _user_text_from_raw_prompt(raw_prompt: Any) -> str:
+    """Extract the seed user request from RLHFDataset ``raw_prompt``.
+
+    Online agentic rollout stores a string prompt on ``AgenticTrajectory``.
+    Datasets usually provide chat messages
+    ``[{"role": "user", "content": "..."}]``; accept either form.
+    """
+    if isinstance(raw_prompt, str):
+        return raw_prompt
+    if isinstance(raw_prompt, list):
+        for message in reversed(raw_prompt):
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                texts = [
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                joined = " ".join(text for text in texts if text).strip()
+                if joined:
+                    return joined
+        return ""
+    return "" if raw_prompt is None else str(raw_prompt)
+
+
 @register("diffusion_ar_multi_turn_agent")
 class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
     """Agent loop for multi-turn agentic RL (Mode 2a).
@@ -48,10 +77,12 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
     """
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> DiffusionAgentLoopOutput:
-        raw_prompt = kwargs["raw_prompt"]
+        raw_prompt = _user_text_from_raw_prompt(kwargs["raw_prompt"])
         max_turns = sampling_params.get("max_turns", 5)
 
-        multi_modal_data = await self.process_vision_info(raw_prompt)
+        # Vision extraction still sees the original dataset messages when present.
+        vision_source = kwargs["raw_prompt"]
+        multi_modal_data = await self.process_vision_info(vision_source)
         images = multi_modal_data.get("images")
         videos = multi_modal_data.get("videos")
 

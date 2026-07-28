@@ -26,11 +26,24 @@ from verl_omni.agent_loop.agentic_trajectory import (
     agentic_trajectory_from_dict,
     agentic_trajectory_to_dict,
 )
+from verl_omni.agent_loop.diffusion_ar_multi_turn_agent_loop import _user_text_from_raw_prompt
 from verl_omni.agent_loop.trajectory_serializer import serialize_trajectories
 
 
 def _make_turn(idx, tokens, logprobs, text, decision, tc=None, to=None):
     return AgenticTurn(idx, tokens, logprobs, text, tc, to, decision)
+
+
+class TestRawPromptNormalization:
+    def test_string_passthrough(self):
+        assert _user_text_from_raw_prompt("a blue hat") == "a blue hat"
+
+    def test_chat_messages(self):
+        messages = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "Generate a cat wearing a blue hat"},
+        ]
+        assert _user_text_from_raw_prompt(messages) == "Generate a cat wearing a blue hat"
 
 
 class TestTrajectoryRoundTrip:

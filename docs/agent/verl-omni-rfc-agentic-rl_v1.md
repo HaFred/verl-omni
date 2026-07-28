@@ -278,6 +278,17 @@ Two PRs in strict dependency order. Each PR is independently reviewable and test
 
 **Scope:** §1 (trajectory format) + §2 (Decoupled Agent–Tool Policy (train agent LLM, freeze diffusion), Mode (2a) only)
 
+**Implementation path:** PR 1 uses the omni token-training path rather than the
+diffusion trainer. The current entrypoint is `verl.trainer.main_ppo`; it may move
+to `verl_omni.trainer.main_omni` once the upstream omni entrypoint is available.
+The policy uses verl's standard `grpo` advantage estimator and an
+`AgenticLLMFSDPEngine` derived from `FSDPEngineWithLMHead`. This preserves
+micro-batching, global data-parallel loss normalization, mixed-precision
+scaling, checkpointing, and the existing `PolicyLoss` integration. The
+generation path is selectively frozen and used only as the image-generation
+tool. PR 1 does not add an `agentic_grpo` estimator to the diffusion registry or
+route token-level policy optimization through `main_diffusion`.
+
 **Model recipe:** BAGEL-7B/Lance-3B (below we use BAGEL as examples):
 
 | | BAGEL-based |
@@ -296,7 +307,7 @@ BAGEL-7B understanding path as the trainable agent plus BAGEL-7B generation path
 - The `AgenticTrajectory` dataclass with per-turn token/logprob/loss_mask/tool_call/tool_output structure
 - An agentic rollout worker that executes the multi-turn loop: agent LLM generates reasoning + prompt → tool call dispatched to vLLM-Omni → observation returned → agent reflects and rewrites prompt → next tool call → repeat until termination or max turns
 - Loss masking: only agent-generated tokens receive policy gradient; tool outputs are masked
-- Agent LLM as a trainable FSDP2 policy (Mode (2a)), optimizing the agent's prompt rewriting ability with the diffusion model configured as a frozen tool
+- Agent LLM as a trainable FSDP/FSDP2 policy using `AgenticLLMFSDPEngine(FSDPEngineWithLMHead)` (Mode (2a)), optimizing the agent's prompt rewriting ability with the diffusion model configured as a frozen tool
 - Configuration options: `max_turns`, `early_termination`, trajectory length limits, co-located vs decoupled GPU pools
 - Data pipeline: load multi-turn trajectory datasets from parquet with nested turn structure
 - Integration with existing async reward computation (reward computed while next rollout batch proceeds)
@@ -308,11 +319,24 @@ BAGEL-7B understanding path as the trainable agent plus BAGEL-7B generation path
 - RPCO staged training
 
 **Acceptance criteria:**
-- `python3 -m verl_omni.trainer.main_diffusion` with `algorithm.adv_estimator=agentic_grpo` completes a full training step on a toy multi-turn dataset where the agent rewrites prompts across iterations
+- `python3 -m verl.trainer.main_ppo` (or `python3 -m verl_omni.trainer.main_omni` once available) with the standard `algorithm.adv_estimator=grpo` completes a full training step on a toy multi-turn dataset where the agent rewrites prompts across iterations
 - Agent LLM weights update; diffusion model weights remain frozen
 - Existing single-turn FlowGRPO training is unaffected
 
-**Evaluation plan (PR 1):** Evaluate on the UniCoT held-out split by checking structural correctness (well-formed `AgenticTrajectory`, frozen diffusion, loss masks on agent tokens only) and behavioral alignment to UniCoT — action/termination accuracy versus the `output_image[i]` non-null label, reflection–edit consistency reusing UniCoT's own fail-closed checks, plus edit semantic similarity and reflection quality versus `eval_summary`. Confirm the single scalar reward (e.g., `R_diffusion`) on trained-agent rollouts exceeds both the SFT cold-start and random baselines within a short GRPO run, while existing single-turn FlowGRPO eval is unchanged.
+**PR 1 merge bar:** Acceptance-only. The three acceptance criteria above are the
+required upstream merge gate. They must be demonstrated with deterministic
+unit/regression tests and a one-step toy multi-turn training smoke test; a
+production-scale Lance/BAGEL training run is not required.
+
+**Post-merge evaluation plan (non-blocking for PR 1):** Evaluate on the UniCoT
+held-out split by checking structural correctness (well-formed
+`AgenticTrajectory`, frozen diffusion, loss masks on agent tokens only) and
+behavioral alignment to UniCoT — action/termination accuracy versus the
+`output_image[i]` non-null label, reflection–edit consistency reusing UniCoT's
+own fail-closed checks, plus edit semantic similarity and reflection quality
+versus `eval_summary`. Confirm the single scalar reward (e.g., `R_diffusion`) on
+trained-agent rollouts exceeds both the SFT cold-start and random baselines
+within a short GRPO run, while existing single-turn FlowGRPO eval is unchanged.
 
 ---
 

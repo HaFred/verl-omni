@@ -32,7 +32,7 @@ gradients via token-level GRPO.
 
 | Recipe | Model | Algorithm | What it trains |
 |--------|-------|-----------|----------------|
-| [Lance-3B Agentic GRPO](lance/) | `bytedance-research/Lance-3B` | GRPO (token-level) | Understanding path (LoRA r=64) |
+| [Lance-3B Agentic GRPO](lance/) | `bytedance-research/Lance` | GRPO (token-level) | Understanding path (LoRA r=64) |
 
 ## Prerequisites
 
@@ -59,13 +59,31 @@ pip install -e ".[train,dev]"
 ## Quick start — Lance-3B
 
 ```bash
-# Prepare multi-turn dataset (UniCoT-Self-Reflection-6K format)
-mkdir -p ~/data/agentic
-# … place train.parquet and val.parquet here (with nested turn structure) …
+# PR1 acceptance smoke: toy prompt seeds (nested turns are generated online)
+python3 tests/special_e2e/create_dummy_agentic_data.py \
+    --local_save_dir ~/data/agentic \
+    --train_size 8 \
+    --val_size 4
 
-# Launch training
+# Launch training (defaults to ~/data/agentic/{train,val}.parquet)
 bash examples/agenticrpco_trainer/lance/run_lance_agentic_grpo.sh
 ```
+
+For a one-step acceptance check, override runtime size (example):
+
+```bash
+TRAIN_FILE=~/data/agentic/train.parquet \
+VAL_FILE=~/data/agentic/val.parquet \
+bash examples/agenticrpco_trainer/lance/run_lance_agentic_grpo.sh \
+    data.train_batch_size=4 \
+    actor_rollout_ref.rollout.n=2 \
+    trainer.total_epochs=1 \
+    trainer.total_training_steps=1 \
+    trainer.logger=console
+```
+
+UniCoT-Self-Reflection-6K nested-turn parquet remains the post-merge evaluation
+source (non-blocking for PR1 acceptance).
 
 CLI overrides:
 ```bash

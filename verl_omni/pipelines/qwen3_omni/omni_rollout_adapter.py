@@ -18,10 +18,15 @@ vLLM-Omni's frozen pipeline definitions — no duplication of what vLLM-Omni
 already owns.
 """
 
-from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
-    QWEN3_OMNI_PIPELINE,
-    QWEN3_OMNI_THINKER_ONLY_PIPELINE,
-)
+from vllm_omni.model_executor.models.qwen3_omni.pipeline import QWEN3_OMNI_PIPELINE
+
+try:
+    # Newer vLLM-Omni releases expose a dedicated one-stage thinker pipeline.
+    from vllm_omni.model_executor.models.qwen3_omni.pipeline import (
+        QWEN3_OMNI_THINKER_ONLY_PIPELINE,
+    )
+except ImportError:  # pragma: no cover - depends on installed vllm-omni version
+    QWEN3_OMNI_THINKER_ONLY_PIPELINE = None
 
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
 
@@ -31,8 +36,8 @@ class Qwen3OmniRolloutAdapter(OmniRolloutPipelineBase):
     """Rollout pipeline topology adapter for Qwen3-Omni.
 
     Registered under ``model_type="qwen3_omni_moe"``.  Stage topology
-    comes unchanged from vLLM-Omni's ``QWEN3_OMNI_PIPELINE`` and
-    ``QWEN3_OMNI_THINKER_ONLY_PIPELINE``.
+    comes from vLLM-Omni's ``QWEN3_OMNI_PIPELINE`` (and
+    ``QWEN3_OMNI_THINKER_ONLY_PIPELINE`` when available).
 
     Three pipeline modes map to subsets of the full 3-stage pipeline
     (thinker → talker → code2wav):
@@ -54,7 +59,12 @@ class Qwen3OmniRolloutAdapter(OmniRolloutPipelineBase):
             list: Per-stage pipeline topology objects from vLLM-Omni.
         """
         if pipeline_mode == "thinker_only":
-            stages = list(QWEN3_OMNI_THINKER_ONLY_PIPELINE.stages)
+            if QWEN3_OMNI_THINKER_ONLY_PIPELINE is not None:
+                stages = list(QWEN3_OMNI_THINKER_ONLY_PIPELINE.stages)
+            else:
+                # vLLM-Omni 0.22.0 only ships the full pipeline; stage 0 is
+                # already configured as text final_output for thinker-only use.
+                stages = list(QWEN3_OMNI_PIPELINE.stages[:1])
             # Guard against upstream changes that silently add stages.
             assert len(stages) == 1, (
                 f"Expected 1 stage in thinker-only pipeline, got {len(stages)}. "
