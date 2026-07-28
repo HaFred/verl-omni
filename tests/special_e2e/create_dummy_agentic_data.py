@@ -81,7 +81,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--local_save_dir",
-        default=os.path.expanduser("~/data/agentic"),
+        default=os.path.expanduser("./data/agentic"),
         help="Directory to write train.parquet and val.parquet",
     )
     parser.add_argument("--train_size", type=int, default=8, help="Number of training samples")

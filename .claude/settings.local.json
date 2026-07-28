@@ -2,11 +2,27 @@
   "permissions": {
     "allow": [
       "Bash",
-      "Bash(cd *)",
-      "Bash(git *)",
+      "Bash(*)",
+      "Read",
+      "Read(*)",
+      "Write",
+      "Write(*)",
+      "Edit",
+      "Edit(*)",
+      "Glob",
+      "Glob(*)",
+      "Grep",
+      "Grep(*)",
+      "WebFetch",
+      "WebFetch(*)",
       "WebSearch",
-      "WebFetch(domain:github.com)",
-      "WebFetch(domain:arxiv.org)"
-    ]
+      "WebSearch(*)",
+      "Skill",
+      "Skill(*)",
+      "Agent",
+      "Agent(*)"
+    ],
+    "defaultMode": "dontAsk",
+    "deny": []
   }
 }
