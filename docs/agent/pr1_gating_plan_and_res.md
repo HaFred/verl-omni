@@ -251,7 +251,7 @@ There is no test in `tests/` that runs even 1 training step. The closest is `tes
 ### 4.3 GPU Test Environment Requirements
 
 All GPU tests require:
-- **4× H800 80GB** (as specified in `run_lance_agentic_grpo.sh`)
+- **4× H800 80GB** (as specified in [run_lance_agentic_grpo.sh](../../examples/agenticrpco_trainer/lance/run_lance_agentic_grpo.sh))
 - Lance-3B model weights at `~/.cache/huggingface/hub/models--bytedance-research--Lance/...`
 - vLLM-Omni ≥ 0.22.0
 - verl ≥ 0.9.0
