@@ -177,7 +177,7 @@ The RFC explicitly states: **"PR 1 does not add an `agentic_grpo` estimator to t
 
 **Fix:** Add two tests:
 1. **CPU (UT-17):** Structural logprob consistency — `serialize_trajectories` produces identically-shaped `agent_logprobs` and `agent_tokens` tensors; non-zero logprob positions align 1:1 with `loss_mask == 1`; padding/OBS positions have logprob == 0.0; per-turn `agent_tokens` and `agent_logprobs` lists have equal length.
-2. **GPU (ST-6):** Rollout-train logprob Pearson consistency — run 1 training step on toy data, verify `training/rollout_actor_probs_pearson_corr` metric > 0.95 after weight sync, confirming rollout logprobs from `DiffusionARMultiTurnAgentLoop` match training-side recomputed logprobs from `AgenticLLMFSDPEngine`.
+2. ~~GPU Pearson consistency~~ — **N/A for PR1**. PR1 uses bypass mode (`old_log_probs = rollout_log_probs` by construction, see [ray_diffusion_trainer.py:1038-1039](verl_omni/trainer/diffusion/ray_diffusion_trainer.py#L1038-L1039)), so the Pearson correlation is trivially 1.0 and the check is skipped. If PR2 introduces decoupled mode with logprob recomputation, this becomes relevant then.
 
 ---
 
@@ -243,10 +243,8 @@ There is no test in `tests/` that runs even 1 training step. The closest is `tes
 | ST-1 | **1-step toy training** (AC1) | 4× H800 80GB | [tests/special_e2e/test_agentic_one_step_smoke.py](tests/special_e2e/test_agentic_one_step_smoke.py) *(new file)* | `python3 -m verl.trainer.main_ppo --config-name=lance_agentic_grpo` completes 1 training step with toy data (8 train / 4 val samples), no OOM, loss is finite | 🔴 CRITICAL |
 | ST-2 | **Agent weights update, diffusion frozen** (AC2) | 4× H800 80GB | [tests/special_e2e/test_agentic_weight_freeze.py](tests/special_e2e/test_agentic_weight_freeze.py) *(new file)* | After ST-1, assert: (a) LLM_UND params changed from initial, (b) LLM_GEN (`moe_gen`) params unchanged | 🔴 CRITICAL |
 | ST-3 | **Single-turn FlowGRPO unaffected** (AC3) | 4× H800 80GB | [tests/special_e2e/](tests/special_e2e/) *(reuse existing FlowGRPO smoke)* | Run existing FlowGRPO test with these changes present — same result as baseline | 🔴 CRITICAL |
-| ST-4 | Multi-turn trajectory end-to-end | 4× H800 80GB | [tests/special_e2e/test_agentic_multiturn_e2e.py](tests/special_e2e/test_agentic_multiturn_e2e.py) *(new file)* | Verify `AgenticTrajectory` in `extra_fields` after rollout; `num_turns` > 1; prompt rewriting between turns | 🟡 HIGH |
-| ST-5 | Loss mask gradient isolation | 4× H800 80GB | [tests/special_e2e/test_agentic_loss_mask_grad.py](tests/special_e2e/test_agentic_loss_mask_grad.py) *(new file)* | Verify gradients are zero on observation positions; only agent token positions receive non-zero gradients | 🟡 HIGH |
-| ST-6 | Rollout-train logprob Pearson consistency | 4× H800 80GB | [tests/special_e2e/test_agentic_logprob_consistency.py](tests/special_e2e/test_agentic_logprob_consistency.py) *(new file)* | Train 1 step on toy data, verify `training/rollout_actor_probs_pearson_corr` > 0.95 after weight sync (per verl PR #291 pattern). Confirms rollout logprobs from `DiffusionARMultiTurnAgentLoop` match training-side recomputed logprobs from `AgenticLLMFSDPEngine` | 🟡 HIGH |
-| ST-7 | Lance-3B agentic GRPO multi-step run | 4× H800 80GB | [tests/special_e2e/test_agentic_multistep_run.py](tests/special_e2e/test_agentic_multistep_run.py) *(new file)* | Train for 10 steps, verify: (a) reward increases, (b) rollout-train logprob Pearson > 0.95, (c) no memory leak | 🟢 MEDIUM |
+
+> **Note:** ST-4 through ST-7 (multi-turn e2e, loss mask gradient isolation, multi-step run) are post-merge validation tests moved to [PR2 gating plan](pr2_gating.md#21-gpu-tests-from-pr1-st-4-through-st-7). ST-6 (Pearson) is N/A for PR1's bypass mode.
 
 ### 4.3 GPU Test Environment Requirements
 
@@ -364,8 +362,10 @@ The two critical issues are resolved:
 **Remaining merge gate (GPU required):**
 - **ST-1** (1-step toy training smoke test) on 4× H800 — per RFC line 326-329.
 
-### Non-Blocking Post-Merge Work
+### Non-Blocking Post-Merge Work (moved to PR2)
+
+All items below are now tracked in the [PR2 gating plan](pr2_gating.md):
 - Co-located vs decoupled GPU pools (RFC line 311)
-- Production-scale Lance/BAGEL training run (RFC line 329: explicitly non-blocking)
-- UniCoT held-out evaluation (RFC lines 331-339: post-merge evaluation plan)
-- UniCoT adapter CPU tests (train/val split, fail-closed validation, SFT→RL conversion) — post-merge scope per RFC lines 331-339
+- Production-scale Lance/BAGEL training run (RFC line 329)
+- UniCoT held-out evaluation + adapter tests (RFC lines 331-339)
+- ST-4 through ST-7 GPU validation tests
