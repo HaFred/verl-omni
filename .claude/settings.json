@@ -1,0 +1,28 @@
+{
+    "permissions": {
+      "allow": [
+        "Bash(*)",
+        "Read",
+        "Read(*)",
+        "Write",
+        "Write(*)",
+        "Edit",
+        "Edit(*)",
+        "Glob",
+        "Glob(*)",
+        "Grep",
+        "Grep(*)",
+        "WebFetch",
+        "WebFetch(*)",
+        "WebSearch",
+        "WebSearch(*)",
+        "Skill",
+        "Skill(*)",
+        "Agent",
+        "Agent(*)"
+      ],
+      "defaultMode": "dontAsk",
+      "deny": []
+    }
+  }
+  

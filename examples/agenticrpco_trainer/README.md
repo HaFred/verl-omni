@@ -56,15 +56,40 @@ pip install "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.22
 pip install -e ".[train,dev]"
 ```
 
-## Quick start — Lance-3B
+## Prepare data
+
+### UniCoT-Self-Reflection-6K (recommended)
+
+Download and preprocess the UniCoT dataset from HuggingFace.  The script applies
+fail-closed validation per RFC S7 and writes verl-compatible train/val parquet splits.
 
 ```bash
-# PR1 acceptance smoke: toy prompt seeds (nested turns are generated online)
+pip install datasets pandas pyarrow
+
+python examples/agenticrpco_trainer/data_process/unicot.py \
+    --local_save_dir ~/data/agentic \
+    --eval_ratio 0.1
+```
+
+Output: `~/data/agentic/{train,val}.parquet` with ~5,400 train / ~600 val
+prompts (90/10 split by `data_id` hash).  Each row contains `raw_prompt`,
+`data_source`, `reward_model` (with ground-truth reflection steps), and
+provenance `extra_info`.
+
+### Toy smoke test (no download)
+
+For a one-step acceptance check that doesn't require the 6K dataset:
+
+```bash
 python3 tests/special_e2e/create_dummy_agentic_data.py \
     --local_save_dir ~/data/agentic \
     --train_size 8 \
     --val_size 4
+```
 
+## Quick start — Lance-3B
+
+```bash
 # Launch training (defaults to ~/data/agentic/{train,val}.parquet)
 bash examples/agenticrpco_trainer/lance/run_lance_agentic_grpo.sh
 ```
@@ -81,9 +106,6 @@ bash examples/agenticrpco_trainer/lance/run_lance_agentic_grpo.sh \
     trainer.total_training_steps=1 \
     trainer.logger=console
 ```
-
-UniCoT-Self-Reflection-6K nested-turn parquet remains the post-merge evaluation
-source (non-blocking for PR1 acceptance).
 
 CLI overrides:
 ```bash
@@ -115,6 +137,8 @@ examples/agenticrpco_trainer/
 │   ├── run_lance_agentic_grpo.sh     ← launch script (volatile overrides only)
 │   └── config/
 │       └── lance_agentic_grpo.yaml   ← recipe config (inherits verl ppo_trainer)
+├── data_process/
+│   └── unicot.py                     ← UniCoT-Self-Reflection-6K preprocessor
 └── README.md                         ← (this file)
 ```
 
