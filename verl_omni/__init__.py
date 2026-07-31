@@ -30,10 +30,6 @@ except Exception:
 
 # Import pipelines / rollout / reward loop / engines to auto-register them
 # Apply model patches and auto-register pipelines / rollout / reward loop / engines
-from verl_omni.utils.flash_attn_fallback import patch_attention_utils_flash_attn_fallback  # noqa: E402
-
-patch_attention_utils_flash_attn_fallback()
-
 import verl_omni.agent_loop  # noqa: E402, F401  # register diffusion agent loops
 import verl_omni.models  # noqa: E402, F401
 import verl_omni.pipelines  # noqa: E402, F401

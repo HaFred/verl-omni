@@ -38,12 +38,11 @@ clear
 # Smoke uses the prepared understanding-only export (prepare_lance_hf_und.py).
 # Do NOT point MODEL_PATH at raw Lance_3B — tokenizer has no chat_template and
 # every prompt is skipped → filter dataset len: 0.
-_LANCE_SNAP="/home/fq9hpsac/fq9hpsacuser11/fred/hf_home/hub/models--bytedance-research--Lance/snapshots/7395315758865e6f56ab87ad06a88c7ac172f056"
+_LANCE_SNAP=""
 _LANCE_RAW="${_LANCE_SNAP}/Lance_3B"
 _LANCE_HF_UND="${_LANCE_SNAP}/Lance_3B_hf_und"
 MODEL_PATH="${MODEL_PATH:-$_LANCE_HF_UND}"
 
-RUN_STS=1
 RUN_STS="${RUN_STS:-all}"
 
 _st_enabled() {
@@ -172,7 +171,7 @@ ST3_TRACE="$TRACES_DIR/st3_compat_trace.json"
 # ============================================================================
 # ST-1: 1-step toy training completes (AC1)
 # ============================================================================
-
+if _st_enabled 1; then
 _info ""
 _info "=== ST-1: 1-Step Agentic GRPO Training ==="
 _info "Log:   $ST1_LOG"
@@ -298,6 +297,7 @@ n_events  = len(trace["events"])
 print(f"ST-1 trace saved: {n_metrics} metrics, {n_events} events → {trace_path}")
 PYEOF
 _info "ST-1 trace: $ST1_TRACE"
+fi
 
 # ============================================================================
 # ST-2: Agent weights update; diffusion weights frozen (AC2)
