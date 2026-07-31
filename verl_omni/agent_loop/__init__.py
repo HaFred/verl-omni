@@ -21,6 +21,10 @@ from .agentic_trajectory import (
 )
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
 from .diffusion_ar_multi_turn_agent_loop import DiffusionARMultiTurnAgentLoop
+from .diffusion_agent_loop_tq import (
+    DiffusionAgentLoopWorkerTQ,
+    create_diffusion_agent_loop_manager,
+)
 from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 
 __all__ = [
@@ -29,6 +33,8 @@ __all__ = [
     "AgenticTurn",
     "DiffusionAgentLoopOutput",
     "DiffusionAgentLoopWorker",
+    "DiffusionAgentLoopWorkerTQ",
+    "create_diffusion_agent_loop_manager",
     "DiffusionSingleTurnAgentLoop",
     "DiffusionARMultiTurnAgentLoop",
     "ToolCall",
