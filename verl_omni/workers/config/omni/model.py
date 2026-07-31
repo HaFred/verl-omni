@@ -51,6 +51,7 @@ class OmniModelConfig(BaseConfig):
         "model_type",
         "architecture",
         "model_stage",
+        "hf_config_path",
         "tokenizer_path",
         "tokenizer",
         "processor",
@@ -120,6 +121,7 @@ class OmniModelConfig(BaseConfig):
     # Optional dtype for LoRA parameters (e.g. "float32"); null = use model dtype.
     # Declared so Hydra can instantiate OmniModelConfig from omni_model.yaml.
     lora_dtype: Optional[str] = None
+    lora_init_weights: str = "gaussian"
     target_modules: Optional[Any] = "all-linear"  # allow both "all-linear" and ["q_proj", "k_proj"]
     target_parameters: Optional[list[str]] = None  # for lora adapter on nn.Parameter
     exclude_modules: Optional[str] = None
@@ -129,6 +131,12 @@ class OmniModelConfig(BaseConfig):
 
     # path to pre-trained LoRA adapter to load for continued training
     lora_adapter_path: Optional[str] = None
+
+    # Named LoRA policy states required by the algorithm. "reference" uses disabled adapters.
+    policy_state_adapters: tuple[str, ...] = ("default",)
+
+    # FSDP layer name prefixes for LoRA parameter layered summon.
+    fsdp_layer_prefixes: list[str] = field(default_factory=list)
 
     use_liger: bool = False
 
