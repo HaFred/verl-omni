@@ -12,6 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync  # noqa: F401
+# Omni sync trainer pulls verl's V1 stack (TransferQueue). Keep import soft so
+# Mode (2a) agentic GRPO via ``verl.trainer.main_ppo`` still loads without it.
+try:
+    from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync  # noqa: F401
 
-__all__ = ["OmniPPOTrainerSync"]
+    __all__ = ["OmniPPOTrainerSync"]
+except ModuleNotFoundError as exc:  # pragma: no cover - optional V1 dependency
+    if getattr(exc, "name", None) != "transfer_queue" and "transfer_queue" not in str(exc):
+        raise
+    OmniPPOTrainerSync = None  # type: ignore[misc, assignment]
+    __all__: list[str] = []

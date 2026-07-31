@@ -12,11 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .agentic_trajectory import (
+    AgenticMetadata,
+    AgenticTrajectory,
+    AgenticTurn,
+    ToolCall,
+    ToolOutput,
+)
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
+from .diffusion_ar_multi_turn_agent_loop import DiffusionARMultiTurnAgentLoop
 from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 
 __all__ = [
+    "AgenticMetadata",
+    "AgenticTrajectory",
+    "AgenticTurn",
     "DiffusionAgentLoopOutput",
     "DiffusionAgentLoopWorker",
     "DiffusionSingleTurnAgentLoop",
+    "DiffusionARMultiTurnAgentLoop",
+    "ToolCall",
+    "ToolOutput",
 ]
