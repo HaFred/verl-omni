@@ -33,9 +33,17 @@ def patch_attention_utils_flash_attn_fallback() -> None:
     except ImportError:
         pass
 
-    import verl.utils.attention_utils as attention_utils
-    from einops import rearrange
-    from transformers.modeling_flash_attention_utils import _index_first_axis, _pad_input, _unpad_input
+    try:
+        import verl.utils.attention_utils as attention_utils
+        from einops import rearrange
+        from transformers.modeling_flash_attention_utils import _index_first_axis, _pad_input, _unpad_input
+    except ImportError as exc:
+        logger.warning(
+            "flash_attn not installed and Transformers padding helpers unavailable (%s); "
+            "leaving verl.utils.attention_utils unchanged.",
+            exc,
+        )
+        return
 
     def _get_attention_functions():
         from verl.utils.device import is_torch_npu_available

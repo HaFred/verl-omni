@@ -240,7 +240,8 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
             response_mask=response_mask[: self.response_length],
             response_logprobs=response_logprobs[: self.response_length] if response_logprobs else None,
             multi_modal_data=multi_modal_data,
-            num_turns=len(turns) + 1,
+            # Align with AgenticMetadata.num_turns (agent decision turns, not +1 user).
+            num_turns=len(turns),
             metrics=metrics,
             extra_fields={
                 "agentic_trajectory": traj_dict,

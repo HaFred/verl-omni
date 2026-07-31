@@ -45,7 +45,9 @@ __all__: list[str] = []
 def _load_optional(name: str) -> None:
     try:
         module = importlib.import_module(f"{__name__}.{name}")
-    except Exception as exc:  # noqa: BLE001 - keep package importable
+    except (ImportError, ModuleNotFoundError, OSError) as exc:
+        # Missing optional deps / shared libs (e.g. libcudart) — keep package importable.
+        # Unexpected bugs (TypeError, RuntimeError, ...) still propagate.
         logger.warning("Skipping optional pipeline adapter %s: %s", name, exc)
         return
     exported = getattr(module, "__all__", None)

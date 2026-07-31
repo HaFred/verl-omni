@@ -172,10 +172,18 @@ class OmniModelConfig(BaseConfig):
             tokenizer_path = os.path.join(self.local_path, "tokenizer")
             self.tokenizer_path = tokenizer_path if os.path.exists(tokenizer_path) else self.local_path
 
-        if self.architecture == MISSING:
+        # Hydra yaml uses `architecture: null` (None), while the dataclass
+        # default is MISSING — treat both as "auto-detect from config.json".
+        if self.architecture is None or self.architecture == MISSING:
             config_path = os.path.join(self.local_path, "config.json")
-            with open(config_path) as f:
-                self.architecture = json.load(f)["architectures"][0]
+            try:
+                with open(config_path) as f:
+                    self.architecture = json.load(f)["architectures"][0]
+            except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError, TypeError, IndexError) as e:
+                raise ValueError(
+                    f"Failed to determine model architecture from {config_path}: {e}. "
+                    f"Set 'architecture' explicitly in the model config."
+                ) from e
 
         # Build hf_config so the FSDP engine can load and wrap the model.
         self.local_hf_config_path = copy_to_local(self.hf_config_path, use_shm=self.use_shm)

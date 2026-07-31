@@ -30,6 +30,28 @@ from verl_omni.agent_loop.diffusion_ar_multi_turn_agent_loop import _user_text_f
 from verl_omni.agent_loop.trajectory_serializer import serialize_trajectories
 
 
+class _FakeTokenizer:
+    """Deterministic stand-in: maps each character to its code point as a token id."""
+
+    def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return [ord(c) for c in text]
+
+
+_TOK = _FakeTokenizer()
+
+
+def _serialize(trajectories, max_prompt_length, observation_token_length, max_total_tokens=4096, **kwargs):
+    return serialize_trajectories(
+        trajectories,
+        max_prompt_length,
+        observation_token_length,
+        max_total_tokens,
+        tokenizer=_TOK,
+        **kwargs,
+    )
+
+
 def _make_turn(idx, tokens, logprobs, text, decision, tc=None, to=None):
     return AgenticTurn(idx, tokens, logprobs, text, tc, to, decision)
 
@@ -100,14 +122,14 @@ class TestLossMasking:
         t1 = _make_turn(1, [4, 5, 6], [0.4, 0.5, 0.6], "t1", "stop", None, ToolOutput("image", torch.ones(3, 512, 512)))
         traj = AgenticTrajectory("p", [t0, t1], metadata=AgenticMetadata(2, True, "agent_stop"))
 
-        result = serialize_trajectories([traj], 256, 128, 1024)
+        result = _serialize([traj], 256, 128, 1024)
         loss_mask = result["loss_mask"][0]
         assert loss_mask.sum().item() == 6, f"Expected 6, got {loss_mask.sum()}"
 
     def test_loss_mask_single_turn(self):
         t0 = _make_turn(0, [1, 2], [0.1, 0.2], "t", "stop")
         traj = AgenticTrajectory("p", [t0])
-        result = serialize_trajectories([traj], 256, 128, 1024)
+        result = _serialize([traj], 256, 128, 1024)
         mask = result["loss_mask"][0]
         assert mask[:2].sum() == 2
         assert mask[2:].sum() == 0
@@ -150,10 +172,37 @@ class TestAgentOutputParser:
         r = parse_agent_output(text)
         assert r["decision"] == "stop"
 
+    def test_discontinue_is_not_continue(self):
+        text = "<decision>discontinue</decision>"
+        r = parse_agent_output(text)
+        assert r["decision"] == "stop"
+
     def test_malformed(self):
         r = parse_agent_output("garbage text")
         assert r["decision"] == "stop"
         assert r["reasoning"] is None
+
+
+class TestResponseImageBatching:
+    def test_mixed_image_shapes_stack(self):
+        """64x64 tool output and missing-image traj both stack at fixed CHW."""
+        t0 = _make_turn(
+            0,
+            [1],
+            [0.1],
+            "t0",
+            "stop",
+            ToolCall("t2i", {"prompt": "p"}),
+            ToolOutput("image", torch.ones(3, 64, 64)),
+        )
+        t1 = _make_turn(0, [2], [0.2], "t1", "stop")
+        result = _serialize(
+            [AgenticTrajectory("a", [t0]), AgenticTrajectory("b", [t1])],
+            32,
+            8,
+            64,
+        )
+        assert result["responses"].shape == (2, 3, 512, 512)
 
 
 class TestBackwardCompatibility:
@@ -184,9 +233,7 @@ class TestEdgeCases:
             [],
             metadata=AgenticMetadata(0, False, "max_turns"),
         )
-        result = serialize_trajectories(
-            [traj], max_prompt_length=256, observation_token_length=128, max_total_tokens=1024
-        )
+        result = _serialize([traj], max_prompt_length=256, observation_token_length=128, max_total_tokens=1024)
         # All tensors must be present with correct batch dimension
         assert result["prompt_tokens"].shape[0] == 1
         assert result["agent_tokens"].shape[0] == 1
@@ -215,7 +262,7 @@ class TestLogProbConsistency:
         )
         t1 = _make_turn(1, [4, 5], [0.4, 0.5], "t1", "stop")
         traj = AgenticTrajectory("p", [t0, t1])
-        result = serialize_trajectories([traj], 256, 128, 1024)
+        result = _serialize([traj], 256, 128, 1024)
         assert result["agent_logprobs"].shape == result["agent_tokens"].shape
 
     def test_loss_mask_logprob_pairing(self):
@@ -230,7 +277,7 @@ class TestLogProbConsistency:
             ToolOutput("image", torch.zeros(3, 64, 64)),
         )
         traj = AgenticTrajectory("p", [t0])
-        result = serialize_trajectories([traj], 256, 128, 512)
+        result = _serialize([traj], 256, 128, 512)
         mask = result["loss_mask"][0]
         logprobs = result["agent_logprobs"][0]
         for i in range(len(mask)):
@@ -248,7 +295,7 @@ class TestLogProbConsistency:
         """All positions beyond the serialized tokens have logprob == 0.0."""
         t0 = _make_turn(0, [7, 8], [0.7, 0.8], "t", "stop")
         traj = AgenticTrajectory("p", [t0])
-        result = serialize_trajectories([traj], 256, 128, 64)
+        result = _serialize([traj], 256, 128, 64)
         mask = result["loss_mask"][0]
         logprobs = result["agent_logprobs"][0]
         # Find last position with mask=1

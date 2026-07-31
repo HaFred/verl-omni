@@ -60,6 +60,11 @@ def parse_agent_output(text: str) -> dict[str, str | None]:
     decision_match = re.search(r"<decision>\s*(.*?)\s*</decision>", text, re.DOTALL)
     if decision_match:
         raw_decision = decision_match.group(1).strip().lower()
-        result["decision"] = "continue" if "continue" in raw_decision else "stop"
+        # Exact token match only — substring checks misclassify "discontinue"/"continuous".
+        if raw_decision == "continue":
+            result["decision"] = "continue"
+        else:
+            # "stop", "terminate", unknown → fail-safe stop
+            result["decision"] = "stop"
 
     return result
