@@ -56,7 +56,6 @@ class OmniModelConfig(BaseConfig):
         "tokenizer",
         "processor",
         "local_path",
-        "hf_config_path",
         "local_tokenizer_path",
         "local_hf_config_path",
         "hf_config",

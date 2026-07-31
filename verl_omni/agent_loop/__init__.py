@@ -20,11 +20,11 @@ from .agentic_trajectory import (
     ToolOutput,
 )
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
-from .diffusion_ar_multi_turn_agent_loop import DiffusionARMultiTurnAgentLoop
 from .diffusion_agent_loop_tq import (
     DiffusionAgentLoopWorkerTQ,
     create_diffusion_agent_loop_manager,
 )
+from .diffusion_ar_multi_turn_agent_loop import DiffusionARMultiTurnAgentLoop
 from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop
 
 __all__ = [
