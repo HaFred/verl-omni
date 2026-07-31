@@ -54,10 +54,10 @@ class AgenticTurn:
     """
 
     turn_idx: int
-    agent_tokens: list[int]      # full agent text tokens (loss_mask=1)
+    agent_tokens: list[int]  # full agent text tokens (loss_mask=1)
     agent_logprobs: list[float]  # per-token logprobs from rollout
-    agent_text: str              # decoded text: reasoning + prompt + decision
-    tool_call: ToolCall | None = None      # None on stop turn
+    agent_text: str  # decoded text: reasoning + prompt + decision
+    tool_call: ToolCall | None = None  # None on stop turn
     tool_output: ToolOutput | None = None  # None on stop turn
     decision: Literal["continue", "stop"] = "stop"
 
@@ -96,15 +96,15 @@ def agentic_trajectory_to_dict(traj: AgenticTrajectory) -> dict[str, Any]:
                 "agent_logprobs": t.agent_logprobs,
                 "agent_text": t.agent_text,
                 "tool_call": (
-                    {"tool_name": t.tool_call.tool_name, "params": t.tool_call.params}
-                    if t.tool_call else None
+                    {"tool_name": t.tool_call.tool_name, "params": t.tool_call.params} if t.tool_call else None
                 ),
                 "tool_output": (
                     {
                         "output_type": t.tool_output.output_type,
                         "output_data_shape": list(t.tool_output.output_data.shape),
                     }
-                    if t.tool_output else None
+                    if t.tool_output
+                    else None
                 ),
                 "decision": t.decision,
             }

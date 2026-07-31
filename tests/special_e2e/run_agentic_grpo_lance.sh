@@ -38,7 +38,7 @@ clear
 # Smoke uses the prepared understanding-only export (prepare_lance_hf_und.py).
 # Do NOT point MODEL_PATH at raw Lance_3B — tokenizer has no chat_template and
 # every prompt is skipped → filter dataset len: 0.
-_LANCE_SNAP=""  # HF model downloaded path
+_LANCE_SNAP="/home/fq9hpsac/fq9hpsacuser11/fred/hf_home/hub/models--bytedance-research--Lance/snapshots/7395315758865e6f56ab87ad06a88c7ac172f056"
 _LANCE_RAW="${_LANCE_SNAP}/Lance_3B"
 _LANCE_HF_UND="${_LANCE_SNAP}/Lance_3B_hf_und"
 MODEL_PATH="${MODEL_PATH:-$_LANCE_HF_UND}"

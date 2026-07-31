@@ -56,9 +56,7 @@ def _user_text_from_raw_prompt(raw_prompt: Any) -> str:
                 return content
             if isinstance(content, list):
                 texts = [
-                    part.get("text", "")
-                    for part in content
-                    if isinstance(part, dict) and part.get("type") == "text"
+                    part.get("text", "") for part in content if isinstance(part, dict) and part.get("type") == "text"
                 ]
                 joined = " ".join(text for text in texts if text).strip()
                 if joined:
@@ -96,7 +94,7 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
         payload = getattr(text_output, "diffusion_output", None)
         if isinstance(payload, str):
             return payload, []
-        if payload is not None and not isinstance(payload, (torch.Tensor, bytes)):
+        if payload is not None and not isinstance(payload, torch.Tensor | bytes):
             return str(payload), []
         return "", []
 
@@ -134,7 +132,6 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
 
         turns: list[AgenticTurn] = []
         metrics: dict[str, Any] = {}
-        final_diffusion_output = None
         decision = "stop"
 
         initial_prompt_ids = await self.apply_chat_template(chat_messages, images=images, videos=videos)
@@ -159,9 +156,7 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
             if not agent_token_ids and agent_text:
                 agent_token_ids = self.tokenizer.encode(agent_text, add_special_tokens=False)
 
-            agent_logprobs = self._normalize_logprobs(
-                getattr(text_output, "log_probs", None), len(agent_token_ids)
-            )
+            agent_logprobs = self._normalize_logprobs(getattr(text_output, "log_probs", None), len(agent_token_ids))
 
             response_ids.extend(agent_token_ids)
             response_mask.extend([1] * len(agent_token_ids))
@@ -196,7 +191,6 @@ class DiffusionARMultiTurnAgentLoop(AgentLoopBase):
                 )
 
             diffusion_output = self._extract_tool_image(img_output)
-            final_diffusion_output = diffusion_output
 
             turns.append(
                 AgenticTurn(

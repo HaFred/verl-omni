@@ -30,7 +30,7 @@ def as_hf_model_config(model_config) -> HFModelConfig:
     if is_dataclass(model_config) and type(model_config) is HFModelConfig:
         return model_config
 
-    if isinstance(model_config, (DictConfig, dict)):
+    if isinstance(model_config, DictConfig | dict):
         cfg = OmegaConf.create(OmegaConf.to_container(model_config, resolve=True))
     elif is_dataclass(model_config):
         cfg = OmegaConf.structured(model_config)

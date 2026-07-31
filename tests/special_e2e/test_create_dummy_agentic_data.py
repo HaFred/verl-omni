@@ -19,7 +19,6 @@ import pandas as pd
 
 from tests.special_e2e.create_dummy_agentic_data import DATA_SOURCE, USER_PROMPTS, build_rows, main
 
-
 REQUIRED_COLUMNS = {"data_source", "prompt", "ability", "reward_model", "extra_info"}
 
 

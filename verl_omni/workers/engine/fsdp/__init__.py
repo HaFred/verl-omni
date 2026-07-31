@@ -11,13 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .agentic_impl import AgenticLLMFSDPEngine  # noqa: F401
 from .diffusers_impl import (  # noqa: F401
     DiffusersFSDPEngine,
     DPODiffusersFSDPEngine,
     NFTDiffusersFSDPEngine,
     PPODiffusersFSDPEngine,
 )
-from .agentic_impl import AgenticLLMFSDPEngine  # noqa: F401
 
 # TODO(andy): unify DPO and NFT engines later.
 __all__ = [

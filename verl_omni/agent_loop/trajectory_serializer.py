@@ -50,8 +50,6 @@ def serialize_trajectories(
         loss_mask: [bsz, max_total_tokens]
         responses: [bsz, C, H, W]  # final turn's image
     """
-    bsz = len(trajectories)
-
     prompt_tokens_list = []
     agent_tokens_list = []
     agent_logprobs_list = []
@@ -59,9 +57,7 @@ def serialize_trajectories(
     responses_list = []
 
     for traj in trajectories:
-        prompt_tok = _pad_or_truncate_int(
-            [ord(c) for c in traj.prompt], max_prompt_length, PAD_TOKEN_ID
-        )
+        prompt_tok = _pad_or_truncate_int([ord(c) for c in traj.prompt], max_prompt_length, PAD_TOKEN_ID)
         prompt_tokens_list.append(prompt_tok)
 
         all_tokens: list[int] = []

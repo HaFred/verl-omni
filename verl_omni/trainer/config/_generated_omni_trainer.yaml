@@ -434,6 +434,12 @@ actor_rollout_ref:
     architecture: null
     model_stage: thinker
     hf_config_name: null
+    agentic:
+      enabled: false
+      max_turns: 5
+      early_termination: true
+      observation_token_length: 128
+    freeze: []
     lora_dtype: null
     target_parameters: null
     max_image_tokens: null

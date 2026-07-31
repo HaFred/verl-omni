@@ -76,9 +76,7 @@ def build_rows(split: str, n: int) -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Generate toy agentic GRPO parquet seeds for PR1 acceptance smoke"
-    )
+    parser = argparse.ArgumentParser(description="Generate toy agentic GRPO parquet seeds for PR1 acceptance smoke")
     parser.add_argument(
         "--local_save_dir",
         default=os.path.expanduser("~/data/agentic"),

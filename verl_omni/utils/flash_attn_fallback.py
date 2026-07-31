@@ -41,8 +41,8 @@ def patch_attention_utils_flash_attn_fallback() -> None:
         from verl.utils.device import is_torch_npu_available
 
         if is_torch_npu_available(check_device=False):
-            from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, rearrange as npu_rearrange
-            from verl.utils.npu_flash_attn_utils import unpad_input
+            from verl.utils.npu_flash_attn_utils import index_first_axis, pad_input, unpad_input
+            from verl.utils.npu_flash_attn_utils import rearrange as npu_rearrange
 
             attention_utils._index_first_axis = index_first_axis
             attention_utils._pad_input = pad_input

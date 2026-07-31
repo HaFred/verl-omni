@@ -19,7 +19,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
-AGENT_SYSTEM_PROMPT = """You are a visual creation agent. Analyze the user request, reason about what to generate, produce a prompt for the diffusion model, evaluate the result, and decide whether to continue or stop.
+AGENT_SYSTEM_PROMPT = """You are a visual creation agent. Analyze the user request, \
+reason about what to generate, produce a prompt for the diffusion model, evaluate \
+the result, and decide whether to continue or stop.
 
 You MUST respond in the following format:
 <reasoning>

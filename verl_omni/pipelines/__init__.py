@@ -57,5 +57,5 @@ def _load_optional(name: str) -> None:
 for _name in _OPTIONAL_SUBMODULES:
     _load_optional(_name)
 
-# Keep pkgutil discovery working for tools that enumerate submodules.
-del importlib, logging, pkgutil, _name, _load_optional
+# Namespace hygiene after optional adapters load (do not del importlib: ruff F821).
+del logging, pkgutil, _name, _load_optional
