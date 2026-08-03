@@ -179,7 +179,7 @@ _info "Arch:  $MODEL_ARCHITECTURE  rollout=$ROLLOUT_BACKEND  freeze=$MODEL_FREEZ
 rm -rf "$ST1_CKPT"
 mkdir -p "$ST1_CKPT"
 
-set +e  # don't exit on failure so we can report
+set +e  # do not exit on failure so we can report
 python3 -m verl.trainer.main_ppo \
     --config-path="$AGENTIC_CONFIG_DIR" \
     --config-name=lance_agentic_grpo \
@@ -265,7 +265,6 @@ if os.path.exists(log_path):
 
     # Extract key events
     event_patterns = [
-        ("engine_loaded", r"AgenticLLMFSDPEngine:"),
         ("oom_detected", r"(?i)out\s+of\s+memory"),
         ("nan_detected", r"\bNaN\b"),
         ("inf_detected", r"\binf\b"),
@@ -273,7 +272,7 @@ if os.path.exists(log_path):
         ("training_completed", r"(?i)training\s+(?:complete|finished|done)"),
         ("checkpoint_saved", r"(?i)(?:saving|saved)\s+(?:checkpoint|model)"),
         ("ray_initialized", r"Started a local Ray instance"),
-        ("tool_stubbed", r"(?i)using stub image tensor"),
+        ("tool_stubbed", r"(?i)using text-only stub diffusion tool"),
     ]
     for line in lines:
         for event_name, pattern in event_patterns:
@@ -283,13 +282,13 @@ if os.path.exists(log_path):
                     "line": line.strip()[:200],
                 })
 
-    # Und-only smoke may use stub tool images — record, do not fail.
+    # Und-only smoke may use the text-only function-tool stub — record, do not fail.
     trace["tool_stubbed"] = any(e.get("event") == "tool_stubbed" for e in trace["events"])
     if trace["tool_stubbed"]:
         trace["claims"] = {
             "infra_smoke": True,
             "real_diffusion_tool": False,
-            "note": "Stub tool images used (und-only). Real MoT tool is a follow-up.",
+            "note": "Text-only diffusion tool stub used. Configure the external endpoint for real images.",
         }
     else:
         trace["claims"] = {"infra_smoke": True}
@@ -346,9 +345,8 @@ trace = {
     "skips": [],
 }
 
-# (a) Stock-path guard + und-only freeze skip.
+# (a) Stock-path guard + external-tool boundary.
 # Diffusion is an external tool, so it is outside the actor optimizer by construction.
-# AgenticLLMFSDPEngine selective-freeze logging was removed with that engine.
 forbidden_worker_path = False
 if os.path.exists(ST1_LOG):
     with open(ST1_LOG, encoding="utf-8", errors="replace") as f:
@@ -370,10 +368,10 @@ if not MODEL_FREEZE:
     trace["checks"]["2a_engine_freeze"] = {
         "passed": True,
         "skipped": True,
-        "reason": "MODEL_FREEZE=[] (und-only smoke); selective freeze deferred to MoT layout",
+        "reason": "Diffusion runs as an external ToolAgentLoop function tool, outside the actor optimizer",
     }
     trace["skips"].append("2a_engine_freeze_empty_MODEL_FREEZE")
-    print("[SKIP] ST-2a freeze: MODEL_FREEZE=[] — not claimed on und-only export")
+    print("[SKIP] ST-2a freeze: external tool is outside the actor checkpoint")
 else:
     # No engine freeze log line anymore; do not fail the merge gate on und-only path.
     trace["checks"]["2a_engine_freeze"] = {
@@ -416,13 +414,18 @@ else:
     print("[FAIL] ST-2b: No checkpoint/model files found")
     trace["warnings"].append("checkpoint_not_found")
 
-# (c) Verify loss is non-zero (gradients flowed)
+# (c) Verify loss is non-zero (gradients flowed).
+# Trainer logs may print plain floats or numpy wrappers:
+#   actor/loss:0.12  |  actor/loss=0.12  |  actor/loss:np.float64(0.12)
 loss_match = False
 loss_value = None
+loss_re = re.compile(
+    r"actor/loss(?:[:\s=]+|:)(?:np\.(?:float64|float32)\()?([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)\)?"
+)
 if os.path.exists(ST1_LOG):
     with open(ST1_LOG, encoding="utf-8", errors="replace") as f:
         for line in f:
-            m = re.search(r"actor/loss[:\s=]+([\d.e+\-]+)", line)
+            m = loss_re.search(line)
             if m:
                 loss_value = float(m.group(1))
                 print(f"Loss value: {loss_value}")
@@ -452,7 +455,7 @@ if os.path.exists(ST1_TRACE):
         e.get("event") == "tool_stubbed" for e in st1_trace.get("events", []) if isinstance(e, dict)
     ):
         trace["warnings"].append("st1_used_stub_tool_und_only")
-        print("[INFO] ST-1 used stub tool images (und-only) — not a real diffusion freeze claim")
+        print("[INFO] ST-1 used the text-only diffusion tool stub — not a real image-tool claim")
 
 # Gate on overall_passed (skips count as passed)
 all_passed = all(c.get("passed", False) for c in trace["checks"].values())
@@ -470,7 +473,8 @@ print("comparing moe_gen params before/after) is model-format dependent.")
 print("CPU test UT-13 (TestFreezeLogic) validates the freeze pattern in isolation.")
 if not all_passed:
     print("[FAIL] ST-2 overall_passed=false")
-    sys.exit(1)
+# Do not sys.exit(1): the outer shell uses set -e and must still run ST-3.
+# overall_passed is recorded in the trace for the shell gate below.
 PYEOF
 ST2_PY_EXIT=$?
 
@@ -478,6 +482,11 @@ if [ "$ST2_PY_EXIT" -ne 0 ]; then
   ST2_FAIL=1
 elif [ -f "$ST2_TRACE" ] && ! python3 -c "import json,sys; t=json.load(open(sys.argv[1])); sys.exit(0 if t.get('overall_passed') else 1)" "$ST2_TRACE"; then
   ST2_FAIL=1
+fi
+
+# Echo ST-2 log to console so redirects don't hide pass/fail.
+if [ -f "$ST2_LOG" ]; then
+  cat "$ST2_LOG"
 fi
 
 if [ "$ST2_FAIL" -eq 0 ]; then

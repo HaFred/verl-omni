@@ -11,15 +11,15 @@ Config: [`lance/config/lance_agentic_grpo.yaml`](lance/config/lance_agentic_grpo
 ### Scope (PR1)
 
 - **ST-1** is an **infra smoke**: 1-step GRPO completes with finite `actor/loss`.
-  Und-only Lance export may use a **stub tool image** (marked `tool_stubbed`);
-  that is not a claim that real diffusion tooling works.
-- **Online train path** masks turn ≥1 agent tokens (`response_mask=0`) until
-  full chat-template retokenize (train↔rollout parity) lands in PR2.
+  Without `AGENTIC_DIFFUSION_TOOL_URL`, the function tool returns a text-only
+  stub; that is not a claim that real diffusion tooling works.
+- Multi-turn orchestration uses verl's stock `ToolAgentLoop`: all assistant
+  turns receive `response_mask=1`, while tool observations receive `0`.
 - **ST-2** verifies the actor checkpoint/loss and guards against routing through
   the removed custom agentic/Omni worker stack.
 - The recipe uses upstream verl's `HFModelConfig`, language-model FSDP engine,
-  vLLM rollout, and agent-loop configuration mechanism. Existing V1 Omni model,
-  trainer, and rollout code is unchanged.
+  vLLM rollout, `ToolAgentLoop`, and function-tool configuration. Existing V1
+  Omni model, trainer, engine, and rollout code is unchanged.
 
 ### Toy data (acceptance smoke)
 
@@ -57,5 +57,11 @@ examples/agenticrpco_trainer/
 └── README.md
 
 verl_omni/agent_loop/
-└── agent_loop.yaml
+├── agentic_trajectory.py
+└── diffusion_tool.py
 ```
+
+Set `AGENTIC_DIFFUSION_TOOL_URL` to an HTTP endpoint accepting
+`{"prompt": "..."}` and returning JSON with optional `image_base64` or
+`images_base64`, `text`, and `reward` fields. A visual actor/processor is
+required when the endpoint returns images.

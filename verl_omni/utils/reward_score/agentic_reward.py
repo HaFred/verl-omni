@@ -11,17 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Scalar agentic reward for Mode (2a) GRPO (PR1).
-
-Lightweight trajectory-aware format heuristic for DAPO/GRPO smoke. Full
-multi-dimensional UTPCR scorers remain PR2.
-"""
+"""Scalar agentic reward for Mode (2a) GRPO acceptance smoke."""
 
 from __future__ import annotations
 
 from typing import Any
-
-from verl_omni.agent_loop.agent_output_parser import parse_agent_output
 
 
 def _trajectory_texts(extra_info: dict | None, kwargs: dict) -> list[str]:
@@ -57,17 +51,10 @@ def _trajectory_texts(extra_info: dict | None, kwargs: dict) -> list[str]:
     return texts
 
 
-def _format_score_for_text(text: str) -> float:
-    """Score one agent turn by structured tag presence (reasoning/prompt/decision)."""
-    parsed = parse_agent_output(text)
-    score = 0.0
-    if parsed.get("reasoning"):
-        score += 0.4
-    if parsed.get("prompt"):
-        score += 0.4
-    if parsed.get("decision") in ("continue", "stop") and "<decision>" in text.lower():
-        score += 0.2
-    return score
+def _tool_call_score(text: str) -> float:
+    """Recognize the stock tool-agent's serialized function call."""
+    lowered = text.lower()
+    return 1.0 if "generate_image" in lowered else min(1.0, len(text.strip()) / 256.0)
 
 
 def compute_score(
@@ -77,30 +64,24 @@ def compute_score(
     extra_info: dict | None = None,
     **kwargs: Any,
 ) -> dict:
-    """DAPO-compatible scalar reward for agentic GRPO.
-
-    Prefer a lightweight format heuristic over multi-turn ``agentic_trajectory``
-    when present. Stock DAPO only forwards the decoded response, so score that
-    directly when it contains the expected structure. Otherwise use a mild
-    response-length prior for toy rollouts.
-    """
+    """DAPO-compatible scalar reward for stock ``ToolAgentLoop`` rollouts."""
     del data_source, ground_truth  # interface compatibility
     texts = _trajectory_texts(extra_info, kwargs)
     if texts:
-        scores = [_format_score_for_text(t) for t in texts]
+        scores = [_tool_call_score(t) for t in texts]
         score = float(sum(scores) / len(scores))
         return {
             "score": score,
-            "method": "agentic_format_heuristic",
+            "method": "agentic_tool_call_heuristic",
             "num_turns_scored": len(texts),
             "tool_stubbed": bool((extra_info or {}).get("tool_stubbed", False)),
         }
 
     text = (solution_str or "").strip()
-    if any(tag in text.lower() for tag in ("<reasoning>", "<prompt>", "<decision>")):
+    if "generate_image" in text.lower():
         return {
-            "score": float(_format_score_for_text(text)),
-            "method": "agentic_format_heuristic",
+            "score": 1.0,
+            "method": "agentic_tool_call_heuristic",
             "num_turns_scored": 1,
         }
 

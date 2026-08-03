@@ -1,12 +1,11 @@
 # Lance-3B Agentic GRPO training config (stock verl FSDP + vLLM rollout).
 #
 # Mode (2a): trains the exported Lance understanding language model via
-# token-level GRPO. The image generator is an external tool and is therefore
-# outside the actor optimizer by construction.
+# token-level GRPO. verl's stock ToolAgentLoop dispatches image generation to
+# an external diffusion function tool, outside the actor optimizer.
 #
 # Inherits verl's default ppo_trainer config.  Volatile values (data/model
-# paths, GPU/node counts, vLLM-Omni stage config path) are set via CLI in the
-# run script.
+# paths and GPU/node counts) are set via CLI in the run script.
 #
 # Launch with:
 #   python3 -m verl.trainer.main_ppo \
@@ -81,15 +80,19 @@ actor_rollout_ref:
     layered_summon: true
     log_prob_micro_batch_size_per_gpu: 2
 
-    agent:
-      default_agent_loop: diffusion_ar_multi_turn_agent
-      agent_loop_config_path: verl_omni/agent_loop/agent_loop.yaml
+    multi_turn:
+      enable: true
+      max_assistant_turns: 5
+      max_user_turns: 5
+      max_parallel_calls: 1
+      max_tool_response_length: 256
+      tool_response_truncate_side: middle
+      format: hermes
+      function_tool_path: verl_omni/agent_loop/diffusion_tool.py
 
-    # Stock RolloutConfig extension point for this custom agent loop.
-    custom:
-      agentic:
-        max_turns: 5
-        early_termination: True
+    agent:
+      default_agent_loop: tool_agent
+      agent_loop_config_path: null
 
   ref:
     log_prob_micro_batch_size_per_gpu: 2

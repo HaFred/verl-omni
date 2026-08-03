@@ -12,11 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the isolated agent-loop extension and trajectory metadata."""
+"""Tests for agentic trajectory metadata and stock tool-agent wiring."""
+
+from pathlib import Path
 
 import torch
+from omegaconf import OmegaConf
+from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+from verl.tools.function_tool import get_function_tool
 
-from verl_omni.agent_loop.agent_output_parser import parse_agent_output
 from verl_omni.agent_loop.agentic_trajectory import (
     AgenticMetadata,
     AgenticTrajectory,
@@ -26,26 +30,11 @@ from verl_omni.agent_loop.agentic_trajectory import (
     agentic_trajectory_from_dict,
     agentic_trajectory_to_dict,
 )
-from verl_omni.agent_loop.diffusion_ar_multi_turn_agent_loop import (
-    DiffusionARMultiTurnAgentLoop,
-    _user_text_from_raw_prompt,
-)
+from verl_omni.agent_loop.diffusion_tool import DIFFUSION_TOOL_SCHEMA, generate_image
 
 
 def _make_turn(idx, tokens, logprobs, text, decision, tc=None, to=None):
     return AgenticTurn(idx, tokens, logprobs, text, tc, to, decision)
-
-
-class TestRawPromptNormalization:
-    def test_string_passthrough(self):
-        assert _user_text_from_raw_prompt("a blue hat") == "a blue hat"
-
-    def test_chat_messages(self):
-        messages = [
-            {"role": "system", "content": "sys"},
-            {"role": "user", "content": "Generate a cat wearing a blue hat"},
-        ]
-        assert _user_text_from_raw_prompt(messages) == "Generate a cat wearing a blue hat"
 
 
 class TestTrajectory:
@@ -105,69 +94,46 @@ class TestTrajectory:
         assert trajectory.turns[1].tool_call.params["prompt"] == "rewritten"
 
 
-class TestAgentOutputParser:
-    def test_full_format(self):
-        text = "<reasoning>analyze</reasoning>\n<prompt>A test</prompt>\n<decision>continue</decision>"
-        parsed = parse_agent_output(text)
-        assert parsed["reasoning"] == "analyze"
-        assert parsed["prompt"] == "A test"
-        assert parsed["decision"] == "continue"
-
-    def test_non_exact_continue_stops(self):
-        assert parse_agent_output("<decision>discontinue</decision>")["decision"] == "stop"
-        assert parse_agent_output("<decision>continuous</decision>")["decision"] == "stop"
-
-    def test_malformed_stops(self):
-        parsed = parse_agent_output("garbage text")
-        assert parsed["decision"] == "stop"
-        assert parsed["reasoning"] is None
-
-
 class TestPr1TrainMaskContract:
-    def test_turn0_only_mask_pattern(self):
-        turns = [
-            _make_turn(0, [1, 2, 3], [0.1, 0.2, 0.3], "t0", "continue"),
-            _make_turn(1, [4, 5], [0.4, 0.5], "t1", "stop"),
-        ]
-        response_mask = [
-            train_mask for turn in turns for train_mask in [1 if turn.turn_idx == 0 else 0] * len(turn.agent_tokens)
-        ]
-        assert response_mask == [1, 1, 1, 0, 0]
+    def test_all_agent_turns_train_and_tool_observations_do_not(self):
+        # Stock ToolAgentLoop contract:
+        # assistant turn 0 | tool observation | assistant turn 1
+        response_mask = [1, 1, 1] + [0, 0] + [1, 1]
+        assert response_mask == [1, 1, 1, 0, 0, 1, 1]
 
 
-class TestLogprobs:
-    def test_reencode_without_logprobs_raises(self):
-        loop = DiffusionARMultiTurnAgentLoop.__new__(DiffusionARMultiTurnAgentLoop)
-        try:
-            loop._require_logprobs(None, 3, reencoded=True)
-            raise AssertionError("expected RuntimeError")
-        except RuntimeError as exc:
-            assert "log_probs are missing" in str(exc)
+class TestStockToolAgentWiring:
+    def test_recipe_uses_stock_tool_agent(self):
+        root = Path(__file__).resolve().parents[2]
+        config = OmegaConf.load(root / "examples/agenticrpco_trainer/lance/config/lance_agentic_grpo.yaml")
+        rollout = config.actor_rollout_ref.rollout
+        assert rollout.agent.default_agent_loop == "tool_agent"
+        assert rollout.agent.agent_loop_config_path is None
+        assert rollout.multi_turn.enable is True
+        assert rollout.multi_turn.function_tool_path == "verl_omni/agent_loop/diffusion_tool.py"
 
-    def test_native_tokens_allow_missing_logprobs(self):
-        loop = DiffusionARMultiTurnAgentLoop.__new__(DiffusionARMultiTurnAgentLoop)
-        assert loop._require_logprobs(None, 2, reencoded=False) == [0.0, 0.0]
+    def test_tool_agent_is_upstream_class(self):
+        assert ToolAgentLoop.__module__ == "verl.experimental.agent_loop.tool_agent_loop"
 
+    def test_diffusion_function_tool_registered(self):
+        tool = get_function_tool("generate_image")
+        assert tool.fn is generate_image
+        assert tool.tool_schema.function.name == DIFFUSION_TOOL_SCHEMA["function"]["name"]
 
-class TestAgenticConfig:
-    def test_reads_rollout_custom_extension(self):
-        loop = DiffusionARMultiTurnAgentLoop.__new__(DiffusionARMultiTurnAgentLoop)
-        loop.rollout_config = {
-            "custom": {
-                "agentic": {
-                    "max_turns": 3,
-                    "early_termination": False,
-                }
-            }
-        }
-        assert loop._agentic_config() == {"max_turns": 3, "early_termination": False}
+    def test_diffusion_tool_stub_without_endpoint(self, monkeypatch):
+        monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
+        response, reward, metrics = generate_image("a blue hat")
+        assert response.image is None
+        assert "stub diffusion result" in response.text
+        assert reward == 0.0
+        assert metrics["tool_stubbed"] is True
 
 
 class TestAgenticReward:
-    def test_format_heuristic_from_trajectory(self):
+    def test_tool_call_heuristic_from_trajectory(self):
         from verl_omni.utils.reward_score.agentic_reward import compute_score
 
-        text = "<reasoning>r</reasoning>\n<prompt>a cat</prompt>\n<decision>stop</decision>"
+        text = '{"name":"generate_image","arguments":{"prompt":"a cat"}}'
         trajectory = {
             "turns": [{"agent_text": text, "decision": "stop"}],
             "metadata": {"tool_stubbed": True},
@@ -177,16 +143,16 @@ class TestAgenticReward:
             solution_str="ignored",
             extra_info={"agentic_trajectory": trajectory, "tool_stubbed": True},
         )
-        assert result["method"] == "agentic_format_heuristic"
+        assert result["method"] == "agentic_tool_call_heuristic"
         assert result["score"] == 1.0
         assert result["tool_stubbed"] is True
 
-    def test_format_heuristic_from_stock_dapo_response(self):
+    def test_tool_call_heuristic_from_stock_dapo_response(self):
         from verl_omni.utils.reward_score.agentic_reward import compute_score
 
-        text = "<reasoning>r</reasoning>\n<prompt>a cat</prompt>\n<decision>stop</decision>"
+        text = '<tool_call>{"name":"generate_image","arguments":{"prompt":"a cat"}}</tool_call>'
         result = compute_score("jpeg_compressibility", solution_str=text)
-        assert result["method"] == "agentic_format_heuristic"
+        assert result["method"] == "agentic_tool_call_heuristic"
         assert result["score"] == 1.0
 
     def test_length_fallback(self):
