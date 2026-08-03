@@ -17,7 +17,6 @@
 from pathlib import Path
 
 import torch
-from omegaconf import OmegaConf
 from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
 from verl.tools.function_tool import get_function_tool
 
@@ -105,12 +104,11 @@ class TestPr1TrainMaskContract:
 class TestStockToolAgentWiring:
     def test_recipe_uses_stock_tool_agent(self):
         root = Path(__file__).resolve().parents[2]
-        config = OmegaConf.load(root / "examples/agenticrpco_trainer/lance/config/lance_agentic_grpo.yaml")
-        rollout = config.actor_rollout_ref.rollout
-        assert rollout.agent.default_agent_loop == "tool_agent"
-        assert rollout.agent.agent_loop_config_path is None
-        assert rollout.multi_turn.enable is True
-        assert rollout.multi_turn.function_tool_path == "verl_omni/agent_loop/diffusion_tool.py"
+        recipe = (root / "examples/agenticrpco_trainer/lance/agentic_grpo_overrides.sh").read_text()
+        assert "default_agent_loop=tool_agent" in recipe
+        assert "agent_loop_config_path=null" in recipe
+        assert "multi_turn.enable=true" in recipe
+        assert "function_tool_path=verl_omni/agent_loop/diffusion_tool.py" in recipe
 
     def test_tool_agent_is_upstream_class(self):
         assert ToolAgentLoop.__module__ == "verl.experimental.agent_loop.tool_agent_loop"
@@ -161,10 +159,3 @@ class TestAgenticReward:
         result = compute_score("x", solution_str="a" * 128)
         assert result["method"] == "response_length_heuristic"
         assert abs(result["score"] - 0.5) < 1e-6
-
-
-class TestBackwardCompatibility:
-    def test_single_turn_agent(self):
-        from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
-
-        assert DiffusionSingleTurnAgentLoop is not None

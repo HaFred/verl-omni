@@ -60,7 +60,10 @@ def main() -> None:
         "rms_norm_eps": llm_cfg.get("rms_norm_eps", 1e-6),
         "rope_theta": llm_cfg.get("rope_theta", 1000000.0),
         "sliding_window": llm_cfg.get("sliding_window"),
-        "tie_word_embeddings": llm_cfg.get("tie_word_embeddings", False),
+        # Force untie: Lance und export already stores distinct embed + lm_head
+        # tensors, and FSDP wrapping both modules while tied corrupts lm_head
+        # (RuntimeError: size mismatch ... vec (~vocab*hidden/world_size)).
+        "tie_word_embeddings": False,
         "torch_dtype": llm_cfg.get("torch_dtype", "bfloat16"),
         "use_cache": True,
         "vocab_size": llm_cfg["vocab_size"],
