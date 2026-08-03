@@ -32,19 +32,10 @@ class DiffusionOutput(BaseModel):
     """Extra fields for dynamic addition."""
 
 
-def _load_vllm():
-    # Override stock verl "vllm" so OmniModelConfig extras (architecture, freeze, …)
-    # are stripped before HFModelConfig merge — needed for und-only agentic smoke.
-    from verl_omni.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
-
-    return vLLMReplica
-
-
 def _load_vllm_omni():
     from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniReplica
 
     return vLLMOmniReplica
 
 
-RolloutReplicaRegistry.register("vllm", _load_vllm)
 RolloutReplicaRegistry.register("vllm_omni", _load_vllm_omni)

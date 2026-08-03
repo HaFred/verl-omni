@@ -28,19 +28,9 @@ from verl.workers.config.model import MtpConfig
 
 from verl_omni.utils.fs import resolve_model_local_dir
 
-__all__ = ["AgenticConfig", "OmniModelConfig"]
+__all__ = ["OmniModelConfig"]
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class AgenticConfig(BaseConfig):
-    """Configuration for agentic RL (Mode 2a) — multi-turn rollout with prompt rewriting."""
-
-    enabled: bool = False
-    max_turns: int = 5
-    early_termination: bool = True
-    observation_token_length: int = 128
 
 
 @dataclass
@@ -62,7 +52,6 @@ class OmniModelConfig(BaseConfig):
         "generation_config",
         "architectures",
         "share_embeddings_and_output_weights",
-        "target_modules",
     }
 
     # note that we separate path, hf_config_path and tokenizer_path in case they are different
@@ -74,20 +63,16 @@ class OmniModelConfig(BaseConfig):
     local_tokenizer_path: Optional[str] = None
 
     # model type
-    model_type: str = "language_model"
+    model_type: str = "omni_model"
 
     # HF config architectures[0] (auto-detected from config.json if unset)
-    architecture: str = MISSING
+    architecture: Optional[str] = None
     architectures: Optional[list[str]] = None
 
     # which stage to train: "thinker", "talker", or "all"
     model_stage: str = "thinker"
     # sub-config key for the trainable component (e.g. "thinker_config", "talker_config")
     hf_config_name: Optional[str] = None
-
-    # agentic RL configuration (Mode 2a)
-    agentic: AgenticConfig = field(default_factory=AgenticConfig)
-    freeze: list[str] = field(default_factory=list)  # param name prefixes to freeze
 
     hf_config: Any = None
     generation_config: Any = None
@@ -117,13 +102,13 @@ class OmniModelConfig(BaseConfig):
     # fsdp / megatron lora related
     lora_rank: int = 0
     lora_alpha: int = 16
-    # Optional dtype for LoRA parameters (e.g. "float32"); null = use model dtype.
-    # Declared so Hydra can instantiate OmniModelConfig from omni_model.yaml.
-    lora_dtype: Optional[str] = None
     lora_init_weights: str = "gaussian"
     target_modules: Optional[Any] = "all-linear"  # allow both "all-linear" and ["q_proj", "k_proj"]
     target_parameters: Optional[list[str]] = None  # for lora adapter on nn.Parameter
     exclude_modules: Optional[str] = None
+
+    # optional dtype for LoRA parameters (e.g. "float32"); None = use model dtype
+    lora_dtype: Optional[str] = None
 
     # megatron lora config
     lora: dict[str, Any] = field(default_factory=dict)
@@ -159,10 +144,6 @@ class OmniModelConfig(BaseConfig):
         if self.path == MISSING:
             raise ValueError("OmniModelConfig.path is required but was not set.")
 
-        # PEFT treats a comma-separated string as one regex. Split into names.
-        if isinstance(self.target_modules, str) and "," in self.target_modules:
-            self.target_modules = [m.strip() for m in self.target_modules.split(",") if m.strip()]
-
         self.local_path = resolve_model_local_dir(self.path, use_shm=self.use_shm)
 
         if self.hf_config_path is None:
@@ -172,14 +153,12 @@ class OmniModelConfig(BaseConfig):
             tokenizer_path = os.path.join(self.local_path, "tokenizer")
             self.tokenizer_path = tokenizer_path if os.path.exists(tokenizer_path) else self.local_path
 
-        # Hydra yaml uses `architecture: null` (None), while the dataclass
-        # default is MISSING — treat both as "auto-detect from config.json".
-        if self.architecture is None or self.architecture == MISSING:
+        if not self.architecture:
             config_path = os.path.join(self.local_path, "config.json")
             try:
                 with open(config_path) as f:
                     self.architecture = json.load(f)["architectures"][0]
-            except (FileNotFoundError, json.JSONDecodeError, KeyError, OSError, TypeError, IndexError) as e:
+            except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
                 raise ValueError(
                     f"Failed to determine model architecture from {config_path}: {e}. "
                     f"Set 'architecture' explicitly in the model config."
@@ -198,25 +177,12 @@ class OmniModelConfig(BaseConfig):
         self.architectures = getattr(self.hf_config, "architectures", None)
 
         if self.load_tokenizer:
-            from verl.utils import hf_processor, hf_tokenizer
+            from verl_omni.pipelines.model_base import OmniModelBase
 
             self.local_tokenizer_path = copy_to_local(self.tokenizer_path, use_shm=self.use_shm)
-            # Agent-loop workers read model_config.tokenizer; load here (same as
-            # HFModelConfig). Pipeline-specific configure_tokenizer can still
-            # replace these later for omni multi-stage models.
-            self.tokenizer = hf_tokenizer(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
-            self.processor = hf_processor(self.local_tokenizer_path, trust_remote_code=self.trust_remote_code)
-            if (
-                self.processor is not None
-                and not getattr(self.processor, "chat_template", None)
-                and getattr(self.tokenizer, "chat_template", None)
-            ):
-                self.processor.chat_template = self.tokenizer.chat_template
-            if self.custom_chat_template is not None:
-                if self.processor is not None:
-                    self.processor.chat_template = self.custom_chat_template
-                elif self.tokenizer is not None:
-                    self.tokenizer.chat_template = self.custom_chat_template
+            adapter_cls = OmniModelBase.get_class_by_name(self.architecture, self.model_stage, self.external_lib)
+            self.tokenizer = adapter_cls.configure_tokenizer(self.local_tokenizer_path, self)
+            self.processor = adapter_cls.configure_processor(self.local_path, self)
 
     def get_processor(self):
         """Return the processor, or fall back to the tokenizer."""

@@ -40,6 +40,7 @@ class ToolOutput:
 
     output_type: Literal["image", "video"]
     output_data: torch.Tensor  # image tensor [C,H,W] or video [T,C,H,W]
+    is_stub: bool = False  # True when und-only / missing diffusion_output synthesized a stub
 
 
 @dataclass
@@ -54,7 +55,7 @@ class AgenticTurn:
     """
 
     turn_idx: int
-    agent_tokens: list[int]  # full agent text tokens (loss_mask=1)
+    agent_tokens: list[int]  # full agent text tokens (loss_mask=1 on turn 0 only until PR2)
     agent_logprobs: list[float]  # per-token logprobs from rollout
     agent_text: str  # decoded text: reasoning + prompt + decision
     tool_call: ToolCall | None = None  # None on stop turn
@@ -68,7 +69,8 @@ class AgenticMetadata:
 
     num_turns: int
     terminated: bool
-    termination_reason: str  # "agent_stop" | "max_turns"
+    termination_reason: str  # "agent_stop" | "max_turns" | "response_truncated"
+    tool_stubbed: bool = False  # True if any tool turn used a stub image
 
 
 @dataclass
@@ -102,6 +104,7 @@ def agentic_trajectory_to_dict(traj: AgenticTrajectory) -> dict[str, Any]:
                     {
                         "output_type": t.tool_output.output_type,
                         "output_data_shape": list(t.tool_output.output_data.shape),
+                        "is_stub": bool(getattr(t.tool_output, "is_stub", False)),
                     }
                     if t.tool_output
                     else None
@@ -115,6 +118,7 @@ def agentic_trajectory_to_dict(traj: AgenticTrajectory) -> dict[str, Any]:
             "num_turns": traj.metadata.num_turns,
             "terminated": traj.metadata.terminated,
             "termination_reason": traj.metadata.termination_reason,
+            "tool_stubbed": bool(getattr(traj.metadata, "tool_stubbed", False)),
         },
     }
 
@@ -129,7 +133,11 @@ def agentic_trajectory_from_dict(d: dict[str, Any]) -> AgenticTrajectory:
         # Round-trip stores shape only; restore an empty tensor of that shape.
         if to is not None:
             shape = to.get("output_data_shape") or []
-            tool_output = ToolOutput(to["output_type"], torch.empty(shape) if shape else torch.empty(0))
+            tool_output = ToolOutput(
+                to["output_type"],
+                torch.empty(shape) if shape else torch.empty(0),
+                is_stub=bool(to.get("is_stub", False)),
+            )
         else:
             tool_output = None
         turns.append(
@@ -152,6 +160,7 @@ def agentic_trajectory_from_dict(d: dict[str, Any]) -> AgenticTrajectory:
             num_turns=meta.get("num_turns", len(turns)),
             terminated=meta.get("terminated", False),
             termination_reason=meta.get("termination_reason", ""),
+            tool_stubbed=bool(meta.get("tool_stubbed", False)),
         ),
         trajectory_id=d.get("trajectory_id", ""),
         source_dataset=d.get("source_dataset", ""),

@@ -43,24 +43,6 @@ model_stage: thinker
 # Sub-config key for the trainable component (e.g. "thinker_config", "talker_config")
 hf_config_name: null
 
-# Agentic RL configuration (Mode 2a) — multi-turn rollout with prompt rewriting
-agentic:
-
-  # Whether to enable agentic RL multi-turn training
-  enabled: False
-
-  # Maximum number of interaction turns per trajectory
-  max_turns: 5
-
-  # Whether the agent can decide to terminate early
-  early_termination: True
-
-  # Number of placeholder tokens for observation slots in the flattened sequence
-  observation_token_length: 128
-
-# Param name prefixes to freeze (only used when model_type="agentic_llm")
-freeze: []
-
 # whether to enable gradient checkpointing
 enable_gradient_checkpointing: True
 

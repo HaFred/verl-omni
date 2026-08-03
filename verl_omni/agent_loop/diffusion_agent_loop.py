@@ -359,25 +359,6 @@ class DiffusionAgentLoopWorker:
             temp_arr[:] = [input.extra_fields.get(key) for input in inputs]
             extra_fields[key] = temp_arr
 
-        # Serialize AgenticTrajectory objects for non_tensor_batch.
-        # Multi-turn loops may already store a dict; accept both forms.
-        if "agentic_trajectory" in extra_fields:
-            from verl_omni.agent_loop.agentic_trajectory import AgenticTrajectory, agentic_trajectory_to_dict
-
-            serialized_trajs = np.empty(len(inputs), dtype=object)
-            serialized_trajs[:] = None
-            for i in range(len(inputs)):
-                traj = extra_fields["agentic_trajectory"][i]
-                if traj is None:
-                    continue
-                if isinstance(traj, dict):
-                    serialized_trajs[i] = traj
-                elif isinstance(traj, AgenticTrajectory):
-                    serialized_trajs[i] = agentic_trajectory_to_dict(traj)
-                else:
-                    raise TypeError(f"agentic_trajectory[{i}] must be AgenticTrajectory|dict|None, got {type(traj)}")
-            extra_fields["agentic_trajectory"] = serialized_trajs
-
         non_tensor_batch.update(extra_fields)
 
         # Only include reward_extra_keys in meta_info if rm_scores is in batch

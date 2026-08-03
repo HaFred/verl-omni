@@ -33,7 +33,6 @@ export VERL_USE_EXTERNAL_MODULES=verl_omni
 
 # ---- Config -----------------------------------------------------------------
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
-clear
 # Lance MoT HF layout (Lance_3B) is incomplete: no config.json / chat_template.
 # Smoke uses the prepared understanding-only export (prepare_lance_hf_und.py).
 # Do NOT point MODEL_PATH at raw Lance_3B — tokenizer has no chat_template and
@@ -112,8 +111,8 @@ _pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 _fail() { echo -e "${RED}[FAIL]${NC} $*"; }
 _info() { echo -e "${YELLOW}[INFO]${NC} $*"; }
 
-# Und-only Qwen2 smoke: stock vLLM (not vllm_omni) — same rationale as RPCO smoke.
-ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
+# Und-only Qwen2 smoke: OmniModelConfig-tolerant stock vLLM (opt-in; does not shadow verl "vllm").
+ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm_omni_model}"
 SMOKE_MODEL_OVERRIDES=(
   "actor_rollout_ref.model.path=$MODEL_PATH"
   "++actor_rollout_ref.model.architecture=$MODEL_ARCHITECTURE"
@@ -279,6 +278,7 @@ if os.path.exists(log_path):
         ("training_completed", r"(?i)training\s+(?:complete|finished|done)"),
         ("checkpoint_saved", r"(?i)(?:saving|saved)\s+(?:checkpoint|model)"),
         ("ray_initialized", r"Started a local Ray instance"),
+        ("tool_stubbed", r"(?i)using stub image tensor"),
     ]
     for line in lines:
         for event_name, pattern in event_patterns:
@@ -288,6 +288,16 @@ if os.path.exists(log_path):
                     "line": line.strip()[:200],
                 })
 
+    # Und-only smoke may use stub tool images — record, do not fail.
+    trace["tool_stubbed"] = any(e.get("event") == "tool_stubbed" for e in trace["events"])
+    if trace["tool_stubbed"]:
+        trace["claims"] = {
+            "infra_smoke": True,
+            "real_diffusion_tool": False,
+            "note": "Stub tool images used (und-only). Real MoT tool is a follow-up.",
+        }
+    else:
+        trace["claims"] = {"infra_smoke": True}
 os.makedirs(os.path.dirname(trace_path), exist_ok=True)
 with open(trace_path, "w") as f:
     json.dump(trace, f, indent=2)
@@ -311,8 +321,8 @@ _info "=== ST-2: Weight Freeze Verification ==="
 _info "Log:   $ST2_LOG"
 _info "Trace: $ST2_TRACE"
 
-python3 - "$MODEL_PATH" "$ST1_LOG" "$ST1_CKPT" "$ST2_TRACE" "$ST1_TRACE" > "$ST2_LOG" 2>&1 << 'PYEOF'
-import sys, json, re, os
+python3 - "$MODEL_PATH" "$ST1_LOG" "$ST1_CKPT" "$ST2_TRACE" "$ST1_TRACE" "$MODEL_FREEZE" > "$ST2_LOG" 2>&1 << 'PYEOF'
+import sys, json, re, os, ast
 from datetime import datetime, timezone
 
 MODEL_PATH  = sys.argv[1]
@@ -320,6 +330,14 @@ ST1_LOG     = sys.argv[2] if len(sys.argv) > 2 else ""
 CKPT_ROOT   = sys.argv[3] if len(sys.argv) > 3 else ""
 TRACE_PATH  = sys.argv[4] if len(sys.argv) > 4 else ""
 ST1_TRACE   = sys.argv[5] if len(sys.argv) > 5 else ""
+MODEL_FREEZE_RAW = sys.argv[6] if len(sys.argv) > 6 else "[]"
+
+try:
+    MODEL_FREEZE = ast.literal_eval(MODEL_FREEZE_RAW) if MODEL_FREEZE_RAW else []
+except (ValueError, SyntaxError):
+    MODEL_FREEZE = []
+if not isinstance(MODEL_FREEZE, list):
+    MODEL_FREEZE = []
 
 trace = {
     "test": "ST-2",
@@ -327,14 +345,16 @@ trace = {
     "timestamp": datetime.now(timezone.utc).isoformat(),
     "model_path": MODEL_PATH,
     "checkpoint_root": CKPT_ROOT,
+    "model_freeze": MODEL_FREEZE,
     "checks": {},
     "warnings": [],
+    "skips": [],
 }
 
-# (a) Check training log for engine freeze confirmation
-engine_match = False
+# (a) Engine freeze confirmation — SKIP when und-only empty freeze; FAIL when freeze set but unconfirmed
 engine_trainable = None
 engine_total = None
+engine_line_found = False
 if os.path.exists(ST1_LOG):
     with open(ST1_LOG, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -342,21 +362,49 @@ if os.path.exists(ST1_LOG):
             if m:
                 engine_trainable = int(m.group(1))
                 engine_total = int(m.group(2))
+                engine_line_found = True
                 print(f"Engine freeze: {engine_trainable}/{engine_total} params trainable")
-                if 0 < engine_trainable < engine_total:
-                    engine_match = True
                 break
-trace["checks"]["2a_engine_freeze"] = {
-    "passed": engine_match,
-    "trainable_params": engine_trainable,
-    "total_params": engine_total,
-    "frozen_params": (engine_total - engine_trainable) if (engine_total is not None and engine_trainable is not None) else None,
-}
-if engine_match:
-    print("[PASS] ST-2a: Engine log confirms selective freezing")
+
+if not MODEL_FREEZE:
+    # Und-only export has no moe_gen tensors; AC2 selective freeze is not claimed.
+    trace["checks"]["2a_engine_freeze"] = {
+        "passed": True,
+        "skipped": True,
+        "reason": "MODEL_FREEZE=[] (und-only smoke); selective freeze deferred to MoT layout",
+        "trainable_params": engine_trainable,
+        "total_params": engine_total,
+    }
+    trace["skips"].append("2a_engine_freeze_empty_MODEL_FREEZE")
+    print("[SKIP] ST-2a: MODEL_FREEZE=[] — selective freeze not claimed on und-only export")
+    print("       (UT-13 TestFreezeLogic still validates freeze prefix pattern in isolation)")
+elif not engine_line_found:
+    trace["checks"]["2a_engine_freeze"] = {
+        "passed": False,
+        "skipped": False,
+        "trainable_params": None,
+        "total_params": None,
+        "frozen_params": None,
+    }
+    print("[FAIL] ST-2a: MODEL_FREEZE set but AgenticLLMFSDPEngine freeze line missing")
+elif not (0 < engine_trainable < engine_total):
+    trace["checks"]["2a_engine_freeze"] = {
+        "passed": False,
+        "skipped": False,
+        "trainable_params": engine_trainable,
+        "total_params": engine_total,
+        "frozen_params": (engine_total - engine_trainable) if engine_total is not None else None,
+    }
+    print(f"[FAIL] ST-2a: Expected selective freeze, got {engine_trainable}/{engine_total} trainable")
 else:
-    print("[WARN] ST-2a: Could not confirm freeze in log — check manually")
-    trace["warnings"].append("engine_freeze_not_confirmed")
+    trace["checks"]["2a_engine_freeze"] = {
+        "passed": True,
+        "skipped": False,
+        "trainable_params": engine_trainable,
+        "total_params": engine_total,
+        "frozen_params": engine_total - engine_trainable,
+    }
+    print("[PASS] ST-2a: Engine log confirms selective freezing")
 
 # (b) Verify a checkpoint was saved
 ckpt_found = False
@@ -371,7 +419,6 @@ if os.path.isdir(CKPT_ROOT):
                 break
         if ckpt_found:
             break
-        # Check for model files
         for f in files:
             if f.endswith((".safetensors", ".pt", ".bin")):
                 ckpt_files.append(f)
@@ -387,7 +434,7 @@ trace["checks"]["2b_checkpoint_saved"] = {
 if ckpt_found:
     print(f"[PASS] ST-2b: Checkpoint saved: {ckpt_path}")
 else:
-    print("[WARN] ST-2b: No checkpoint/model files found")
+    print("[FAIL] ST-2b: No checkpoint/model files found")
     trace["warnings"].append("checkpoint_not_found")
 
 # (c) Verify loss is non-zero (gradients flowed)
@@ -410,7 +457,7 @@ trace["checks"]["2c_nonzero_loss"] = {
 if loss_match:
     print("[PASS] ST-2c: Non-zero loss confirms gradients flowed")
 else:
-    print("[WARN] ST-2c: Could not extract non-zero loss value")
+    print("[FAIL] ST-2c: Could not extract non-zero loss value")
     trace["warnings"].append("loss_not_extracted")
 
 # (d) Cross-check: if ST-1 trace has metrics, include them
@@ -421,23 +468,36 @@ if os.path.exists(ST1_TRACE):
         k: v for k, v in st1_trace.get("metrics", {}).items()
         if any(prefix in k for prefix in ["actor/", "training/", "rollout/", "reward/", "perf/"])
     }
+    # Surface stub-tool note from ST-1 if present (not a failure).
+    if st1_trace.get("tool_stubbed") or any(
+        e.get("event") == "tool_stubbed" for e in st1_trace.get("events", []) if isinstance(e, dict)
+    ):
+        trace["warnings"].append("st1_used_stub_tool_und_only")
+        print("[INFO] ST-1 used stub tool images (und-only) — not a real diffusion freeze claim")
 
-# Determine overall
-all_passed = all(c["passed"] for c in trace["checks"].values())
+# Gate on overall_passed (skips count as passed)
+all_passed = all(c.get("passed", False) for c in trace["checks"].values())
 trace["overall_passed"] = all_passed
 
-os.makedirs(os.path.dirname(TRACE_PATH), exist_ok=True)
+os.makedirs(os.path.dirname(TRACE_PATH) or ".", exist_ok=True)
 with open(TRACE_PATH, "w") as f:
     json.dump(trace, f, indent=2)
-print(f"\nST-2 trace saved: {len(trace['checks'])} checks, {len(trace['warnings'])} warnings → {TRACE_PATH}")
+print(f"\nST-2 trace saved: {len(trace['checks'])} checks, {len(trace['warnings'])} warnings, "
+      f"{len(trace['skips'])} skips → {TRACE_PATH}")
+print(f"overall_passed={all_passed}")
 
 print("\nNote: Full weight-level verification (loading FSDP checkpoint and")
 print("comparing moe_gen params before/after) is model-format dependent.")
 print("CPU test UT-13 (TestFreezeLogic) validates the freeze pattern in isolation.")
+if not all_passed:
+    print("[FAIL] ST-2 overall_passed=false")
+    sys.exit(1)
 PYEOF
+ST2_PY_EXIT=$?
 
-# Check if python script reported any failure
-if grep -q "FAIL" "$ST2_LOG" 2>/dev/null; then
+if [ "$ST2_PY_EXIT" -ne 0 ]; then
+  ST2_FAIL=1
+elif [ -f "$ST2_TRACE" ] && ! python3 -c "import json,sys; t=json.load(open(sys.argv[1])); sys.exit(0 if t.get('overall_passed') else 1)" "$ST2_TRACE"; then
   ST2_FAIL=1
 fi
 

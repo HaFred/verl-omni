@@ -1,0 +1,2 @@
+- name: diffusion_ar_multi_turn_agent
+  _target_: verl_omni.agent_loop.diffusion_ar_multi_turn_agent_loop.DiffusionARMultiTurnAgentLoop

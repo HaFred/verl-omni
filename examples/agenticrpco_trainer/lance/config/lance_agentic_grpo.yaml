@@ -1,8 +1,8 @@
-# Lance-3B Agentic GRPO training config (FSDP + vLLM-Omni multi-turn rollout).
+# Lance-3B Agentic GRPO training config (stock verl FSDP + vLLM rollout).
 #
-# Mode (2a): trains the Lance understanding path (LLM_UND) via token-level GRPO
-# with a frozen diffusion tool (LLM_GEN).  The agent learns to reason, rewrite
-# prompts, reflect on tool outputs, and decide when to stop.
+# Mode (2a): trains the exported Lance understanding language model via
+# token-level GRPO. The image generator is an external tool and is therefore
+# outside the actor optimizer by construction.
 #
 # Inherits verl's default ppo_trainer config.  Volatile values (data/model
 # paths, GPU/node counts, vLLM-Omni stage config path) are set via CLI in the
@@ -15,12 +15,9 @@
 hydra:
   searchpath:
     - pkg://verl.trainer.config
-    - pkg://verl_omni.trainer.config
 
 defaults:
   - ppo_trainer
-  # Replace HFModelConfig with OmniModelConfig (supports agentic/freeze).
-  - omni/model@actor_rollout_ref.model: omni_model
   - _self_
 
 data:
@@ -35,8 +32,6 @@ data:
 actor_rollout_ref:
 
   model:
-    # model_type triggers AgenticLLMFSDPEngine (inherits FSDPEngineWithLMHead)
-    model_type: agentic_llm
     override_config:
       attn_implementation: sdpa
     lora_rank: 64
@@ -45,17 +40,6 @@ actor_rollout_ref:
     target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
     use_remove_padding: true
     enable_gradient_checkpointing: true
-
-    # Agentic RL configuration
-    agentic:
-      enabled: True
-      max_turns: 5
-      early_termination: True
-      observation_token_length: 128
-
-    # Freeze Lance generation path (LLM_GEN) — only understanding path trains
-    freeze:
-      - moe_gen
 
   actor:
     optim:
@@ -84,8 +68,7 @@ actor_rollout_ref:
     loss_agg_mode: seq-mean-token-mean
 
   rollout:
-    # Stock vLLM (OmniModelConfig stripped via verl_omni vllm_async_server).
-    # Smoke / und-only Qwen2 path; override to vllm_omni when full MoT is available.
+    # The actor export is a regular HF language model, so use stock verl vLLM.
     name: vllm
     mode: async
     n: 8
@@ -100,7 +83,13 @@ actor_rollout_ref:
 
     agent:
       default_agent_loop: diffusion_ar_multi_turn_agent
-      agent_loop_config_path: null  # registered via @register decorator
+      agent_loop_config_path: verl_omni/agent_loop/agent_loop.yaml
+
+    # Stock RolloutConfig extension point for this custom agent loop.
+    custom:
+      agentic:
+        max_turns: 5
+        early_termination: True
 
   ref:
     log_prob_micro_batch_size_per_gpu: 2
@@ -124,7 +113,7 @@ reward:
     path: pkg://verl_omni.utils.reward_score.agentic_reward
     name: compute_score
   reward_manager:
-    name: dapo                 # single scalar reward; replace with multi-dim in PR2
+    name: dapo
 
 trainer:
   val_before_train: false
