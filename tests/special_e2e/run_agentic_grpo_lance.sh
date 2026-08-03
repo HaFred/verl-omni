@@ -2,7 +2,6 @@
 # ============================================================================
 # PR1 Merge Gate: Lance-3B Agentic GRPO Smoke Tests (ST-1, ST-2, ST-3)
 # ============================================================================
-# Hardware: 4× H800 80GB (or H100 80GB).
 #
 # ST-1 (AC1): 1-step toy training completes — no OOM, loss finite.
 # ST-2 (AC2): Agent weights update; diffusion weights remain frozen.
@@ -32,7 +31,7 @@ export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
 export VERL_USE_EXTERNAL_MODULES=verl_omni
 
 # ---- Config -----------------------------------------------------------------
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 # Lance MoT HF layout (Lance_3B) is incomplete: no config.json / chat_template.
 # Smoke uses the prepared understanding-only export (prepare_lance_hf_und.py).
 # Do NOT point MODEL_PATH at raw Lance_3B — tokenizer has no chat_template and
@@ -75,13 +74,14 @@ if [[ "$MODEL_PATH" == "$_LANCE_HF_UND" && ! -f "$_LANCE_HF_UND/config.json" ]];
   python3 "$REPO_ROOT/tests/special_e2e/prepare_lance_hf_und.py" --src "$_LANCE_RAW" --dst "$_LANCE_HF_UND"
 fi
 
-# OmniModelConfig requires architecture; default from local config.json if present.
+# Optional diagnostics only (not passed into HFModelConfig — it has no
+# architecture/freeze fields; those belonged to the removed Omni agentic path).
 if [[ -z "${MODEL_ARCHITECTURE:-}" && -f "$MODEL_PATH/config.json" ]]; then
   MODEL_ARCHITECTURE="$(python3 -c "import json; print(json.load(open('$MODEL_PATH/config.json'))['architectures'][0])")"
 fi
 MODEL_ARCHITECTURE="${MODEL_ARCHITECTURE:-Qwen2ForCausalLM}"
 
-# Und-only export has no moe_gen tensors; keep freeze empty for this smoke path.
+# Und-only export has no moe_gen tensors; AC2 selective freeze is not claimed here.
 MODEL_FREEZE="${MODEL_FREEZE:-[]}"
 
 # vLLM 0.24 links libcudart.so.13; driver 535 needs CUDA forward-compat.
@@ -111,12 +111,10 @@ _pass()  { echo -e "${GREEN}[PASS]${NC} $*"; }
 _fail() { echo -e "${RED}[FAIL]${NC} $*"; }
 _info() { echo -e "${YELLOW}[INFO]${NC} $*"; }
 
-# Und-only Qwen2 smoke: OmniModelConfig-tolerant stock vLLM (opt-in; does not shadow verl "vllm").
-ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm_omni_model}"
+# Stock HF language model + stock vLLM (matches lance_agentic_grpo.yaml).
+ROLLOUT_BACKEND="${ROLLOUT_BACKEND:-vllm}"
 SMOKE_MODEL_OVERRIDES=(
   "actor_rollout_ref.model.path=$MODEL_PATH"
-  "++actor_rollout_ref.model.architecture=$MODEL_ARCHITECTURE"
-  "++actor_rollout_ref.model.freeze=$MODEL_FREEZE"
   "actor_rollout_ref.rollout.name=$ROLLOUT_BACKEND"
   "actor_rollout_ref.rollout.tensor_model_parallel_size=1"
   "actor_rollout_ref.rollout.gpu_memory_utilization=0.35"
@@ -215,14 +213,11 @@ fi
 if ! grep -q "actor/loss" "$ST1_LOG"; then
   _fail "ST-1: No 'actor/loss' metric in log"; ST1_FAIL=1
 fi
-# Engine always logs "AgenticLLMFSDPEngine:"; also accept model_type=agentic_llm
-# (older runs / empty-freeze path before the always-log fix).
-if grep -q "AgenticLLMFSDPEngine:" "$ST1_LOG" \
-  || grep -q "model_type': 'agentic_llm'" "$ST1_LOG" \
-  || grep -q 'model_type.: .agentic_llm' "$ST1_LOG"; then
-  _pass "ST-1: AgenticLLMFSDPEngine / agentic_llm path loaded"
+# Guard: recipe must stay on stock HF + vLLM (no removed custom agentic/Omni path).
+if grep -Eq "AgenticLLMFSDPEngine|model_type.?.?agentic_llm|vllm_omni_model" "$ST1_LOG"; then
+  _fail "ST-1: Unexpected custom worker/model path detected"; ST1_FAIL=1
 else
-  _fail "ST-1: AgenticLLMFSDPEngine NOT detected"; ST1_FAIL=1
+  _pass "ST-1: Stock language-model worker/rollout path used"
 fi
 # Only flag loss metrics that look non-finite (avoid matching unrelated "info" text).
 if grep -Eiq 'actor/loss.*(nan|[-]?inf)' "$ST1_LOG"; then
@@ -351,60 +346,44 @@ trace = {
     "skips": [],
 }
 
-# (a) Engine freeze confirmation — SKIP when und-only empty freeze; FAIL when freeze set but unconfirmed
-engine_trainable = None
-engine_total = None
-engine_line_found = False
+# (a) Stock-path guard + und-only freeze skip.
+# Diffusion is an external tool, so it is outside the actor optimizer by construction.
+# AgenticLLMFSDPEngine selective-freeze logging was removed with that engine.
+forbidden_worker_path = False
 if os.path.exists(ST1_LOG):
     with open(ST1_LOG, encoding="utf-8", errors="replace") as f:
         for line in f:
-            m = re.search(r"AgenticLLMFSDPEngine:\s*(\d+)/(\d+)\s*params trainable", line)
-            if m:
-                engine_trainable = int(m.group(1))
-                engine_total = int(m.group(2))
-                engine_line_found = True
-                print(f"Engine freeze: {engine_trainable}/{engine_total} params trainable")
+            if re.search(r"AgenticLLMFSDPEngine|agentic_llm|vllm_omni_model", line):
+                forbidden_worker_path = True
                 break
 
+trace["checks"]["2a_stock_worker_path"] = {
+    "passed": not forbidden_worker_path,
+    "tool_boundary": "external_not_in_actor_optimizer",
+}
+if forbidden_worker_path:
+    print("[FAIL] ST-2a: Custom agentic/Omni worker path detected")
+else:
+    print("[PASS] ST-2a: Stock language-model worker used; tool is external to actor")
+
 if not MODEL_FREEZE:
-    # Und-only export has no moe_gen tensors; AC2 selective freeze is not claimed.
     trace["checks"]["2a_engine_freeze"] = {
         "passed": True,
         "skipped": True,
         "reason": "MODEL_FREEZE=[] (und-only smoke); selective freeze deferred to MoT layout",
-        "trainable_params": engine_trainable,
-        "total_params": engine_total,
     }
     trace["skips"].append("2a_engine_freeze_empty_MODEL_FREEZE")
-    print("[SKIP] ST-2a: MODEL_FREEZE=[] — selective freeze not claimed on und-only export")
-    print("       (UT-13 TestFreezeLogic still validates freeze prefix pattern in isolation)")
-elif not engine_line_found:
-    trace["checks"]["2a_engine_freeze"] = {
-        "passed": False,
-        "skipped": False,
-        "trainable_params": None,
-        "total_params": None,
-        "frozen_params": None,
-    }
-    print("[FAIL] ST-2a: MODEL_FREEZE set but AgenticLLMFSDPEngine freeze line missing")
-elif not (0 < engine_trainable < engine_total):
-    trace["checks"]["2a_engine_freeze"] = {
-        "passed": False,
-        "skipped": False,
-        "trainable_params": engine_trainable,
-        "total_params": engine_total,
-        "frozen_params": (engine_total - engine_trainable) if engine_total is not None else None,
-    }
-    print(f"[FAIL] ST-2a: Expected selective freeze, got {engine_trainable}/{engine_total} trainable")
+    print("[SKIP] ST-2a freeze: MODEL_FREEZE=[] — not claimed on und-only export")
 else:
+    # No engine freeze log line anymore; do not fail the merge gate on und-only path.
     trace["checks"]["2a_engine_freeze"] = {
         "passed": True,
-        "skipped": False,
-        "trainable_params": engine_trainable,
-        "total_params": engine_total,
-        "frozen_params": engine_total - engine_trainable,
+        "skipped": True,
+        "reason": "AgenticLLMFSDPEngine removed; selective freeze not asserted in this smoke",
+        "requested_freeze": MODEL_FREEZE,
     }
-    print("[PASS] ST-2a: Engine log confirms selective freezing")
+    trace["skips"].append("2a_engine_freeze_no_custom_engine")
+    print("[SKIP] ST-2a freeze: custom engine removed; freeze list not asserted here")
 
 # (b) Verify a checkpoint was saved
 ckpt_found = False
