@@ -4,14 +4,16 @@
 # ============================================================================
 #
 # ST-1 (AC1): 1-step toy training completes — no OOM, loss finite.
-# ST-2 (AC2): Agent weights update; diffusion weights remain frozen.
+# ST-2 (AC2): Agent weights update; Diffusion remains frozen (Mode 2a —
+#             ToolAgentLoop external tool, outside the actor optimizer).
 # ST-3 (AC3): Existing single-turn FlowGRPO training unaffected.
 #
-# Usage:
-#   # Default MODEL_PATH is Lance_3B_hf_und (not raw Lance_3B).
-#   bash tests/special_e2e/run_agentic_grpo_lance.sh
+# Usage (from verl-omni repo root; set MODEL_PATH — no machine-local default):
+#   MODEL_PATH=/path/to/Lance_3B_hf_und \
+#     bash tests/special_e2e/run_agentic_grpo_lance.sh
 #   MODEL_PATH=/path/to/hf_export MODEL_ARCHITECTURE=Qwen2ForCausalLM \
-#   bash tests/special_e2e/run_agentic_grpo_lance.sh
+#     bash tests/special_e2e/run_agentic_grpo_lance.sh
+# Do NOT point MODEL_PATH at raw Lance_3B (no chat_template → empty dataset).
 #
 # Output:
 #   outputs/pr1_smoke/st1_agentic_onestep_*.log
