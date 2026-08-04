@@ -35,12 +35,16 @@ class TestMode2aDiffusionOutsideActor:
     """AC2 — diffusion is an external tool, not an actor FSDP submodule."""
 
     def test_recipe_wires_external_function_tool(self):
-        recipe = (REPO_ROOT / "examples/agenticrpco_trainer/lance/agentic_grpo_overrides.sh").read_text()
+        recipe = (REPO_ROOT / "tests/special_e2e/run_agentic_grpo_lance.sh").read_text()
         assert "default_agent_loop=tool_agent" in recipe
         assert "function_tool_path=verl_omni/agent_loop/diffusion_tool.py" in recipe
         assert "agent_loop_config_path=null" in recipe
         assert "algorithm.adv_estimator=grpo" in recipe
         assert "multi_turn.enable=true" in recipe
+        # PR1 no longer ships the multi-step e2e example tree.
+        assert "examples/agenticrpco_trainer" not in recipe
+        assert (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.yaml").is_file()
+        assert not (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.jinja").exists()
 
     def test_no_custom_agentic_fsdp_engine_module(self):
         # PR1 removed AgenticLLMFSDPEngine; stock HF FSDP path only.

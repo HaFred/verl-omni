@@ -104,7 +104,7 @@ class TestPr1TrainMaskContract:
 class TestStockToolAgentWiring:
     def test_recipe_uses_stock_tool_agent(self):
         root = Path(__file__).resolve().parents[2]
-        recipe = (root / "examples/agenticrpco_trainer/lance/agentic_grpo_overrides.sh").read_text()
+        recipe = (root / "tests/special_e2e/run_agentic_grpo_lance.sh").read_text()
         assert "default_agent_loop=tool_agent" in recipe
         assert "agent_loop_config_path=null" in recipe
         assert "multi_turn.enable=true" in recipe
@@ -118,44 +118,92 @@ class TestStockToolAgentWiring:
         assert tool.fn is generate_image
         assert tool.tool_schema.function.name == DIFFUSION_TOOL_SCHEMA["function"]["name"]
 
-    def test_diffusion_tool_stub_without_endpoint(self, monkeypatch):
+    def test_diffusion_tool_stub_without_endpoint(self, monkeypatch, tmp_path):
         monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
+        monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
         response, reward, metrics = generate_image("a blue hat")
         assert response.image is None
         assert "stub diffusion result" in response.text
         assert reward == 0.0
         assert metrics["tool_stubbed"] is True
+        assert metrics["diffusion_backend"] == "stub"
+        assert metrics["num_images"] == 0
+        assert metrics["image_paths"]
+        assert Path(metrics["image_paths"][0]).name == "STUB_NO_IMAGE.txt"
 
 
 class TestAgenticReward:
-    def test_tool_call_heuristic_from_trajectory(self):
+    def test_hermes_in_solution_gets_partial_format(self):
         from verl_omni.utils.reward_score.agentic_reward import compute_score
 
-        text = '{"name":"generate_image","arguments":{"prompt":"a cat"}}'
-        trajectory = {
-            "turns": [{"agent_text": text, "decision": "stop"}],
-            "metadata": {"tool_stubbed": True},
-        }
+        text = (
+            "Reflection: need clearer hat.\n"
+            '<tool_call>{"name":"generate_image","arguments":{"prompt":"a cat with a blue hat"}}'
+            "</tool_call>\n"
+            "agentic_tool ok=1 path=/tmp/a.png\n"
+            "Reflection: add detail.\n"
+            '<tool_call>{"name":"generate_image","arguments":'
+            '{"prompt":"a cat with a blue hat, highly detailed"}}</tool_call>\n'
+            "agentic_tool ok=1 path=/tmp/b.png"
+        )
         result = compute_score(
             "jpeg_compressibility",
-            solution_str="ignored",
-            extra_info={"agentic_trajectory": trajectory, "tool_stubbed": True},
+            solution_str=text,
+            ground_truth={"user_request": "cat blue hat", "expected_num_images": 2},
+            tool_extra_fields={
+                "num_forced_tool_calls": 2,
+                "num_successful_images": 2,
+                "num_voluntary_hermes": 0,
+                "num_voluntary_successful_images": 0,
+                "diffusion_prompts": [
+                    "a cat with a blue hat",
+                    "a cat with a blue hat, highly detailed",
+                ],
+            },
         )
-        assert result["method"] == "agentic_tool_call_heuristic"
-        assert result["score"] == 1.0
-        assert result["tool_stubbed"] is True
+        assert result["method"] == "agentic_reflect_format_tool_result"
+        assert result["r_format"] >= 0.4
+        assert result["r_reflect"] >= 0.4
+        assert result["score"] > 0.2
 
-    def test_tool_call_heuristic_from_stock_dapo_response(self):
+    def test_voluntary_two_calls_score_high(self):
         from verl_omni.utils.reward_score.agentic_reward import compute_score
 
-        text = '<tool_call>{"name":"generate_image","arguments":{"prompt":"a cat"}}</tool_call>'
-        result = compute_score("jpeg_compressibility", solution_str=text)
-        assert result["method"] == "agentic_tool_call_heuristic"
-        assert result["score"] == 1.0
+        text = (
+            '<tool_call>{"name":"generate_image","arguments":{"prompt":"a cat"}}</tool_call>\n'
+            "agentic_tool ok=1 path=/tmp/a.png\n"
+            "Reflection: add hat color.\n"
+            '<tool_call>{"name":"generate_image","arguments":'
+            '{"prompt":"a cat with a blue hat, detailed"}}</tool_call>\n'
+            "agentic_tool ok=1 path=/tmp/b.png"
+        )
+        result = compute_score(
+            "jpeg_compressibility",
+            solution_str=text,
+            ground_truth={"user_request": "cat blue hat", "expected_num_images": 2},
+            tool_extra_fields={
+                "num_forced_tool_calls": 0,
+                "num_successful_images": 2,
+                "num_voluntary_hermes": 2,
+                "num_voluntary_successful_images": 2,
+                "diffusion_prompts": ["a cat", "a cat with a blue hat, detailed"],
+            },
+        )
+        assert result["method"] == "agentic_reflect_format_tool_result"
+        assert result["r_format"] >= 1.0
+        assert result["score"] >= 0.8
 
-    def test_length_fallback(self):
+    def test_free_text_without_tools_scores_low(self):
+        from verl_omni.utils.reward_score.agentic_reward import compute_score
+
+        result = compute_score("jpeg_compressibility", solution_str="I will use generate_image now")
+        assert result["method"] == "agentic_reflect_format_tool_result"
+        assert result["score"] < 0.2
+
+    def test_empty_response_low(self):
         from verl_omni.utils.reward_score.agentic_reward import compute_score
 
         result = compute_score("x", solution_str="a" * 128)
-        assert result["method"] == "response_length_heuristic"
-        assert abs(result["score"] - 0.5) < 1e-6
+        assert result["method"] == "agentic_reflect_format_tool_result"
+        assert result["score"] <= 0.1

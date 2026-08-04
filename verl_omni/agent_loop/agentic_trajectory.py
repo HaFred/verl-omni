@@ -38,8 +38,8 @@ class ToolCall:
 class ToolOutput:
     """Observation returned by a frozen diffusion tool call."""
 
-    output_type: Literal["image", "video"]
-    output_data: torch.Tensor  # image tensor [C,H,W] or video [T,C,H,W]
+    output_type: Literal["image"]
+    output_data: torch.Tensor  # image tensor [C, H, W]
     is_stub: bool = False  # True when und-only / missing diffusion_output synthesized a stub
 
 

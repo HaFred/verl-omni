@@ -11,20 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Create toy prompt parquet files for Mode (2a) agentic GRPO smoke tests.
+"""Create toy prompt parquet files for Mode (2a) agentic GRPO smoke / e2e.
 
-Online agentic RL does **not** load offline nested-turn trajectories for
-training. The parquet only seeds the initial user request; verl's stock
-``ToolAgentLoop`` generates the multi-turn agent/tool exchange at rollout time.
-
-Schema mirrors the FlowGRPO dummy data used by jpeg_compressibility e2e
-smokes so acceptance can run without an external reward model:
-
-  data_source / prompt / ability / reward_model / extra_info
-
-Default output paths:
-  ~/data/agentic/train.parquet
-  ~/data/agentic/val.parquet
+Seeds a reflection-oriented Hermes multi-turn chat for VisionCreator-R1-style
+GRPO on Lance_3B_hf_und (frozen Lance MoT diffusion tool).
 """
 
 from __future__ import annotations
@@ -36,13 +26,46 @@ import pandas as pd
 
 DATA_SOURCE = "jpeg_compressibility"
 ABILITY = "agentic_prompt_rewrite"
-SYSTEM_PROMPT = (
-    "You are a visual creation agent. Use the generate_image tool to create the "
-    "requested image. Review each tool result and call generate_image again with "
-    "a refined prompt when improvement is needed; otherwise provide a final answer."
+EXPECTED_NUM_IMAGES = 2
+
+SYSTEM_PROMPT = """You are a visual creation agent that improves images by reflection.
+
+Workflow (required, every task):
+1) Emit Hermes tool call generate_image with a detailed first prompt.
+2) After the tool observation, write one short line starting with \
+"Reflection:" that names what to improve (detail, lighting, attributes).
+3) Emit a SECOND Hermes generate_image call with a REWRITTEN prompt \
+(must differ from the first; add missing attributes / quality cues).
+4) After the second tool result, give a short final confirmation (no tool call).
+
+Exact tool format:
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "<complete image prompt>"}}
+</tool_call>
+
+Never copy or paraphrase tool observations (no "Lance frozen MoT", no \
+"agentic_tool ok=", no path= lines). Never emit bare JSON without <tool_call> \
+XML. First assistant turn must be a Hermes tool call only.
+"""
+
+FEWSHOT_USER = "Generate an image of a red apple"
+FEWSHOT_ASSISTANT_1 = (
+    "<tool_call>\n"
+    '{"name": "generate_image", "arguments": {"prompt": '
+    '"a bright red apple on a white table, soft studio lighting"}}\n'
+    "</tool_call>"
+)
+# Keep tool obs short/machine-readable so the policy does not memorize prose echoes.
+FEWSHOT_TOOL = "agentic_tool ok=1 images=1 path=/tmp/example/image_00.png"
+FEWSHOT_ASSISTANT_2 = (
+    "Reflection: edges soft and reds muted; rewrite for sharper detail.\n"
+    "<tool_call>\n"
+    '{"name": "generate_image", "arguments": {"prompt": '
+    '"a bright red apple on a white table, soft studio lighting, '
+    'highly detailed, sharp focus, richer reds, coherent composition"}}\n'
+    "</tool_call>"
 )
 
-# Attribute-heavy requests that invite multi-turn reflection / rewriting.
 USER_PROMPTS = [
     "Generate an image of a cat wearing a blue hat",
     "Create a sunset over snowy mountains with a red cabin",
@@ -55,25 +78,50 @@ USER_PROMPTS = [
 ]
 
 
-def build_rows(split: str, n: int) -> list[dict]:
-    """Build ``n`` RLHFDataset-compatible rows for the given split."""
+def build_prompt_messages(user_text: str) -> list[dict]:
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": FEWSHOT_USER},
+        {"role": "assistant", "content": FEWSHOT_ASSISTANT_1},
+        {"role": "tool", "content": FEWSHOT_TOOL},
+        {"role": "assistant", "content": FEWSHOT_ASSISTANT_2},
+        {"role": "user", "content": user_text},
+    ]
+
+
+def build_ground_truth(user_text: str) -> dict:
+    """Reflection-weighted GT for 100-step overfit AC."""
+    return {
+        "user_request": user_text,
+        "expected_num_images": EXPECTED_NUM_IMAGES,
+        "w_format": 0.25,
+        "w_reflect": 0.35,
+        "w_tool": 0.2,
+        "w_result": 0.2,
+        "forced_consolation": 0.05,
+    }
+
+
+def build_rows(split: str, n: int, prompts: list[str] | None = None) -> list[dict]:
+    prompt_pool = prompts or USER_PROMPTS
     rows = []
     for i in range(n):
-        prompt_text = USER_PROMPTS[i % len(USER_PROMPTS)]
+        prompt_text = prompt_pool[i % len(prompt_pool)]
+        gt = build_ground_truth(prompt_text)
         rows.append(
             {
                 "data_source": DATA_SOURCE,
-                "prompt": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt_text},
-                ],
+                "prompt": build_prompt_messages(prompt_text),
                 "ability": ABILITY,
-                "reward_model": {"style": "rule", "ground_truth": prompt_text},
+                "reward_model": {"style": "rule", "ground_truth": gt},
                 "extra_info": {
                     "split": split,
                     "index": i,
                     "raw_prompt": prompt_text,
                     "toy_agentic": True,
+                    "expected_num_images": EXPECTED_NUM_IMAGES,
+                    "require_multiturn_tools": True,
+                    **{k: gt[k] for k in ("w_format", "w_reflect", "w_tool", "w_result")},
                 },
             }
         )
@@ -81,29 +129,28 @@ def build_rows(split: str, n: int) -> list[dict]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate toy agentic GRPO parquet seeds for PR1 acceptance smoke")
+    parser = argparse.ArgumentParser(description="Generate toy agentic GRPO parquet seeds for PR1 acceptance")
+    parser.add_argument("--local_save_dir", default=os.path.expanduser("~/data/agentic"))
+    parser.add_argument("--train_size", type=int, default=64)
+    parser.add_argument("--val_size", type=int, default=8)
     parser.add_argument(
-        "--local_save_dir",
-        default=os.path.expanduser("~/data/agentic"),
-        help="Directory to write train.parquet and val.parquet",
+        "--overfit",
+        action="store_true",
+        help="Repeat 2 prompts only (accelerates reflection learning in ~100 steps)",
     )
-    parser.add_argument("--train_size", type=int, default=8, help="Number of training samples")
-    parser.add_argument("--val_size", type=int, default=4, help="Number of validation samples")
     args = parser.parse_args()
 
     os.makedirs(args.local_save_dir, exist_ok=True)
-
-    train_df = pd.DataFrame(build_rows("train", args.train_size))
-    val_df = pd.DataFrame(build_rows("val", args.val_size))
-
+    prompts = USER_PROMPTS[:2] if args.overfit else None
+    train_df = pd.DataFrame(build_rows("train", args.train_size, prompts))
+    val_df = pd.DataFrame(build_rows("val", args.val_size, prompts))
     train_path = os.path.join(args.local_save_dir, "train.parquet")
     val_path = os.path.join(args.local_save_dir, "val.parquet")
-
     train_df.to_parquet(train_path)
     val_df.to_parquet(val_path)
-
     print(f"Wrote {len(train_df)} train samples to {train_path}")
     print(f"Wrote {len(val_df)} val samples to {val_path}")
+    print(f"reflection few-shot; overfit={args.overfit}; w_reflect={build_ground_truth('x')['w_reflect']}")
 
 
 if __name__ == "__main__":

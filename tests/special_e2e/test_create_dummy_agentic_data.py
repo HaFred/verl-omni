@@ -31,8 +31,14 @@ def test_build_rows_schema_and_prompt_seed():
     assert first["data_source"] == DATA_SOURCE
     assert isinstance(first["prompt"], list)
     assert first["prompt"][0]["role"] == "system"
+    # Hermes few-shot precedes the live user request.
     assert first["prompt"][1]["role"] == "user"
-    assert first["prompt"][1]["content"] == USER_PROMPTS[0]
+    assert any(
+        isinstance(m, dict) and m.get("role") == "assistant" and "<tool_call>" in str(m.get("content", ""))
+        for m in first["prompt"]
+    )
+    assert first["prompt"][-1]["role"] == "user"
+    assert first["prompt"][-1]["content"] == USER_PROMPTS[0]
     assert first["extra_info"]["raw_prompt"] == USER_PROMPTS[0]
     assert first["extra_info"]["toy_agentic"] is True
     # Seeds only — nested offline turns are produced online by the agent loop.
@@ -64,4 +70,4 @@ def test_main_writes_train_and_val_parquet(tmp_path, monkeypatch):
     assert len(train_df) == 4
     assert len(val_df) == 2
     assert REQUIRED_COLUMNS.issubset(train_df.columns)
-    assert train_df.iloc[0]["prompt"][1]["content"] in USER_PROMPTS
+    assert train_df.iloc[0]["prompt"][-1]["content"] in USER_PROMPTS
