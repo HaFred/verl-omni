@@ -12,19 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU checks for Mode (2a) Agentic LLM RL wiring (verl-omni#302).
-
-Covers two contracts that do not need a GPU:
-
-1. Diffusion stays outside the actor optimizer — the smoke recipe uses stock
-   ``ToolAgentLoop`` plus an external ``generate_image`` function tool (not a
-   shared MoT checkpoint with selective freeze).
-2. Existing single-turn FlowGRPO paths stay importable, and
-   ``ray_diffusion_trainer.py`` has no agentic branches.
-
-The one-step GPU smoke lives in ``tests/special_e2e/run_agentic_grpo_lance.sh``.
-"""
-
 from __future__ import annotations
 
 import ast
