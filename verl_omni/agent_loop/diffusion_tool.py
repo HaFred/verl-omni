@@ -14,7 +14,7 @@
 
 """Frozen diffusion function tool for verl's stock ``ToolAgentLoop``.
 
-Mode (2a) keeps the diffusion/gen path **outside** the actor optimizer.
+Agentic Mode (2a) keeps the diffusion/gen path **outside** the actor optimizer.
 For Lance-3B the recommended backend is the **full MoT checkpoint** served by
 vLLM-Omni (``moe_gen`` + Wan2.2 VAE), while GRPO trains only
 ``Lance_3B_hf_und`` (understanding path) via stock vLLM + ``tool_agent``.
