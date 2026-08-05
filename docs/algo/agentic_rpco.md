@@ -6,8 +6,7 @@ Last updated: 08/05/2026
 This note records what landed and was verified for
 [Mode (2a) agentic GRPO](https://github.com/verl-project/verl-omni/issues/302)
 on Lance-3B understanding (`Lance_3B_hf_und`), with frozen diffusion as an
-external tool. Full RPCO / multi-step Lance e2e / overfit diagnostics are
-out of scope for this merge.
+external tool.
 
 ## Goal
 
@@ -16,9 +15,6 @@ Prove the Mode (2a) infra boundary:
 1. Train **only** the agent LLM with stock verl GRPO (`main_ppo` + vLLM).
 2. Call frozen diffusion through a **function tool** outside the actor optimizer.
 3. Keep existing single-turn FlowGRPO paths untouched.
-
-The current change (#329) does **not** claim Strong-Reflection convergence, voluntary Hermes mastery,
-or real-MoT image quality learning.
 
 ## Current Design
 
