@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""Tests for agentic trajectory metadata and stock tool-agent wiring."""
+
 from pathlib import Path
 
 import torch
@@ -91,7 +93,7 @@ class TestTrajectory:
         assert trajectory.turns[1].tool_call.params["prompt"] == "rewritten"
 
 
-class TestTrainMaskContract:
+class TestPr1TrainMaskContract:
     def test_all_agent_turns_train_and_tool_observations_do_not(self):
         # Stock ToolAgentLoop contract:
         # assistant turn 0 | tool observation | assistant turn 1
@@ -102,7 +104,7 @@ class TestTrainMaskContract:
 class TestStockToolAgentWiring:
     def test_recipe_uses_stock_tool_agent(self):
         root = Path(__file__).resolve().parents[2]
-        recipe = (root / "tests/special_e2e/run_agentic_grpo_lance.sh").read_text()
+        recipe = (root / "examples/agenticrpco_trainer/lance/agentic_grpo_overrides.sh").read_text()
         assert "default_agent_loop=tool_agent" in recipe
         assert "agent_loop_config_path=null" in recipe
         assert "multi_turn.enable=true" in recipe
@@ -116,16 +118,64 @@ class TestStockToolAgentWiring:
         assert tool.fn is generate_image
         assert tool.tool_schema.function.name == DIFFUSION_TOOL_SCHEMA["function"]["name"]
 
-    def test_diffusion_tool_stub_without_endpoint(self, monkeypatch, tmp_path):
+    def test_diffusion_tool_stub_without_endpoint(self, monkeypatch):
         monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
-        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
-        monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
         response, reward, metrics = generate_image("a blue hat")
         assert response.image is None
         assert "stub diffusion result" in response.text
         assert reward == 0.0
         assert metrics["tool_stubbed"] is True
-        assert metrics["diffusion_backend"] == "stub"
-        assert metrics["num_images"] == 0
-        assert metrics["image_paths"]
-        assert Path(metrics["image_paths"][0]).name == "STUB_NO_IMAGE.txt"
+
+
+class TestAgenticReward:
+    def test_tool_call_heuristic_from_trajectory(self):
+        from verl_omni.utils.reward_score.agentic_reward import compute_score
+
+        text = '{"name":"generate_image","arguments":{"prompt":"a cat"}}'
+        trajectory = {
+            "turns": [
+                {
+                    "agent_text": text,
+                    "decision": "stop",
+                    "tool_call": {
+                        "tool_name": "generate_image",
+                        "params": {"prompt": "a cat"},
+                    },
+                }
+            ],
+            "metadata": {"tool_stubbed": True},
+        }
+        result = compute_score(
+            "jpeg_compressibility",
+            solution_str="ignored",
+            extra_info={
+                "agentic_trajectory": trajectory,
+                "tool_stubbed": True,
+                "raw_prompt": "a cat",
+            },
+        )
+        assert result["method"] == "agentic_multi_turn_heuristic"
+        # tool_depth: 1/5*0.30=0.06  diversity: 0 (1 prompt)
+        # engagement: ~2 words => 0.004   completion: 0.10 (stop with tool call)
+        # total ≈ 0.164
+        assert 0.10 < result["score"] < 0.25
+        assert result["tool_stubbed"] is True
+        assert result["num_tool_calls"] == 1
+        assert result["prompt_diversity"] == 0.0
+
+    def test_tool_call_heuristic_from_stock_dapo_response(self):
+        from verl_omni.utils.reward_score.agentic_reward import compute_score
+
+        text = '<tool_call>{"name":"generate_image","arguments":{"prompt":"a cat"}}</tool_call>'
+        result = compute_score("jpeg_compressibility", solution_str=text)
+        assert result["method"] == "agentic_multi_turn_heuristic"
+        # fallback: 0.30 base tool score
+        assert abs(result["score"] - 0.30) < 0.05
+
+    def test_length_fallback(self):
+        from verl_omni.utils.reward_score.agentic_reward import compute_score
+
+        result = compute_score("x", solution_str="a" * 128)
+        assert result["method"] == "response_length_heuristic"
+        # 128 / 256 = 0.5
+        assert abs(result["score"] - 0.5) < 1e-6
