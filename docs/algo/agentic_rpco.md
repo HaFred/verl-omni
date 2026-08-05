@@ -3,10 +3,11 @@
 
 Last updated: 08/05/2026
 
-This note records what landed and was verified in **PR1** for Mode (2a) agentic
-GRPO on Lance-3B understanding (`Lance_3B_hf_und`), with frozen diffusion as an
+This note records what landed and was verified in **PR1** for
+[Mode (2a) agentic GRPO](https://github.com/verl-project/verl-omni/issues/302)
+on Lance-3B understanding (`Lance_3B_hf_und`), with frozen diffusion as an
 external tool. Full RPCO / multi-step Lance e2e / overfit diagnostics live on
-the **PR2 working branch** (`verlomni-fredfork`), not in this merge gate.
+the PR2, not in this merge gate.
 
 ## Goal
 
