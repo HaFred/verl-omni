@@ -23,7 +23,6 @@ import json
 import shutil
 from pathlib import Path
 
-import yaml
 from safetensors.torch import load_file, save_file
 
 
@@ -109,19 +108,17 @@ def main() -> None:
             shutil.copy2(src_f, dst / name)
 
     # Tool-aware Qwen2.5 chat template (required so ToolAgentLoop's tools=schemas
-    # are rendered and Hermes <tool_call> format is instructed). A tools-blind
-    # template silently drops schemas → single-turn only on stock tool_agent.
-    # Packaged as YAML for tests/special_e2e conventions; body is still Jinja2.
+    # are rendered and Hermes <tool_call> format is instructed). Same packaging as
+    # upstream verl tests: a raw ``.jinja2`` file (see
+    # tests/experimental/agent_loop/qwen_vl_tool_chat_template.jinja2).
     repo_root = Path(__file__).resolve().parents[2]
-    tool_tmpl_path = repo_root / "tests/special_e2e/qwen2_tool_chat_template.yaml"
+    tool_tmpl_path = repo_root / "tests/special_e2e/qwen2_tool_chat_template.jinja2"
     if not tool_tmpl_path.exists():
         raise FileNotFoundError(
-            f"missing tool chat template at {tool_tmpl_path}; expected tests/special_e2e/qwen2_tool_chat_template.yaml"
+            f"missing tool chat template at {tool_tmpl_path}; "
+            "expected tests/special_e2e/qwen2_tool_chat_template.jinja2"
         )
-    payload = yaml.safe_load(tool_tmpl_path.read_text())
-    if not isinstance(payload, dict) or "chat_template" not in payload:
-        raise ValueError(f"{tool_tmpl_path} must define a top-level chat_template string")
-    qwen2_chat_template = payload["chat_template"]
+    qwen2_chat_template = tool_tmpl_path.read_text()
 
     tok_cfg_path = dst / "tokenizer_config.json"
     if tok_cfg_path.exists():

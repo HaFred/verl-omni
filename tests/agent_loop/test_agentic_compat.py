@@ -43,8 +43,13 @@ class TestMode2aDiffusionOutsideActor:
         assert "multi_turn.enable=true" in recipe
         # PR1 no longer ships the multi-step e2e example tree.
         assert "examples/agenticrpco_trainer" not in recipe
-        assert (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.yaml").is_file()
-        assert not (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.jinja").exists()
+        assert (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.jinja2").is_file()
+        assert not (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.yaml").exists()
+        assert "multi_turn.format=hermes" in recipe
+        assert "st1_preflight.py" not in recipe
+        # Prefer baked und tokenizer (prepare_lance); avoid fragile CLI Jinja override.
+        assert "custom_chat_template=" not in recipe
+        assert "qwen2_tool_chat_template.jinja2" in recipe
 
     def test_diffusion_tool_registers_generate_image(self):
         # Source scan keeps this AC CPU-safe (importing the tool pulls vLLM/CUDA).
