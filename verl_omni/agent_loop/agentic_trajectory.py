@@ -55,7 +55,7 @@ class AgenticTurn:
     """
 
     turn_idx: int
-    agent_tokens: list[int]  # full agent text tokens (loss_mask=1 on turn 0 only until PR2)
+    agent_tokens: list[int]  # full agent text tokens (train mask applies to agent turns only)
     agent_logprobs: list[float]  # per-token logprobs from rollout
     agent_text: str  # decoded text: reasoning + prompt + decision
     tool_call: ToolCall | None = None  # None on stop turn

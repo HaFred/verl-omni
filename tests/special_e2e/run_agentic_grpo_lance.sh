@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-# PR1 Merge Gate: Lance-3B Agentic GRPO GPU Smoke (ST-1)
+# Lance-3B Agentic GRPO GPU Smoke (#329 ST-1 / AC1)
 # ============================================================================
 #
 # ST-1 (AC1): 1-step toy training completes — no OOM, finite non-zero loss,
@@ -13,8 +13,8 @@
 #   bash tests/special_e2e/run_agentic_grpo_lance.sh
 # Do NOT point MODEL_PATH at raw Lance_3B (no chat_template → empty dataset).
 #
-# Output:
-#   outputs/pr1_smoke/st1_agentic_onestep.log
+# Output (override with OUTPUT_DIR):
+#   outputs/agentic_grpo_lance_smoke/agentic_grpo_onestep.log
 # ============================================================================
 set -euo pipefail
 
@@ -26,7 +26,7 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a prepared HF understanding export (see prepare_lance_hf_und.py)}"
 
 DATA_DIR="${DATA_DIR:-$HOME/data/agentic}"
-OUTPUT_DIR="${OUTPUT_DIR:-$PWD/outputs/pr1_smoke}"
+OUTPUT_DIR="${OUTPUT_DIR:-$PWD/outputs/agentic_grpo_lance_smoke}"
 # Merge gate always uses its own toy parquet unless ST1_USE_ENV_DATA=1
 # (operator env often exports overfit TRAIN_FILE/VAL_FILE).
 if [[ "${ST1_USE_ENV_DATA:-0}" == "1" ]]; then
@@ -99,8 +99,8 @@ if command -v nvidia-smi >/dev/null 2>&1; then
   done
 fi
 
-# Mode (2a) + toy sizing inlined for the PR1 1-step merge gate.
-# Multi-step Lance e2e / overfit recipes live on the PR2 working branch.
+# Mode (2a) + toy sizing inlined for the 1-step GPU smoke.
+# Multi-step Lance e2e / overfit recipes are out of scope here.
 SMOKE_OVERRIDES=(
   algorithm.adv_estimator=grpo
 
@@ -190,7 +190,7 @@ if ! "$PYTHON_BIN" -c "import transfer_queue" >/dev/null 2>&1; then
   "$PYTHON_BIN" -m pip install 'TransferQueue==0.1.8'
 fi
 
-_info "=== PR1 Agentic GRPO GPU Smoke (ST-1) ==="
+_info "=== Agentic GRPO GPU Smoke (ST-1) ==="
 _info "Python: $($PYTHON_BIN -c 'import sys; print(sys.executable)')"
 _info "Model:  $MODEL_PATH"
 _info "Data:   $DATA_DIR"
@@ -222,8 +222,8 @@ if [[ "$NEED_DATA" -eq 1 ]]; then
 fi
 
 ST1_FAIL=0
-ST1_LOG="$OUTPUT_DIR/st1_agentic_onestep.log"
-ST1_CKPT="$OUTPUT_DIR/st1_ckpt"
+ST1_LOG="$OUTPUT_DIR/agentic_grpo_onestep.log"
+ST1_CKPT="$OUTPUT_DIR/agentic_grpo_onestep_ckpt"
 
 # Record a failed assertion without putting FAIL= on the same line as _fail
 # (avoids brittle `; VAR=1` parsing after echo -e / ANSI).
@@ -343,21 +343,21 @@ fi
 
 echo ""
 echo "================================================================================"
-echo "  PR1 Merge Gate: GPU Smoke Test Results"
+echo "   Merge Gate: GPU Smoke Test Results"
 echo "================================================================================"
-printf "  ST-1 (AC1: 1-step training):     %s\n" "$([ "$ST1_FAIL" -eq 0 ] && echo '✅ PASS' || echo '❌ FAIL')"
+printf "ST-1 (AC1: 1-step training):     %s\n" "$([ "$ST1_FAIL" -eq 0 ] && echo '✅ PASS' || echo '❌ FAIL')"
 echo "--------------------------------------------------------------------------------"
 echo "  Log: $ST1_LOG"
 echo "================================================================================"
 
 if [ "$ST1_FAIL" -eq 0 ]; then
   echo ""
-  echo "  ✅ PR1 GPU SMOKE (ST-1): PASSED"
+  echo "  ✅ GPU SMOKE (ST-1): PASSED"
   echo ""
   exit 0
 else
   echo ""
-  echo "  ❌ PR1 GPU SMOKE (ST-1): FAILED"
+  echo "  ❌ GPU SMOKE (ST-1): FAILED"
   echo ""
   exit 1
 fi

@@ -3,11 +3,11 @@
 
 Last updated: 08/05/2026
 
-This note records what landed and was verified in **PR1** for
+This note records what landed and was verified for
 [Mode (2a) agentic GRPO](https://github.com/verl-project/verl-omni/issues/302)
 on Lance-3B understanding (`Lance_3B_hf_und`), with frozen diffusion as an
-external tool. Full RPCO / multi-step Lance e2e / overfit diagnostics live on
-the PR2, not in this merge gate.
+external tool. Full RPCO / multi-step Lance e2e / overfit diagnostics are
+out of scope for this merge.
 
 ## Goal
 
@@ -17,7 +17,7 @@ Prove the Mode (2a) infra boundary:
 2. Call frozen diffusion through a **function tool** outside the actor optimizer.
 3. Keep existing single-turn FlowGRPO paths untouched.
 
-PR1 (#329) does **not** claim Strong-Reflection convergence, voluntary Hermes mastery,
+The current change (#329) does **not** claim Strong-Reflection convergence, voluntary Hermes mastery,
 or real-MoT image quality learning.
 
 ## Current Design
@@ -41,11 +41,11 @@ Hermes handling follows **upstream verl**:
   `prepare_lance_hf_und.py` (Instruct-style; no fragile Hydra CLI Jinja override)
 - No Hermes-specific preflight helper
 
-PR1 deliberately uses the stock `ToolAgentLoop` with no worker monkey patches.
+This merge deliberately uses the stock `ToolAgentLoop` with no worker monkey patches.
 `AgenticTrajectory` is delivered as an in-tree data contract with CPU coverage;
 ST-1 does not yet consume it on the live `main_ppo` path. The full Mode (2a)
 reward, rollout artifact context, custom metrics, and force/teacher loop remain
-on the PR2 working branch.
+follow-up work outside this merge.
 
 ## How to run
 

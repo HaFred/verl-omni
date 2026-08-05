@@ -93,7 +93,7 @@ class TestTrajectory:
         assert trajectory.turns[1].tool_call.params["prompt"] == "rewritten"
 
 
-class TestPr1TrainMaskContract:
+class TestTrainMaskContract:
     def test_all_agent_turns_train_and_tool_observations_do_not(self):
         # Stock ToolAgentLoop contract:
         # assistant turn 0 | tool observation | assistant turn 1

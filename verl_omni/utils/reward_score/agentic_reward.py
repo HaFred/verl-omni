@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Deterministic reward used only by the PR1 one-step GRPO smoke."""
+"""Deterministic length-heuristic reward for the one-step agentic GRPO smoke.
+
+TODO (fred): include multi-dimensional RPCO rewards (reflection / plan /
+image quality) with the multi-step e2e in
+https://github.com/verl-project/verl-omni/issues/303.
+"""
 
 from typing import Any
 
@@ -23,7 +28,7 @@ def compute_score(
     extra_info: dict | None = None,
     **kwargs: Any,
 ) -> dict[str, float | str]:
-    """Create reward variance so ST1 exercises the actor update path."""
+    """Length heuristic so one-step agentic GRPO has non-zero reward variance."""
     del data_source, ground_truth, extra_info, kwargs
     text = (solution_str or "").strip()
     score = 0.0 if not text else min(1.0, len(text) / 256.0)

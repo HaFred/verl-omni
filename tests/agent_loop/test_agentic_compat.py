@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU unit checks formerly embedded as ST-2 / ST-3 in the GPU smoke shell.
+"""CPU checks for Mode (2a) Agentic LLM RL wiring (verl-omni#302).
 
-ST-1 (1-step Lance GRPO) remains the GPU e2e in
-``tests/special_e2e/run_agentic_grpo_lance.sh``.
+Covers two contracts that do not need a GPU:
 
-AC2 / former ST-2: Mode (2a) keeps diffusion outside the actor optimizer via
-stock ``ToolAgentLoop`` + function tool (not a selective MoT freeze in-ckpt).
-AC3 / former ST-3: single-turn FlowGRPO entrypoints stay importable and
-``ray_diffusion_trainer.py`` has no agentic branches.
+1. Diffusion stays outside the actor optimizer — the smoke recipe uses stock
+   ``ToolAgentLoop`` plus an external ``generate_image`` function tool (not a
+   shared MoT checkpoint with selective freeze).
+2. Existing single-turn FlowGRPO paths stay importable, and
+   ``ray_diffusion_trainer.py`` has no agentic branches.
+
+The one-step GPU smoke lives in ``tests/special_e2e/run_agentic_grpo_lance.sh``.
 """
 
 from __future__ import annotations
@@ -31,8 +33,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-class TestMode2aDiffusionOutsideActor:
-    """AC2 — diffusion is an external tool, not an actor FSDP submodule."""
+class TestAgenticLlmRlDiffusionOutsideActor:
+    """Mode (2a) Agentic LLM RL: diffusion is an external tool, not an actor FSDP submodule."""
 
     def test_recipe_wires_external_function_tool(self):
         recipe = (REPO_ROOT / "tests/special_e2e/run_agentic_grpo_lance.sh").read_text()
@@ -41,7 +43,7 @@ class TestMode2aDiffusionOutsideActor:
         assert "agent_loop_config_path=null" in recipe
         assert "algorithm.adv_estimator=grpo" in recipe
         assert "multi_turn.enable=true" in recipe
-        # PR1 no longer ships the multi-step e2e example tree.
+        # Multi-step e2e example tree is out of scope for this smoke recipe.
         assert "examples/agenticrpco_trainer" not in recipe
         assert (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.jinja2").is_file()
         assert not (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.yaml").exists()
@@ -52,7 +54,7 @@ class TestMode2aDiffusionOutsideActor:
         assert "qwen2_tool_chat_template.jinja2" in recipe
 
     def test_diffusion_tool_registers_generate_image(self):
-        # Source scan keeps this AC CPU-safe (importing the tool pulls vLLM/CUDA).
+        # Source scan keeps this CPU-safe (importing the tool pulls vLLM/CUDA).
         src = (REPO_ROOT / "verl_omni/agent_loop/diffusion_tool.py").read_text()
         assert '@function_tool("generate_image"' in src
         assert "DIFFUSION_TOOL_SCHEMA" in src
@@ -65,14 +67,14 @@ class TestMode2aDiffusionOutsideActor:
         assert response_mask == [1, 1, 1, 0, 0, 1, 1]
 
     def test_no_custom_agentic_fsdp_engine_module(self):
-        # PR1 removed AgenticLLMFSDPEngine; stock HF FSDP path only.
+        # No custom agentic FSDP engine; stock HF FSDP path only.
         engine_root = REPO_ROOT / "verl_omni/workers/engine"
         hits = [p for p in engine_root.rglob("*agentic*.py") if p.is_file()]
         assert hits == [], f"unexpected agentic engine files: {hits}"
 
 
 class TestFlowGrpoBackwardCompat:
-    """AC3 — former ST-3: FlowGRPO single-turn path unaffected by Mode (2a)."""
+    """Mode (0) Single-stage RL (FlowGRPO) stays unaffected by Mode (2a) Agentic LLM RL."""
 
     def test_main_diffusion_importable(self):
         from verl_omni.trainer import main_diffusion  # noqa: F401
@@ -95,7 +97,8 @@ class TestFlowGrpoBackwardCompat:
     def test_ray_diffusion_trainer_has_no_agentic_branches(self):
         path = REPO_ROOT / "verl_omni/trainer/diffusion/ray_diffusion_trainer.py"
         source = path.read_text()
-        # Parse ensures the file is valid Python; string scan matches former ST-3e.
+        # Parse ensures the file is valid Python; string scan guards against
+        # agentic branches leaking into the single-turn diffusion trainer.
         ast.parse(source)
         assert "is_agentic" not in source
         assert "agentic_grpo" not in source

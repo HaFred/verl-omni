@@ -129,7 +129,7 @@ def build_rows(split: str, n: int, prompts: list[str] | None = None) -> list[dic
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate toy agentic GRPO parquet seeds for PR1 acceptance")
+    parser = argparse.ArgumentParser(description="Generate toy agentic GRPO parquet seeds for the one-step smoke")
     parser.add_argument("--local_save_dir", default=os.path.expanduser("~/data/agentic"))
     parser.add_argument("--train_size", type=int, default=64)
     parser.add_argument("--val_size", type=int, default=8)
