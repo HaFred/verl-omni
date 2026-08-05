@@ -50,24 +50,7 @@ from PIL import Image
 from verl.tools.function_tool import function_tool
 from verl.tools.schemas import ToolResponse
 
-from verl_omni.agent_loop.agentic_worker_patch import install_agentic_worker_patches
-
-# Re-export for callers that historically imported from this module.
-from verl_omni.agent_loop.trajectory_context import (  # noqa: F401
-    get_active_call_provenance,
-    get_active_trajectory_relpath,
-    get_active_user_prompt,
-    set_active_call_provenance,
-    set_active_trajectory_name,
-    set_active_trajectory_relpath,
-    set_active_user_prompt,
-)
-
 logger = logging.getLogger(__file__)
-
-# Real-package patch (not defined in this file-path-loaded module — Ray-safe).
-install_agentic_worker_patches()
-
 
 DIFFUSION_TOOL_SCHEMA = {
     "type": "function",
@@ -128,132 +111,12 @@ def _next_call_dir(root: Path) -> Path:
     return call_dir
 
 
-def _next_image_index(traj_dir: Path) -> int:
-    """Next ``image_XX`` index under a trajectory folder."""
-    idxs: list[int] = []
-    for path in traj_dir.glob("image_*.png"):
-        try:
-            idxs.append(int(path.stem.split("_", 1)[1]))
-        except (IndexError, ValueError):
-            continue
-    return (max(idxs) + 1) if idxs else 0
-
-
-def _call_meta_fields(prompt: str, *, user_prompt: str) -> dict:
-    """Explicit reflection→rewrite provenance for meta.json call entries."""
-    prov = dict(get_active_call_provenance() or {})
-    controlled = bool(prov.get("controlled_by_reflection"))
-    call_role = prov.get("call_role") or ("reflection_rewrite" if controlled else "initial")
-    reflection = prov.get("reflection") or ""
-    prev_prompt = prov.get("prev_tool_prompt") or ""
-    source_image = prov.get("source_image") or ""
-    rewritten = prov.get("rewritten_prompt") or (prompt if controlled else "")
-    return {
-        "call_role": call_role,
-        "controlled_by_reflection": controlled,
-        "reflection": reflection,
-        "prev_tool_prompt": prev_prompt,
-        "source_image_for_reflection": source_image,
-        "rewritten_prompt": rewritten if controlled else "",
-        # Explicit: this PNG was generated from the reflected/rewritten prompt.
-        "image_generated_from_reflected_prompt": bool(controlled and prompt == rewritten),
-        "tool_prompt_equals_rewritten_prompt": bool(controlled and prompt == rewritten),
-        "content_source": prov.get("content_source") or ("teacher" if controlled else "initial"),
-        "llm_reflection": prov.get("llm_reflection") or "",
-        "llm_prompt": prov.get("llm_prompt") or "",
-        "model_decode": prov.get("model_decode") or "",
-        "user_prompt": user_prompt,
-        "tool_prompt": prompt,
-    }
-
-
-def _update_traj_meta(traj_dir: Path, entry: dict) -> None:
-    meta_path = traj_dir / "meta.json"
-    meta: dict
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text())
-        except json.JSONDecodeError:
-            meta = {}
-    else:
-        meta = {}
-    meta.setdefault("trajectory", traj_dir.name)
-    meta.setdefault("experiment", os.getenv("AGENTIC_E2E_RUN_NAME", ""))
-    user_prompt = entry.get("user_prompt") or get_active_user_prompt() or ""
-    if user_prompt:
-        meta["user_prompt"] = user_prompt
-        entry.setdefault("user_prompt", user_prompt)
-    calls = list(meta.get("calls") or [])
-    calls.append(entry)
-    meta["calls"] = calls
-    meta["num_images"] = len(calls)
-    meta["reflection_controlled_image_files"] = [c.get("file") for c in calls if c.get("controlled_by_reflection")]
-    meta["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
-
-
 def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_stubbed: bool) -> list[str]:
-    """Persist tool images under ``rollout_images/step_*/g*_n*/image_XX.png``.
-
-    When no trajectory is bound (e.g. standalone smoke), falls back to
-    ``rollout_images/call_<ts>_<uuid>/``.
-    """
-    root = _e2e_run_root()
-    root.mkdir(parents=True, exist_ok=True)
-    relpath = get_active_trajectory_relpath()
-    user_prompt = get_active_user_prompt() or ""
-    provenance = _call_meta_fields(prompt, user_prompt=user_prompt)
+    """Persist one standalone tool-call artifact directory."""
+    call_dir = _next_call_dir(_e2e_run_root())
     paths: list[str] = []
-
-    def _entry(idx: int, path: Path, *, stubbed: bool) -> dict:
-        return {
-            "index": idx,
-            "file": path.name,
-            "path": str(path),
-            "prompt": prompt,
-            "backend": backend,
-            "tool_stubbed": stubbed,
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            **provenance,
-        }
-
-    if relpath:
-        traj_dir = root / relpath
-        traj_dir.mkdir(parents=True, exist_ok=True)
-        start_idx = _next_image_index(traj_dir)
-        if images:
-            for offset, img in enumerate(images):
-                idx = start_idx + offset
-                path = traj_dir / f"image_{idx:02d}.png"
-                img.save(path)
-                paths.append(str(path))
-                _update_traj_meta(traj_dir, _entry(idx, path, stubbed=tool_stubbed))
-        else:
-            stub_path = traj_dir / f"STUB_NO_IMAGE_{start_idx:02d}.txt"
-            stub_path.write_text(
-                "No PNG produced (text stub or empty tool response).\n"
-                f"user_prompt={user_prompt!r}\n"
-                f"tool_prompt={prompt!r}\n"
-                f"controlled_by_reflection={provenance.get('controlled_by_reflection')}\n"
-                f"reflection={provenance.get('reflection')!r}\n"
-                f"backend={backend}\n"
-                "Set AGENTIC_LANCE_SERVER_URL to a running Lance MoT serve for real images.\n"
-            )
-            paths.append(str(stub_path))
-            _update_traj_meta(traj_dir, _entry(start_idx, stub_path, stubbed=True))
-        logger.info(
-            "diffusion tool artifacts (%d image(s), stub=%s, reflect_ctrl=%s) -> %s",
-            len(images),
-            tool_stubbed,
-            provenance.get("controlled_by_reflection"),
-            traj_dir,
-        )
-        return paths
-
-    # Legacy fallback (no active trajectory context).
-    call_dir = _next_call_dir(root)
     meta = {
-        **provenance,
+        "tool_prompt": prompt,
         "backend": backend,
         "tool_stubbed": tool_stubbed,
         "num_images": len(images),
@@ -268,7 +131,6 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
         stub_path = call_dir / "STUB_NO_IMAGE.txt"
         stub_path.write_text(
             "No PNG produced (text stub or empty tool response).\n"
-            f"user_prompt={user_prompt!r}\n"
             f"tool_prompt={prompt!r}\n"
             f"backend={backend}\n"
             "Set AGENTIC_LANCE_SERVER_URL to a running Lance MoT serve for real images.\n"

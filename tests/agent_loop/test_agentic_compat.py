@@ -46,6 +46,19 @@ class TestMode2aDiffusionOutsideActor:
         assert (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.yaml").is_file()
         assert not (REPO_ROOT / "tests/special_e2e/qwen2_tool_chat_template.jinja").exists()
 
+    def test_diffusion_tool_registers_generate_image(self):
+        # Source scan keeps this AC CPU-safe (importing the tool pulls vLLM/CUDA).
+        src = (REPO_ROOT / "verl_omni/agent_loop/diffusion_tool.py").read_text()
+        assert '@function_tool("generate_image"' in src
+        assert "DIFFUSION_TOOL_SCHEMA" in src
+        assert "def generate_image(" in src
+
+    def test_train_mask_marks_tool_obs_as_non_trainable(self):
+        # Stock ToolAgentLoop contract:
+        # assistant turn 0 | tool observation | assistant turn 1
+        response_mask = [1, 1, 1] + [0, 0] + [1, 1]
+        assert response_mask == [1, 1, 1, 0, 0, 1, 1]
+
     def test_no_custom_agentic_fsdp_engine_module(self):
         # PR1 removed AgenticLLMFSDPEngine; stock HF FSDP path only.
         engine_root = REPO_ROOT / "verl_omni/workers/engine"

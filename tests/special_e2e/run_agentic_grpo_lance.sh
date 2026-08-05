@@ -183,9 +183,8 @@ SMOKE_OVERRIDES=(
   actor_rollout_ref.rollout.agent.num_workers=2
 
   reward.custom_reward_function.path=pkg://verl_omni.utils.reward_score.agentic_reward
-  # Length heuristic: Mode (2a) compute_score needs Hermes/tools; cold und →
-  # zero advantages → actor/loss=0. Smoke only needs reward variance for GRPO.
-  reward.custom_reward_function.name=compute_score_smoke
+  # Deterministic length heuristic gives cold und reward variance for GRPO.
+  reward.custom_reward_function.name=compute_score
 
   data.train_batch_size=4
   data.max_prompt_length=1024

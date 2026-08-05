@@ -28,11 +28,16 @@ or real-MoT image quality learning.
 | HF und export | `tests/special_e2e/prepare_lance_hf_und.py` | MoT → HF CausalLM und checkpoint |
 | Tool chat template | `tests/special_e2e/qwen2_tool_chat_template.yaml` | YAML-packaged Jinja for Hermes tools |
 | Frozen tool stub/HTTP | `verl_omni/agent_loop/diffusion_tool.py` | `generate_image` function tool |
-| Scalar reward | `verl_omni/utils/reward_score/agentic_reward.py` | Mode (2a) `compute_score`; ST-1 uses `compute_score_smoke` |
+| Smoke reward | `verl_omni/utils/reward_score/agentic_reward.py` | Deterministic response-length variance for ST-1 |
+| Trajectory types | `verl_omni/agent_loop/agentic_trajectory.py` | Mode (2a) data contract (`AgenticTrajectory`) |
+| Trajectory CPU tests | `tests/agent_loop/test_agentic_trajectory.py` | Round-trip + stock tool wiring |
+| CPU AC2 / AC3 | `tests/agent_loop/test_agentic_compat.py` | Stock tool wiring + FlowGRPO compat |
 
-| Worker patches | `verl_omni/agent_loop/agentic_worker_patch.py` | Traj kwargs + reward metric logging |
-| Trajectory helpers | `agentic_trajectory.py`, `trajectory_context.py` | Metadata / artifact context |
-| CPU AC2 / AC3 | `tests/agent_loop/test_agentic_compat.py` | Tool boundary + FlowGRPO compat |
+PR1 deliberately uses the stock `ToolAgentLoop` with no worker monkey patches.
+`AgenticTrajectory` is delivered as an in-tree data contract with CPU coverage;
+ST-1 does not yet consume it on the live `main_ppo` path. The full Mode (2a)
+reward, rollout artifact context, custom metrics, and force/teacher loop remain
+on the PR2 working branch.
 
 ## How to run
 
@@ -43,6 +48,8 @@ MODEL_PATH=/path/to/Lance_3B_hf_und \
 
 # CPU ACs
 pytest tests/agent_loop/test_agentic_compat.py \
+       tests/agent_loop/test_agentic_trajectory.py \
+       tests/utils/test_agentic_reward.py \
        tests/special_e2e/test_create_dummy_agentic_data.py
 ```
 

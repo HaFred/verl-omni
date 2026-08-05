@@ -36,11 +36,3 @@ import verl_omni.reward_loop  # noqa: E402, F401
 import verl_omni.trainer  # noqa: E402, F401
 import verl_omni.workers.engine  # noqa: E402, F401
 import verl_omni.workers.rollout  # noqa: E402, F401
-
-# Driver-side: log agentic R_format / R_tool / R_result on the GRPO step metrics.
-try:
-    from verl_omni.agent_loop.agentic_worker_patch import install_agentic_reward_metrics_patch
-
-    install_agentic_reward_metrics_patch()
-except Exception:
-    pass
