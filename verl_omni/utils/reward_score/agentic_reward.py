@@ -11,25 +11,257 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Deterministic length-heuristic reward for the one-step agentic GRPO smoke.
+"""Scalar reward: Hermes format + image reflection + 2x generate_image.
 
-TODO (fred): include multi-dimensional RPCO rewards (reflection / plan /
-image quality) with the multi-step e2e in
-https://github.com/verl-project/verl-omni/issues/303.
+Hard-gated for overfit GRPO. Incomplete trajectories score **exactly 0** so the
+lazy "stop at turn 1–2 / spam to max length" policy cannot earn partial credit
+and create a local optimum. Only the full protocol scores:
+
+1. Exactly two Hermes ``generate_image`` calls
+2. A ``Reflection:`` line **between** them
+3. A **rewritten** 2nd prompt (must differ from the 1st)
+4. Optional soft bonuses for tool-ok markers / final confirmation
+
+TODO (fred): multi-dimensional RPCO rewards (VLM reflection / plan / image
+quality) — https://github.com/verl-project/verl-omni/issues/303.
 """
 
+from __future__ import annotations
+
+import json
+import re
 from typing import Any
+
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+_REFLECT_RE = re.compile(r"(?im)^\s*Reflection\s*:\s*(.+)$")
+_BARE_JSON = re.compile(r'(?<!<tool_call>\s)\{\s*"name"\s*:\s*"generate_image"', re.IGNORECASE)
+_TOOL_OK = re.compile(r"agentic_tool\s+ok=1", re.IGNORECASE)
+_IMAGE_REFLECT_LEX = re.compile(
+    r"\b(image|generated|edges?|detail|lighting|color|composition|focus|sharp|soft|muted|blur)\b",
+    re.IGNORECASE,
+)
+_REFINE_LEX = {
+    "detailed",
+    "lighting",
+    "composition",
+    "focus",
+    "texture",
+    "color",
+    "sharp",
+    "richer",
+    "coherent",
+}
+
+
+def _as_dict(ground_truth: Any) -> dict[str, Any]:
+    if ground_truth is None:
+        return {}
+    if isinstance(ground_truth, dict):
+        return dict(ground_truth)
+    if isinstance(ground_truth, str):
+        raw = ground_truth.strip()
+        if raw.startswith("{"):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return {"user_request": raw}
+    return {}
+
+
+def _extract_tool_calls(text: str) -> list[tuple[int, int, dict[str, Any]]]:
+    """Return (start, end, parsed_call) for each Hermes tool-call block."""
+    out: list[tuple[int, int, dict[str, Any]]] = []
+    for match in _TOOL_CALL_RE.finditer(text or ""):
+        try:
+            call = json.loads(match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(call, dict) and call.get("name"):
+            out.append((match.start(), match.end(), call))
+    return out
+
+
+def _gen_image_prompts(calls: list[tuple[int, int, dict[str, Any]]]) -> list[str]:
+    prompts: list[str] = []
+    for _, _, call in calls:
+        if str(call.get("name", "")).lower() != "generate_image":
+            continue
+        args = call.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if isinstance(args, dict):
+            p = str(args.get("prompt") or "").strip()
+            if p:
+                prompts.append(p)
+    return prompts
+
+
+def _gen_image_spans(calls: list[tuple[int, int, dict[str, Any]]]) -> list[tuple[int, int, dict[str, Any]]]:
+    return [(s, e, c) for s, e, c in calls if str(c.get("name", "")).lower() == "generate_image"]
+
+
+def _reflection_between(text: str, gen: list[tuple[int, int, dict[str, Any]]]) -> str | None:
+    if len(gen) < 2:
+        return None
+    between = (text or "")[gen[0][1] : gen[1][0]]
+    m = _REFLECT_RE.search(between)
+    if not m:
+        return None
+    body = m.group(1).strip()
+    return body or None
+
+
+def _protocol_ok(text: str, calls: list[tuple[int, int, dict[str, Any]]], prompts: list[str]) -> bool:
+    """Full overfit protocol: 2 Hermes calls + Reflection between + rewritten prompt."""
+    if len(prompts) != 2:
+        return False
+    gen = _gen_image_spans(calls)
+    if len(gen) < 2:
+        return False
+    reflect = _reflection_between(text, gen)
+    if not reflect or len(reflect) < 8:
+        return False
+    if prompts[0].lower().strip() == prompts[1].lower().strip():
+        return False
+    return True
+
+
+def _score_format(text: str, calls: list[tuple[int, int, dict[str, Any]]]) -> float:
+    if not calls:
+        return 0.0
+    valid = 0
+    for _, _, call in calls:
+        args = call.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = None
+        if isinstance(args, dict) and "prompt" in args:
+            valid += 1
+    score = valid / max(1, len(calls))
+    if _BARE_JSON.search(text or ""):
+        score *= 0.5
+    return float(min(1.0, score))
+
+
+def _score_reflection(text: str, calls: list[tuple[int, int, dict[str, Any]]]) -> float:
+    gen = _gen_image_spans(calls)
+    body = _reflection_between(text, gen)
+    if not body:
+        return 0.0
+    score = 0.7
+    if len(body) >= 12:
+        score += 0.15
+    if _IMAGE_REFLECT_LEX.search(body):
+        score += 0.15
+    return float(min(1.0, score))
+
+
+def _score_tool_usage(prompts: list[str]) -> float:
+    if len(prompts) != 2:
+        return 0.0
+    if prompts[0].lower().strip() == prompts[1].lower().strip():
+        return 0.0
+    base = 1.0
+    t0 = set(re.findall(r"[a-z0-9]+", prompts[0].lower()))
+    t1 = set(re.findall(r"[a-z0-9]+", prompts[1].lower()))
+    if len(t1) > len(t0) or (t1 & _REFINE_LEX):
+        return 1.0
+    return float(base)
+
+
+def _score_result(text: str, prompts: list[str], has_good_reflect: bool) -> float:
+    if len(prompts) != 2 or not has_good_reflect:
+        return 0.0
+    ok = len(_TOOL_OK.findall(text or ""))
+    last_end = 0
+    for m in _TOOL_CALL_RE.finditer(text or ""):
+        last_end = max(last_end, m.end())
+    after = (text or "")[last_end:].strip()
+    has_final = len(after) > 5 and "<tool_call>" not in after.lower()
+    if ok >= 2 and has_final:
+        return 1.0
+    if ok >= 1 and has_final:
+        return 0.75
+    if ok >= 2:
+        return 0.7
+    if has_final:
+        return 0.55
+    return 0.4
+
+
+def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
+    return {
+        "score": 0.0,
+        "reward_format": 0.0,
+        "reward_reflection": 0.0,
+        "reward_tool_usage": 0.0,
+        "reward_result": 0.0,
+        "num_hermes_tool_calls": 0,
+        "num_generate_image_prompts": 0,
+        "protocol_ok": 0,
+        "method": method,
+    }
 
 
 def compute_score(
-    data_source: str,
+    data_source: str = "",
     solution_str: str = "",
     ground_truth: Any = None,
-    extra_info: dict | None = None,
+    extra_info: dict[str, Any] | None = None,
     **kwargs: Any,
-) -> dict[str, float | str]:
-    """Length heuristic so one-step agentic GRPO has non-zero reward variance."""
-    del data_source, ground_truth, extra_info, kwargs
-    text = (solution_str or "").strip()
-    score = 0.0 if not text else min(1.0, len(text) / 256.0)
-    return {"score": float(score), "method": "response_length_heuristic"}
+) -> dict[str, float | str | int | None]:
+    """Score an agentic image-generation trajectory for GRPO."""
+    del data_source, kwargs
+    extra_info = dict(extra_info or {})
+    gt = _as_dict(ground_truth)
+
+    blob = solution_str or ""
+    if not blob.strip():
+        return _zero_result(method="agentic_reflect_two_tool_calls")
+
+    calls = _extract_tool_calls(blob)
+    prompts = _gen_image_prompts(calls)
+    if not _protocol_ok(blob, calls, prompts):
+        # Incomplete / lazy / spam trajectories: hard zero (no floor, no partial).
+        out = _zero_result(method="agentic_reflect_two_tool_calls")
+        out["num_hermes_tool_calls"] = int(len(prompts))
+        out["num_generate_image_prompts"] = int(len(prompts))
+        return out
+
+    f_format = _score_format(blob, calls)
+    f_reflect = _score_reflection(blob, calls)
+    f_tool = _score_tool_usage(prompts)
+    f_result = _score_result(blob, prompts, has_good_reflect=f_reflect >= 0.7)
+
+    w_format = float(extra_info.get("w_format", gt.get("w_format", 0.15)))
+    w_reflect = float(extra_info.get("w_reflect", gt.get("w_reflect", 0.35)))
+    w_tool = float(extra_info.get("w_tool", gt.get("w_tool", 0.35)))
+    w_result = float(extra_info.get("w_result", gt.get("w_result", 0.15)))
+    w_sum = w_format + w_reflect + w_tool + w_result
+    if w_sum <= 0:
+        w_format, w_reflect, w_tool, w_result, w_sum = 0.15, 0.35, 0.35, 0.15, 1.0
+
+    # Passed the hard gate → base credit so GRPO always prefers protocol over zero.
+    total = 0.55 + 0.45 * (
+        (w_format * f_format + w_reflect * f_reflect + w_tool * f_tool + w_result * f_result) / w_sum
+    )
+
+    return {
+        "score": float(total),
+        "reward_format": float(f_format),
+        "reward_reflection": float(f_reflect),
+        "reward_tool_usage": float(f_tool),
+        "reward_result": float(f_result),
+        "num_hermes_tool_calls": int(len(prompts)),
+        "num_generate_image_prompts": int(len(prompts)),
+        "protocol_ok": 1,
+        "method": "agentic_reflect_two_tool_calls",
+    }
