@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Qwen3-VL-2B-Thinking Mode (2a) agentic GRPO overfit.
+# Qwen3.5 / Qwen3-VL Mode (2a) agentic GRPO overfit.
 #
-# The actor is a pretrained Hermes-capable VLM. The frozen Qwen-Image service
-# remains outside the optimizer and returns pixels through generate_image, so
-# the actor can inspect image 1, reflect, rewrite, and call the tool again.
+# The actor is a pretrained Hermes-capable VLM (default: Qwen3.5-2B via MODEL_PATH).
+# Frozen Qwen-Image returns pixels through generate_image; the actor self-reflects
+# on the attached image and either Done. or rewrite + generate_image again.
+# Frozen Qwen3-VL at AGENTIC_REFLECT_VLM_URL is the reward judge only (C/A).
 #
 #   source ~/fred/fred_verlomni_agentic_multiturn_pr1.sh
 #   cd ~/fred/verlomni-pr-fredfork
-#   # pane A (GPU not in CUDA_VISIBLE_DEVICES):
-#   CUDA_VISIBLE_DEVICES=6 bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
-#   # pane B:
+#   # pane A (GPUs not in CUDA_VISIBLE_DEVICES):
+#   CUDA_VISIBLE_DEVICES=0,1 QWEN_IMAGE_MEMORY_MODE=balanced \
+#     bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
+#   # pane B (reflect VLM reward judge; keep AGENTIC_REFLECT_VLM_PATH on Qwen3-VL):
+#   CUDA_VISIBLE_DEVICES=2 \
+#     bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh
+#   # pane C:
 #   TOTAL_STEPS=100 bash examples/agenticrpco_trainer/agent_llm/run_agentic_grpo.sh
 #
 # Short smokes (TOTAL_STEPS≤20) auto-enable GATE_SIDECAR=1: prints expected
@@ -22,7 +27,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-2B-Thinking}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-2B}"
 TRAIN_FILE="${TRAIN_FILE:-${REPO_ROOT}/data/agentic/train.parquet}"
 VAL_FILE="${VAL_FILE:-${REPO_ROOT}/data/agentic/val.parquet}"
 N_GPUS="${N_GPUS:-2}"
@@ -31,7 +36,7 @@ ROLLOUT_N="${ROLLOUT_N:-4}"
 OVERFIT_DATA="${OVERFIT_DATA:-1}"
 # Unique WandB run + ckpt dir every launch (override with EXPERIMENT_NAME / RUN_TS).
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3_vl_agentic_grpo_${RUN_TS}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35_agentic_grpo_${RUN_TS}}"
 CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints/verl_omni_agentic/${EXPERIMENT_NAME}}"
 # Per-run rollout artifacts: PNGs (or stub manifests) land here when generate_image fires.
 E2E_ROOT="${E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
@@ -39,9 +44,10 @@ E2E_RUN_DIR="${E2E_RUN_DIR:-${E2E_ROOT}/${EXPERIMENT_NAME}}"
 export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-$E2E_ROOT}"
 export AGENTIC_E2E_RUN_NAME="${AGENTIC_E2E_RUN_NAME:-$EXPERIMENT_NAME}"
 export AGENTIC_DIFFUSION_IMAGE_DIR="${AGENTIC_DIFFUSION_IMAGE_DIR:-$E2E_RUN_DIR/rollout_images}"
-# Qwen3-VL has an image processor: return generated pixels to the actor.
+# Actor is vision-capable: return generated pixels for self-reflection.
 export AGENTIC_DIFFUSION_ATTACH_IMAGE="${AGENTIC_DIFFUSION_ATTACH_IMAGE:-1}"
 REQUIRE_REAL_IMAGE_TOOL="${REQUIRE_REAL_IMAGE_TOOL:-1}"
+REQUIRE_REFLECT_VLM="${REQUIRE_REFLECT_VLM:-1}"
 GATE_SCRIPT="${GATE_SCRIPT:-$SCRIPT_DIR/check_overfit_gates.py}"
 DATA_SCRIPT="${DATA_SCRIPT:-$SCRIPT_DIR/../data_process/create_dummy_agentic_data.py}"
 # Sidecar gates for short overfit smokes (TOTAL_STEPS≤20 default on). Override GATE_SIDECAR=0 to skip.
@@ -71,6 +77,8 @@ rollout trajectories: ${E2E_RUN_DIR}/rollout_trajectories
 raw assistant rollouts (per step): ${E2E_RUN_DIR}/hermes_actions/step_XXXXXX.txt
 agent model: ${MODEL_PATH}
 Qwen-Image tool URL: ${AGENTIC_QWEN_IMAGE_URL:-<unset — generic/legacy fallback or stub>}
+reflect VLM URL: ${AGENTIC_REFLECT_VLM_URL:-<unset — heuristic fallback>}
+reflect VLM path: ${AGENTIC_REFLECT_VLM_PATH:-<defaults to MODEL_PATH / Qwen3-VL>}
 attach generated pixels to VLM: ${AGENTIC_DIFFUSION_ATTACH_IMAGE}
 overfit gates: GATE_SIDECAR=${GATE_SIDECAR} (see overfit_gates.json)
 agent loop: stock verl tool_agent (no force/teacher implementation)
@@ -82,6 +90,8 @@ echo "[INFO] e2e rollout images -> ${AGENTIC_DIFFUSION_IMAGE_DIR}"
 echo "[INFO] e2e full trajectories -> ${E2E_RUN_DIR}/rollout_trajectories"
 echo "[INFO] e2e raw assistant rollouts -> ${E2E_RUN_DIR}/hermes_actions/"
 echo "[INFO] agent loop=stock tool_agent; no force/teacher implementation is loaded"
+echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
+echo "[INFO] reflect URL=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
 python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --expect-only --total-steps "${TOTAL_STEPS}" --no-force
 if [[ "${AGENTIC_DIFFUSION_ATTACH_IMAGE}" != "1" ]]; then
   echo "[ERROR] This visual-reflection recipe requires AGENTIC_DIFFUSION_ATTACH_IMAGE=1." >&2
@@ -91,6 +101,13 @@ if [[ -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" &
   echo "[ERROR] No frozen image service is configured; visual reflection cannot be trained on stubs." >&2
   echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh" >&2
   if [[ "${REQUIRE_REAL_IMAGE_TOOL}" == "1" ]]; then
+    exit 2
+  fi
+fi
+if [[ -z "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
+  echo "[ERROR] AGENTIC_REFLECT_VLM_URL is unset; reward C/A cannot hit the VLM sidecar." >&2
+  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh" >&2
+  if [[ "${REQUIRE_REFLECT_VLM}" == "1" ]]; then
     exit 2
   fi
 fi
@@ -114,6 +131,42 @@ except Exception as exc:
         raise SystemExit(2)
 PY
 fi
+if [[ -n "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
+  python3 - "${AGENTIC_REFLECT_VLM_URL}" "${REQUIRE_REFLECT_VLM}" <<'PY'
+import json
+import sys
+from urllib.request import Request, urlopen
+
+endpoint, required = sys.argv[1], sys.argv[2] == "1"
+# Prefer /health when present; otherwise a tiny POST proves the route is up.
+health = endpoint.rsplit("/", 1)[0] + "/health"
+try:
+    with urlopen(health, timeout=5) as response:  # noqa: S310
+        payload = json.loads(response.read())
+    print(f"[INFO] Reflect VLM health OK: {payload}")
+except Exception:
+    try:
+        req = Request(
+            endpoint,
+            data=json.dumps(
+                {
+                    "user_request": "health check",
+                    "image_prompt": "a red apple",
+                    "notes": "",
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=30) as response:  # noqa: S310
+            payload = json.loads(response.read())
+        print(f"[INFO] Reflect VLM endpoint reachable: keys={sorted(payload)[:8]}")
+    except Exception as exc:
+        print(f"[ERROR] Reflect VLM check failed at {endpoint}: {exc}", file=sys.stderr)
+        if required:
+            raise SystemExit(2)
+PY
+fi
 
 _run_final_gates() {
   local train_rc="${1:-0}"
@@ -134,11 +187,19 @@ _run_final_gates() {
   fi
 }
 
+# Qwen3.5 GDN: this box's pip nvidia-cu13 is headers 13.3 + nvcc 13.2, so FlashInfer
+# GDN JIT dies with CCCL "CUDA compiler and CUDA toolkit headers are incompatible".
+# Force Triton/FLA prefill (vLLM --gdn-prefill-backend triton) and skip that JIT.
+GDN_PREFILL_BACKEND="${GDN_PREFILL_BACKEND:-triton}"
+
 # Refresh Ray worker env so tool artifacts / Qwen-Image URL / WandB reach TaskRunner.
 export RAY_RUNTIME_ENV_JSON="$(python3 - <<'PY'
 import json, os
 keys = [
     "LD_LIBRARY_PATH",
+    "PATH",
+    "CUDA_HOME",
+    "CUDA_PATH",
     "HF_HOME",
     "VERL_USE_EXTERNAL_MODULES",
     "WANDB_API_KEY",
@@ -148,6 +209,8 @@ keys = [
     "WANDB_DIR",
     "WANDB_PROJECT",
     "AGENTIC_QWEN_IMAGE_URL",
+    "AGENTIC_REFLECT_VLM_URL",
+    "AGENTIC_REFLECT_VLM_PATH",
     "AGENTIC_LANCE_SERVER_URL",
     "AGENTIC_DIFFUSION_TOOL_URL",
     "AGENTIC_DIFFUSION_TOOL_TOKEN",
@@ -176,8 +239,8 @@ print(json.dumps(base))
 PY
 )"
 
-# Never replace the model's native template. Qwen3-VL is pretrained for Hermes
-# JSON in <tool_call> and its processor is required for returned tool images.
+# Never replace the model's native template. Actor must expose Hermes tools +
+# an image processor so generate_image pixels can be attached for reflection.
 python3 - "$MODEL_PATH" <<'PY'
 import sys
 from transformers import AutoProcessor
@@ -189,14 +252,63 @@ if "<tool_call>" not in template or "tools" not in template:
     raise SystemExit(f"{model_path} does not expose the required tool-aware chat template")
 if not getattr(processor, "image_processor", None):
     raise SystemExit(f"{model_path} does not expose an image_processor")
-print(f"[INFO] Verified native Hermes tool template + image processor: {model_path}")
+print(f"[INFO] Verified native tool template + image processor: {model_path}")
 PY
 
-# Keep the tiny overfit parquet synchronized with the native Qwen3-VL protocol.
+# Tool-call wire format must match the actor chat template.
+# Qwen3.5 / Qwen3-Coder emit XML (<function=...><parameter=...>); Hermes is JSON.
+# Wrong parser → "Failed to decode tool call: Expecting value..." and tool_calls=0.
+if [[ -z "${TOOL_PARSER_FORMAT:-}" ]]; then
+  TOOL_PARSER_FORMAT="$(python3 - "$MODEL_PATH" <<'PY'
+import sys
+from transformers import AutoConfig, AutoProcessor
+
+path = sys.argv[1]
+model_type = str(getattr(AutoConfig.from_pretrained(path, trust_remote_code=True), "model_type", "") or "")
+if model_type in {"qwen3_5", "qwen3_5_moe", "qwen3_coder"}:
+    print("qwen3_coder")
+    raise SystemExit(0)
+proc = AutoProcessor.from_pretrained(path, trust_remote_code=True)
+tmpl = (getattr(proc, "chat_template", None) or getattr(getattr(proc, "tokenizer", None), "chat_template", None) or "")
+print("qwen3_coder" if "<function=" in tmpl else "hermes")
+PY
+)"
+fi
+echo "[INFO] multi_turn.format=${TOOL_PARSER_FORMAT}"
+
+# Qwen3.5 GDN backend: default triton avoids FlashInfer JIT (broken on mismatched CTK).
+python3 - "$MODEL_PATH" "${GDN_PREFILL_BACKEND}" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+from transformers import AutoConfig
+
+model_path, backend = sys.argv[1], sys.argv[2].strip().lower()
+model_type = str(getattr(AutoConfig.from_pretrained(model_path, trust_remote_code=True), "model_type", "") or "")
+if model_type != "qwen3_5":
+    print(f"[INFO] model_type={model_type}; skipping Qwen3.5 GDN preflight")
+    raise SystemExit(0)
+print(f"[INFO] Qwen3.5 GDN prefill backend={backend}")
+if backend == "flashinfer":
+    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or ""
+    nvcc = Path(cuda_home) / "bin" / "nvcc" if cuda_home else Path()
+    if not cuda_home or not nvcc.is_file():
+        raise SystemExit(
+            "GDN_PREFILL_BACKEND=flashinfer needs CUDA_HOME with bin/nvcc "
+            f"(got CUDA_HOME={cuda_home!r}). Prefer GDN_PREFILL_BACKEND=triton on this box."
+        )
+    print(f"[WARN] flashinfer GDN JIT needs matching nvcc+headers; this box often mismatches.")
+    print(f"[INFO] CUDA_HOME={cuda_home} nvcc={nvcc}")
+PY
+
+# Keep the tiny overfit parquet synchronized with the actor's native tool format.
 if [[ "${OVERFIT_DATA}" == "1" ]]; then
   python3 "${DATA_SCRIPT}" \
     --local_save_dir "$(dirname "$TRAIN_FILE")" \
-    --overfit --train_size "${OVERFIT_TRAIN_SIZE:-8}" --val_size "${OVERFIT_VAL_SIZE:-2}"
+    --overfit --train_size "${OVERFIT_TRAIN_SIZE:-8}" --val_size "${OVERFIT_VAL_SIZE:-2}" \
+    --tool_call_format "${TOOL_PARSER_FORMAT}" \
+    --model_path "${MODEL_PATH}"
 fi
 
 # Colocated FSDP actor + vLLM: after actor init, free VRAM << gpu_memory_utilization
@@ -325,12 +437,13 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.layered_summon=false \
   actor_rollout_ref.rollout.max_num_seqs=8 \
   "actor_rollout_ref.rollout.max_model_len=${MAX_MODEL_LEN}" \
+  "+actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend=${GDN_PREFILL_BACKEND}" \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.multi_turn.enable=true \
-  actor_rollout_ref.rollout.multi_turn.max_assistant_turns=4 \
-  actor_rollout_ref.rollout.multi_turn.max_user_turns=4 \
+  actor_rollout_ref.rollout.multi_turn.max_assistant_turns=8 \
+  actor_rollout_ref.rollout.multi_turn.max_user_turns=8 \
   actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2048 \
-  actor_rollout_ref.rollout.multi_turn.format=hermes \
+  "actor_rollout_ref.rollout.multi_turn.format=${TOOL_PARSER_FORMAT}" \
   actor_rollout_ref.rollout.multi_turn.function_tool_path=verl_omni/agent_loop/diffusion_tool.py \
   actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
   +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.agentic_metrics_manager.AgenticMetricsAgentLoopManager \

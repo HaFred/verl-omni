@@ -51,6 +51,12 @@ _active_call_provenance: contextvars.ContextVar[dict | None] = contextvars.Conte
 
 _rollout_alloc_lock = threading.Lock()
 
+# Live tool saves register here so the post-hoc manager can place image_00/01
+# under step_*/sample_* even when stock ToolAgentLoop never binds contextvars
+# and attached vision tokens truncate later ``path=`` markers from the response.
+_artifact_registry_lock = threading.Lock()
+_artifact_registry: list[dict] = []
+
 
 def set_active_trajectory_relpath(relpath: str | None) -> contextvars.Token:
     """Bind (or clear) the relative artifact path for subsequent tool saves."""
@@ -77,6 +83,81 @@ def set_active_call_provenance(meta: dict | None) -> contextvars.Token:
 
 def get_active_call_provenance() -> dict | None:
     return _active_call_provenance.get()
+
+
+def register_tool_artifact(
+    *,
+    prompt: str,
+    paths: list[str],
+    backend: str = "",
+    tool_stubbed: bool = False,
+) -> None:
+    """Record a live generate_image save for later step/sample materialization."""
+    entry = {
+        "prompt": (prompt or "").strip(),
+        "paths": [str(p) for p in paths],
+        "backend": backend,
+        "tool_stubbed": bool(tool_stubbed),
+        "claimed": False,
+    }
+    with _artifact_registry_lock:
+        _artifact_registry.append(entry)
+
+
+def claim_tool_artifacts_for_prompts(prompts: list[str]) -> list[dict]:
+    """FIFO-claim unclaimed registry rows matching each prompt (exact, then stripped).
+
+    Returns one dict per successfully claimed prompt (may be shorter than ``prompts``).
+    """
+    claimed: list[dict] = []
+    with _artifact_registry_lock:
+        for prompt in prompts:
+            want = (prompt or "").strip()
+            if not want:
+                continue
+            hit = None
+            for entry in _artifact_registry:
+                if entry.get("claimed"):
+                    continue
+                got = (entry.get("prompt") or "").strip()
+                if got == want:
+                    hit = entry
+                    break
+            if hit is None:
+                # Soft fallback: allow trailing punctuation / whitespace drift.
+                for entry in _artifact_registry:
+                    if entry.get("claimed"):
+                        continue
+                    got = (entry.get("prompt") or "").strip().rstrip(".,; ")
+                    if got == want.rstrip(".,; "):
+                        hit = entry
+                        break
+            if hit is None:
+                continue
+            hit["claimed"] = True
+            claimed.append(dict(hit))
+    return claimed
+
+
+def clear_tool_artifact_registry() -> None:
+    """Test helper."""
+    with _artifact_registry_lock:
+        _artifact_registry.clear()
+    set_latest_tool_image_path(None)
+
+
+_latest_tool_image_path: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "agentic_latest_tool_image_path", default=None
+)
+
+
+def set_latest_tool_image_path(path: str | None) -> contextvars.Token:
+    """Remember the most recent generate_image PNG for reflect_image."""
+    return _latest_tool_image_path.set(path)
+
+
+def get_latest_tool_image_path() -> str | None:
+    return _latest_tool_image_path.get()
 
 
 # Back-compat aliases used by earlier smoke tests.

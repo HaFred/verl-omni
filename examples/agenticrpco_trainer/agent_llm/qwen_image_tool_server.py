@@ -201,7 +201,13 @@ def generate(request: GenerateRequest) -> GenerateResponse:
 
     started = time.perf_counter()
     try:
+        # Single pipeline: serialize generates. Concurrent agent workers queue here,
+        # which is why GPU util flickers and HTTP clients look "slow to refresh".
         with _generate_lock, torch.inference_mode():
+            queue_wait_s = time.perf_counter() - started
+            if queue_wait_s > 1.0:
+                logger.info("generate queued %.1fs before acquiring pipeline lock", queue_wait_s)
+            gen_started = time.perf_counter()
             result = _pipe(
                 prompt=request.prompt,
                 negative_prompt=negative,
@@ -212,8 +218,18 @@ def generate(request: GenerateRequest) -> GenerateResponse:
                 generator=torch.Generator(device=_generator_device()).manual_seed(seed),
             )
             image = result.images[0]
+            infer_s = time.perf_counter() - gen_started
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            logger.info(
+                "generate ok wait=%.1fs infer=%.1fs steps=%d size=%dx%d prompt=%r",
+                queue_wait_s,
+                infer_s,
+                steps,
+                width,
+                height,
+                request.prompt[:80],
+            )
     except Exception as exc:  # noqa: BLE001 - convert model failure to HTTP diagnostics
         logger.exception("Qwen-Image generation failed")
         if torch.cuda.is_available():

@@ -15,9 +15,10 @@
 """Frozen image-generation function tool for verl's stock ``ToolAgentLoop``.
 
 Mode (2a) keeps image generation **outside** the actor optimizer. GRPO trains
-Qwen3-VL-2B-Thinking as the visual agent while a frozen Qwen-Image pipeline
-generates candidate images. Generated pixels are returned to the VLM, allowing
-an on-policy image → reflection → rewritten prompt → image trajectory.
+the actor as the visual agent while a frozen Qwen-Image pipeline generates
+candidate images. Generated pixels are attached so the actor can self-reflect
+and either finish with Done. or rewrite + call generate_image again.
+
 
 Backends (first match wins):
   1. ``AGENTIC_QWEN_IMAGE_URL`` — bundled Qwen-Image HTTP service
@@ -55,10 +56,13 @@ from verl_omni.agent_loop.agentic_trajectory_context import (  # noqa: F401
     get_active_call_provenance,
     get_active_trajectory_relpath,
     get_active_user_prompt,
+    get_latest_tool_image_path,
+    register_tool_artifact,
     set_active_call_provenance,
     set_active_trajectory_name,
     set_active_trajectory_relpath,
     set_active_user_prompt,
+    set_latest_tool_image_path,
 )
 
 logger = logging.getLogger(__file__)
@@ -69,8 +73,10 @@ DIFFUSION_TOOL_SCHEMA = {
     "function": {
         "name": "generate_image",
         "description": (
-            "Generate an image with the frozen diffusion model. Review the returned "
-            "image, then call this tool again with a refined prompt or finish."
+            "Generate an image with the frozen diffusion model. After each generation, "
+            "inspect the attached image yourself: write a brief reflection, then either "
+            "finish with Done. if good enough, or rewrite the prompt and call "
+            "generate_image again in the same assistant turn."
         ),
         "parameters": {
             "type": "object",
@@ -243,6 +249,7 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
             provenance.get("controlled_by_reflection"),
             traj_dir,
         )
+        register_tool_artifact(prompt=prompt, paths=paths, backend=backend, tool_stubbed=tool_stubbed)
         return paths
 
     # Legacy fallback (no active trajectory context).
@@ -276,6 +283,7 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
         tool_stubbed,
         call_dir,
     )
+    register_tool_artifact(prompt=prompt, paths=paths, backend=backend, tool_stubbed=tool_stubbed)
     return paths
 
 
@@ -336,6 +344,8 @@ def _pack_response(
         f"backend={backend} prompt={prompt_snip!r}"
     )
     png0 = next((p for p in paths if str(p).endswith(".png")), None)
+    if png0:
+        set_latest_tool_image_path(png0)
     vis = _image_vis_summary(png0)
     if paths and "path=" not in text:
         text = f"{text} path={paths[0]}"

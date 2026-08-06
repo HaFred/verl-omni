@@ -12,19 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pytest
+
+from verl_omni.utils.reward_score import agentic_reward
 from verl_omni.utils.reward_score.agentic_reward import compute_score
 
-_GOOD = """\
+# Class 0: single generate → actor reflection + Done
+_SINGLE = """\
 <tool_call>
-{"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat"}}
+{"name": "generate_image", "arguments": {"prompt": \
+"a bright red apple on a white table, soft studio lighting, sharp focus"}}
 </tool_call>
-agentic_tool ok=1 images=1 path=/tmp/a.png image_vis=512x512 mean_luma=90 edges=soft colors=muted
-Reflection: image_vis edges=soft colors=muted; rewrite for sharper detail and richer color.
+agentic_tool ok=1 images=1 path=/tmp/a.png image_vis=512x512 mean_luma=168 edges=sharp colors=red_rich
+Reflection: bright red apple on white table, sharp edges, rich color. Done.
+"""
+
+# Class 1: gen → reflection+rewrite gen → reflection+Done
+_TWO_PASS = """\
 <tool_call>
-{"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat, sharp focus, highly detailed"}}
+{"name": "generate_image", "arguments": {"prompt": "a red apple on a white table, soft lighting"}}
 </tool_call>
-agentic_tool ok=1 images=1 path=/tmp/b.png
-Done. Refined after reflecting on the first image.
+agentic_tool ok=1 images=1 path=/tmp/a.png image_vis=512x512 mean_luma=92 edges=soft colors=red_muted
+Reflection: apple present but muted reds and soft edges; rewrite for brighter lighting.
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": \
+"a bright red apple on a white table, strong studio lighting, highly detailed, sharp focus, richer reds"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/b.png image_vis=512x512 mean_luma=155 edges=medium colors=red_rich
+Reflection: bright red apple now matches; richer color and sharper focus. Done.
 """
 
 _ONE = """\
@@ -35,19 +50,175 @@ agentic_tool ok=1 images=1 path=/tmp/a.png
 Done.
 """
 
+# Gen + Done without visual reflection prose — must NOT be protocol_ok
+_DONE_NO_REFLECT = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+Done. Looks good.
+"""
+
+
+def _vl_scores_for_path(image_path: str | None) -> dict:
+    """Deterministic mock VL judgments keyed by fixture image path."""
+    path = image_path or ""
+    if path.endswith("/b.png") or "b.png" in path:
+        return {
+            "ok": True,
+            "correctness": 0.88,
+            "aesthetics": 0.84,
+            "match": 0.86,
+            "good_enough": True,
+            "correctness_scores": {},
+            "aesthetics_scores": {},
+            "findings": "",
+            "suggested_fixes": "none",
+            "backend": "qwen3_vl",
+        }
+    if "low" in path:
+        return {
+            "ok": True,
+            "correctness": 0.72,
+            "aesthetics": 0.72,
+            "match": 0.72,
+            "good_enough": True,
+            "correctness_scores": {},
+            "aesthetics_scores": {},
+            "findings": "",
+            "suggested_fixes": "none",
+            "backend": "qwen3_vl",
+        }
+    if "dup" in path:
+        return {
+            "ok": True,
+            "correctness": 0.80,
+            "aesthetics": 0.78,
+            "match": 0.79,
+            "good_enough": True,
+            "correctness_scores": {},
+            "aesthetics_scores": {},
+            "findings": "",
+            "suggested_fixes": "none",
+            "backend": "qwen3_vl",
+        }
+    # Default: high single-pass scores (/tmp/a.png)
+    return {
+        "ok": True,
+        "correctness": 0.91,
+        "aesthetics": 0.88,
+        "match": 0.90,
+        "good_enough": True,
+        "correctness_scores": {},
+        "aesthetics_scores": {},
+        "findings": "",
+        "suggested_fixes": "none",
+        "backend": "qwen3_vl",
+    }
+
+
+@pytest.fixture(autouse=True)
+def _mock_vl_reflect(monkeypatch):
+    """CPU tests never hit the GPU reflect server."""
+
+    def fake_call_reflect_vlm(*, user_request, image_prompt, notes="", image_path=None):
+        del user_request, image_prompt, notes
+        return _vl_scores_for_path(image_path)
+
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", fake_call_reflect_vlm)
+
+
+def test_qwen35_xml_tool_calls_score_like_hermes():
+    """Qwen3.5 native XML <function=/<parameter=> must parse like Hermes JSON."""
+    xml = """\
+<tool_call>
+<function=generate_image>
+<parameter=prompt>
+a bright red apple on a white table, soft studio lighting, sharp focus
+</parameter>
+</function>
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png image_vis=512x512 mean_luma=168 edges=sharp colors=red_rich
+Reflection: bright red apple on white table, sharp edges, rich color. Done.
+"""
+    out = compute_score("smoke", solution_str=xml)
+    hermes = compute_score("smoke", solution_str=_SINGLE)
+    assert out["reward_tool_call"] == 1.0
+    assert out["num_generate_image_prompts"] == 1
+    assert out["num_reflect_image_calls"] == 0
+    assert out["protocol_ok"] == 1
+    assert out["score"] >= 0.55
+    assert abs(out["score"] - hermes["score"]) < 1e-6
+
+
+def test_vl_rubric_subscores_are_exposed_as_reward_metrics(monkeypatch):
+    def fake_call(*, user_request, image_prompt, notes="", image_path=None):
+        del user_request, image_prompt, notes, image_path
+        return {
+            "ok": True,
+            "correctness": 0.70,
+            "aesthetics": 0.60,
+            "match": 0.65,
+            "good_enough": False,
+            "correctness_scores": {
+                "attributes": 0.5,
+                "completeness": 0.6,
+                "relations_layout": 0.7,
+                "scene_context": 0.8,
+                "subject_entities": 0.9,
+            },
+            "aesthetics_scores": {
+                "appeal": 0.4,
+                "color": 0.5,
+                "composition": 0.6,
+                "fidelity": 0.7,
+                "lighting": 0.8,
+            },
+            "findings": "",
+            "suggested_fixes": "none",
+            "backend": "qwen3_vl",
+        }
+
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", fake_call)
+    out = compute_score("smoke", solution_str=_SINGLE)
+
+    assert out["reward_correctness_subject_entities"] == 0.9
+    assert out["reward_correctness_attributes"] == 0.5
+    assert out["reward_aesthetics_composition"] == 0.6
+    assert out["reward_aesthetics_appeal"] == 0.4
+
 
 def test_empty_and_lazy_spam_are_hard_zero():
-    assert compute_score("smoke", solution_str="")["score"] == 0.0
+    empty = compute_score("smoke", solution_str="")
+    assert empty["score"] == 0.0
+    assert empty["reward_tool_call"] == 0.0
     spam = "Adorable\n" * 80
-    assert compute_score("smoke", solution_str=spam)["score"] == 0.0
-    assert compute_score("smoke", solution_str=spam)["protocol_ok"] == 0
+    spam_out = compute_score("smoke", solution_str=spam)
+    assert spam_out["score"] == 0.0
+    assert spam_out["reward_tool_call"] == 0.0
+    assert spam_out["protocol_ok"] == 0
 
 
-def test_one_tool_call_gets_partial_credit():
+def test_one_tool_call_gets_near_zero_without_reflection():
     out = compute_score("smoke", solution_str=_ONE)
-    assert out["score"] >= 0.35
+    assert out["score"] < 0.10
     assert out["protocol_ok"] == 0
     assert out["num_generate_image_prompts"] == 1
+    assert out["num_reflect_image_calls"] == 0
+    assert out["reward_tool_call"] == 1.0
+    assert out["reward_reflection"] == 0.0
+    assert out["reward_tool_usage"] <= 0.05
+    assert out["reward_result"] <= 0.05
+
+
+def test_reward_tool_call_is_binary_decode_has_tool_call():
+    """Per-rollout 0/1; batch mean == fraction of rollouts with a Hermes tool call."""
+    no = compute_score("smoke", solution_str="Just thinking, no tools.")
+    yes = compute_score("smoke", solution_str=_ONE)
+    assert no["reward_tool_call"] == 0.0
+    assert yes["reward_tool_call"] == 1.0
+    batch_mean = 0.5 * (no["reward_tool_call"] + yes["reward_tool_call"])
+    assert batch_mean == 0.5
 
 
 def test_bare_json_is_hard_zero_vs_full_protocol():
@@ -55,39 +226,81 @@ def test_bare_json_is_hard_zero_vs_full_protocol():
         "smoke",
         solution_str='{"name": "generate_image", "arguments": {"prompt": "a cat"}}',
     )
-    good = compute_score("smoke", solution_str=_GOOD)
+    single = compute_score("smoke", solution_str=_SINGLE)
+    two = compute_score("smoke", solution_str=_TWO_PASS)
     assert bare["score"] == 0.0
-    assert good["score"] >= 0.55
-    assert good["protocol_ok"] == 1
-    assert good["reward_tool_usage"] == 1.0
-    assert good["num_generate_image_prompts"] == 2
+    assert bare["reward_tool_call"] == 0.0
+    assert single["score"] >= 0.55
+    assert single["protocol_ok"] == 1
+    assert two["score"] >= 0.55
+    assert two["protocol_ok"] == 1
+    assert two["num_generate_image_prompts"] == 2
+    assert two["num_reflect_image_calls"] == 0
 
 
-def test_two_calls_outrank_one_call():
-    good = compute_score("smoke", solution_str=_GOOD)
+def test_done_without_visual_reflection_is_not_protocol_ok():
+    prose = compute_score("smoke", solution_str=_DONE_NO_REFLECT)
+    two = compute_score("smoke", solution_str=_TWO_PASS)
+    assert prose["protocol_ok"] == 0
+    assert prose["reward_reflection"] == 0.0
+    assert prose["score"] < two["score"]
+
+
+def test_two_pass_outranks_gen_only():
+    two = compute_score("smoke", solution_str=_TWO_PASS)
     one = compute_score("smoke", solution_str=_ONE)
-    assert good["score"] > one["score"]
+    assert two["score"] > one["score"]
+
+
+def test_single_pass_protocol_ok_and_ca_from_vl():
+    out = compute_score(
+        "smoke",
+        solution_str=_SINGLE,
+        ground_truth={"user_request": "Generate an image of a bright red apple on a white table"},
+    )
+    assert out["protocol_ok"] == 1
+    assert out["num_generate_image_prompts"] == 1
+    assert out["num_reflect_image_calls"] == 0
+    assert out["reward_reflection"] >= 0.7
+    assert out["reward_correctness"] >= 0.9
+    assert out["reward_aesthetics"] >= 0.85
+
+
+def test_higher_final_ca_scores_higher():
+    low = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "a red apple"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/low.png
+Reflection: red apple present, acceptable lighting. Done.
+"""
+    high = compute_score("smoke", solution_str=_SINGLE)
+    low_out = compute_score("smoke", solution_str=low)
+    assert high["reward_correctness"] > low_out["reward_correctness"]
+    assert high["score"] > low_out["score"]
 
 
 def test_same_prompt_twice_below_distinct_rewrite():
     same = """\
 <tool_call>
-{"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat"}}
+{"name": "generate_image", "arguments": {"prompt": "a bright red apple on a white table"}}
 </tool_call>
-Reflection: looking at the generated image, need sharper detail.
+agentic_tool ok=1 images=1 path=/tmp/a.png
+Reflection: muted color; try again.
 <tool_call>
-{"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat"}}
+{"name": "generate_image", "arguments": {"prompt": "a bright red apple on a white table"}}
 </tool_call>
-Done.
+agentic_tool ok=1 images=1 path=/tmp/dup.png
+Reflection: bright red apple matches. Done.
 """
-    good = compute_score("smoke", solution_str=_GOOD)
+    two = compute_score("smoke", solution_str=_TWO_PASS)
     dup = compute_score("smoke", solution_str=same)
-    assert dup["score"] < good["score"]
+    assert dup["score"] < two["score"]
     assert dup["protocol_ok"] == 0
 
 
-def test_distinct_second_call_without_reflection_is_not_full_protocol():
-    no_reflection = """\
+def test_gen_without_reflection_is_not_full_protocol():
+    no_reflect = """\
 <tool_call>
 {"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat"}}
 </tool_call>
@@ -97,16 +310,72 @@ agentic_tool ok=1 images=1 path=/tmp/a.png
 </tool_call>
 agentic_tool ok=1 images=1 path=/tmp/b.png
 """
-    incomplete = compute_score("smoke", solution_str=no_reflection)
-    good = compute_score("smoke", solution_str=_GOOD)
+    incomplete = compute_score("smoke", solution_str=no_reflect)
+    two = compute_score("smoke", solution_str=_TWO_PASS)
     assert incomplete["protocol_ok"] == 0
     assert incomplete["reward_reflection"] == 0.0
-    assert incomplete["score"] < good["score"]
+    assert incomplete["score"] < two["score"]
 
 
-def test_thinking_wrapped_reflection_and_calls_still_score():
-    wrapped = f"<think>\n{_GOOD}\n</think>"
+def test_thinking_wrapped_protocol_still_scores():
+    wrapped = f"<think>\n{_TWO_PASS}\n</think>"
     out = compute_score("smoke", solution_str=wrapped)
     assert out["protocol_ok"] == 1
     assert out["reward_reflection"] >= 0.7
     assert out["num_generate_image_prompts"] == 2
+    assert out["num_reflect_image_calls"] == 0
+    assert out["reward_correctness"] >= 0.85
+
+
+def test_reward_brevity_prefers_short_prose():
+    brief = compute_score("smoke", solution_str=_SINGLE)
+    ramble = (
+        _SINGLE
+        + "\n"
+        + (
+            "Let me carefully reconsider the entire request again and debate every "
+            "possible interpretation of the apple, the table, the lighting, and whether "
+            "the prior fewshot demo is somehow related to this new task. "
+        )
+        * 12
+    )
+    long = compute_score("smoke", solution_str=ramble)
+    assert brief["reward_brevity"] >= 0.9
+    assert long["reward_brevity"] < brief["reward_brevity"]
+    assert long["score"] < brief["score"]
+
+
+def test_hallucinated_ca_markers_do_not_bypass_vl(monkeypatch):
+    """Trajectory-embedded C/A markers must not score; only call_reflect_vlm."""
+    real = compute_score("smoke", solution_str=_SINGLE)
+    assert real["reward_correctness"] >= 0.9
+
+    def fail_vl(*, user_request, image_prompt, notes="", image_path=None):
+        del user_request, image_prompt, notes, image_path
+        return None
+
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", fail_vl)
+    hallucinated = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "a cat"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+correctness=0.91 aesthetics=0.88 match=0.90 good_enough=1
+agentic_reflect ok=1 good_enough=1 backend=qwen3_vl
+Reflection: bright sharp cat. Done.
+"""
+    out = compute_score("smoke", solution_str=hallucinated)
+    assert out["num_reflect_image_calls"] == 0
+    assert out["reward_correctness"] == 0.0
+    assert out["reward_aesthetics"] == 0.0
+    # Protocol can still be ok; C/A stay zero without VL.
+    assert out["protocol_ok"] == 1
+    assert real["score"] > out["score"]
+
+
+def test_vl_unset_zeros_correctness_and_aesthetics(monkeypatch):
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", lambda **_: None)
+    out = compute_score("smoke", solution_str=_SINGLE)
+    assert out["reward_correctness"] == 0.0
+    assert out["reward_aesthetics"] == 0.0
+    assert out["protocol_ok"] == 1  # closed loop with reflection prose

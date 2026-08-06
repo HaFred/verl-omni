@@ -32,21 +32,88 @@ import numpy as np
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.utils import hf_tokenizer
 
-from verl_omni.agent_loop.agentic_trajectory_context import build_trajectory_relpath
+from verl_omni.agent_loop.agentic_trajectory_context import (
+    build_trajectory_relpath,
+    claim_tool_artifacts_for_prompts,
+)
 
 logger = logging.getLogger(__name__)
 
 REWARD_COMPONENTS = (
+    "reward_tool_call",
+    "reward_brevity",
     "reward_format",
     "reward_reflection",
     "reward_tool_usage",
     "reward_result",
+    "reward_correctness",
+    "reward_aesthetics",
+    "reward_correctness_subject_entities",
+    "reward_correctness_attributes",
+    "reward_correctness_relations_layout",
+    "reward_correctness_scene_context",
+    "reward_correctness_completeness",
+    "reward_aesthetics_composition",
+    "reward_aesthetics_lighting",
+    "reward_aesthetics_color",
+    "reward_aesthetics_fidelity",
+    "reward_aesthetics_appeal",
 )
-_HERMES_GENERATE_IMAGE_RE = re.compile(
-    r"<tool_call>\s*\{.*?\"name\"\s*:\s*\"generate_image\".*?\}\s*</tool_call>",
+REWARD_ARTIFACT_FIELDS = (
+    *REWARD_COMPONENTS,
+    "num_hermes_tool_calls",
+    "num_generate_image_prompts",
+    "num_reflect_image_calls",
+    "protocol_ok",
+)
+_TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(?:\{.*?\"name\"\s*:\s*\"[^\"]+\".*?\}|"
+    r"<function=[^>\s]+\s*>.*?</function>)\s*</tool_call>",
     re.IGNORECASE | re.DOTALL,
 )
+_EXECUTED_TOOL_RESPONSE_RE = re.compile(r"\bagentic_(?:tool|reflect)\s+ok=[01]\b", re.IGNORECASE)
 _TOOL_ARTIFACT_PATH_RE = re.compile(r"\bpath=([^\s<>]+)")
+_HERMES_PROMPT_RE = re.compile(
+    r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
+    re.IGNORECASE | re.DOTALL,
+)
+_QWEN_XML_PROMPT_RE = re.compile(
+    r"<tool_call>\s*<function=generate_image\s*>.*?"
+    r"<parameter=prompt\s*>\s*(.*?)\s*</parameter>.*?"
+    r"</function>\s*</tool_call>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_generate_image_prompts(decoded_response: str) -> list[str]:
+    """Ordered prompts from Hermes JSON or Qwen3.5 XML tool calls."""
+    found: list[tuple[int, str]] = []
+    for match in _HERMES_PROMPT_RE.finditer(decoded_response or ""):
+        raw = match.group(1)
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("name", "")).strip() != "generate_image":
+            continue
+        args = payload.get("arguments") or {}
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {}
+        if not isinstance(args, dict):
+            continue
+        prompt = args.get("prompt")
+        if isinstance(prompt, str) and prompt.strip():
+            found.append((match.start(), prompt.strip()))
+    for match in _QWEN_XML_PROMPT_RE.finditer(decoded_response or ""):
+        prompt = match.group(1).strip()
+        if prompt:
+            found.append((match.start(), prompt))
+    return [prompt for _, prompt in sorted(found)]
 
 
 def aggregate_agentic_reward_metrics(non_tensor_batch: dict[str, Any]) -> dict[str, float]:
@@ -65,20 +132,93 @@ def aggregate_agentic_reward_metrics(non_tensor_batch: dict[str, Any]) -> dict[s
     return metrics
 
 
+def _artifact_reward_metrics(output: Any, index: int) -> dict[str, float | int]:
+    """Per-rollout scorer outputs for compact ``hermes_actions`` JSONL rows."""
+    metrics: dict[str, float | int] = {}
+    rm_scores = output.batch.get("rm_scores")
+    if rm_scores is not None:
+        # AgentLoopManager writes the scalar reward on the final valid response
+        # token; the first token is normally zero. Sum the token-level tensor.
+        value = np.asarray(rm_scores[index].detach().cpu()).sum()
+        metrics["score"] = float(value)
+
+    integer_fields = {
+        "num_hermes_tool_calls",
+        "num_generate_image_prompts",
+        "num_reflect_image_calls",
+        "protocol_ok",
+    }
+    for key in REWARD_ARTIFACT_FIELDS:
+        values = output.non_tensor_batch.get(key)
+        if values is None:
+            continue
+        value = np.asarray(values[index]).reshape(-1)[0]
+        metrics[key] = int(value) if key in integer_fields else float(value)
+    return metrics
+
+
 def split_assistant_rollouts(token_ids, response_mask, tokenizer) -> list[str]:
     """Decode contiguous model-token spans; tool observations have mask 0."""
+    return [turn["decode"] for turn in split_rollout_turns(token_ids, response_mask, tokenizer)]
+
+
+def split_rollout_turns(token_ids, response_mask, tokenizer) -> list[dict[str, Any]]:
+    """Split response into assistant turns with the tool-obs that preceded each turn.
+
+    ``response_mask==1`` → model tokens (assistant decode).
+    ``response_mask==0`` → tool / env tokens (recorded as the next turn's ``turn_prompt``).
+
+    Turn 1 has no prior tool obs in the response tensor; the caller should set
+    ``turn_prompt`` to the dataset ``user_prompt`` when empty.
+    """
     ids = token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
     mask = response_mask.tolist() if hasattr(response_mask, "tolist") else list(response_mask)
-    turns: list[str] = []
-    current: list[int] = []
+    turns: list[dict[str, Any]] = []
+    current_model: list[int] = []
+    current_tool: list[int] = []
+    pending_tool_prompt = ""
+
+    def _flush_tool() -> None:
+        nonlocal pending_tool_prompt, current_tool
+        if not current_tool:
+            return
+        # Drop vision/special pads so monitors keep path= / image_vis / agentic_tool.
+        pending_tool_prompt = tokenizer.decode(current_tool, skip_special_tokens=True).strip()
+        current_tool = []
+
+    def _flush_model() -> None:
+        nonlocal current_model, pending_tool_prompt
+        if not current_model:
+            return
+        decode = tokenizer.decode(current_model, skip_special_tokens=False)
+        turns.append(
+            {
+                "turn": len(turns) + 1,
+                "turn_prompt": pending_tool_prompt,
+                "decode": decode,
+                "decode_has_tool_call": "<tool_call>" in decode.lower(),
+            }
+        )
+        pending_tool_prompt = ""
+        current_model = []
+
     for token_id, is_model_token in zip(ids, mask, strict=True):
         if int(is_model_token) == 1:
-            current.append(int(token_id))
-        elif current:
-            turns.append(tokenizer.decode(current, skip_special_tokens=False))
-            current = []
-    if current:
-        turns.append(tokenizer.decode(current, skip_special_tokens=False))
+            if current_tool:
+                _flush_tool()
+            current_model.append(int(token_id))
+        else:
+            if current_model:
+                _flush_model()
+            current_tool.append(int(token_id))
+    if current_model:
+        _flush_model()
+    # Trailing tool obs (after final assistant tool_call) is kept on a synthetic note.
+    if current_tool:
+        _flush_tool()
+        if turns:
+            turns[-1]["tool_response_after"] = pending_tool_prompt
+        pending_tool_prompt = ""
     return turns
 
 
@@ -111,31 +251,69 @@ def _materialize_rollout_images(
     relpath: str,
     user_prompt: str,
 ) -> list[str]:
-    """Copy stock function-tool artifacts into the stable step/sample layout."""
+    """Move live tool artifacts into ``step_*/sample_*/image_00.png``, ``image_01.png``, …
+
+    Stock ``ToolAgentLoop`` does not bind trajectory contextvars, so live saves land
+    under ``call_<ts>_<uuid>/``. Attached vision tokens also often truncate later
+    ``path=`` markers from the logged response. We therefore:
+
+    1. Claim registry rows by ordered Hermes ``generate_image`` prompts (preferred)
+    2. Fall back to any remaining ``path=`` markers in the decoded response
+    3. Remove the temporary ``call_*`` staging directory after all its files move
+    """
     target_dir = run_dir / "rollout_images" / relpath
     target_dir.mkdir(parents=True, exist_ok=True)
     copied: list[str] = []
     seen: set[Path] = set()
+    staging_dirs: set[Path] = set()
     image_n = 0
     call_n = 0
-    for raw_path in _TOOL_ARTIFACT_PATH_RE.findall(decoded_response):
-        source = Path(raw_path.rstrip("',\".;"))
+
+    def _copy_source(source: Path) -> None:
+        nonlocal image_n, call_n
         if source in seen or not source.is_file():
-            continue
+            return
         seen.add(source)
         if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
             destination = target_dir / f"image_{image_n:02d}{source.suffix.lower()}"
             image_n += 1
-        elif source.name == "STUB_NO_IMAGE.txt":
+        elif source.name.startswith("STUB_NO_IMAGE"):
             destination = target_dir / f"STUB_NO_IMAGE_{call_n:02d}.txt"
         else:
-            continue
-        shutil.copy2(source, destination)
-        copied.append(str(destination))
+            return
         source_meta = source.parent / "meta.json"
         if source_meta.is_file():
             shutil.copy2(source_meta, target_dir / f"call_{call_n:02d}_meta.json")
+        # The call_* path is only a live staging location. Move instead of copy
+        # so every persisted generated image has one canonical step/sample path.
+        shutil.move(str(source), str(destination))
+        copied.append(str(destination))
+        if source.parent.name.startswith("call_"):
+            staging_dirs.add(source.parent)
         call_n += 1
+
+    prompts = _extract_generate_image_prompts(decoded_response)
+    for entry in claim_tool_artifacts_for_prompts(prompts):
+        for raw in entry.get("paths") or []:
+            _copy_source(Path(raw))
+
+    # Fallback / fill-in when registry was empty (e.g. manager-only dump of old run).
+    for raw_path in _TOOL_ARTIFACT_PATH_RE.findall(decoded_response):
+        source = Path(raw_path.rstrip("',\".;"))
+        # path= may point at the PNG or a stub file.
+        _copy_source(source)
+
+    for staging_dir in staging_dirs:
+        # Preserve per-call metadata above, then remove the staging envelope.
+        source_meta = staging_dir / "meta.json"
+        if source_meta.is_file():
+            source_meta.unlink()
+        try:
+            staging_dir.rmdir()
+        except OSError:
+            # A multi-image/concurrent call may still have an unclaimed file.
+            logger.debug("Keeping non-empty tool staging directory: %s", staging_dir)
+
     if copied:
         (target_dir / "meta.json").write_text(
             json.dumps(
@@ -143,6 +321,7 @@ def _materialize_rollout_images(
                     "trajectory_relpath": relpath,
                     "user_prompt": user_prompt,
                     "image_paths": copied,
+                    "tool_prompts": prompts,
                     "source": "stock_tool_agent_manager_copy",
                 },
                 indent=2,
@@ -191,19 +370,13 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                     rollout_n=rollout_n,
                 )
                 user_prompt = _last_user_prompt(raw_prompts[i]) if raw_prompts is not None else ""
-                turns = split_assistant_rollouts(
+                rollout_turns = split_rollout_turns(
                     responses[i],
                     response_masks[i],
                     self._monitor_tokenizer,
                 )
-                rollout_turns = [
-                    {
-                        "turn": turn_i,
-                        "decode": decode,
-                        "decode_has_tool_call": "<tool_call>" in decode.lower(),
-                    }
-                    for turn_i, decode in enumerate(turns, start=1)
-                ]
+                if rollout_turns and not rollout_turns[0].get("turn_prompt"):
+                    rollout_turns[0]["turn_prompt"] = user_prompt
                 decoded_response = self._monitor_tokenizer.decode(
                     responses[i].tolist(),
                     skip_special_tokens=False,
@@ -223,13 +396,21 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                     "rollout_turns": rollout_turns,
                     "image_paths": image_paths,
                     "num_tool_calls_executed": sum(
-                        len(_HERMES_GENERATE_IMAGE_RE.findall(turn["decode"])) for turn in rollout_turns
+                        len(
+                            _EXECUTED_TOOL_RESPONSE_RE.findall(
+                                f"{turn.get('turn_prompt', '')}\n{turn.get('tool_response_after', '')}"
+                            )
+                        )
+                        for turn in rollout_turns
                     ),
                     "num_forced_tool_calls": 0,
-                    "num_voluntary_hermes": sum(
-                        len(_HERMES_GENERATE_IMAGE_RE.findall(turn["decode"])) for turn in rollout_turns
+                    "num_voluntary_tool_calls": sum(
+                        len(_TOOL_CALL_RE.findall(turn["decode"])) for turn in rollout_turns
                     ),
+                    # Legacy field name retained for downstream dashboards.
+                    "num_voluntary_hermes": sum(len(_TOOL_CALL_RE.findall(turn["decode"])) for turn in rollout_turns),
                 }
+                reward_metrics = _artifact_reward_metrics(output, i)
 
                 name = Path(relpath).name
                 (trajectory_dir / f"{name}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
@@ -246,16 +427,56 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                     ]
                 )
                 for turn in rollout_turns:
-                    header = f"  turn={turn['turn']} decode_has_tool_call={turn['decode_has_tool_call']}"
-                    trajectory_text.extend([header, "    decode:"])
-                    step_text.extend([header, "    decode:"])
+                    t = int(turn["turn"])
+                    header = f"  turn={t} decode_has_tool_call={turn['decode_has_tool_call']}"
+                    turn_prompt = turn.get("turn_prompt") or ""
+                    trajectory_text.extend(
+                        [
+                            header,
+                            f"    turn_{t}_prompt:",
+                            *[f"      {line}" for line in (turn_prompt.splitlines() or [""])],
+                            "    decode:",
+                        ]
+                    )
+                    step_text.extend(
+                        [
+                            header,
+                            f"    turn_{t}_prompt:",
+                            *[f"      {line}" for line in (turn_prompt.splitlines() or [""])],
+                            "    decode:",
+                        ]
+                    )
                     decode_lines = turn["decode"].splitlines() or [""]
                     trajectory_text.extend(f"      {line}" for line in decode_lines)
                     step_text.extend(f"      {line}" for line in decode_lines)
+                    after = turn.get("tool_response_after") or ""
+                    if after:
+                        trajectory_text.extend(
+                            [
+                                f"    turn_{t}_tool_response:",
+                                *[f"      {line}" for line in after.splitlines() or [""]],
+                            ]
+                        )
+                        step_text.extend(
+                            [
+                                f"    turn_{t}_tool_response:",
+                                *[f"      {line}" for line in after.splitlines() or [""]],
+                            ]
+                        )
                 trajectory_text.append("")
                 step_text.append("")
                 (trajectory_dir / f"{name}.txt").write_text("\n".join(trajectory_text) + "\n")
-                jsonl_rows.append(json.dumps(payload, ensure_ascii=False))
+                # ``rollout_trajectories`` is the canonical home of raw
+                # decodes. Keep hermes_actions compact and focused on action
+                # metadata plus the exact per-rollout reward outputs.
+                monitor_payload = {
+                    **payload,
+                    "rollout_turns": [
+                        {key: value for key, value in turn.items() if key != "decode"} for turn in rollout_turns
+                    ],
+                    "reward_metrics": reward_metrics,
+                }
+                jsonl_rows.append(json.dumps(monitor_payload, ensure_ascii=False))
 
             (monitor_dir / f"{step_tag}.txt").write_text("\n".join(step_text) + "\n")
             (monitor_dir / f"{step_tag}.jsonl").write_text("\n".join(jsonl_rows) + "\n")

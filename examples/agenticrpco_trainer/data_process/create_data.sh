@@ -17,11 +17,14 @@ VAL_SIZE="${OVERFIT_VAL_SIZE:-2}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 mkdir -p "$SAVE_DIR"
-echo "[INFO] Writing overfit agentic parquet under $SAVE_DIR"
+TOOL_CALL_FORMAT="${TOOL_CALL_FORMAT:-auto}"
+echo "[INFO] Writing overfit agentic parquet under $SAVE_DIR (tool_call_format=${TOOL_CALL_FORMAT})"
 "$PYTHON_BIN" "$SCRIPT_DIR/create_dummy_agentic_data.py" \
   --local_save_dir "$SAVE_DIR" \
   --overfit \
   --train_size "$TRAIN_SIZE" \
-  --val_size "$VAL_SIZE"
+  --val_size "$VAL_SIZE" \
+  --tool_call_format "${TOOL_CALL_FORMAT}" \
+  ${MODEL_PATH:+--model_path "$MODEL_PATH"}
 
 echo "[INFO] Done: $SAVE_DIR/train.parquet , $SAVE_DIR/val.parquet"
