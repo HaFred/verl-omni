@@ -245,14 +245,9 @@ def _demo_messages(class_id: int) -> list[dict]:
 
 
 USER_PROMPTS = [
-    "Generate an image of a bright red apple on a white table",
-    "Create a vivid sunset over snowy mountains with a red cabin",
-    "Draw a silver robot painting a colorful landscape on an easel",
-    "A glass of orange juice next to three green apples on a wooden table",
-    "A yellow bicycle leaning against a blue brick wall in soft morning light",
-    "A small brown dog wearing red sunglasses sitting on a white sofa",
-    "An astronaut holding a purple umbrella on the surface of Mars",
-    "A vintage typewriter with the word HELLO typed in bold letters",
+    "In a realistic and emotionally evocative pencil sketch style, the composition focuses on a heartwarming indoor scene. Under the dim glow of an oil lamp, a returned soldier son is showing his elderly mother a yellowed letter from home. The soldier, tall and dressed in a dusty military uniform with medals pinned to his chest, leans forward and points at the words on the letter. His mother, with silver hair and a face full of wrinkles, sits on a wooden chair, her eyes glistening with tears of emotion as she gently touches the letter. The soldier's kind-hearted wife stands behind her husband, her hand resting on his shoulder, smiling reassuringly at her mother-in-law. The warm light of the oil lamp illuminates the faces of the three and the letter in their hands, while a faded family portrait hangs on the wall. The entire scene is filled with dramatic lighting and a profound sense of family emotion.",
+    "Epic fantasy scene, wide-angle shot. In the dim ancient ruins, a circle of runestones on the ground glows with mysterious light. An elderly white-haired wizard, clad in a deep blue robe adorned with stars, wears a solemn expression as he chants a spell with both hands outstretched. Before him hovers an open, glowing blue magic book. He is protecting a young and beautiful elf princess, who has pointed ears and golden hair, dressed in an emerald-green gown. She tightly grips a life staff topped with a shining green gem, watching the enemy nervously. Their foe is a dark knight clad in full black runic armor, his face unseen, with ominous red light seeping through the cracks in his armor. He raises a massive black runic sword, poised to strike. Dynamic poses, dramatic lighting, digital painting, intricate details, cinematic feel.",
+    "In a dimly lit ancient stone chamber, the flames danced in the fireplace. An elderly rune master, dressed in a dark robe with silver-white hair and beard, was holding a wooden staff and pointing at an unfolded, weathered parchment scroll, imparting ancient knowledge to a young Celtic priestess. The priestess wore a green linen dress adorned with Celtic knots, her red hair braided into intricate plaits, and she gazed intently at the complex Norse runes on the scroll. Beside them, a sharp-eyed Viking warrior clad in leather armor stood with his arms crossed, observing the scene with curiosity. In the background, a massive runestone stood upright. The composition is a mid-shot, with strong contrasts of light and shadow.",
 ]
 
 OVERFIT_PROMPTS = USER_PROMPTS[:3]
