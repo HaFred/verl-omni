@@ -18,13 +18,21 @@ _GOOD = """\
 <tool_call>
 {"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat"}}
 </tool_call>
-agentic_tool ok=1 images=1 path=/tmp/a.png
-Reflection: looking at the generated image, the hat is blurry; rewrite for sharper detail.
+agentic_tool ok=1 images=1 path=/tmp/a.png image_vis=512x512 mean_luma=90 edges=soft colors=muted
+Reflection: image_vis edges=soft colors=muted; rewrite for sharper detail and richer color.
 <tool_call>
 {"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat, sharp focus, highly detailed"}}
 </tool_call>
 agentic_tool ok=1 images=1 path=/tmp/b.png
 Done. Refined after reflecting on the first image.
+"""
+
+_ONE = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "a cat"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+Done.
 """
 
 
@@ -35,17 +43,11 @@ def test_empty_and_lazy_spam_are_hard_zero():
     assert compute_score("smoke", solution_str=spam)["protocol_ok"] == 0
 
 
-def test_one_tool_call_is_hard_zero():
-    one = """\
-<tool_call>
-{"name": "generate_image", "arguments": {"prompt": "a cat"}}
-</tool_call>
-agentic_tool ok=1 images=1 path=/tmp/a.png
-Done.
-"""
-    out = compute_score("smoke", solution_str=one)
-    assert out["score"] == 0.0
+def test_one_tool_call_gets_partial_credit():
+    out = compute_score("smoke", solution_str=_ONE)
+    assert out["score"] >= 0.35
     assert out["protocol_ok"] == 0
+    assert out["num_generate_image_prompts"] == 1
 
 
 def test_bare_json_is_hard_zero_vs_full_protocol():
@@ -58,27 +60,16 @@ def test_bare_json_is_hard_zero_vs_full_protocol():
     assert good["score"] >= 0.55
     assert good["protocol_ok"] == 1
     assert good["reward_tool_usage"] == 1.0
-    assert good["reward_reflection"] >= 0.7
     assert good["num_generate_image_prompts"] == 2
 
 
-def test_reflection_must_sit_between_tool_calls():
-    wrong_place = """\
-Reflection: looking at the image, soft edges.
-<tool_call>
-{"name": "generate_image", "arguments": {"prompt": "a cat"}}
-</tool_call>
-<tool_call>
-{"name": "generate_image", "arguments": {"prompt": "a cat, sharp focus"}}
-</tool_call>
-"""
+def test_two_calls_outrank_one_call():
     good = compute_score("smoke", solution_str=_GOOD)
-    bad = compute_score("smoke", solution_str=wrong_place)
-    assert bad["score"] == 0.0
-    assert good["score"] > bad["score"]
+    one = compute_score("smoke", solution_str=_ONE)
+    assert good["score"] > one["score"]
 
 
-def test_same_prompt_twice_is_hard_zero():
+def test_same_prompt_twice_below_distinct_rewrite():
     same = """\
 <tool_call>
 {"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat"}}
@@ -91,5 +82,31 @@ Done.
 """
     good = compute_score("smoke", solution_str=_GOOD)
     dup = compute_score("smoke", solution_str=same)
-    assert dup["score"] == 0.0
-    assert good["score"] > dup["score"]
+    assert dup["score"] < good["score"]
+    assert dup["protocol_ok"] == 0
+
+
+def test_distinct_second_call_without_reflection_is_not_full_protocol():
+    no_reflection = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "a cat wearing a blue hat"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "a detailed cat wearing a blue hat, sharp focus"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/b.png
+"""
+    incomplete = compute_score("smoke", solution_str=no_reflection)
+    good = compute_score("smoke", solution_str=_GOOD)
+    assert incomplete["protocol_ok"] == 0
+    assert incomplete["reward_reflection"] == 0.0
+    assert incomplete["score"] < good["score"]
+
+
+def test_thinking_wrapped_reflection_and_calls_still_score():
+    wrapped = f"<think>\n{_GOOD}\n</think>"
+    out = compute_score("smoke", solution_str=wrapped)
+    assert out["protocol_ok"] == 1
+    assert out["reward_reflection"] >= 0.7
+    assert out["num_generate_image_prompts"] == 2

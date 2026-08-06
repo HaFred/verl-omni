@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-task binding shared by the agent loop and diffusion tool.
+"""Artifact path helpers and optional per-task diffusion-tool bindings.
 
-Kept in a tiny module (no ``@function_tool``) so ``AgenticForceToolAgentLoop`` can
-import it without re-loading ``diffusion_tool`` under a second module name,
-which would double-register ``generate_image``.
+Kept in a tiny module with no ``@function_tool`` registration so path helpers
+can be shared by the stock-loop manager and diffusion tool safely.
 
 Artifact layout (under ``rollout_images`` / ``rollout_trajectories``)::
 
@@ -25,9 +24,8 @@ Artifact layout (under ``rollout_images`` / ``rollout_trajectories``)::
         meta.json
     step_{global_step:06d}/sample_{index}.{rollout_n:02d}.json
 
-``global_steps`` comes from stock vLLM generate ``extra_fields`` (no custom
-worker). ``rollout_n`` is allocated with an exclusive marker under the step
-folder so concurrent Ray workers stay unique without trainer metadata.
+The manager uses stock rollout metadata for trajectory JSON/text dumps. The
+context bindings remain optional for standalone/custom tool callers.
 """
 
 from __future__ import annotations
@@ -81,7 +79,7 @@ def get_active_call_provenance() -> dict | None:
     return _active_call_provenance.get()
 
 
-# Back-compat aliases used by earlier AgenticForceToolAgentLoop / smoke tests.
+# Back-compat aliases used by earlier smoke tests.
 set_active_trajectory_name = set_active_trajectory_relpath
 get_active_trajectory_name = get_active_trajectory_relpath
 

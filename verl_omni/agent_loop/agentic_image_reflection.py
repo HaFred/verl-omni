@@ -12,18 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Image-grounded reflection → rewritten diffusion prompt (PR1 Stage-1 proxy).
+"""Deterministic supplemental measurements for visual-agent observations.
 
-Lance_3B_hf_und is text-only in this recipe (no image_processor), so we cannot
-feed pixels into the actor for a true VLM judge. Instead we **inspect the PNG
-produced by the frozen diffusion tool** with lightweight vision heuristics and
-emit:
+Qwen3-VL receives the generated pixels directly and produces the on-policy
+reflection/rewrite. This helper measures simple brightness, contrast, edge, and
+color statistics that are included as ``image_vis=...`` evidence. It can also
+produce a deterministic diagnostic rewrite for standalone tests:
 
 1. A ``Reflection:`` string that cites the observed image + defects.
 2. A **new** ``generate_image`` prompt derived from that reflection (missing
    user attributes + quality fixes), not a generic suffix.
 
-Full VLM-as-judge reflection remains PR2 / RFC Stage-1+.
+It is not a teacher and is not used to replace model actions during GRPO.
 """
 
 from __future__ import annotations

@@ -12,35 +12,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Overfit gate sidecar for Lance agentic GRPO e2e.
+"""Overfit gate sidecar for Qwen3-VL visual-agent GRPO (force OFF).
 
-Expected 10-step overfit behavior (force + stable teacher + hard-gated reward):
+Expected 10-step voluntary overfit (no teacher/force):
 
-  Steps 1–3
-    - Almost every rollout executes ≥2 generate_image calls (force)
-    - Hermes actions dominated by overfit_teacher / wrap_* / final_confirm
+  Steps 1–10
+    - Measure real Hermes: Decode should grow ``<tool_call>`` / voluntary modes
     - Artifacts under rollout_trajectories/step_XXXXXX/sample_*.**
-    - Reward contrast: teacher-replaced trajs high; on-policy garbage ≈0
+    - Track native Hermes calls, two-call rewrites, and generated artifacts
 
-  Steps 4–7
-    - Escape rate (tools=0 AND forced=0) stays low — no spam-to-max-length majority
-    - Still mostly multi-turn (≥3 assistant/tool turns on successful trajs)
-
-  Steps 8–10
-    - Same force/protocol health as above
-    - Bonus (soft): num_voluntary_hermes rising is nice-to-have, not required
-      for a 10-step smoke (cold und usually needs teacher longer)
-
-Hard gates (fail the sidecar if broken):
-  G1  After ≥1 finished step: ≥1 traj with num_tool_calls_executed ≥ 2
-  G2  Escape rate across all scored trajs < --max-escape-rate (default 0.25)
+Hard gates (no-force):
   G3  Trajectories live under step_[0-9]+/ (not only step_unknown/)
-  G4  Among last N finished steps (default 3): mean tools_executed ≥ 1.0
-  G5  At least one traj uses a teacher/force Hermes mode (not all empty)
+  G0  At least one trajectory JSON was written
+
+Soft (reported, do not fail the run in --no-force):
+  G1  ≥1 traj with tools≥2
+  G2  escape rate
+  G4  recent mean tools
+  G5  teacher modes (should be absent when force is off)
 
 Usage:
-  python3 check_overfit_gates.py --run-dir outputs/e2e/<exp> --final
-  python3 check_overfit_gates.py --run-dir outputs/e2e/<exp> --watch --total-steps 10
+  python3 check_overfit_gates.py --run-dir outputs/e2e/<exp> --final --no-force
 """
 
 from __future__ import annotations
@@ -94,30 +86,41 @@ def _summarize(trajs: list[tuple[int, Path, dict]]) -> dict:
             "escape_rate": 1.0,
             "mean_tools": 0.0,
             "n_protocol_like": 0,
+            "n_two_tool": 0,
             "n_escape": 0,
             "modes": {},
             "unknown_step_dirs": 0,
+            "mean_voluntary": 0.0,
+            "n_voluntary": 0,
         }
     steps = sorted({s for s, _, _ in trajs})
     escapes = 0
     tools = []
     protocol_like = 0
+    two_tool = 0
+    voluntary = 0
     modes: Counter[str] = Counter()
     for _, _, data in trajs:
         executed = int(data.get("num_tool_calls_executed") or 0)
         forced = int(data.get("num_forced_tool_calls") or 0)
+        vol = int(data.get("num_voluntary_hermes") or 0)
         tools.append(executed)
+        voluntary += vol
         if executed == 0 and forced == 0:
             escapes += 1
         if executed >= 2:
-            protocol_like += 1
+            two_tool += 1
+            decodes = "\n".join(
+                str(turn.get("decode") or "") for turn in (data.get("rollout_turns") or []) if isinstance(turn, dict)
+            )
+            if re.search(r"(?im)^\s*Reflection\s*:", decodes):
+                protocol_like += 1
         for action in data.get("hermes_actions") or []:
             if isinstance(action, dict) and action.get("mode"):
                 modes[str(action["mode"])] += 1
-        # also count impose mode string if present
         mode = data.get("hermes_impose_mode")
         if isinstance(mode, str) and mode not in {"none", ""}:
-            modes[mode] += 0  # keep key visible without double-count spam
+            modes[mode] += 0
     n = len(trajs)
     unknown = 0
     traj_root = trajs[0][1].parents[1] if trajs else None
@@ -129,10 +132,12 @@ def _summarize(trajs: list[tuple[int, Path, dict]]) -> dict:
         "escape_rate": escapes / max(1, n),
         "mean_tools": sum(tools) / max(1, n),
         "n_protocol_like": protocol_like,
+        "n_two_tool": two_tool,
         "n_escape": escapes,
         "modes": dict(modes),
         "unknown_step_dirs": unknown,
-        "mean_voluntary": sum(int(d.get("num_voluntary_hermes") or 0) for _, _, d in trajs) / max(1, n),
+        "mean_voluntary": voluntary / max(1, n),
+        "n_voluntary": voluntary,
     }
 
 
@@ -142,44 +147,48 @@ def evaluate(
     max_escape_rate: float,
     last_k_steps: int,
     min_last_mean_tools: float,
-) -> tuple[list[tuple[str, bool, str]], dict]:
+    no_force: bool,
+) -> tuple[list[tuple[str, bool, str, bool]], dict]:
+    """Return gates as (name, ok, detail, hard)."""
     trajs = _iter_traj_json(run_dir)
     summary = _summarize(trajs)
-    gates: list[tuple[str, bool, str]] = []
+    gates: list[tuple[str, bool, str, bool]] = []
 
-    # G1
+    ok0 = summary["n_traj"] >= 1
+    gates.append(("G0_has_trajectories", ok0, f"n_traj={summary['n_traj']}", True))
+
     ok1 = summary["n_protocol_like"] >= 1
     gates.append(
         (
-            "G1_two_tool_traj_exists",
+            "G1_reflected_rewrite_traj_exists",
             ok1,
-            f"protocol_like(tools≥2)={summary['n_protocol_like']} / {summary['n_traj']}",
+            f"reflection+tools≥2={summary['n_protocol_like']}; tools≥2={summary['n_two_tool']} / {summary['n_traj']}",
+            not no_force,
         )
     )
 
-    # G2
     ok2 = summary["n_traj"] == 0 or summary["escape_rate"] <= max_escape_rate
     gates.append(
         (
             "G2_low_escape_rate",
             ok2,
             f"escape_rate={summary['escape_rate']:.2f} (max {max_escape_rate:.2f}); escapes={summary['n_escape']}",
+            not no_force,
         )
     )
 
-    # G3
     numbered = [s for s in summary["steps"] if s >= 0]
     ok3 = len(numbered) >= 1
     gates.append(
         (
-            "G3_step_numbered_artifacts",
+            "G3_step_numbered_dirs",
             ok3,
             f"steps={numbered[:12]}{'...' if len(numbered) > 12 else ''}; "
             f"step_unknown_populated={summary['unknown_step_dirs']}",
+            True,
         )
     )
 
-    # G4 last-k mean tools
     if numbered:
         last_steps = set(numbered[-last_k_steps:])
         last_trajs = [t for t in trajs if t[0] in last_steps]
@@ -191,26 +200,36 @@ def evaluate(
         (
             "G4_recent_mean_tools",
             ok4,
-            f"last_{last_k_steps}_steps mean_tools={last_mean:.2f} (min {min_last_mean_tools:.2f})",
+            f"last_{last_k_steps}_steps mean_tools={last_mean:.2f} (min {min_last_mean_tools:.2f}); "
+            f"mean_voluntary={summary.get('mean_voluntary', 0):.2f}",
+            not no_force,
         )
     )
 
-    # G5 teacher/force mode present
     mode_hits = sum(v for k, v in summary["modes"].items() if k in _TEACHER_MODES)
-    ok5 = summary["n_traj"] == 0 or mode_hits >= 1 or summary["n_protocol_like"] >= 1
-    gates.append(
-        (
-            "G5_teacher_or_protocol_signal",
-            ok5,
-            f"teacherish_mode_events={mode_hits}; modes={summary['modes']}",
+    if no_force:
+        # Prefer voluntary / empty teacher modes when force is off.
+        ok5 = mode_hits == 0 or summary.get("n_voluntary", 0) >= 1 or summary["n_traj"] == 0
+        detail = (
+            f"teacherish_mode_events={mode_hits} voluntary={summary.get('n_voluntary', 0)}; modes={summary['modes']}"
         )
-    )
+        gates.append(("G5_voluntary_not_teacher", ok5, detail, False))
+    else:
+        ok5 = summary["n_traj"] == 0 or mode_hits >= 1 or summary["n_protocol_like"] >= 1
+        gates.append(
+            (
+                "G5_teacher_or_protocol_signal",
+                ok5,
+                f"teacherish_mode_events={mode_hits}; modes={summary['modes']}",
+                True,
+            )
+        )
 
     summary["last_mean_tools"] = last_mean
     return gates, summary
 
 
-def _print_report(gates: list[tuple[str, bool, str]], summary: dict, *, header: str) -> int:
+def _print_report(gates: list[tuple[str, bool, str, bool]], summary: dict, *, header: str, no_force: bool) -> int:
     print(header)
     print(
         f"  trajs={summary.get('n_traj', 0)} steps={summary.get('steps', [])} "
@@ -219,11 +238,17 @@ def _print_report(gates: list[tuple[str, bool, str]], summary: dict, *, header: 
         f"mean_voluntary={summary.get('mean_voluntary', 0):.2f}"
     )
     failed = 0
-    for name, ok, detail in gates:
-        mark = "PASS" if ok else "FAIL"
-        if not ok:
+    for name, ok, detail, hard in gates:
+        if ok:
+            mark = "PASS"
+        elif hard:
+            mark = "FAIL"
             failed += 1
+        else:
+            mark = "SOFT"
         print(f"  [{mark}] {name}: {detail}")
+    if no_force:
+        print("  (no-force mode: only hard gates fail the sidecar)")
     return failed
 
 
@@ -235,12 +260,10 @@ def watch_loop(
     max_escape_rate: float,
     last_k_steps: int,
     min_last_mean_tools: float,
+    no_force: bool,
 ) -> int:
-    print(
-        f"[GATE] watching {run_dir} every {interval_s:.0f}s "
-        f"(expect ~{total_steps} steps; hard gates apply once trajs appear)"
-    )
-    print_expected_behavior(total_steps)
+    print(f"[GATE] watching {run_dir} every {interval_s:.0f}s (expect ~{total_steps} steps; no_force={no_force})")
+    print_expected_behavior(total_steps, no_force=no_force)
     seen_steps: set[int] = set()
     last_failed = 0
     while True:
@@ -249,6 +272,7 @@ def watch_loop(
             max_escape_rate=max_escape_rate,
             last_k_steps=last_k_steps,
             min_last_mean_tools=min_last_mean_tools,
+            no_force=no_force,
         )
         steps = set(summary.get("steps") or [])
         new = sorted(steps - seen_steps)
@@ -259,26 +283,34 @@ def watch_loop(
                 gates,
                 summary,
                 header=f"[GATE] snapshot steps={sorted(steps)} (+{new})",
+                no_force=no_force,
             )
-        # Stop watching once we have all expected numbered steps (best-effort).
         if total_steps > 0 and len([s for s in steps if 1 <= s <= total_steps]) >= total_steps:
             print("[GATE] watch: reached expected step count; exiting watch loop")
             return last_failed
-        # Parent may kill us; otherwise idle until final check.
         time.sleep(interval_s)
 
 
-def print_expected_behavior(total_steps: int) -> None:
-    print(
-        f"""
-[GATE] Expected behavior for this {total_steps}-step overfit smoke
-  • Force stays on (MIN_TOOL_CALLS=2, STABLE_TEACHER=1): most rollouts do 2× generate_image
-  • Hard-gated reward: incomplete protocol → score 0; full protocol → ≥0.55
-  • ~{int(100 * 0.3)}% forced turns keep raw decode (ON_POLICY_FRAC) for GRPO contrast
-  • Artifacts: rollout_trajectories/step_XXXXXX/sample_i.nn.{{json,txt}}
-  • Soft (not gated in 10 steps): voluntary Hermes may still be rare on cold und
+def print_expected_behavior(total_steps: int, *, no_force: bool = True) -> None:
+    if no_force:
+        print(
+            f"""
+[GATE] Expected behavior for this {total_steps}-step VOLUNTARY overfit (force OFF)
+  • No teacher/force replace — Decode == Used for tool calls
+  • Success signal: Decode contains Hermes <tool_call> generate_image (voluntary)
+  • Tool obs includes image_vis=... so Reflection can cite real PNG stats
+  • Reward: ≥1 Hermes call scores; ≥2 distinct prompts scores higher
+  • Soft in {total_steps} steps: cold und may still emit mostly prose
 """.rstrip()
-    )
+        )
+    else:
+        print(
+            f"""
+[GATE] Expected behavior for this {total_steps}-step forced overfit
+  • Force/teacher on: most rollouts do 2× generate_image via Used templates
+  • Artifacts: rollout_trajectories/step_XXXXXX/sample_i.nn.{{json,txt}}
+""".rstrip()
+        )
 
 
 def main() -> int:
@@ -293,15 +325,25 @@ def main() -> int:
     parser.add_argument("--last-k-steps", type=int, default=3)
     parser.add_argument("--min-last-mean-tools", type=float, default=1.0)
     parser.add_argument(
+        "--no-force",
+        action="store_true",
+        help="Voluntary overfit: only G0/G3 are hard; tool/teacher gates are soft",
+    )
+    parser.add_argument(
         "--allow-empty",
         action="store_true",
         help="If no trajs yet, treat gates as pass (used mid-watch before step 1)",
     )
     args = parser.parse_args()
     run_dir = args.run_dir.resolve()
+    no_force = bool(args.no_force)
+    if no_force:
+        # Do not fail short voluntary smokes on high escape rate.
+        args.max_escape_rate = max(args.max_escape_rate, 1.0)
+        args.min_last_mean_tools = min(args.min_last_mean_tools, 0.0)
 
     if args.expect_only:
-        print_expected_behavior(args.total_steps)
+        print_expected_behavior(args.total_steps, no_force=no_force)
         return 0
 
     if args.watch:
@@ -312,27 +354,29 @@ def main() -> int:
             max_escape_rate=args.max_escape_rate,
             last_k_steps=args.last_k_steps,
             min_last_mean_tools=args.min_last_mean_tools,
+            no_force=no_force,
         )
 
-    # default / --final
-    print_expected_behavior(args.total_steps)
+    print_expected_behavior(args.total_steps, no_force=no_force)
     gates, summary = evaluate(
         run_dir,
         max_escape_rate=args.max_escape_rate,
         last_k_steps=args.last_k_steps,
         min_last_mean_tools=args.min_last_mean_tools,
+        no_force=no_force,
     )
     if summary.get("n_traj", 0) == 0 and args.allow_empty:
         print(f"[GATE] no trajectories yet under {run_dir}; --allow-empty → pass")
         return 0
-    failed = _print_report(gates, summary, header=f"[GATE] final report for {run_dir}")
+    failed = _print_report(gates, summary, header=f"[GATE] final report for {run_dir}", no_force=no_force)
     report_path = run_dir / "overfit_gates.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(
         json.dumps(
             {
                 "failed": failed,
-                "gates": [{"name": n, "ok": ok, "detail": d} for n, ok, d in gates],
+                "no_force": no_force,
+                "gates": [{"name": n, "ok": ok, "detail": d, "hard": hard} for n, ok, d, hard in gates],
                 "summary": summary,
             },
             indent=2,
@@ -341,7 +385,7 @@ def main() -> int:
     )
     print(f"[GATE] wrote {report_path}")
     if failed:
-        print(f"[GATE] FAILED {failed} gate(s)", file=sys.stderr)
+        print(f"[GATE] FAILED {failed} hard gate(s)", file=sys.stderr)
         return 2
     print("[GATE] all hard gates PASS")
     return 0

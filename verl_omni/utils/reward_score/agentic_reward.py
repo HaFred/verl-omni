@@ -11,16 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Scalar reward: Hermes format + image reflection + 2x generate_image.
+"""Scalar reward: Hermes ``generate_image`` tool-calling first.
 
-Hard-gated for overfit GRPO. Incomplete trajectories score **exactly 0** so the
-lazy "stop at turn 1–2 / spam to max length" policy cannot earn partial credit
-and create a local optimum. Only the full protocol scores:
+Overfit smoke without rollout force: score rises with valid Hermes tool calls.
+The full protocol requires a grounded ``Reflection:`` between two distinct
+calls. One call still earns bootstrap credit; incomplete spam / no
+``<tool_call>`` stays at 0.
 
-1. Exactly two Hermes ``generate_image`` calls
-2. A ``Reflection:`` line **between** them
-3. A **rewritten** 2nd prompt (must differ from the 1st)
-4. Optional soft bonuses for tool-ok markers / final confirmation
+Protocol tiers:
+  0 Hermes generate_image → 0
+  1 valid Hermes call     → ~0.35–0.45 (learn to emit the tool)
+  ≥2 distinct calls + reflection → ≥0.55
 
 TODO (fred): multi-dimensional RPCO rewards (VLM reflection / plan / image
 quality) — https://github.com/verl-project/verl-omni/issues/303.
@@ -37,7 +38,7 @@ _REFLECT_RE = re.compile(r"(?im)^\s*Reflection\s*:\s*(.+)$")
 _BARE_JSON = re.compile(r'(?<!<tool_call>\s)\{\s*"name"\s*:\s*"generate_image"', re.IGNORECASE)
 _TOOL_OK = re.compile(r"agentic_tool\s+ok=1", re.IGNORECASE)
 _IMAGE_REFLECT_LEX = re.compile(
-    r"\b(image|generated|edges?|detail|lighting|color|composition|focus|sharp|soft|muted|blur)\b",
+    r"\b(image_vis|mean_luma|edges?|detail|lighting|color|composition|focus|sharp|soft|muted|blur)\b",
     re.IGNORECASE,
 )
 _REFINE_LEX = {
@@ -117,21 +118,6 @@ def _reflection_between(text: str, gen: list[tuple[int, int, dict[str, Any]]]) -
     return body or None
 
 
-def _protocol_ok(text: str, calls: list[tuple[int, int, dict[str, Any]]], prompts: list[str]) -> bool:
-    """Full overfit protocol: 2 Hermes calls + Reflection between + rewritten prompt."""
-    if len(prompts) != 2:
-        return False
-    gen = _gen_image_spans(calls)
-    if len(gen) < 2:
-        return False
-    reflect = _reflection_between(text, gen)
-    if not reflect or len(reflect) < 8:
-        return False
-    if prompts[0].lower().strip() == prompts[1].lower().strip():
-        return False
-    return True
-
-
 def _score_format(text: str, calls: list[tuple[int, int, dict[str, Any]]]) -> float:
     if not calls:
         return 0.0
@@ -156,29 +142,30 @@ def _score_reflection(text: str, calls: list[tuple[int, int, dict[str, Any]]]) -
     body = _reflection_between(text, gen)
     if not body:
         return 0.0
-    score = 0.7
+    score = 0.55
     if len(body) >= 12:
         score += 0.15
     if _IMAGE_REFLECT_LEX.search(body):
-        score += 0.15
+        score += 0.30
     return float(min(1.0, score))
 
 
 def _score_tool_usage(prompts: list[str]) -> float:
-    if len(prompts) != 2:
+    if len(prompts) == 0:
         return 0.0
+    if len(prompts) == 1:
+        return 0.55
     if prompts[0].lower().strip() == prompts[1].lower().strip():
-        return 0.0
-    base = 1.0
+        return 0.35
     t0 = set(re.findall(r"[a-z0-9]+", prompts[0].lower()))
     t1 = set(re.findall(r"[a-z0-9]+", prompts[1].lower()))
     if len(t1) > len(t0) or (t1 & _REFINE_LEX):
         return 1.0
-    return float(base)
+    return 0.85
 
 
 def _score_result(text: str, prompts: list[str], has_good_reflect: bool) -> float:
-    if len(prompts) != 2 or not has_good_reflect:
+    if not prompts:
         return 0.0
     ok = len(_TOOL_OK.findall(text or ""))
     last_end = 0
@@ -186,15 +173,15 @@ def _score_result(text: str, prompts: list[str], has_good_reflect: bool) -> floa
         last_end = max(last_end, m.end())
     after = (text or "")[last_end:].strip()
     has_final = len(after) > 5 and "<tool_call>" not in after.lower()
-    if ok >= 2 and has_final:
+    if len(prompts) >= 2 and ok >= 2 and has_good_reflect:
         return 1.0
-    if ok >= 1 and has_final:
-        return 0.75
-    if ok >= 2:
+    if len(prompts) >= 2 and ok >= 1:
         return 0.7
-    if has_final:
+    if len(prompts) >= 1 and ok >= 1:
         return 0.55
-    return 0.4
+    if has_final and len(prompts) >= 1:
+        return 0.35
+    return 0.2 if len(prompts) >= 1 else 0.0
 
 
 def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
@@ -218,22 +205,21 @@ def compute_score(
     extra_info: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, float | str | int | None]:
-    """Score an agentic image-generation trajectory for GRPO."""
+    """Score an agentic image-generation trajectory for GRPO (tool-call first)."""
     del data_source, kwargs
     extra_info = dict(extra_info or {})
     gt = _as_dict(ground_truth)
 
     blob = solution_str or ""
     if not blob.strip():
-        return _zero_result(method="agentic_reflect_two_tool_calls")
+        return _zero_result(method="agentic_hermes_tool_calls")
 
     calls = _extract_tool_calls(blob)
     prompts = _gen_image_prompts(calls)
-    if not _protocol_ok(blob, calls, prompts):
-        # Incomplete / lazy / spam trajectories: hard zero (no floor, no partial).
-        out = _zero_result(method="agentic_reflect_two_tool_calls")
-        out["num_hermes_tool_calls"] = int(len(prompts))
-        out["num_generate_image_prompts"] = int(len(prompts))
+    if not prompts:
+        # No Hermes generate_image → hard zero (bare JSON / prose / spam).
+        out = _zero_result(method="agentic_hermes_tool_calls")
+        out["num_hermes_tool_calls"] = int(len(calls))
         return out
 
     f_format = _score_format(blob, calls)
@@ -241,16 +227,29 @@ def compute_score(
     f_tool = _score_tool_usage(prompts)
     f_result = _score_result(blob, prompts, has_good_reflect=f_reflect >= 0.7)
 
-    w_format = float(extra_info.get("w_format", gt.get("w_format", 0.15)))
-    w_reflect = float(extra_info.get("w_reflect", gt.get("w_reflect", 0.35)))
-    w_tool = float(extra_info.get("w_tool", gt.get("w_tool", 0.35)))
-    w_result = float(extra_info.get("w_result", gt.get("w_result", 0.15)))
+    w_format = float(extra_info.get("w_format", gt.get("w_format", 0.35)))
+    w_reflect = float(extra_info.get("w_reflect", gt.get("w_reflect", 0.10)))
+    w_tool = float(extra_info.get("w_tool", gt.get("w_tool", 0.45)))
+    w_result = float(extra_info.get("w_result", gt.get("w_result", 0.10)))
     w_sum = w_format + w_reflect + w_tool + w_result
     if w_sum <= 0:
-        w_format, w_reflect, w_tool, w_result, w_sum = 0.15, 0.35, 0.35, 0.15, 1.0
+        w_format, w_reflect, w_tool, w_result, w_sum = 0.35, 0.10, 0.45, 0.10, 1.0
 
-    # Passed the hard gate → base credit so GRPO always prefers protocol over zero.
-    total = 0.55 + 0.45 * (
+    # Tiered floor: one call bootstraps discovery, but the overfit target is
+    # image-grounded reflection followed by a materially different second call.
+    distinct = len(prompts) >= 2 and prompts[0].lower().strip() != prompts[1].lower().strip()
+    reflected_rewrite = distinct and f_reflect >= 0.7
+    if reflected_rewrite:
+        base, scale = 0.55, 0.45
+        protocol_ok = 1
+    elif distinct:
+        base, scale = 0.45, 0.25
+        protocol_ok = 0
+    else:
+        base, scale = 0.35, 0.20
+        protocol_ok = 0
+
+    total = base + scale * (
         (w_format * f_format + w_reflect * f_reflect + w_tool * f_tool + w_result * f_result) / w_sum
     )
 
@@ -262,6 +261,6 @@ def compute_score(
         "reward_result": float(f_result),
         "num_hermes_tool_calls": int(len(prompts)),
         "num_generate_image_prompts": int(len(prompts)),
-        "protocol_ok": 1,
-        "method": "agentic_reflect_two_tool_calls",
+        "protocol_ok": int(protocol_ok),
+        "method": "agentic_hermes_tool_calls",
     }

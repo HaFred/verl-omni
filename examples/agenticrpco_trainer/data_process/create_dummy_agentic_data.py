@@ -11,14 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Toy / overfit parquet for Mode (2a) agentic GRPO (Lance und + frozen tool).
+"""Tiny Qwen3-VL overfit parquet for visual reflection + prompt rewriting.
 
-Each sample seeds a **full** Hermes trajectory so cold und can imitate:
-
-  generate_image → tool obs → Reflection (on the image) → rewritten
-  generate_image → tool obs → short final confirmation
-
-Use ``--overfit`` for the 100-step e2e (1–2 prompts repeated).
+Qwen3-VL's native chat template supplies the Hermes tool schema and the model
+already knows ``<tool_call>``. One demonstration teaches only the task-specific
+policy: generate → inspect attached image → reflect → rewrite → generate.
 """
 
 from __future__ import annotations
@@ -29,50 +26,50 @@ import os
 import pandas as pd
 
 DATA_SOURCE = "jpeg_compressibility"
-ABILITY = "agentic_prompt_rewrite"
+ABILITY = "agentic_hermes_tool_call"
 EXPECTED_NUM_IMAGES = 2
 
-SYSTEM_PROMPT = """You are a visual creation agent that improves images by reflection.
-
-Workflow (required, every task):
-1) Emit Hermes tool call generate_image with a detailed first prompt.
-2) After the tool observation, write one short line starting with \
-"Reflection:" that names what to improve in the *generated image* \
-(detail, lighting, attributes). Ground the critique in the tool result.
-3) Emit a SECOND Hermes generate_image call with a REWRITTEN prompt \
-(must differ from the first; add missing attributes / quality cues).
-4) After the second tool result, give a short final confirmation (no tool call).
-
-Exact tool format:
-<tool_call>
-{"name": "generate_image", "arguments": {"prompt": "<complete image prompt>"}}
-</tool_call>
-
-Never copy or paraphrase tool observations (no "Lance frozen MoT", no \
-"agentic_tool ok=", no path= lines). Never emit bare JSON without <tool_call> \
-XML. First assistant turn must be a Hermes tool call only.
+# The model's native template defines the wire format. This prompt defines the
+# visual-refinement behavior, without teacher-generating any runtime action.
+SYSTEM_PROMPT = """You are a visual creation agent with a generate_image tool.
+Call it once with a complete prompt. Inspect the returned image itself and its
+image_vis measurements. In your next assistant turn, write one concise line
+starting with "Reflection:" that identifies a visible shortcoming, then call
+generate_image again with a materially rewritten prompt that addresses it.
+After inspecting the second image, briefly finish. Never invent tool results or
+copy path= and agentic_tool metadata into your reply.
 """
 
-# Full demo: call → image obs → reflect-on-image → rewrite call → obs → done.
-FEWSHOT_USER = "Generate an image of a red apple"
-FEWSHOT_ASSISTANT_1 = (
+# --- One two-call visual-refinement demonstration ---------------------------
+FS2_USER = "Generate an image of a red apple"
+FS2_ASSISTANT_1 = (
     "<tool_call>\n"
     '{"name": "generate_image", "arguments": {"prompt": '
     '"a bright red apple on a white table, soft studio lighting"}}\n'
     "</tool_call>"
 )
-FEWSHOT_TOOL_1 = "agentic_tool ok=1 images=1 path=/tmp/example/image_00.png"
-FEWSHOT_ASSISTANT_2 = (
-    "Reflection: looking at the generated image, edges are soft and reds "
-    "look muted; rewrite for sharper detail and richer color.\n"
+FS2_TOOL_1 = (
+    "Frozen diffusion produced the image. path=/tmp/fewshot/apple_00.png "
+    "image_vis=512x512 mean_luma=92 edges=soft colors=red_muted "
+    "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
+    "prompt='a bright red apple on a white table, soft studio lighting'"
+)
+FS2_ASSISTANT_2 = (
+    "Reflection: image_vis shows mean_luma=92 and colors=red_muted with soft edges; "
+    "rewrite for brighter reds and sharper detail.\n"
     "<tool_call>\n"
     '{"name": "generate_image", "arguments": {"prompt": '
     '"a bright red apple on a white table, soft studio lighting, '
     'highly detailed, sharp focus, richer reds, coherent composition"}}\n'
     "</tool_call>"
 )
-FEWSHOT_TOOL_2 = "agentic_tool ok=1 images=1 path=/tmp/example/image_01.png"
-FEWSHOT_ASSISTANT_3 = "Done. Refined the apple image after reflecting on the first generation."
+FS2_TOOL_2 = (
+    "Frozen diffusion produced the image. path=/tmp/fewshot/apple_01.png "
+    "image_vis=512x512 mean_luma=140 edges=medium colors=red_rich "
+    "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
+    "prompt='a bright red apple on a white table, soft studio lighting, "
+    "highly detailed, sharp focus, richer reds, coherent composition'"
+)
 
 USER_PROMPTS = [
     "Generate an image of a cat wearing a blue hat",
@@ -85,44 +82,34 @@ USER_PROMPTS = [
     "A vintage typewriter with the word HELLO typed in bold letters",
 ]
 
-# Tiny pool for 100-step overfit (repeat these only).
 OVERFIT_PROMPTS = USER_PROMPTS[:2]
 
 
 def build_prompt_messages(user_text: str) -> list[dict]:
+    """System + one visual-refinement demonstration + the live user turn."""
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": FEWSHOT_USER},
-        {"role": "assistant", "content": FEWSHOT_ASSISTANT_1},
-        {"role": "tool", "content": FEWSHOT_TOOL_1},
-        {"role": "assistant", "content": FEWSHOT_ASSISTANT_2},
-        {"role": "tool", "content": FEWSHOT_TOOL_2},
-        {"role": "assistant", "content": FEWSHOT_ASSISTANT_3},
+        # Demonstrate the objective, not basic tool syntax discovery.
+        {"role": "user", "content": FS2_USER},
+        {"role": "assistant", "content": FS2_ASSISTANT_1},
+        {"role": "tool", "content": FS2_TOOL_1},
+        {"role": "assistant", "content": FS2_ASSISTANT_2},
+        {"role": "tool", "content": FS2_TOOL_2},
+        # Live task
         {"role": "user", "content": user_text},
     ]
 
 
 def build_ground_truth(user_text: str, *, overfit: bool = False) -> dict:
-    """Weights for ``agentic_reward.compute_score`` (hard-gated protocol)."""
-    if overfit:
-        # Hard gate in agentic_reward zeros incomplete trajs; weights only rank
-        # complete gen→reflect→rewrite trajectories. No consolation floor.
-        return {
-            "user_request": user_text,
-            "expected_num_images": EXPECTED_NUM_IMAGES,
-            "w_format": 0.15,
-            "w_reflect": 0.35,
-            "w_tool": 0.35,
-            "w_result": 0.15,
-            "forced_consolation": 0.0,
-        }
+    """Tool-call-first weights for ``agentic_reward.compute_score``."""
+    del overfit
     return {
         "user_request": user_text,
         "expected_num_images": EXPECTED_NUM_IMAGES,
-        "w_format": 0.15,
-        "w_reflect": 0.35,
+        "w_format": 0.35,
+        "w_reflect": 0.20,
         "w_tool": 0.35,
-        "w_result": 0.15,
+        "w_result": 0.10,
         "forced_consolation": 0.0,
     }
 
@@ -154,6 +141,8 @@ def build_rows(
                     "expected_num_images": EXPECTED_NUM_IMAGES,
                     "require_multiturn_tools": True,
                     "require_reflection_between_tools": True,
+                    "native_tool_template": True,
+                    "visual_tool_observation": True,
                     **{k: gt[k] for k in ("w_format", "w_reflect", "w_tool", "w_result")},
                 },
             }
@@ -162,14 +151,14 @@ def build_rows(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate toy/overfit agentic GRPO parquet (reflect → 2nd tool call)")
+    parser = argparse.ArgumentParser(description="Generate Qwen3-VL visual-reflection GRPO overfit parquet")
     parser.add_argument("--local_save_dir", default=os.path.expanduser("~/data/agentic"))
     parser.add_argument("--train_size", type=int, default=64)
     parser.add_argument("--val_size", type=int, default=8)
     parser.add_argument(
         "--overfit",
         action="store_true",
-        help="Repeat 2 prompts only + reflection-heavy reward weights (100-step e2e)",
+        help="Repeat 2 prompts only (short overfit e2e)",
     )
     args = parser.parse_args()
 
@@ -183,13 +172,10 @@ def main() -> None:
     val_path = os.path.join(args.local_save_dir, "val.parquet")
     train_df.to_parquet(train_path)
     val_df.to_parquet(val_path)
-    gt0 = build_ground_truth("x", overfit=args.overfit)
+    n_msgs = len(build_prompt_messages("x"))
     print(f"Wrote {len(train_df)} train samples to {train_path}")
     print(f"Wrote {len(val_df)} val samples to {val_path}")
-    print(
-        f"full few-shot (call→reflect→2nd call→done); overfit={args.overfit}; "
-        f"w_reflect={gt0['w_reflect']} w_tool={gt0['w_tool']}"
-    )
+    print(f"native-tool visual-reflection messages/sample={n_msgs}; overfit={args.overfit}")
 
 
 if __name__ == "__main__":

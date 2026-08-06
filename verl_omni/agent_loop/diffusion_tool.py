@@ -12,26 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen diffusion function tool for verl's stock ``ToolAgentLoop``.
+"""Frozen image-generation function tool for verl's stock ``ToolAgentLoop``.
 
-Mode (2a) keeps the diffusion/gen path **outside** the actor optimizer.
-For Lance-3B the recommended backend is the **full MoT checkpoint** served by
-vLLM-Omni (``moe_gen`` + Wan2.2 VAE), while GRPO trains only
-``Lance_3B_hf_und`` (understanding path) via stock vLLM + ``tool_agent``.
+Mode (2a) keeps image generation **outside** the actor optimizer. GRPO trains
+Qwen3-VL-2B-Thinking as the visual agent while a frozen Qwen-Image pipeline
+generates candidate images. Generated pixels are returned to the VLM, allowing
+an on-policy image → reflection → rewritten prompt → image trajectory.
 
 Backends (first match wins):
-  1. ``AGENTIC_LANCE_SERVER_URL`` — OpenAI-compatible Lance Omni serve
+  1. ``AGENTIC_QWEN_IMAGE_URL`` — bundled Qwen-Image HTTP service
+     (POST ``{"prompt"}`` → base64 image JSON).
+  2. ``AGENTIC_DIFFUSION_TOOL_URL`` — generic service with the same response
+     contract.
+  3. ``AGENTIC_LANCE_SERVER_URL`` — legacy OpenAI-compatible Lance Omni serve
      (``/v1/chat/completions``, ``modalities=["image"]``).
-  2. ``AGENTIC_DIFFUSION_TOOL_URL`` — generic POST ``{"prompt"}`` → JSON with
-     ``image_base64`` / ``images_base64`` / ``text`` / ``reward``.
-  3. Else text-only stub (acceptance smoke when no gen service is up).
+  4. Else text-only stub (acceptance smoke when no gen service is up).
 
 Observation modality:
-  ``Lance_3B_hf_und`` is text-only. Stock ``ToolAgentLoop`` raises if
-  ``ToolResponse.image`` is set without an ``image_processor``. By default this
-  tool therefore returns **text-only** observations (image saved under
-  ``AGENTIC_DIFFUSION_IMAGE_DIR`` and referenced in text + metrics). Set
-  ``AGENTIC_DIFFUSION_ATTACH_IMAGE=1`` only when the actor is a real VLM.
+  Set ``AGENTIC_DIFFUSION_ATTACH_IMAGE=1`` for a VLM actor. Stock
+  ``ToolAgentLoop`` then adds the generated PIL image to the next model turn.
+  Set it to 0 only for a text-only actor or diagnostics.
 """
 
 from __future__ import annotations
@@ -111,7 +111,7 @@ def _e2e_run_root() -> Path:
     repo_out = os.getenv("AGENTIC_E2E_ROOT", "").strip()
     if repo_out:
         return Path(repo_out) / run / "rollout_images"
-    return Path("/tmp/agentic_lance_t2i") / run / "rollout_images"
+    return Path("/tmp/agentic_qwen_image_t2i") / run / "rollout_images"
 
 
 def _next_call_dir(root: Path) -> Path:
@@ -232,7 +232,7 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
                 f"controlled_by_reflection={provenance.get('controlled_by_reflection')}\n"
                 f"reflection={provenance.get('reflection')!r}\n"
                 f"backend={backend}\n"
-                "Set AGENTIC_LANCE_SERVER_URL to a running Lance MoT serve for real images.\n"
+                "Set AGENTIC_QWEN_IMAGE_URL to a running Qwen-Image service for real images.\n"
             )
             paths.append(str(stub_path))
             _update_traj_meta(traj_dir, _entry(start_idx, stub_path, stubbed=True))
@@ -266,7 +266,7 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
             f"user_prompt={user_prompt!r}\n"
             f"tool_prompt={prompt!r}\n"
             f"backend={backend}\n"
-            "Set AGENTIC_LANCE_SERVER_URL to a running Lance MoT serve for real images.\n"
+            "Set AGENTIC_QWEN_IMAGE_URL to a running Qwen-Image service for real images.\n"
         )
         paths.append(str(stub_path))
     (call_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
@@ -277,6 +277,36 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
         call_dir,
     )
     return paths
+
+
+def _image_vis_summary(image_path: str | None) -> str:
+    """Compact measurable facts that complement the VLM's pixel observation."""
+    if not image_path or not str(image_path).endswith(".png"):
+        return ""
+    try:
+        from verl_omni.agent_loop.agentic_image_reflection import analyze_image
+
+        stats = analyze_image(image_path)
+    except Exception:  # noqa: BLE001 - never break the tool on viz failures
+        return ""
+    if not stats.get("ok"):
+        return ""
+    bright = float(stats.get("brightness") or 0.0)
+    contrast = float(stats.get("contrast") or 0.0)
+    edges = float(stats.get("edge_strength") or 0.0)
+    color = float(stats.get("colorfulness") or 0.0)
+    edge_tag = "soft" if edges < 0.04 else ("medium" if edges < 0.08 else "sharp")
+    color_tag = "muted" if color < 0.08 else ("moderate" if color < 0.16 else "rich")
+    luma_tag = "dark" if bright < 0.32 else ("bright" if bright > 0.82 else "mid")
+    bits = [
+        f"{stats.get('width')}x{stats.get('height')}",
+        f"mean_luma={int(round(bright * 255))}",
+        f"luma={luma_tag}",
+        f"edges={edge_tag}",
+        f"contrast={contrast:.2f}",
+        f"colors={color_tag}",
+    ]
+    return "image_vis=" + " ".join(str(b) for b in bits)
 
 
 def _pack_response(
@@ -305,16 +335,26 @@ def _pack_response(
         f"agentic_tool ok={ok} stub={1 if tool_stubbed else 0} images={len(images)} "
         f"backend={backend} prompt={prompt_snip!r}"
     )
+    png0 = next((p for p in paths if str(p).endswith(".png")), None)
+    vis = _image_vis_summary(png0)
     if paths and "path=" not in text:
         text = f"{text} path={paths[0]}"
+    if vis and "image_vis=" not in text:
+        text = f"{text} {vis}"
+        metrics["image_vis"] = vis
     text = f"{text} {marker}"
     if images and _attach_images_enabled():
         return ToolResponse(text=text, image=images), reward, metrics
-    # Text-only obs for Lance_3B_hf_und / any LLM without image_processor.
+    # Text-only fallback for an actor without image_processor or diagnostics.
     return ToolResponse(text=text), reward, metrics
 
 
-def _call_generic_http(prompt: str, endpoint: str) -> tuple[ToolResponse, float, dict]:
+def _call_generic_http(
+    prompt: str,
+    endpoint: str,
+    *,
+    backend: str = "http",
+) -> tuple[ToolResponse, float, dict]:
     headers = {"Content-Type": "application/json"}
     token = os.getenv("AGENTIC_DIFFUSION_TOOL_TOKEN")
     if token:
@@ -325,14 +365,37 @@ def _call_generic_http(prompt: str, endpoint: str) -> tuple[ToolResponse, float,
         headers=headers,
         method="POST",
     )
-    timeout = float(os.getenv("AGENTIC_DIFFUSION_TOOL_TIMEOUT", "120"))
-    with urlopen(request, timeout=timeout) as result:  # noqa: S310 - endpoint is operator-configured
-        payload = json.loads(result.read())
+    # Offloaded Qwen-Image requests may queue behind other rollout workers on
+    # the single frozen-tool GPU.
+    timeout = float(os.getenv("AGENTIC_DIFFUSION_TOOL_TIMEOUT", "900"))
+    try:
+        with urlopen(request, timeout=timeout) as result:  # noqa: S310 - endpoint is operator-configured
+            payload = json.loads(result.read())
+    except Exception as exc:  # noqa: BLE001 - return failure as an observable tool result
+        err = f"{backend} request failed: {exc}"
+        logger.error(err)
+        return _pack_response(
+            prompt,
+            err,
+            images=[],
+            reward=0.0,
+            backend=f"{backend}_error",
+            tool_stubbed=True,
+        )
 
     images = _decode_images(payload)
     text = payload.get("text") or "The frozen diffusion tool generated the requested image."
     reward = float(payload.get("reward", 0.0))
-    return _pack_response(prompt, text, images, reward, backend="http", tool_stubbed=False)
+    if not images:
+        return _pack_response(
+            prompt,
+            text or f"{backend} returned no image",
+            images=[],
+            reward=0.0,
+            backend=f"{backend}_empty",
+            tool_stubbed=True,
+        )
+    return _pack_response(prompt, text, images, reward, backend=backend, tool_stubbed=False)
 
 
 def _call_lance_omni(prompt: str, server_url: str) -> tuple[ToolResponse, float, dict]:
@@ -411,21 +474,26 @@ def _call_lance_omni(prompt: str, server_url: str) -> tuple[ToolResponse, float,
 
 @function_tool("generate_image", schema=DIFFUSION_TOOL_SCHEMA)
 def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
-    """Generate an image with a frozen external diffusion / Lance MoT service.
+    """Generate an image with a frozen external Qwen-Image service.
 
     Args:
         prompt: Complete text prompt for the diffusion model.
     """
-    lance_url = os.getenv("AGENTIC_LANCE_SERVER_URL", "").strip()
-    if lance_url:
-        return _call_lance_omni(prompt, lance_url)
+    qwen_image_url = os.getenv("AGENTIC_QWEN_IMAGE_URL", "").strip()
+    if qwen_image_url:
+        return _call_generic_http(prompt, qwen_image_url, backend="qwen_image")
 
     endpoint = os.getenv("AGENTIC_DIFFUSION_TOOL_URL", "").strip()
     if endpoint:
         return _call_generic_http(prompt, endpoint)
 
+    # Retained only so older runs remain reproducible.
+    lance_url = os.getenv("AGENTIC_LANCE_SERVER_URL", "").strip()
+    if lance_url:
+        return _call_lance_omni(prompt, lance_url)
+
     logger.warning(
-        "AGENTIC_LANCE_SERVER_URL / AGENTIC_DIFFUSION_TOOL_URL unset; "
+        "AGENTIC_QWEN_IMAGE_URL / AGENTIC_DIFFUSION_TOOL_URL unset; "
         "using text-only stub diffusion tool (acceptance smoke only)"
     )
     text = f"[stub diffusion result] No image service is configured. The requested prompt was: {prompt}"

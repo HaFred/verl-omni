@@ -1,60 +1,49 @@
 #!/usr/bin/env bash
-# Lance-3B Mode (2a) agentic GRPO — FlowGRPO-style launch (stock ppo_trainer + CLI).
+# Qwen3-VL-2B-Thinking Mode (2a) agentic GRPO overfit.
 #
-# Diffusion remains frozen: ToolAgentLoop dispatches generate_image outside the
-# actor optimizer. For real Lance MoT images, start the frozen tool server on a
-# *free* GPU (not the GRPO GPUs), then set AGENTIC_LANCE_SERVER_URL (see README).
-# Without it the tool returns a text stub — still valid for multi-turn if the
-# agent emits Hermes <tool_call>s.
+# The actor is a pretrained Hermes-capable VLM. The frozen Qwen-Image service
+# remains outside the optimizer and returns pixels through generate_image, so
+# the actor can inspect image 1, reflect, rewrite, and call the tool again.
 #
-#   source ~/path/to/local_env.sh
-#   # pane A: CUDA_VISIBLE_DEVICES=0 bash examples/.../run_lance_frozen_diffusion_tool_server.sh
+#   source ~/fred/fred_verlomni_agentic_multiturn_pr1.sh
+#   cd ~/fred/verlomni-pr-fredfork
+#   # pane A (GPU not in CUDA_VISIBLE_DEVICES):
+#   CUDA_VISIBLE_DEVICES=6 bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
 #   # pane B:
-#   MODEL_PATH=/path/to/Lance_3B_hf_und \
-#     AGENTIC_LANCE_SERVER_URL=http://127.0.0.1:8091 \
-#     TOTAL_STEPS=10 \
-#     bash examples/agenticrpco_trainer/lance/run_lance_agentic_grpo.sh
+#   TOTAL_STEPS=100 bash examples/agenticrpco_trainer/agent_llm/run_agentic_grpo.sh
 #
 # Short smokes (TOTAL_STEPS≤20) auto-enable GATE_SIDECAR=1: prints expected
 # behavior, watches rollout_trajectories during train, then writes
-# overfit_gates.json (exit 2 on gate fail). Disable with GATE_SIDECAR=0.
+# overfit_gates.json. Force/teacher default OFF so voluntary Hermes is measurable.
+set -euo pipefail
 set -x
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+cd "${REPO_ROOT}"
 
-MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to a prepared HF understanding export (see README)}"
-TRAIN_FILE="${TRAIN_FILE:-data/agentic/train.parquet}"
-VAL_FILE="${VAL_FILE:-data/agentic/val.parquet}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-2B-Thinking}"
+TRAIN_FILE="${TRAIN_FILE:-${REPO_ROOT}/data/agentic/train.parquet}"
+VAL_FILE="${VAL_FILE:-${REPO_ROOT}/data/agentic/val.parquet}"
 N_GPUS="${N_GPUS:-2}"
 TOTAL_STEPS="${TOTAL_STEPS:-100}"
-TOOL_CHAT_TEMPLATE="${TOOL_CHAT_TEMPLATE:-$SCRIPT_DIR/qwen2_tool_chat_template.jinja2}"
-if [[ ! -f "$TOOL_CHAT_TEMPLATE" && -f "$SCRIPT_DIR/qwen2_tool_chat_template.yaml" ]]; then
-  TOOL_CHAT_TEMPLATE="$SCRIPT_DIR/qwen2_tool_chat_template.yaml"
-fi
+ROLLOUT_N="${ROLLOUT_N:-4}"
+OVERFIT_DATA="${OVERFIT_DATA:-1}"
 # Unique WandB run + ckpt dir every launch (override with EXPERIMENT_NAME / RUN_TS).
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-lance_agentic_grpo_${RUN_TS}}"
-CKPT_DIR="${CKPT_DIR:-$PWD/checkpoints/verl_omni_agentic/${EXPERIMENT_NAME}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen3_vl_agentic_grpo_${RUN_TS}}"
+CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints/verl_omni_agentic/${EXPERIMENT_NAME}}"
 # Per-run rollout artifacts: PNGs (or stub manifests) land here when generate_image fires.
-E2E_ROOT="${E2E_ROOT:-$PWD/outputs/e2e}"
-E2E_RUN_DIR="${E2E_RUN_DIR:-$E2E_ROOT/${EXPERIMENT_NAME}}"
+E2E_ROOT="${E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
+E2E_RUN_DIR="${E2E_RUN_DIR:-${E2E_ROOT}/${EXPERIMENT_NAME}}"
 export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-$E2E_ROOT}"
 export AGENTIC_E2E_RUN_NAME="${AGENTIC_E2E_RUN_NAME:-$EXPERIMENT_NAME}"
 export AGENTIC_DIFFUSION_IMAGE_DIR="${AGENTIC_DIFFUSION_IMAGE_DIR:-$E2E_RUN_DIR/rollout_images}"
-# Force / teacher / reflection curriculum (defaults for cold Lance und overfit).
-# Override in the operator env. Keep force on so GRPO sees real 2-call trajectories;
-# agentic_reward then ranks Reflection: + rewritten 2nd generate_image.
-export AGENTIC_FORCE_GENERATE_IMAGE="${AGENTIC_FORCE_GENERATE_IMAGE:-1}"
-export AGENTIC_FORCE_MIN_TOOL_CALLS="${AGENTIC_FORCE_MIN_TOOL_CALLS:-2}"
-export AGENTIC_FORCE_PROB="${AGENTIC_FORCE_PROB:-1.0}"
-export AGENTIC_TEACHER_FORCE_HERMES="${AGENTIC_TEACHER_FORCE_HERMES:-1}"
-# Stable overfit teacher: fixed gen→reflect→rewrite targets (not wrap_caption of garbage).
-# Keep ~30% forced turns on-policy (no token replace) so GRPO groups keep reward contrast.
-export AGENTIC_OVERFIT_STABLE_TEACHER="${AGENTIC_OVERFIT_STABLE_TEACHER:-1}"
-export AGENTIC_OVERFIT_ON_POLICY_FRAC="${AGENTIC_OVERFIT_ON_POLICY_FRAC:-0.30}"
-export AGENTIC_PREFER_LLM_REFLECTION="${AGENTIC_PREFER_LLM_REFLECTION:-1}"
-FORCE_AGENT_LOOP_CFG="${FORCE_AGENT_LOOP_CFG:-$SCRIPT_DIR/agentic_force_tool_agent_loop.yaml}"
+# Qwen3-VL has an image processor: return generated pixels to the actor.
+export AGENTIC_DIFFUSION_ATTACH_IMAGE="${AGENTIC_DIFFUSION_ATTACH_IMAGE:-1}"
+REQUIRE_REAL_IMAGE_TOOL="${REQUIRE_REAL_IMAGE_TOOL:-1}"
 GATE_SCRIPT="${GATE_SCRIPT:-$SCRIPT_DIR/check_overfit_gates.py}"
+DATA_SCRIPT="${DATA_SCRIPT:-$SCRIPT_DIR/../data_process/create_dummy_agentic_data.py}"
 # Sidecar gates for short overfit smokes (TOTAL_STEPS≤20 default on). Override GATE_SIDECAR=0 to skip.
 if [[ -z "${GATE_SIDECAR:-}" ]]; then
   if [[ "${TOTAL_STEPS}" -le 20 ]]; then
@@ -79,20 +68,51 @@ wandb dir: ${WANDB_DIR}
 ckpt: ${CKPT_DIR}
 rollout images: ${AGENTIC_DIFFUSION_IMAGE_DIR}
 rollout trajectories: ${E2E_RUN_DIR}/rollout_trajectories
-hermes actions (per step): ${E2E_RUN_DIR}/hermes_actions/step_XXXXXX.txt
-Lance tool URL: ${AGENTIC_LANCE_SERVER_URL:-<unset — stub only, no real PNGs>}
+raw assistant rollouts (per step): ${E2E_RUN_DIR}/hermes_actions/step_XXXXXX.txt
+agent model: ${MODEL_PATH}
+Qwen-Image tool URL: ${AGENTIC_QWEN_IMAGE_URL:-<unset — generic/legacy fallback or stub>}
+attach generated pixels to VLM: ${AGENTIC_DIFFUSION_ATTACH_IMAGE}
 overfit gates: GATE_SIDECAR=${GATE_SIDECAR} (see overfit_gates.json)
+agent loop: stock verl tool_agent (no force/teacher implementation)
 EOF
+echo "[INFO] repo root=${REPO_ROOT}"
 echo "[INFO] wandb online experiment_name=${EXPERIMENT_NAME} (WANDB_SERVICE_TRANSPORT=${WANDB_SERVICE_TRANSPORT})"
 echo "[INFO] ckpt dir=${CKPT_DIR}"
 echo "[INFO] e2e rollout images -> ${AGENTIC_DIFFUSION_IMAGE_DIR}"
 echo "[INFO] e2e full trajectories -> ${E2E_RUN_DIR}/rollout_trajectories"
-echo "[INFO] e2e hermes actions -> ${E2E_RUN_DIR}/hermes_actions/"
-echo "[INFO] force/teacher env: FORCE_GENERATE_IMAGE=${AGENTIC_FORCE_GENERATE_IMAGE:-<unset>} MIN_TOOL_CALLS=${AGENTIC_FORCE_MIN_TOOL_CALLS:-<unset>} TEACHER_FORCE_HERMES=${AGENTIC_TEACHER_FORCE_HERMES:-<unset>} OVERFIT_STABLE_TEACHER=${AGENTIC_OVERFIT_STABLE_TEACHER:-<unset>} ON_POLICY_FRAC=${AGENTIC_OVERFIT_ON_POLICY_FRAC:-<unset>} PREFER_LLM_REFLECTION=${AGENTIC_PREFER_LLM_REFLECTION:-<unset>} (agent_loop=agentic_force_tool_agent)"
-python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --expect-only --total-steps "${TOTAL_STEPS}"
-if [[ -z "${AGENTIC_LANCE_SERVER_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" ]]; then
-  echo "[WARN] No AGENTIC_LANCE_SERVER_URL set — generate_image will write STUB_NO_IMAGE.txt only."
-  echo "[WARN] Start: CUDA_VISIBLE_DEVICES=0 bash examples/agenticrpco_trainer/lance/run_lance_frozen_diffusion_tool_server.sh"
+echo "[INFO] e2e raw assistant rollouts -> ${E2E_RUN_DIR}/hermes_actions/"
+echo "[INFO] agent loop=stock tool_agent; no force/teacher implementation is loaded"
+python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --expect-only --total-steps "${TOTAL_STEPS}" --no-force
+if [[ "${AGENTIC_DIFFUSION_ATTACH_IMAGE}" != "1" ]]; then
+  echo "[ERROR] This visual-reflection recipe requires AGENTIC_DIFFUSION_ATTACH_IMAGE=1." >&2
+  exit 2
+fi
+if [[ -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" && -z "${AGENTIC_LANCE_SERVER_URL:-}" ]]; then
+  echo "[ERROR] No frozen image service is configured; visual reflection cannot be trained on stubs." >&2
+  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh" >&2
+  if [[ "${REQUIRE_REAL_IMAGE_TOOL}" == "1" ]]; then
+    exit 2
+  fi
+fi
+if [[ -n "${AGENTIC_QWEN_IMAGE_URL:-}" ]]; then
+  python3 - "${AGENTIC_QWEN_IMAGE_URL}" "${REQUIRE_REAL_IMAGE_TOOL}" <<'PY'
+import json
+import sys
+from urllib.request import urlopen
+
+endpoint, required = sys.argv[1], sys.argv[2] == "1"
+health = endpoint.rsplit("/", 1)[0] + "/health"
+try:
+    with urlopen(health, timeout=5) as response:  # noqa: S310 - operator-configured localhost service
+        payload = json.loads(response.read())
+    if not payload.get("ok"):
+        raise RuntimeError(f"unhealthy response: {payload}")
+    print(f"[INFO] Qwen-Image health OK: {payload}")
+except Exception as exc:
+    print(f"[ERROR] Qwen-Image health check failed at {health}: {exc}", file=sys.stderr)
+    if required:
+        raise SystemExit(2)
+PY
 fi
 
 _run_final_gates() {
@@ -105,7 +125,7 @@ _run_final_gates() {
     return 0
   fi
   echo "[GATE] running final overfit gates on ${E2E_RUN_DIR}"
-  if python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --final --total-steps "${TOTAL_STEPS}"; then
+  if python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --final --total-steps "${TOTAL_STEPS}" --no-force; then
     echo "[GATE] final gates PASS (train_rc=${train_rc})"
     return 0
   else
@@ -114,11 +134,12 @@ _run_final_gates() {
   fi
 }
 
-# Refresh Ray worker env so tool artifacts / Lance URL / WandB reach TaskRunner.
+# Refresh Ray worker env so tool artifacts / Qwen-Image URL / WandB reach TaskRunner.
 export RAY_RUNTIME_ENV_JSON="$(python3 - <<'PY'
 import json, os
 keys = [
     "LD_LIBRARY_PATH",
+    "HF_HOME",
     "VERL_USE_EXTERNAL_MODULES",
     "WANDB_API_KEY",
     "WANDB_MODE",
@@ -126,19 +147,13 @@ keys = [
     "WANDB_SILENT",
     "WANDB_DIR",
     "WANDB_PROJECT",
+    "AGENTIC_QWEN_IMAGE_URL",
     "AGENTIC_LANCE_SERVER_URL",
     "AGENTIC_DIFFUSION_TOOL_URL",
     "AGENTIC_DIFFUSION_TOOL_TOKEN",
     "AGENTIC_DIFFUSION_TOOL_TIMEOUT",
     "AGENTIC_DIFFUSION_IMAGE_DIR",
     "AGENTIC_DIFFUSION_ATTACH_IMAGE",
-    "AGENTIC_FORCE_GENERATE_IMAGE",
-    "AGENTIC_FORCE_MIN_TOOL_CALLS",
-    "AGENTIC_FORCE_PROB",
-    "AGENTIC_TEACHER_FORCE_HERMES",
-    "AGENTIC_PREFER_LLM_REFLECTION",
-    "AGENTIC_OVERFIT_STABLE_TEACHER",
-    "AGENTIC_OVERFIT_ON_POLICY_FRAC",
     "AGENTIC_E2E_ROOT",
     "AGENTIC_E2E_RUN_NAME",
     "AGENTIC_LANCE_HEIGHT",
@@ -161,45 +176,35 @@ print(json.dumps(base))
 PY
 )"
 
-# ToolAgentLoop passes tools=schemas into apply_chat_template; without a tools-
-# aware Jinja, schemas are silently dropped and the base model never sees the
-# Hermes format → single-turn only. Patch MODEL_PATH once if needed.
-python3 - "$MODEL_PATH" "$TOOL_CHAT_TEMPLATE" <<'PY'
-import json
+# Never replace the model's native template. Qwen3-VL is pretrained for Hermes
+# JSON in <tool_call> and its processor is required for returned tool images.
+python3 - "$MODEL_PATH" <<'PY'
 import sys
-from pathlib import Path
+from transformers import AutoProcessor
 
-model_path = Path(sys.argv[1])
-tmpl_path = Path(sys.argv[2])
-raw = tmpl_path.read_text()
-if tmpl_path.suffix in {".yaml", ".yml"}:
-    import yaml
-
-    payload = yaml.safe_load(raw)
-    tmpl = payload["chat_template"] if isinstance(payload, dict) else str(payload)
-else:
-    tmpl = raw
-tok_cfg_path = model_path / "tokenizer_config.json"
-tok_cfg = json.loads(tok_cfg_path.read_text()) if tok_cfg_path.exists() else {}
-current = tok_cfg.get("chat_template") or ""
-if "tool_call" in current and "tools" in current:
-    print(f"[INFO] MODEL_PATH already has tool-aware chat template: {model_path}")
-else:
-    tok_cfg["chat_template"] = tmpl
-    tok_cfg_path.write_text(json.dumps(tok_cfg, indent=2) + "\n")
-    (model_path / "chat_template.jinja").write_text(tmpl)
-    print(f"[INFO] Installed tool-aware chat template into {model_path}")
+model_path = sys.argv[1]
+processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+template = getattr(processor, "chat_template", "") or getattr(processor.tokenizer, "chat_template", "")
+if "<tool_call>" not in template or "tools" not in template:
+    raise SystemExit(f"{model_path} does not expose the required tool-aware chat template")
+if not getattr(processor, "image_processor", None):
+    raise SystemExit(f"{model_path} does not expose an image_processor")
+print(f"[INFO] Verified native Hermes tool template + image processor: {model_path}")
 PY
 
-# Expect parquet from examples/agenticrpco_trainer/data_process/create_data.sh
-# (default: data/agentic/{train,val}.parquet under the repo root).
+# Keep the tiny overfit parquet synchronized with the native Qwen3-VL protocol.
+if [[ "${OVERFIT_DATA}" == "1" ]]; then
+  python3 "${DATA_SCRIPT}" \
+    --local_save_dir "$(dirname "$TRAIN_FILE")" \
+    --overfit --train_size "${OVERFIT_TRAIN_SIZE:-8}" --val_size "${OVERFIT_VAL_SIZE:-2}"
+fi
 
 # Colocated FSDP actor + vLLM: after actor init, free VRAM << gpu_memory_utilization
 # * total. Cap util from currently free memory. Also refuse to start if a prior
 # crashed VLLM::EngineCore still owns the GPU (seen as "Free memory ... less than
 # desired GPU memory utilization").
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-}"
-MIN_FREE_GB="${MIN_FREE_GB:-35}"
+export MIN_FREE_GB="${MIN_FREE_GB:-24}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   python3 - <<PY
 import os, subprocess, sys
@@ -209,7 +214,7 @@ raw = subprocess.check_output(
 ).strip().splitlines()
 vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
 idxs = [int(x) for x in vis.split(",") if x.strip() != ""] if vis.strip() else list(range(len(raw)))
-min_free_gb = float(os.environ.get("MIN_FREE_GB", "35"))
+min_free_gb = float(os.environ.get("MIN_FREE_GB", "24"))
 bad = []
 for i in idxs:
     if i >= len(raw):
@@ -225,7 +230,7 @@ if bad:
     for idx, free, used in bad:
         print(f"[ERROR]   GPU {idx}: free={free:.1f}GiB used={used:.1f}GiB (need >= {min_free_gb}GiB free)", file=sys.stderr)
     print("[ERROR] Inspect: nvidia-smi", file=sys.stderr)
-    print("[ERROR] Free zombies (keep GPU0 Lance diffusion server if running):", file=sys.stderr)
+    print("[ERROR] Free zombies (keep the separate Qwen-Image server GPU if running):", file=sys.stderr)
     print("[ERROR]   nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv", file=sys.stderr)
     print("[ERROR]   kill <EngineCore/Worker pids on CUDA_VISIBLE_DEVICES>   # or pick empty GPUs", file=sys.stderr)
     print("[ERROR] Override gate with MIN_FREE_GB=0 if you insist.", file=sys.stderr)
@@ -261,10 +266,9 @@ fi
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.12}"
 echo "[INFO] rollout.gpu_memory_utilization=${GPU_MEM_UTIL}"
 
-# Sequence budget for colocated KV: Hermes tool calls are small, but two tool
-# observations + refine turns need more room than single-turn free text.
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-1024}"
-MAX_RESP_LEN="${MAX_RESP_LEN:-512}"
+# Leave room for two generated images, two tool calls, reflection, and a final turn.
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"
+MAX_RESP_LEN="${MAX_RESP_LEN:-2048}"
 MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESP_LEN))
 
 if [[ "${GATE_SIDECAR}" == "1" ]]; then
@@ -274,13 +278,17 @@ if [[ "${GATE_SIDECAR}" == "1" ]]; then
     --watch \
     --total-steps "${TOTAL_STEPS}" \
     --interval-s "${GATE_INTERVAL_S:-20}" \
+    --no-force \
     >"$E2E_RUN_DIR/gate_watch.log" 2>&1 &
   GATE_PID=$!
   echo "[GATE] watch pid=${GATE_PID}"
 fi
 
 TRAIN_RC=0
-# Mode (2a) essentials + memory-safe Lance sizing for ~100 steps on 2 GPUs.
+# Mode (2a): optimize only Qwen3-VL language projections; ViT stays pretrained.
+# layered_summon=false: FSDP LoRA leaf wraps + Qwen3-VL nesting produce names like
+# ...lora_A.default._fsdp_wrapped_module.weight that vLLM rejects. Full summon is fine at 2B.
+set +e
 python3 -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
   data.train_files="${TRAIN_FILE}" \
@@ -290,12 +298,14 @@ python3 -m verl.trainer.main_ppo \
   data.max_response_length="${MAX_RESP_LEN}" \
   data.filter_overlong_prompts=true \
   data.truncation=left \
+  data.return_raw_chat=true \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
   actor_rollout_ref.model.lora_rank=32 \
   actor_rollout_ref.model.lora_alpha=16 \
   "actor_rollout_ref.model.target_modules=[q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj]" \
   actor_rollout_ref.model.enable_gradient_checkpointing=true \
-  +actor_rollout_ref.model.override_config.tie_word_embeddings=false \
+  actor_rollout_ref.model.trust_remote_code=true \
+  actor_rollout_ref.model.use_remove_padding=true \
   +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
   actor_rollout_ref.actor.ppo_mini_batch_size=2 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
@@ -305,13 +315,14 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.fsdp_config.use_orig_params=true \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.load_format=safetensors \
-  actor_rollout_ref.rollout.n=2 \
+  actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.temperature=0.7 \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   "actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL}" \
   actor_rollout_ref.rollout.enable_chunked_prefill=true \
   actor_rollout_ref.rollout.enforce_eager=true \
   actor_rollout_ref.rollout.free_cache_engine=true \
+  actor_rollout_ref.rollout.layered_summon=false \
   actor_rollout_ref.rollout.max_num_seqs=8 \
   "actor_rollout_ref.rollout.max_model_len=${MAX_MODEL_LEN}" \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
@@ -319,9 +330,9 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.multi_turn.max_assistant_turns=4 \
   actor_rollout_ref.rollout.multi_turn.max_user_turns=4 \
   actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2048 \
+  actor_rollout_ref.rollout.multi_turn.format=hermes \
   actor_rollout_ref.rollout.multi_turn.function_tool_path=verl_omni/agent_loop/diffusion_tool.py \
-  actor_rollout_ref.rollout.agent.default_agent_loop=agentic_force_tool_agent \
-  "actor_rollout_ref.rollout.agent.agent_loop_config_path=${FORCE_AGENT_LOOP_CFG}" \
+  actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
   +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.agentic_metrics_manager.AgenticMetricsAgentLoopManager \
   actor_rollout_ref.rollout.agent.num_workers=2 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
@@ -342,7 +353,9 @@ python3 -m verl.trainer.main_ppo \
   'trainer.logger=["console","wandb"]' \
   trainer.project_name=verl_omni_agentic \
   "trainer.experiment_name=${EXPERIMENT_NAME}" \
-  "$@" || TRAIN_RC=$?
+  "$@"
+TRAIN_RC=$?
+set -e
 
 GATE_RC=0
 _run_final_gates "${TRAIN_RC}" || GATE_RC=$?

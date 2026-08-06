@@ -8,12 +8,12 @@
 #
 # Usage (separate shell / tmux pane from training):
 #   source ~/fred/fred_verlomni_agentic_multiturn_pr1.sh   # for LD_LIBRARY_PATH
-#   CUDA_VISIBLE_DEVICES=0 \
-#     bash examples/agenticrpco_trainer/lance/run_lance_frozen_diffusion_tool_server.sh
+#   CUDA_VISIBLE_DEVICES=6 \
+#     bash examples/agenticrpco_trainer/agent_llm/run_lance_frozen_diffusion_tool_server.sh
 #
 # Then point the trainer at this server:
 #   export AGENTIC_LANCE_SERVER_URL=http://127.0.0.1:8091
-#   bash examples/agenticrpco_trainer/lance/run_lance_agentic_grpo.sh
+#   bash examples/agenticrpco_trainer/agent_llm/run_agentic_grpo.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
