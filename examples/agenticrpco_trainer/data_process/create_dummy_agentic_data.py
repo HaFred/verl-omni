@@ -138,71 +138,172 @@ def _tc(name: str, **params: str) -> str:
     return f"<tool_call>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_call>"
 
 
-# --- Class 0: one generate → reflection + Done --------------------------------
-C1_TASK = "Generate an image of a bright red apple on a white table"
-C1_USER = _with_brevity(C1_TASK)
-C1_GEN_PROMPT = "a bright red apple on a white table, soft studio lighting, sharp focus"
+USER_PROMPTS = [
+    (
+        "In a realistic and emotionally evocative pencil sketch style, the composition focuses on a "
+        "heartwarming indoor scene. Under the dim glow of an oil lamp, a returned soldier son is "
+        "showing his elderly mother a yellowed letter from home. The soldier, tall and dressed in a "
+        "dusty military uniform with medals pinned to his chest, leans forward and points at the words "
+        "on the letter. His mother, with silver hair and a face full of wrinkles, sits on a wooden "
+        "chair, her eyes glistening with tears of emotion as she gently touches the letter. The "
+        "soldier's kind-hearted wife stands behind her husband, her hand resting on his shoulder, "
+        "smiling reassuringly at her mother-in-law. The warm light of the oil lamp illuminates the "
+        "faces of the three and the letter in their hands, while a faded family portrait hangs on the "
+        "wall. The entire scene is filled with dramatic lighting and a profound sense of family emotion."
+    ),
+    (
+        "Epic fantasy scene, wide-angle shot. In the dim ancient ruins, a circle of runestones on the "
+        "ground glows with mysterious light. An elderly white-haired wizard, clad in a deep blue robe "
+        "adorned with stars, wears a solemn expression as he chants a spell with both hands outstretched. "
+        "Before him hovers an open, glowing blue magic book. He is protecting a young and beautiful elf "
+        "princess, who has pointed ears and golden hair, dressed in an emerald-green gown. She tightly "
+        "grips a life staff topped with a shining green gem, watching the enemy nervously. Their foe is "
+        "a dark knight clad in full black runic armor, his face unseen, with ominous red light seeping "
+        "through the cracks in his armor. He raises a massive black runic sword, poised to strike. "
+        "Dynamic poses, dramatic lighting, digital painting, intricate details, cinematic feel."
+    ),
+    (
+        "In a dimly lit ancient stone chamber, the flames danced in the fireplace. An elderly rune "
+        "master, dressed in a dark robe with silver-white hair and beard, was holding a wooden staff "
+        "and pointing at an unfolded, weathered parchment scroll, imparting ancient knowledge to a "
+        "young Celtic priestess. The priestess wore a green linen dress adorned with Celtic knots, "
+        "her red hair braided into intricate plaits, and she gazed intently at the complex Norse runes "
+        "on the scroll. Beside them, a sharp-eyed Viking warrior clad in leather armor stood with his "
+        "arms crossed, observing the scene with curiosity. In the background, a massive runestone stood "
+        "upright. The composition is a mid-shot, with strong contrasts of light and shadow."
+    ),
+]
+
+OVERFIT_PROMPTS = USER_PROMPTS[:3]
+
+# ── Shared task (same for all three demo classes) ────────────────────────────
+_SHARED_TASK = USER_PROMPTS[0]
+_SHARED_USER = _with_brevity(_SHARED_TASK)
+
+# Fewshot prompts — all three classes use the same task, differing only in the
+# number of generate→reflect→rewrite passes and the detail of the self-critique.
+#
+# --- Class 0: single-pass — comprehensive prompt, one-shot success ------------
+C1_USER = _SHARED_USER
+C1_GEN_PROMPT = (
+    "realistic pencil sketch, heartwarming indoor scene under oil lamp glow, "
+    "a tall soldier in dusty uniform with medals pointing at a yellowed letter, "
+    "elderly silver-haired mother on wooden chair touching the letter with "
+    "teary eyes, soldier's wife standing behind with hand on his shoulder "
+    "smiling reassuringly, faded family portrait on wall, dramatic lighting"
+)
 C1_TOOL_1 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c1_apple_00.png "
-    "image_vis=512x512 mean_luma=168 edges=sharp colors=red_rich "
+    "Frozen diffusion produced the image. path=/tmp/fewshot/c1_pencilsketch_00.png "
+    "image_vis=512x512 mean_luma=142 edges=sharp scene=pencil_sketch "
+    "detected=soldier|uniform|medals|mother|silver_hair|letter|wife|oil_lamp|portrait "
     "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
     f"prompt='{C1_GEN_PROMPT}'"
 )
-C1_ASSISTANT_2 = "Reflection: bright red apple on white table, sharp edges, rich color. Done."
+C1_ASSISTANT_2 = (
+    "Reflection: pencil sketch rendering with all three figures — soldier in "
+    "uniform with medals, elderly mother on chair, wife behind with hand on "
+    "shoulder — plus oil lamp glow, yellowed letter, and family portrait on "
+    "wall. Lighting is dramatic and emotional. Done."
+)
 
-# --- Class 1: gen → reflection+rewrite gen → reflection+Done ------------------
-C2_TASK = "Generate an image of a bright red apple on a white table"
-C2_USER = _with_brevity(C2_TASK)
-C2_GEN1 = "a red apple on a white table, soft lighting"
+# --- Class 1: two-pass — initial attempt misses key elements; one rewrite ----
+C2_USER = _SHARED_USER
+C2_GEN1 = "a soldier showing a letter to an old woman by lamplight, sketch style"
 C2_GEN2 = (
-    "a bright red apple on a white table, strong studio lighting, "
-    "highly detailed, sharp focus, richer reds, coherent composition"
+    "realistic pencil sketch of a tall soldier in dusty military uniform with "
+    "medals pinned to his chest, pointing at a yellowed letter, silver-haired "
+    "elderly mother seated on wooden chair touching the letter with tears in "
+    "her eyes, soldier's wife standing behind him with hand resting on his "
+    "shoulder smiling reassuringly, warm oil lamp glow lighting faces and letter, "
+    "faded family portrait on wall in background"
 )
 C2_TOOL_1 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c2_apple_00.png "
-    "image_vis=512x512 mean_luma=92 edges=soft colors=red_muted "
+    "Frozen diffusion produced the image. path=/tmp/fewshot/c2_pencilsketch_00.png "
+    "image_vis=512x512 mean_luma=78 edges=soft scene=dim_interior "
+    "detected=soldier|elderly_woman|lamplight "
+    "missing=wife|medals|portrait|letter_detail|dramatic_lighting "
     "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
     f"prompt='{C2_GEN1}'"
 )
 C2_TOOL_2 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c2_apple_01.png "
-    "image_vis=512x512 mean_luma=155 edges=medium colors=red_rich "
+    "Frozen diffusion produced the image. path=/tmp/fewshot/c2_pencilsketch_01.png "
+    "image_vis=512x512 mean_luma=138 edges=medium scene=pencil_sketch "
+    "detected=soldier|uniform|medals|mother|silver_hair|letter|wife|oil_lamp|portrait "
     "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
     f"prompt='{C2_GEN2}'"
 )
-C2_REFLECT_REWRITE = "Reflection: apple present but muted reds and soft edges; rewrite for brighter lighting."
-C2_ASSISTANT_3 = "Reflection: bright red apple now matches; richer color and sharper focus. Done."
+C2_REFLECT_REWRITE = (
+    "Reflection: only two figures visible — soldier and elderly woman — missing "
+    "the wife standing behind, no medals on uniform, and no family portrait on "
+    "wall. Lighting is too dim for dramatic effect. Rewriting with full cast and "
+    "brighter oil lamp."
+)
+C2_ASSISTANT_3 = (
+    "Reflection: all three figures now present — soldier with medals, silver-haired "
+    "mother touching letter, wife behind with hand on shoulder. Oil lamp glow, "
+    "yellowed letter, and family portrait all visible. Dramatic pencil shading. Done."
+)
 
-# --- Class 2: three-pass same pattern ----------------------------------------
-C3_TASK = "Create a vivid sunset over snowy mountains with a red cabin"
-C3_USER = _with_brevity(C3_TASK)
-C3_GEN1 = "a sunset over mountains with a cabin"
-C3_GEN2 = "a vivid sunset over snowy mountains with a red cabin, soft light"
+# --- Class 2: three-pass — progressive refinement across three iterations -----
+C3_USER = _SHARED_USER
+C3_GEN1 = "a soldier and an old woman indoors, pencil drawing"
+C3_GEN2 = (
+    "realistic pencil sketch of a soldier in uniform showing a yellowed letter "
+    "to an elderly mother under oil lamp, indoor scene with dramatic shadows"
+)
 C3_GEN3 = (
-    "a vivid golden-hour sunset over snow-capped mountains with a rustic red cabin "
-    "in the foreground, high contrast, sharp details, rich warm colors"
+    "realistic emotionally evocative pencil sketch, heartwarming indoor scene, "
+    "under dim glow of oil lamp a tall returned soldier in dusty military uniform "
+    "with medals on chest leans forward pointing at yellowed letter, his elderly "
+    "mother with silver hair and wrinkled face sits on wooden chair with glistening "
+    "teary eyes gently touching the letter, his kind-hearted wife stands behind "
+    "him with hand resting on his shoulder smiling reassuringly at her "
+    "mother-in-law, warm lamp light illuminates the three faces and the letter, "
+    "faded family portrait hangs on wall in background, dramatic lighting, "
+    "profound family emotion"
 )
 C3_TOOL_1 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_sunset_00.png "
-    "image_vis=512x512 mean_luma=88 edges=soft colors=muted "
+    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_pencilsketch_00.png "
+    "image_vis=512x512 mean_luma=65 edges=blurry scene=vague_interior "
+    "detected=two_figures|dim_light "
+    "missing=uniform|medals|mother_details|wife|letter|oil_lamp|portrait|pencil_style "
     "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
     f"prompt='{C3_GEN1}'"
 )
 C3_TOOL_2 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_sunset_01.png "
-    "image_vis=512x512 mean_luma=110 edges=soft colors=moderate "
+    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_pencilsketch_01.png "
+    "image_vis=512x512 mean_luma=105 edges=medium scene=pencil_sketch_interior "
+    "detected=soldier|uniform|elderly_woman|letter|oil_lamp "
+    "missing=medals|wife|mother_silver_hair|portrait|teary_emotion "
     "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
     f"prompt='{C3_GEN2}'"
 )
 C3_TOOL_3 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_sunset_02.png "
-    "image_vis=512x512 mean_luma=148 edges=medium colors=rich "
+    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_pencilsketch_02.png "
+    "image_vis=512x512 mean_luma=140 edges=sharp scene=pencil_sketch "
+    "detected=soldier|uniform|medals|mother|silver_hair|wrinkles|letter|"
+    "wife|hand_on_shoulder|oil_lamp|portrait|dramatic_lighting|teary_eyes "
     "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
     f"prompt='{C3_GEN3}'"
 )
-C3_REFLECT_REWRITE_1 = "Reflection: missing snowy mountains and red cabin; muted vs vivid request."
-C3_REFLECT_REWRITE_2 = "Reflection: attributes mostly present but vividness and contrast still weak."
-C3_ASSISTANT_4 = "Reflection: vivid sunset, snowy mountains, and red cabin match the request. Done."
+C3_REFLECT_REWRITE_1 = (
+    "Reflection: image is blurry and lacks the pencil sketch style. Only two "
+    "indistinct figures visible — no uniform details, no medals, no wife, no "
+    "oil lamp, and no letter detail. Needs dramatic lighting and full cast."
+)
+C3_REFLECT_REWRITE_2 = (
+    "Reflection: pencil sketch style now present, soldier in uniform and oil lamp "
+    "visible, but still missing the wife behind the soldier, the medals on his "
+    "chest, the mother's silver hair and emotional tears, and the family portrait "
+    "on wall. Adding full emotional detail and composition."
+)
+C3_ASSISTANT_4 = (
+    "Reflection: pencil sketch rendering is now complete — soldier with medals "
+    "pointing at yellowed letter, silver-haired elderly mother with tears "
+    "touching letter, wife behind with hand on shoulder smiling, oil lamp "
+    "illuminating all three faces, faded family portrait on wall. Dramatic "
+    "lighting conveys profound family emotion. Done."
+)
 
 
 def _demo_messages(class_id: int) -> list[dict]:
@@ -242,15 +343,6 @@ def _demo_messages(class_id: int) -> list[dict]:
         {"role": "tool", "content": C3_TOOL_3},
         {"role": "assistant", "content": C3_ASSISTANT_4},
     ]
-
-
-USER_PROMPTS = [
-    "In a realistic and emotionally evocative pencil sketch style, the composition focuses on a heartwarming indoor scene. Under the dim glow of an oil lamp, a returned soldier son is showing his elderly mother a yellowed letter from home. The soldier, tall and dressed in a dusty military uniform with medals pinned to his chest, leans forward and points at the words on the letter. His mother, with silver hair and a face full of wrinkles, sits on a wooden chair, her eyes glistening with tears of emotion as she gently touches the letter. The soldier's kind-hearted wife stands behind her husband, her hand resting on his shoulder, smiling reassuringly at her mother-in-law. The warm light of the oil lamp illuminates the faces of the three and the letter in their hands, while a faded family portrait hangs on the wall. The entire scene is filled with dramatic lighting and a profound sense of family emotion.",
-    "Epic fantasy scene, wide-angle shot. In the dim ancient ruins, a circle of runestones on the ground glows with mysterious light. An elderly white-haired wizard, clad in a deep blue robe adorned with stars, wears a solemn expression as he chants a spell with both hands outstretched. Before him hovers an open, glowing blue magic book. He is protecting a young and beautiful elf princess, who has pointed ears and golden hair, dressed in an emerald-green gown. She tightly grips a life staff topped with a shining green gem, watching the enemy nervously. Their foe is a dark knight clad in full black runic armor, his face unseen, with ominous red light seeping through the cracks in his armor. He raises a massive black runic sword, poised to strike. Dynamic poses, dramatic lighting, digital painting, intricate details, cinematic feel.",
-    "In a dimly lit ancient stone chamber, the flames danced in the fireplace. An elderly rune master, dressed in a dark robe with silver-white hair and beard, was holding a wooden staff and pointing at an unfolded, weathered parchment scroll, imparting ancient knowledge to a young Celtic priestess. The priestess wore a green linen dress adorned with Celtic knots, her red hair braided into intricate plaits, and she gazed intently at the complex Norse runes on the scroll. Beside them, a sharp-eyed Viking warrior clad in leather armor stood with his arms crossed, observing the scene with curiosity. In the background, a massive runestone stood upright. The composition is a mid-shot, with strong contrasts of light and shadow.",
-]
-
-OVERFIT_PROMPTS = USER_PROMPTS[:3]
 
 
 def build_prompt_messages(user_text: str, *, class_id: int = 1) -> list[dict]:
