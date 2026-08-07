@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Frozen Qwen3-VL reflect sidecar for agentic GRPO (correctness + aesthetics).
+# Frozen Qwen3-VL judge sidecar for agentic GRPO (continuous batching via vLLM).
 #
 # Dedicated GPU (separate from train & Qwen-Image):
 #   CUDA_VISIBLE_DEVICES=2 bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh
@@ -8,6 +8,9 @@
 #   CUDA_VISIBLE_DEVICES=0 bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh
 #   CUDA_VISIBLE_DEVICES=0 QWEN_IMAGE_MEMORY_MODE=model_offload \
 #     bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
+#
+# Or use the legacy FastAPI server for the custom /reflect endpoint:
+#   AGENTIC_REFLECT_VLM_URL=http://127.0.0.1:8093/reflect
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,14 +27,18 @@ if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   exit 2
 fi
 
-echo "[INFO] Frozen Qwen3-VL reflect sidecar"
+echo "[INFO] Frozen Qwen3-VL judge sidecar (vLLM, continuous batching)"
 echo "[INFO]   model       : ${AGENTIC_REFLECT_VLM_PATH}"
 echo "[INFO]   cuda devices: ${CUDA_VISIBLE_DEVICES}"
 echo "[INFO]   listen      : http://${HOST}:${PORT}"
-echo "[INFO] Trainer should export AGENTIC_REFLECT_VLM_URL=http://${HOST}:${PORT}/reflect"
+echo "[INFO] Trainer should export AGENTIC_VLLM_URL=http://${HOST}:${PORT}"
+echo "[INFO] (Legacy custom endpoint: AGENTIC_REFLECT_VLM_URL=http://${HOST}:${PORT}/reflect)"
 
-exec python3 -m uvicorn qwen_vl_reflect_server:app \
-  --app-dir "${SCRIPT_DIR}" \
+exec vllm serve "${AGENTIC_REFLECT_VLM_PATH}" \
   --host "${HOST}" \
   --port "${PORT}" \
+  --max-num-seqs 8 \
+  --gpu-memory-utilization 0.85 \
+  --max-model-len 4096 \
+  --trust-remote-code \
   "$@"

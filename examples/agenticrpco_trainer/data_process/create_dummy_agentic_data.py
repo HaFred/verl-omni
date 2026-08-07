@@ -197,7 +197,13 @@ def _judge_obs(
     c_detail: str = "",
     a_detail: str = "",
 ) -> str:
-    """Format a judge_image tool observation matching _call_judge_vlm output."""
+    """Format a fewshot judge_image tool observation.
+
+    Live rollouts use ``diffusion_tool._call_judge_vlm`` (scores only; no
+    ``REQUIRED NEXT ACTION`` boilerplate — ``agentic_tool_agent`` injects
+    ``Reflection:`` / ``Done.``). This helper keeps the instructional line for
+    fewshot demonstrations only.
+    """
     c_part = f"  correctness={correctness:.2f}  ({c_detail})" if c_detail else f"  correctness={correctness:.2f}"
     a_part = f"  aesthetics ={aesthetics:.2f}  ({a_detail})" if a_detail else f"  aesthetics ={aesthetics:.2f}"
     return (

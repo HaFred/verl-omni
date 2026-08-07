@@ -110,24 +110,50 @@ flowchart TD
 
 Each logical turn now follows the contract above:
 
-- Turn k: `generate_image(prompt_k)` → `judge_image(user_request, prompt_k)` → agent reads VL feedback, reflects, then either `Done.` or rewrite + `generate_image(prompt_{k+1})`.
+- Turn k: `generate_image(prompt_k)` → `judge_image(user_request, prompt_k)` → forced
+  `Reflection:` (injected by `agentic_tool_agent`) then either `Done.` or rewrite +
+  `generate_image(prompt_{k+1})`.
+- After `AGENTIC_MAX_GENERATE_IMAGE_PASSES` (default **3**) successful generates, the
+  next judge **force-stops** with `Done.` even if `good_enough=NO` (README 3-pass max).
 - Turn k+1 input is the agent's reflection/rewrite from turn k (not a bare image `tool_response`).
 
-Verify that rollout trajectories show `judge_image` tool calls between each
-`generate_image` and the agent's `Reflection: …` decision text.
+Verify trajectories for `agentic_forced_reflection=1` and, at pass 3,
+`agentic_force_stop_max_passes=1`.
+
+### Rollout trajectory JSON protocol
+
+Each ``rollout_trajectories/step_XXXXXX/sample_Y.ZZ.json`` lists ``rollout_turns``
+with this key order:
+
+| Key | Meaning |
+| --- | --- |
+| `turn` | 1-based index in the response tensor |
+| `turn_kind` | Grepable stage label (`call_generate_image`, `call_judge_image`, …) |
+| `turn_prompt` | Env / tool observation the policy conditions on for this decode (image obs or VL judge scores). **Does not** include forced Reflection |
+| `decode` | Policy-sampled assistant tokens for this turn (`<tool_call>…` or prose) |
+| `response` | Injected assistant text after the tool obs (forced `Reflection: …`), **not** sampled from the policy. Empty when none |
+| `decode_has_tool_call` | `true` iff **`decode`** contains `<tool_call>` (ignores `response`) |
+
+Important: **`decode` of turn T need not equal `turn_prompt` of turn T+1`.**
+After `judge_image`, the loop injects `response=Reflection: …` (and may `Done.`);
+the next policy `decode` is the rewrite `generate_image` (or empty if force-stopped).
+Fewshot demos in `create_dummy_agentic_data.py` may still include a
+`REQUIRED NEXT ACTION` line; **live** `judge_image` observations do not — the
+agent loop supplies Reflection / Done / rewrite instead.
 
 ### Primary fields (enter the weighted mix)
 
 | Field | Default weight | Physical meaning | Zero when |
 | --- | ---: | --- | --- |
 | `reward_tool_call` | 0.10 | Binary: trajectory contains ≥1 parseable `<tool_call>`. **In scalar.** | No parseable tool call |
+| `reward_done` | 0.10 | Closed loop: agent reflection prose + `Done.`. **In scalar.** | No `Done.` / no reflection |
 | `reward_brevity` | — | Short assistant prose (≤4 sentences / ≤280 chars). **Metric only.** | Long rambling / debate CoT |
 | `reward_format` | — | Fraction of `generate_image` calls with valid arguments. **Metric only.** | No / malformed calls |
 | `reward_reflection` | — | Quality of agent self-reflection prose. **Metric only.** | No reflection prose |
 | `reward_tool_usage` | — | Protocol shape and distinct rewritten prompts. **Metric only.** | No `generate_image` |
 | `reward_result` | — | Closed-loop outcome quality. **Metric only.** | No `generate_image` |
-| `reward_correctness` | 0.45 | Frozen-VL correctness via `AGENTIC_REFLECT_VLM_URL` on last image. **In scalar.** | URL unset / VL call fails |
-| `reward_aesthetics` | 0.45 | Frozen-VL aesthetics via `AGENTIC_REFLECT_VLM_URL` on last image. **In scalar.** | URL unset / VL call fails |
+| `reward_correctness` | 0.40 | Frozen-VL correctness via `AGENTIC_REFLECT_VLM_URL` on last image. **In scalar.** | URL unset / VL call fails |
+| `reward_aesthetics` | 0.40 | Frozen-VL aesthetics via `AGENTIC_REFLECT_VLM_URL` on last image. **In scalar.** | URL unset / VL call fails |
 
 Weighted mix (then scaled by a protocol tier `base + scale * mix`):
 
@@ -144,7 +170,7 @@ score = base + scale * mix
 | Gen-only (starved) | ≥1 `generate_image`, **no** reflection prose | 0.02 | 0.03 | 0 |
 
 Weights are stored per row in parquet `ground_truth` / `extra_info` (`w_tool_call`,
-`w_correctness`, `w_aesthetics`). Brevity, format, reflection, tool_usage, and
+`w_correctness`, `w_aesthetics`, `w_done`). Brevity, format, reflection, tool_usage, and
 result are logged as metrics but excluded from the scalar reward (saturated from
 step 1).
 

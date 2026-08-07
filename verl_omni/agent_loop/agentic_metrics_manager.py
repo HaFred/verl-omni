@@ -41,11 +41,7 @@ logger = logging.getLogger(__name__)
 
 REWARD_COMPONENTS = (
     "reward_tool_call",
-    "reward_brevity",
-    "reward_format",
-    "reward_reflection",
-    "reward_tool_usage",
-    "reward_result",
+    "reward_done",
     "reward_correctness",
     "reward_aesthetics",
     "reward_correctness_subject_entities",
@@ -91,26 +87,32 @@ _VL_JUDGE_OBS_RE = re.compile(r"\b(?:VL judge|agentic_judge)\b", re.IGNORECASE)
 _FORCED_REFLECTION_RE = re.compile(r"\bagentic_forced_reflection=1\b", re.IGNORECASE)
 
 
-def _turn_kind(decode: str, turn_prompt: str) -> str:
+def _turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
     """Label turns so trajectory dumps make protocol stages grep-able."""
+    resp = response or ""
     if _JUDGE_CALL_RE.search(decode or ""):
         return "call_judge_image"
     if _GEN_CALL_RE.search(decode or ""):
-        # Forced Reflection (mask=0) precedes this rewrite in ``turn_prompt``.
-        if _FORCED_REFLECTION_RE.search(turn_prompt or ""):
-            return "forced_reflection_rewrite"
+        if _FORCED_REFLECTION_RE.search(resp) or _FORCED_REFLECTION_RE.search(turn_prompt or ""):
+            return "agent_rewrite_after_forced_reflection"
         return "call_generate_image"
-    if _FORCED_REFLECTION_RE.search(decode or ""):
-        if re.search(r"\bDone\.", decode or ""):
+    if re.search(r"\bagentic_force_stop_max_passes=1\b", resp) or (
+        not (decode or "").strip() and re.search(r"\bagentic_force_stop_max_passes=1\b", turn_prompt or "")
+    ):
+        return "forced_reflection_max_passes_done"
+    if _FORCED_REFLECTION_RE.search(resp):
+        if re.search(r"\bDone\.", resp):
             return "forced_reflection_done"
-        return "forced_reflection_rewrite"
+        return "forced_reflection_continue"
+    if not (decode or "").strip() and _FORCED_REFLECTION_RE.search(turn_prompt or ""):
+        if re.search(r"\bDone\.", turn_prompt or ""):
+            return "forced_reflection_done"
+        return "forced_reflection_continue"
     if _AGENT_REFLECTION_RE.search(decode or ""):
         if _GEN_CALL_RE.search(decode or ""):
             return "agent_reflection_rewrite"
         return "agent_reflection_done"
     if _VL_JUDGE_OBS_RE.search(turn_prompt or ""):
-        if _FORCED_REFLECTION_RE.search(turn_prompt or ""):
-            return "forced_reflection_rewrite"
         return "after_judge_feedback"
     if "path=" in (turn_prompt or "") and "agentic_tool" in (turn_prompt or ""):
         return "after_generate_image"
@@ -190,49 +192,110 @@ def _artifact_reward_metrics(output: Any, index: int) -> dict[str, float | int]:
     return metrics
 
 
+def _split_env_blob(blob: str) -> tuple[str, str]:
+    """Split mask=0 env text into ``(turn_prompt, response)``.
+
+    ``turn_prompt`` = tool / user obs the policy reads.
+    ``response`` = injected assistant text (forced ``Reflection:…``), if any.
+    These can diverge from the previous turn's ``decode`` because the agent loop
+    may inject Reflection after ``judge_image`` without sampling it from the policy.
+    """
+    text = (blob or "").strip()
+    if not text:
+        return "", ""
+    force_idx = -1
+    for match in re.finditer(r"(?:^|\n)\s*Reflection\s*:", text, re.IGNORECASE):
+        # Prefer the forced marker when present.
+        window = text[match.start() : match.start() + 400]
+        if "agentic_forced_reflection=1" in window or force_idx < 0:
+            force_idx = match.start()
+            if "agentic_forced_reflection=1" in window:
+                break
+    if force_idx < 0 or not _FORCED_REFLECTION_RE.search(text):
+        # No injected assistant response — entire blob is the next-turn prompt.
+        return text, ""
+    # Include any chat-template role tags immediately before Reflection.
+    cut = force_idx
+    preamble = text[:force_idx]
+    # If the decode left a trailing bare ``assistant`` / think block before Reflection,
+    # keep tool_response in turn_prompt and put Reflection(+trailing) in response.
+    tool_end = preamble.rfind("</tool_response>")
+    if tool_end >= 0:
+        turn_prompt = text[: tool_end + len("</tool_response>")].strip()
+        response = text[tool_end + len("</tool_response>") :].strip()
+        # Drop leading role/think scaffolding noise from response but keep Reflection.
+        refl = re.search(r"Reflection\s*:", response, re.IGNORECASE)
+        if refl:
+            response = response[refl.start() :].strip()
+        return turn_prompt, response
+    return text[:cut].strip(), text[cut:].strip()
+
+
+def _turn_record(
+    *,
+    turn: int,
+    turn_prompt: str,
+    response: str,
+    decode: str,
+) -> dict[str, Any]:
+    return {
+        "turn": turn,
+        "turn_prompt": turn_prompt or "",
+        "decode": decode or "",
+        "response": response or "",
+        "decode_has_tool_call": "<tool_call>" in (decode or "").lower(),
+    }
+
+
 def split_assistant_rollouts(token_ids, response_mask, tokenizer) -> list[str]:
     """Decode contiguous model-token spans; tool observations have mask 0."""
     return [turn["decode"] for turn in split_rollout_turns(token_ids, response_mask, tokenizer)]
 
 
 def split_rollout_turns(token_ids, response_mask, tokenizer) -> list[dict[str, Any]]:
-    """Split response into assistant turns with the tool-obs that preceded each turn.
+    """Split response into turns with explicit prompt / response / decode fields.
 
-    ``response_mask==1`` → model tokens (assistant decode).
-    ``response_mask==0`` → tool / env tokens (recorded as the next turn's ``turn_prompt``).
+    ``response_mask==1`` → model tokens (``decode``).
+    ``response_mask==0`` → env tokens, split into:
+      - ``turn_prompt``: tool obs the policy conditions on
+      - ``response``: forced ``Reflection:…`` (injected, not policy-sampled)
 
-    Turn 1 has no prior tool obs in the response tensor; the caller should set
-    ``turn_prompt`` to the dataset ``user_prompt`` when empty.
+    Keys per turn: ``turn``, ``turn_prompt``, ``decode``, ``response``,
+    ``decode_has_tool_call``.
     """
     ids = token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
     mask = response_mask.tolist() if hasattr(response_mask, "tolist") else list(response_mask)
     turns: list[dict[str, Any]] = []
     current_model: list[int] = []
     current_tool: list[int] = []
-    pending_tool_prompt = ""
+    pending_prompt = ""
+    pending_response = ""
 
     def _flush_tool() -> None:
-        nonlocal pending_tool_prompt, current_tool
+        nonlocal pending_prompt, pending_response, current_tool
         if not current_tool:
             return
-        # Drop vision/special pads so monitors keep path= / image_vis / agentic_tool.
-        pending_tool_prompt = tokenizer.decode(current_tool, skip_special_tokens=True).strip()
+        blob = tokenizer.decode(current_tool, skip_special_tokens=True).strip()
         current_tool = []
+        prompt, response = _split_env_blob(blob)
+        pending_prompt = prompt
+        pending_response = response
 
     def _flush_model() -> None:
-        nonlocal current_model, pending_tool_prompt
+        nonlocal current_model, pending_prompt, pending_response
         if not current_model:
             return
         decode = tokenizer.decode(current_model, skip_special_tokens=False)
         turns.append(
-            {
-                "turn": len(turns) + 1,
-                "turn_prompt": pending_tool_prompt,
-                "decode": decode,
-                "decode_has_tool_call": "<tool_call>" in decode.lower(),
-            }
+            _turn_record(
+                turn=len(turns) + 1,
+                turn_prompt=pending_prompt,
+                response=pending_response,
+                decode=decode,
+            )
         )
-        pending_tool_prompt = ""
+        pending_prompt = ""
+        pending_response = ""
         current_model = []
 
     for token_id, is_model_token in zip(ids, mask, strict=True):
@@ -246,12 +309,20 @@ def split_rollout_turns(token_ids, response_mask, tokenizer) -> list[dict[str, A
             current_tool.append(int(token_id))
     if current_model:
         _flush_model()
-    # Trailing tool obs (after final assistant tool_call) is kept on a synthetic note.
+    # Trailing env (e.g. final judge + forced Done with no further decode).
     if current_tool:
         _flush_tool()
-        if turns:
-            turns[-1]["tool_response_after"] = pending_tool_prompt
-        pending_tool_prompt = ""
+        if pending_prompt or pending_response:
+            turns.append(
+                _turn_record(
+                    turn=len(turns) + 1,
+                    turn_prompt=pending_prompt,
+                    response=pending_response,
+                    decode="",
+                )
+            )
+        pending_prompt = ""
+        pending_response = ""
     return turns
 
 
@@ -429,21 +500,39 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                     "rollout_turns": rollout_turns,
                     "image_paths": image_paths,
                     "num_tool_calls_executed": sum(
-                        len(
-                            _EXECUTED_TOOL_RESPONSE_RE.findall(
-                                f"{turn.get('turn_prompt', '')}\n{turn.get('tool_response_after', '')}"
-                            )
-                        )
+                        len(_EXECUTED_TOOL_RESPONSE_RE.findall(turn.get("turn_prompt", "") or ""))
                         for turn in rollout_turns
                     ),
                     "num_forced_tool_calls": 0,
                     "num_voluntary_tool_calls": sum(
-                        len(_TOOL_CALL_RE.findall(turn["decode"])) for turn in rollout_turns
+                        len(_TOOL_CALL_RE.findall(turn.get("decode") or "")) for turn in rollout_turns
                     ),
                     # Legacy field name retained for downstream dashboards.
-                    "num_voluntary_hermes": sum(len(_TOOL_CALL_RE.findall(turn["decode"])) for turn in rollout_turns),
+                    "num_voluntary_hermes": sum(
+                        len(_TOOL_CALL_RE.findall(turn.get("decode") or "")) for turn in rollout_turns
+                    ),
                 }
                 reward_metrics = _artifact_reward_metrics(output, i)
+
+                # Stable key order for trajectory JSON.
+                for turn in rollout_turns:
+                    turn["turn_kind"] = _turn_kind(
+                        turn.get("decode") or "",
+                        turn.get("turn_prompt") or "",
+                        turn.get("response") or "",
+                    )
+                ordered_turns = [
+                    {
+                        "turn": t.get("turn"),
+                        "turn_kind": t.get("turn_kind"),
+                        "turn_prompt": t.get("turn_prompt") or "",
+                        "decode": t.get("decode") or "",
+                        "response": t.get("response") or "",
+                        "decode_has_tool_call": bool(t.get("decode_has_tool_call")),
+                    }
+                    for t in rollout_turns
+                ]
+                payload["rollout_turns"] = ordered_turns
 
                 name = Path(relpath).name
                 (trajectory_dir / f"{name}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
@@ -459,55 +548,24 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                         "assistant_rollout:",
                     ]
                 )
-                for turn in rollout_turns:
+                for turn in ordered_turns:
                     t = int(turn["turn"])
                     turn_prompt = turn.get("turn_prompt") or ""
+                    response = turn.get("response") or ""
                     decode = turn.get("decode") or ""
-                    kind = _turn_kind(decode, turn_prompt)
-                    turn["turn_kind"] = kind
+                    kind = turn.get("turn_kind") or "other"
                     header = f"  turn={t} kind={kind} decode_has_tool_call={turn['decode_has_tool_call']}"
-                    trajectory_text.extend(
-                        [
-                            header,
-                            f"    turn_{t}_prompt:",
-                            *[f"      {line}" for line in (turn_prompt.splitlines() or [""])],
-                            "    decode:",
-                        ]
-                    )
-                    step_text.extend(
-                        [
-                            header,
-                            f"    turn_{t}_prompt:",
-                            *[f"      {line}" for line in (turn_prompt.splitlines() or [""])],
-                            "    decode:",
-                        ]
-                    )
-                    decode_lines = decode.splitlines() or [""]
-                    trajectory_text.extend(f"      {line}" for line in decode_lines)
-                    step_text.extend(f"      {line}" for line in decode_lines)
-                    after = turn.get("tool_response_after") or ""
-                    if after:
-                        after_kind = (
-                            "forced_reflection_done"
-                            if _FORCED_REFLECTION_RE.search(after)
-                            else "judge_feedback"
-                            if _VL_JUDGE_OBS_RE.search(after)
-                            else "image_obs"
-                            if "agentic_tool" in after
-                            else "tool_response"
-                        )
-                        trajectory_text.extend(
-                            [
-                                f"    turn_{t}_tool_response ({after_kind}):",
-                                *[f"      {line}" for line in after.splitlines() or [""]],
-                            ]
-                        )
-                        step_text.extend(
-                            [
-                                f"    turn_{t}_tool_response ({after_kind}):",
-                                *[f"      {line}" for line in after.splitlines() or [""]],
-                            ]
-                        )
+                    block = [
+                        header,
+                        f"    turn_{t}_prompt:",
+                        *[f"      {line}" for line in (turn_prompt.splitlines() or [""])],
+                        f"    turn_{t}_response:",
+                        *[f"      {line}" for line in (response.splitlines() or [""])],
+                        "    decode:",
+                        *[f"      {line}" for line in (decode.splitlines() or [""])],
+                    ]
+                    trajectory_text.extend(block)
+                    step_text.extend(block)
                 trajectory_text.append("")
                 step_text.append("")
                 (trajectory_dir / f"{name}.txt").write_text("\n".join(trajectory_text) + "\n")
@@ -517,7 +575,7 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 monitor_payload = {
                     **payload,
                     "rollout_turns": [
-                        {key: value for key, value in turn.items() if key != "decode"} for turn in rollout_turns
+                        {key: value for key, value in turn.items() if key != "decode"} for turn in ordered_turns
                     ],
                     "reward_metrics": reward_metrics,
                 }

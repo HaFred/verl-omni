@@ -165,18 +165,19 @@ def test_agentic_reward_components_are_aggregated_for_wandb():
     metrics = aggregate_agentic_reward_metrics(
         {
             "reward_tool_call": np.array([0.0, 1.0]),
-            "reward_format": np.array([0.0, 1.0]),
-            "reward_reflection": np.array([0.4, 0.8]),
-            "reward_tool_usage": np.array([0.5, 1.0]),
-            "reward_result": np.array([0.0, 0.5]),
+            "reward_done": np.array([0.0, 1.0]),
+            "reward_correctness": np.array([0.72, 0.88]),
+            "reward_aesthetics": np.array([0.65, 0.95]),
+            "reward_correctness_subject_entities": np.array([0.8, 0.9]),
+            "reward_aesthetics_composition": np.array([0.7, 0.85]),
             "method": np.array(["a", "b"]),
         }
     )
     assert metrics["agentic_reward/tool_call/mean"] == 0.5
-    assert metrics["agentic_reward/format/mean"] == 0.5
-    assert metrics["agentic_reward/reflection/min"] == 0.4
-    assert metrics["agentic_reward/tool_usage/max"] == 1.0
-    assert metrics["agentic_reward/result/mean"] == 0.25
+    assert metrics["agentic_reward/done/mean"] == 0.5
+    assert metrics["agentic_reward/correctness/mean"] == 0.80
+    assert metrics["agentic_reward/aesthetics/min"] == 0.65
+    assert metrics["agentic_reward/correctness_subject_entities/max"] == 0.9
     assert all("method" not in key for key in metrics)
 
 
@@ -218,17 +219,14 @@ def test_rollout_monitor_writes_only_prompt_and_raw_decodes(monkeypatch, tmp_pat
             ),
             "index": np.array([3]),
             "reward_tool_call": np.array([1.0]),
-            "reward_brevity": np.array([0.8]),
-            "reward_format": np.array([1.0]),
-            "reward_reflection": np.array([0.0]),
-            "reward_tool_usage": np.array([0.3]),
-            "reward_result": np.array([0.25]),
+            "reward_done": np.array([0.0]),
             "reward_correctness": np.array([0.0]),
             "reward_aesthetics": np.array([0.0]),
             "num_hermes_tool_calls": np.array([1]),
             "num_generate_image_prompts": np.array([1]),
-            "num_reflect_image_calls": np.array([0]),
+            "num_judge_image_calls": np.array([0]),
             "protocol_ok": np.array([0]),
+            "rollout_valid": np.array([1]),
         },
     )
     manager = AgenticMetricsAgentLoopManager.__new__(AgenticMetricsAgentLoopManager)
@@ -258,17 +256,14 @@ def test_rollout_monitor_writes_only_prompt_and_raw_decodes(monkeypatch, tmp_pat
     assert action["reward_metrics"] == {
         "score": 0.75,
         "reward_tool_call": 1.0,
-        "reward_brevity": 0.8,
-        "reward_format": 1.0,
-        "reward_reflection": 0.0,
-        "reward_tool_usage": 0.3,
-        "reward_result": 0.25,
+        "reward_done": 0.0,
         "reward_correctness": 0.0,
         "reward_aesthetics": 0.0,
         "num_hermes_tool_calls": 1,
         "num_generate_image_prompts": 1,
-        "num_reflect_image_calls": 0,
+        "num_judge_image_calls": 0,
         "protocol_ok": 0,
+        "rollout_valid": 1,
     }
 
 

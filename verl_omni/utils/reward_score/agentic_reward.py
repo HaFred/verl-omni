@@ -502,11 +502,14 @@ def compute_score(
     )
 
     w_tool_call = float(extra_info.get("w_tool_call", gt.get("w_tool_call", 0.10)))
-    w_correctness = float(extra_info.get("w_correctness", gt.get("w_correctness", 0.45)))
-    w_aesthetics = float(extra_info.get("w_aesthetics", gt.get("w_aesthetics", 0.45)))
-    w_sum = w_tool_call + w_correctness + w_aesthetics
+    w_correctness = float(extra_info.get("w_correctness", gt.get("w_correctness", 0.40)))
+    w_aesthetics = float(extra_info.get("w_aesthetics", gt.get("w_aesthetics", 0.40)))
+    # Closed-loop Done. gets an explicit scalar weight so GRPO prefers stopping
+    # after Reflection+Done over endless rewrite loops.
+    w_done = float(extra_info.get("w_done", gt.get("w_done", 0.10)))
+    w_sum = w_tool_call + w_correctness + w_aesthetics + w_done
     if w_sum <= 0:
-        w_tool_call, w_correctness, w_aesthetics, w_sum = 0.10, 0.45, 0.45, 1.0
+        w_tool_call, w_correctness, w_aesthetics, w_done, w_sum = 0.10, 0.40, 0.40, 0.10, 1.0
 
     prose = _assistant_prose(blob)
     has_refl = _has_agent_reflection_prose(prose)
@@ -515,6 +518,7 @@ def compute_score(
     distinct = len(prompts) >= 2 and prompts[0].lower().strip() != prompts[-1].lower().strip()
     f_correctness = float(last_c if last_c is not None else 0.0)
     f_aesthetics = float(last_a if last_a is not None else 0.0)
+    f_done = 1.0 if closed else (0.4 if has_done else 0.0)
     ca_ok = last_c is not None and last_a is not None and last_c >= 0.70 and last_a >= 0.70
 
     # High tier only for protocol_ok. Gen without reflection prose is starved.
@@ -534,12 +538,10 @@ def compute_score(
         base, scale = 0.02, 0.03
         protocol_ok = 0
 
-    # Total uses only tool_call (binary gate) + VL-judge C/A.
-    # Brevity, format, reflection, tool_usage, and result are logged as
-    # metrics but excluded from the scalar reward — Qwen3.5 saturates them
-    # from step 1 and they add constant offset with zero gradient signal.
+    # Scalar: tool_call gate + VL C/A + closed-loop Done.
     total = base + scale * (
-        (w_tool_call * f_tool_call + w_correctness * f_correctness + w_aesthetics * f_aesthetics) / w_sum
+        (w_tool_call * f_tool_call + w_correctness * f_correctness + w_aesthetics * f_aesthetics + w_done * f_done)
+        / w_sum
     )
 
     result: dict[str, float | str | int | None] = {
@@ -552,6 +554,7 @@ def compute_score(
         "reward_result": float(f_result),
         "reward_correctness": f_correctness,
         "reward_aesthetics": f_aesthetics,
+        "reward_done": float(f_done),
         "num_hermes_tool_calls": int(len(calls)),
         "num_generate_image_prompts": int(len(prompts)),
         "num_judge_image_calls": int(n_reflect),

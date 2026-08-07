@@ -122,19 +122,48 @@ def _clamp_score(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _strip_fences(blob: str) -> str:
+    text = (blob or "").strip()
+    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    return text.strip()
+
+
+def _repair_json_fragment(blob: str) -> str:
+    """Close truncated JSON objects/arrays so partial VLM dumps can still parse."""
+    text = blob.strip()
+    if not text:
+        return text
+    # Drop a trailing incomplete key/value fragment after the last comma/brace.
+    text = re.sub(r",\s*(\"[^\"]*\"?\s*:?\s*)$", "", text)
+    text = re.sub(r",\s*$", "", text)
+    opens = text.count("{") - text.count("}")
+    opens_list = text.count("[") - text.count("]")
+    # Close strings left open by truncation.
+    if text.count('"') % 2 == 1:
+        text += '"'
+    text += "]" * max(0, opens_list)
+    text += "}" * max(0, opens)
+    return text
+
+
 def _json_objects(blob: str) -> list[dict[str, Any]]:
-    """Decode JSON objects from prose/fences, including nested objects."""
+    """Decode JSON objects from prose/fences, including truncated objects."""
+    cleaned = _strip_fences(blob)
     decoder = json.JSONDecoder()
     objects: list[dict[str, Any]] = []
-    for index, char in enumerate(blob):
+    for index, char in enumerate(cleaned):
         if char != "{":
             continue
-        try:
-            value, _ = decoder.raw_decode(blob[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            objects.append(value)
+        chunk = cleaned[index:]
+        for candidate in (chunk, _repair_json_fragment(chunk)):
+            try:
+                value, _ = decoder.raw_decode(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                objects.append(value)
+                break
     return objects
 
 
@@ -148,6 +177,9 @@ def _dimension_scores(
     raw = data.get(field)
     if isinstance(raw, dict):
         return {key: _clamp_score(raw.get(key), 0.0) for key in questions}
+    # Flat keys at top level (some models omit the nested objects).
+    if all(key in data for key in questions):
+        return {key: _clamp_score(data.get(key), 0.0) for key in questions}
     # Backward-compatible parsing for the old two-scalar response.
     if aggregate_field in data:
         scalar = _clamp_score(data.get(aggregate_field), 0.0)
@@ -155,9 +187,23 @@ def _dimension_scores(
     return None
 
 
+def _regex_dimension_scores(blob: str, questions: dict[str, str]) -> dict[str, float] | None:
+    scores: dict[str, float] = {}
+    for key in questions:
+        match = re.search(
+            rf'["\']?{re.escape(key)}["\']?\s*[:=]\s*([01](?:\.\d+)?)',
+            blob,
+            re.I,
+        )
+        if not match:
+            return None
+        scores[key] = _clamp_score(match.group(1))
+    return scores
+
+
 def _parse_scores(text: str) -> dict[str, Any]:
     """Extract ten rubric scores and aggregate correctness/aesthetics."""
-    blob = (text or "").strip()
+    blob = _strip_fences(text or "")
     for data in reversed(_json_objects(blob)):
         correctness_scores = _dimension_scores(
             data,
@@ -184,8 +230,26 @@ def _parse_scores(text: str) -> dict[str, Any]:
             "aesthetics_scores": aesthetics_scores,
             "findings": findings[:400],
             "suggested_fixes": fixes[:400],
+            "parse_ok": True,
         }
-    # Regex fallback if the model emitted bare numbers.
+
+    # Per-facet regex if JSON braces were mangled but keys survived.
+    c_scores = _regex_dimension_scores(blob, CORRECTNESS_QUESTIONS)
+    a_scores = _regex_dimension_scores(blob, AESTHETICS_QUESTIONS)
+    if c_scores and a_scores:
+        findings_m = re.search(r'findings["\']?\s*[:=]\s*["\']([^"\']+)', blob, re.I)
+        fixes_m = re.search(r'suggested_fixes["\']?\s*[:=]\s*["\']([^"\']+)', blob, re.I)
+        return {
+            "correctness": sum(c_scores.values()) / len(c_scores),
+            "aesthetics": sum(a_scores.values()) / len(a_scores),
+            "correctness_scores": c_scores,
+            "aesthetics_scores": a_scores,
+            "findings": (findings_m.group(1) if findings_m else blob[:200])[:400],
+            "suggested_fixes": (fixes_m.group(1) if fixes_m else "")[:400],
+            "parse_ok": True,
+        }
+
+    # Regex fallback if the model emitted bare aggregate numbers.
     c_m = re.search(r"correctness\s*[:=]\s*([01](?:\.\d+)?)", blob, re.I)
     a_m = re.search(r"aesthetics?\s*[:=]\s*([01](?:\.\d+)?)", blob, re.I)
     if c_m and a_m:
@@ -198,7 +262,9 @@ def _parse_scores(text: str) -> dict[str, Any]:
             "aesthetics_scores": {key: aesthetics for key in AESTHETICS_QUESTIONS},
             "findings": blob[:200],
             "suggested_fixes": "",
+            "parse_ok": True,
         }
+    logger.warning("VL score parse failed; raw[:240]=%r", blob[:240])
     return {
         "correctness": 0.4,
         "aesthetics": 0.4,
@@ -206,6 +272,7 @@ def _parse_scores(text: str) -> dict[str, Any]:
         "aesthetics_scores": {key: 0.4 for key in AESTHETICS_QUESTIONS},
         "findings": "vlm parse fallback; could not read structured scores",
         "suggested_fixes": "clearer subject match to user request; improve composition and lighting",
+        "parse_ok": False,
     }
 
 
@@ -253,15 +320,15 @@ def _judge(image: Image.Image, user_request: str, image_prompt: str, notes: str)
         "confirmed in the pixels, score the relevant dimension ≤0.40.\n"
         "- For complex user requests with 8+ distinct elements, the DEFAULT correctness "
         "score is 0.35 unless the image clearly shows ALL of them.\n"
-        '- List at least THREE specific flaws, missing elements, or defects in "findings". '
-        "If you cannot find three, look harder — there are always flaws in generated images.\n"
+        '- List at least TWO specific flaws, missing elements, or defects in "findings".\n'
         "- Every score ≥0.70 MUST be justified with pixel-level evidence for every "
         "sub-requirement in that dimension. If you hesitate, score ≤0.55.\n"
         "- The median score across all ten dimensions should be ≤0.55. "
         "A median above 0.60 means you are being too generous.\n"
         "- Generated images are ALWAYS flawed. Start from 0.40 and require evidence to go UP, "
         "not from 1.0 and deduct.\n"
-        "Return ONLY this JSON shape (replace every 0.0 with an independently judged score):\n"
+        "Return ONLY valid JSON (no markdown fences) in this shape "
+        "(replace every 0.0 with an independently judged score):\n"
         "{\n"
         '  "correctness_scores": {\n'
         f"{correctness_schema}\n"
@@ -269,7 +336,7 @@ def _judge(image: Image.Image, user_request: str, image_prompt: str, notes: str)
         '  "aesthetics_scores": {\n'
         f"{aesthetics_schema}\n"
         "  },\n"
-        '  "findings": "specific visual evidence for the lowest scores (at least three flaws)",\n'
+        '  "findings": "specific visual evidence for the lowest scores (two+ flaws)",\n'
         '  "suggested_fixes": "specific prompt rewrite hints"\n'
         "}\n"
     )
@@ -285,8 +352,10 @@ def _judge(image: Image.Image, user_request: str, image_prompt: str, notes: str)
     chat = _processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     inputs = _processor(text=[chat], images=[image], return_tensors="pt", padding=True)
     inputs = {k: v.to(_model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+    # 384 was truncating the ten-facet JSON → permanent parse-fallback 0.40/NO.
+    max_new = int(os.getenv("AGENTIC_REFLECT_MAX_NEW_TOKENS", "768"))
     with torch.inference_mode():
-        out_ids = _model.generate(**inputs, max_new_tokens=384, do_sample=False)
+        out_ids = _model.generate(**inputs, max_new_tokens=max_new, do_sample=False)
     # Strip prompt tokens.
     gen = out_ids[:, inputs["input_ids"].shape[-1] :]
     text = _processor.batch_decode(gen, skip_special_tokens=True)[0]
@@ -344,7 +413,8 @@ def reflect(request: ReflectRequest) -> ReflectResponse:
         fixes = fixes or "none"
     elapsed = time.perf_counter() - started
     logger.info(
-        "reflect ok=1 correctness=%.2f aesthetics=%.2f good_enough=%s latency=%.2fs",
+        "reflect ok=1 parse_ok=%s correctness=%.2f aesthetics=%.2f good_enough=%s latency=%.2fs",
+        bool(scores.get("parse_ok", True)),
         correctness,
         aesthetics,
         good_enough,

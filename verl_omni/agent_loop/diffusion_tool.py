@@ -42,6 +42,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from pathlib import Path
@@ -490,6 +491,11 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     Args:
         prompt: Complete text prompt for the diffusion model.
     """
+    # vLLM-omni (continuous batching) — preferred.
+    vllm_omni_url = os.getenv("AGENTIC_VLLM_OMNI_URL", "").strip()
+    if vllm_omni_url:
+        return _call_vllm_omni(prompt, vllm_omni_url)
+
     qwen_image_url = os.getenv("AGENTIC_QWEN_IMAGE_URL", "").strip()
     if qwen_image_url:
         return _call_generic_http(prompt, qwen_image_url, backend="qwen_image")
@@ -504,11 +510,70 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
         return _call_lance_omni(prompt, lance_url)
 
     logger.warning(
-        "AGENTIC_QWEN_IMAGE_URL / AGENTIC_DIFFUSION_TOOL_URL unset; "
+        "AGENTIC_QWEN_IMAGE_URL / AGENTIC_VLLM_OMNI_URL unset; "
         "using text-only stub diffusion tool (acceptance smoke only)"
     )
     text = f"[stub diffusion result] No image service is configured. The requested prompt was: {prompt}"
     return _pack_response(prompt, text, images=[], reward=0.0, backend="stub", tool_stubbed=True)
+
+
+def _call_vllm_omni(
+    prompt: str,
+    vllm_omni_url: str,
+) -> tuple[ToolResponse, float, dict]:
+    """Call vLLM-Omni's OpenAI-compatible image-generation endpoint."""
+    base = vllm_omni_url.rstrip("/")
+    height = int(os.getenv("QWEN_IMAGE_HEIGHT", "512"))
+    width = int(os.getenv("QWEN_IMAGE_WIDTH", "512"))
+    steps = int(os.getenv("QWEN_IMAGE_STEPS", "20"))
+    cfg = float(os.getenv("QWEN_IMAGE_TRUE_CFG_SCALE", "4.0"))
+    seed = os.getenv("QWEN_IMAGE_SEED")
+
+    payload: dict = {
+        "prompt": prompt,
+        "n": 1,
+        "size": f"{width}x{height}",
+        "response_format": "b64_json",
+        "num_inference_steps": steps,
+        "true_cfg_scale": cfg,
+    }
+    if seed is not None and seed != "":
+        payload["seed"] = int(seed)
+
+    headers = {"Content-Type": "application/json"}
+    token = os.getenv("AGENTIC_DIFFUSION_TOOL_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    timeout = float(os.getenv("AGENTIC_DIFFUSION_TOOL_TIMEOUT", "900"))
+    try:
+        req = Request(
+            f"{base}/v1/images/generations",
+            data=json.dumps(payload).encode(),
+            headers=headers,
+            method="POST",
+        )
+        with urlopen(req, timeout=timeout) as result:  # noqa: S310
+            data = json.loads(result.read().decode())
+    except Exception as exc:  # noqa: BLE001
+        err = f"vLLM-omni request failed: {exc}"
+        logger.error(err)
+        return _pack_response(prompt, err, images=[], reward=0.0, backend="vllm_omni_error", tool_stubbed=True)
+
+    images: list[Image.Image] = []
+    for item in data.get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        b64_data = item.get("b64_json")
+        if b64_data:
+            images.append(Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("RGB"))
+
+    if not images:
+        err = f"vLLM-omni returned no image for prompt={prompt!r}"
+        logger.error("%s", err)
+        return _pack_response(prompt, err, images=[], reward=0.0, backend="vllm_omni_empty", tool_stubbed=True)
+
+    text = "vLLM-Omni generated the requested image."
+    return _pack_response(prompt, text, images, 0.0, backend="vllm_omni", tool_stubbed=False)
 
 
 JUDGE_TOOL_SCHEMA = {
@@ -546,14 +611,250 @@ def _call_judge_vlm(
 ) -> tuple[str, dict]:
     """Call the frozen Qwen3-VL sidecar to judge the last generated image.
 
+    When ``AGENTIC_VLLM_URL`` is set, uses vLLM's OpenAI-compatible
+    ``/v1/chat/completions`` with continuous batching. Otherwise falls back
+    to the custom FastAPI ``/reflect`` endpoint.
+
     Returns ``(text, meta)`` where *text* is formatted for the agent to read
     and *meta* carries per-dimension scores for logging.
     """
+    vllm_url = os.getenv("AGENTIC_VLLM_URL", "").strip()
+    if vllm_url:
+        return _call_judge_vllm(user_request, image_prompt, vllm_url)
+    return _call_judge_custom(user_request, image_prompt)
+
+
+# ── vLLM judge path (OpenAI /v1/chat/completions, continuous batching) ──────
+
+# Rubric questions — keep in sync with qwen_vl_reflect_server.py.
+_JUDGE_CORRECTNESS_QUESTIONS = {
+    "subject_entities": "Are the requested primary subjects/entities visibly present and recognizable?",
+    "attributes": "Are requested attributes such as color, count, material, text, and identity correct?",
+    "relations_layout": "Are requested actions, spatial relations, and layout/composition constraints correct?",
+    "scene_context": "Does the environment, setting, style, and overall scene match the request?",
+    "completeness": "Is the request fully satisfied without missing requested details or contradictory extras?",
+}
+_JUDGE_AESTHETICS_QUESTIONS = {
+    "composition": "Is the composition balanced with a clear focal hierarchy and intentional framing?",
+    "lighting": "Are lighting, exposure, contrast, and depth visually effective?",
+    "color": "Are color harmony, saturation, and tonal relationships pleasing and coherent?",
+    "fidelity": "Is the image sharp and spatially coherent, without obvious generation artifacts or distortions?",
+    "appeal": "Does the image have strong overall visual appeal and professional finish?",
+}
+
+
+def _build_judge_prompt(user_request: str, image_prompt: str, notes: str = "") -> str:
+    """Build the VL judge prompt (same rubric as the custom FastAPI server)."""
+    c_schema = ",\n".join(f'    "{key}": 0.0' for key in _JUDGE_CORRECTNESS_QUESTIONS)
+    a_schema = ",\n".join(f'    "{key}": 0.0' for key in _JUDGE_AESTHETICS_QUESTIONS)
+    rubric = "\n".join(
+        [
+            "CORRECTNESS QUESTIONS:",
+            *[f"- {key}: {q}" for key, q in _JUDGE_CORRECTNESS_QUESTIONS.items()],
+            "AESTHETICS QUESTIONS:",
+            *[f"- {key}: {q}" for key, q in _JUDGE_AESTHETICS_QUESTIONS.items()],
+        ]
+    )
+    return (
+        "You are a strict, calibrated visual reward judge. Inspect the pixels, not merely the "
+        "diffusion prompt. Independently answer all ten rubric questions.\n"
+        f"User request: {user_request}\n"
+        f"Diffusion prompt used (context only; never treat it as visual evidence): {image_prompt or '(none)'}\n"
+        f"Notes: {notes or '(none)'}\n\n"
+        f"{rubric}\n\n"
+        "CALIBRATION (HARSH — default LOW):\n"
+        "  0.00 = absent, broken, or completely wrong\n"
+        "  0.20 = severely deficient, majority of requested elements missing or wrong\n"
+        "  0.40 = several elements present but at least half are wrong, blurry, or misplaced\n"
+        "  0.55 = mostly correct BUT one or two notable flaws (missing entity, wrong color, bad layout)\n"
+        "  0.70 = clearly good, all key elements present, minor aesthetic issues only\n"
+        "  0.85+ = near-flawless, every detail exactly as requested (RARELY given)\n"
+        "MANDATORY ANTI-INFLATION RULES:\n"
+        "- For EVERY distinct entity/attribute/detail from the user request NOT visibly "
+        "confirmed in the pixels, score the relevant dimension ≤0.40.\n"
+        "- For complex user requests with 8+ distinct elements, the DEFAULT correctness "
+        "score is 0.35 unless the image clearly shows ALL of them.\n"
+        '- List at least THREE specific flaws, missing elements, or defects in "findings". '
+        "If you cannot find three, look harder — there are always flaws in generated images.\n"
+        "- Every score ≥0.70 MUST be justified with pixel-level evidence for every "
+        "sub-requirement in that dimension. If you hesitate, score ≤0.55.\n"
+        "- The median score across all ten dimensions should be ≤0.55. "
+        "A median above 0.60 means you are being too generous.\n"
+        "- Generated images are ALWAYS flawed. Start from 0.40 and require evidence to go UP, "
+        "not from 1.0 and deduct.\n"
+        "Return ONLY this JSON shape (replace every 0.0 with an independently judged score):\n"
+        "{\n"
+        '  "correctness_scores": {\n'
+        f"{c_schema}\n"
+        "  },\n"
+        '  "aesthetics_scores": {\n'
+        f"{a_schema}\n"
+        "  },\n"
+        '  "findings": "specific visual evidence for the lowest scores (at least three flaws)",\n'
+        '  "suggested_fixes": "specific prompt rewrite hints"\n'
+        "}\n"
+    )
+
+
+def _parse_judge_json(text: str) -> dict | None:
+    """Extract correctness/aesthetics scores from vLLM judge text response."""
+    blob = (text or "").strip()
+    # Try to find JSON objects, preferring the outermost one.
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(blob):
+        if char != "{":
+            continue
+        try:
+            data, _ = decoder.raw_decode(blob[index:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        c_scores = data.get("correctness_scores")
+        a_scores = data.get("aesthetics_scores")
+        if not isinstance(c_scores, dict) or not isinstance(a_scores, dict):
+            # Fallback: treat top-level correctness/aesthetics scalars.
+            if "correctness" in data or "aesthetics" in data:
+                return data
+            continue
+        correctness = sum(float(v) for v in c_scores.values()) / max(1, len(c_scores))
+        aesthetics = sum(float(v) for v in a_scores.values()) / max(1, len(a_scores))
+        return {
+            "correctness": max(0.0, min(1.0, correctness)),
+            "aesthetics": max(0.0, min(1.0, aesthetics)),
+            "correctness_scores": {k: max(0.0, min(1.0, float(v))) for k, v in c_scores.items()},
+            "aesthetics_scores": {k: max(0.0, min(1.0, float(v))) for k, v in a_scores.items()},
+            "findings": str(data.get("findings") or ""),
+            "suggested_fixes": str(data.get("suggested_fixes") or ""),
+        }
+    return None
+
+
+def _call_judge_vllm(
+    user_request: str,
+    image_prompt: str,
+    vllm_url: str,
+) -> tuple[str, dict]:
+    """Judge via vLLM's OpenAI-compatible ``/v1/chat/completions``."""
+    image_path = resolve_tool_image_path(image_prompt=image_prompt)
+    if not image_path:
+        msg = (
+            "[judge error] no image on disk for this generate_image call "
+            f"(image_prompt={image_prompt[:120]!r}). "
+            "Refusing to call the VL sidecar without pixels."
+        )
+        logger.error("judge_image aborted: missing image path (prompt=%r)", image_prompt[:160])
+        return msg, {"error": "missing_image_path"}
+
+    try:
+        image_b64 = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+    except OSError as exc:
+        msg = f"[judge error] cannot read image at {image_path}: {exc}"
+        logger.error("%s", msg)
+        return msg, {"error": str(exc), "image_path": image_path}
+
+    prompt_text = _build_judge_prompt(user_request, image_prompt)
+    payload = {
+        "model": os.getenv("AGENTIC_VLLM_MODEL", "").strip() or "",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ],
+        "max_tokens": 512,
+        "temperature": 0.0,
+    }
+    if not payload["model"]:
+        del payload["model"]
+
+    timeout = float(os.getenv("AGENTIC_REFLECT_VLM_TIMEOUT", "120"))
+    try:
+        req = Request(
+            f"{vllm_url.rstrip('/')}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("vLLM judge call failed: %s", exc)
+        return (
+            f"[judge error] vLLM request failed ({exc}). "
+            "Inspect the attached image yourself and decide Done. or rewrite.",
+            {"error": str(exc), "image_path": image_path},
+        )
+
+    # vLLM response: choices[0].message.content
+    choices = data.get("choices") or []
+    raw_text = ""
+    if choices:
+        raw_text = str(choices[0].get("message", {}).get("content", "") or "")
+    if not raw_text:
+        return (
+            "[judge error] vLLM returned empty response — inspect the attached image yourself.",
+            {"error": "empty_response", "image_path": image_path},
+        )
+
+    parsed = _parse_judge_json(raw_text)
+    if parsed is None:
+        logger.warning("vLLM judge returned unparseable text: %.200s", raw_text)
+        return (
+            "[judge error] VLM returned unparseable response — inspect the attached image yourself.",
+            {"error": "unparseable", "raw": raw_text[:300], "image_path": image_path},
+        )
+
+    correctness = float(parsed.get("correctness", 0.0))
+    aesthetics = float(parsed.get("aesthetics", 0.0))
+    c_scores = parsed.get("correctness_scores") or {}
+    a_scores = parsed.get("aesthetics_scores") or {}
+    findings = str(parsed.get("findings") or "no specific findings")
+    fixes = str(parsed.get("suggested_fixes") or "none")
+
+    findings_short = re.sub(r"\s+", " ", findings).strip()[:220]
+    fixes_short = re.sub(r"\s+", " ", fixes).strip()[:160]
+    text = (
+        f"VL judge on the last generated image:\n"
+        f"  path={image_path}\n"
+        f"  correctness={correctness:.2f}\n"
+        f"  aesthetics ={aesthetics:.2f}\n"
+        f"  good_enough ={'YES' if correctness >= 0.70 and aesthetics >= 0.70 else 'NO'}\n"
+        f"  findings: {findings_short}\n"
+        f"  suggested_fixes: {fixes_short}\n"
+        f"  agentic_judge ok=1 stub=0 backend=vllm"
+    )
+
+    meta = {
+        "correctness": correctness,
+        "aesthetics": aesthetics,
+        "good_enough": correctness >= 0.70 and aesthetics >= 0.70,
+        "findings": findings,
+        "suggested_fixes": fixes,
+        "image_path": image_path,
+        "backend": "vllm",
+    }
+    meta.update({f"correctness_{k}": float(v) for k, v in c_scores.items() if isinstance(v, int | float)})
+    meta.update({f"aesthetics_{k}": float(v) for k, v in a_scores.items() if isinstance(v, int | float)})
+    return text, meta
+
+
+# ── Custom FastAPI fallback (original /reflect endpoint) ────────────────────
+
+
+def _call_judge_custom(
+    user_request: str,
+    image_prompt: str,
+) -> tuple[str, dict]:
+    """Fallback: call the custom FastAPI ``/reflect`` endpoint."""
     image_path = resolve_tool_image_path(image_prompt=image_prompt)
     endpoint = os.getenv("AGENTIC_REFLECT_VLM_URL", "").strip()
     if not endpoint:
         return (
-            "[judge stub] AGENTIC_REFLECT_VLM_URL unset — inspect the attached image yourself.",
+            "[judge stub] AGENTIC_REFLECT_VLM_URL / AGENTIC_VLLM_URL unset — inspect the attached image yourself.",
             {"stub": True},
         )
 
@@ -591,21 +892,11 @@ def _call_judge_vlm(
         with urlopen(req, timeout=timeout) as resp:  # noqa: S310
             data = json.loads(resp.read().decode())
     except Exception as exc:  # noqa: BLE001
-        detail = str(exc)
-        body = ""
-        try:
-            from urllib.error import HTTPError
-
-            if isinstance(exc, HTTPError) and exc.fp is not None:
-                body = exc.read().decode("utf-8", errors="replace")[:300]
-                detail = f"{exc} body={body!r}"
-        except Exception:  # noqa: BLE001
-            pass
-        logger.warning("judge VLM call failed: %s", detail)
+        logger.warning("judge VLM call failed: %s", exc)
         return (
-            f"[judge error] VL sidecar request failed ({detail}). "
+            f"[judge error] VL sidecar request failed ({exc}). "
             "Inspect the attached image yourself and decide Done. or rewrite.",
-            {"error": detail, "image_path": image_path},
+            {"error": str(exc), "image_path": image_path},
         )
 
     if not isinstance(data, dict):
@@ -621,24 +912,17 @@ def _call_judge_vlm(
     findings = str(data.get("findings") or "no specific findings")
     fixes = str(data.get("suggested_fixes") or "none")
     good = bool(data.get("good_enough", False))
-
-    c_parts = ", ".join(f"{k}={float(v):.2f}" for k, v in c_scores.items() if isinstance(v, int | float))
-    a_parts = ", ".join(f"{k}={float(v):.2f}" for k, v in a_scores.items() if isinstance(v, int | float))
+    findings_short = re.sub(r"\s+", " ", findings).strip()[:220]
+    fixes_short = re.sub(r"\s+", " ", fixes).strip()[:160]
     text = (
-        f"VL judge / reflection feedback on the last generated image:\n"
+        f"VL judge on the last generated image:\n"
         f"  path={image_path}\n"
-        f"  correctness={correctness:.2f}  ({c_parts})\n"
-        f"  aesthetics ={aesthetics:.2f}  ({a_parts})\n"
+        f"  correctness={correctness:.2f}\n"
+        f"  aesthetics ={aesthetics:.2f}\n"
         f"  good_enough ={'YES' if good else 'NO'}\n"
-        f"  findings: {findings}\n"
-        f"  suggested_fixes: {fixes}\n"
-        f"  agentic_judge ok=1 stub=0\n"
-        f"\n"
-        f"REQUIRED NEXT ACTION (same assistant turn after reading this): "
-        f'write "Reflection: <brief notes on the VL scores/findings>". '
-        f"If good_enough=YES, end with Done. "
-        f"If good_enough=NO, continue in the SAME message with a rewritten "
-        f"generate_image call that incorporates suggested_fixes."
+        f"  findings: {findings_short}\n"
+        f"  suggested_fixes: {fixes_short}\n"
+        f"  agentic_judge ok=1 stub=0 backend=custom"
     )
 
     meta = {
@@ -648,6 +932,7 @@ def _call_judge_vlm(
         "findings": findings,
         "suggested_fixes": fixes,
         "image_path": image_path,
+        "backend": "custom",
     }
     meta.update({f"correctness_{k}": float(v) for k, v in c_scores.items() if isinstance(v, int | float)})
     meta.update({f"aesthetics_{k}": float(v) for k, v in a_scores.items() if isinstance(v, int | float)})

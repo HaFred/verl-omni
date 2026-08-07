@@ -1,21 +1,22 @@
 #!/usr/bin/env bash
 # Qwen3.5 / Qwen3-VL Mode (2a) agentic GRPO overfit.
 #
-# The actor is a pretrained Hermes-capable VLM (default: Qwen3.5-2B via MODEL_PATH).
-# Frozen Qwen-Image returns pixels through generate_image; the actor self-reflects
-# on the attached image and either Done. or rewrite + generate_image again.
-# Frozen Qwen3-VL at AGENTIC_REFLECT_VLM_URL is the reward judge only (C/A).
+# The actor is a pretrained tool-calling VLM (default: Qwen3.5-2B via MODEL_PATH).
+# Frozen tools (vLLM-omni Qwen-Image + vLLM Qwen3-VL) serve generate_image and
+# judge_image with continuous batching. The agent follows the gen→judge→reflect
+# protocol: generate_image → judge_image(VL feedback) → Done / rewrite.
 #
 #   source ~/fred/fred_verlomni_agentic_multiturn_pr1.sh
 #   cd ~/fred/verlomni-pr-fredfork
-#   # pane A (GPUs not in CUDA_VISIBLE_DEVICES):
-#   CUDA_VISIBLE_DEVICES=0,1 QWEN_IMAGE_MEMORY_MODE=balanced \
+#   # pane A — vLLM-omni image gen server (GPUs 0,1):
+#   CUDA_VISIBLE_DEVICES=0,1 \
 #     bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
-#   # pane B (reflect VLM reward judge; keep AGENTIC_REFLECT_VLM_PATH on Qwen3-VL):
+#   # pane B — vLLM VL judge server (GPU 2):
 #   CUDA_VISIBLE_DEVICES=2 \
 #     bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh
-#   # pane C:
-#   TOTAL_STEPS=100 bash examples/agenticrpco_trainer/agent_llm/run_agentic_grpo.sh
+#   # pane C — training (GPUs 4-7):
+#   CUDA_VISIBLE_DEVICES=4,5,6,7 N_GPUS=4 TOTAL_STEPS=100 \
+#     bash examples/agenticrpco_trainer/agent_llm/run_agentic_grpo_lora.sh
 #
 # Short smokes (TOTAL_STEPS≤20) auto-enable GATE_SIDECAR=1: prints expected
 # behavior, watches rollout_trajectories during train, then writes
@@ -30,7 +31,7 @@ cd "${REPO_ROOT}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-2B}"
 TRAIN_FILE="${TRAIN_FILE:-${REPO_ROOT}/data/agentic/train.parquet}"
 VAL_FILE="${VAL_FILE:-${REPO_ROOT}/data/agentic/val.parquet}"
-N_GPUS="${N_GPUS:-2}"
+N_GPUS="${N_GPUS:-4}"
 TOTAL_STEPS="${TOTAL_STEPS:-100}"
 ROLLOUT_N="${ROLLOUT_N:-4}"
 OVERFIT_DATA="${OVERFIT_DATA:-1}"
@@ -77,12 +78,12 @@ rollout images: ${AGENTIC_DIFFUSION_IMAGE_DIR}
 rollout trajectories: ${E2E_RUN_DIR}/rollout_trajectories
 raw assistant rollouts (per step): ${E2E_RUN_DIR}/hermes_actions/step_XXXXXX.txt
 agent model: ${MODEL_PATH}
-Qwen-Image tool URL: ${AGENTIC_QWEN_IMAGE_URL:-<unset — generic/legacy fallback or stub>}
-reflect VLM URL: ${AGENTIC_REFLECT_VLM_URL:-<unset — heuristic fallback>}
-reflect VLM path: ${AGENTIC_REFLECT_VLM_PATH:-<defaults to MODEL_PATH / Qwen3-VL>}
+vLLM-omni image URL: ${AGENTIC_VLLM_OMNI_URL:-<unset>}  legacy: ${AGENTIC_QWEN_IMAGE_URL:-<unset>}
+vLLM judge URL:     ${AGENTIC_VLLM_URL:-<unset>}  legacy: ${AGENTIC_REFLECT_VLM_URL:-<unset>}
+judge model path:   ${AGENTIC_REFLECT_VLM_PATH:-<defaults to MODEL_PATH / Qwen3-VL>}
 attach generated pixels to VLM: ${AGENTIC_DIFFUSION_ATTACH_IMAGE}
 overfit gates: GATE_SIDECAR=${GATE_SIDECAR} (see overfit_gates.json)
-agent loop: stock verl tool_agent (no force/teacher implementation)
+agent loop: agentic_tool_agent (force Reflection after judge; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-3})
 EOF
 echo "[INFO] repo root=${REPO_ROOT}"
 echo "[INFO] wandb online experiment_name=${EXPERIMENT_NAME} (WANDB_SERVICE_TRANSPORT=${WANDB_SERVICE_TRANSPORT})"
@@ -91,38 +92,55 @@ echo "[INFO] e2e rollout images -> ${AGENTIC_DIFFUSION_IMAGE_DIR}"
 echo "[INFO] e2e full trajectories -> ${E2E_RUN_DIR}/rollout_trajectories"
 echo "[INFO] e2e raw assistant rollouts -> ${E2E_RUN_DIR}/hermes_actions/"
 export AGENTIC_FORCE_REFLECTION_AFTER_JUDGE="${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-1}"
-echo "[INFO] agent loop=agentic_tool_agent (forces Reflection: after successful judge_image; AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE})"
+export AGENTIC_MAX_GENERATE_IMAGE_PASSES="${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-3}"
+echo "[INFO] agent loop=agentic_tool_agent (force Reflection after judge; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES}; AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE})"
 echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
-echo "[INFO] reflect URL=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
+echo "[INFO] reflect judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} legacy=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
 python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --expect-only --total-steps "${TOTAL_STEPS}" --no-force
 if [[ "${AGENTIC_DIFFUSION_ATTACH_IMAGE}" != "1" ]]; then
   echo "[ERROR] This visual-reflection recipe requires AGENTIC_DIFFUSION_ATTACH_IMAGE=1." >&2
   exit 2
 fi
-if [[ -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" && -z "${AGENTIC_LANCE_SERVER_URL:-}" ]]; then
+if [[ -z "${AGENTIC_VLLM_OMNI_URL:-}" && -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" && -z "${AGENTIC_LANCE_SERVER_URL:-}" ]]; then
   echo "[ERROR] No frozen image service is configured; visual reflection cannot be trained on stubs." >&2
   echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh" >&2
   if [[ "${REQUIRE_REAL_IMAGE_TOOL}" == "1" ]]; then
     exit 2
   fi
 fi
-if [[ -z "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
-  echo "[ERROR] AGENTIC_REFLECT_VLM_URL is unset; reward C/A cannot hit the VLM sidecar." >&2
+if [[ -z "${AGENTIC_VLLM_URL:-}" && -z "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
+  echo "[ERROR] AGENTIC_VLLM_URL and AGENTIC_REFLECT_VLM_URL are both unset; judge_image has no backend." >&2
   echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh" >&2
   if [[ "${REQUIRE_REFLECT_VLM}" == "1" ]]; then
     exit 2
   fi
 fi
-if [[ -n "${AGENTIC_QWEN_IMAGE_URL:-}" ]]; then
+if [[ -n "${AGENTIC_VLLM_OMNI_URL:-}" ]]; then
+  python3 - "${AGENTIC_VLLM_OMNI_URL}" "${REQUIRE_REAL_IMAGE_TOOL}" <<'PY'
+import json, sys
+from urllib.request import urlopen, Request
+
+base = sys.argv[1].rstrip("/")
+required = sys.argv[2] == "1"
+try:
+    req = Request(f"{base}/health", method="GET")
+    with urlopen(req, timeout=5) as resp:  # noqa: S310
+        payload = json.loads(resp.read())
+    print(f"[INFO] vLLM-omni health OK: {payload}")
+except Exception as exc:
+    print(f"[ERROR] vLLM-omni health check failed at {base}/health: {exc}", file=sys.stderr)
+    if required:
+        raise SystemExit(2)
+PY
+elif [[ -n "${AGENTIC_QWEN_IMAGE_URL:-}" ]]; then
   python3 - "${AGENTIC_QWEN_IMAGE_URL}" "${REQUIRE_REAL_IMAGE_TOOL}" <<'PY'
-import json
-import sys
+import json, sys
 from urllib.request import urlopen
 
 endpoint, required = sys.argv[1], sys.argv[2] == "1"
 health = endpoint.rsplit("/", 1)[0] + "/health"
 try:
-    with urlopen(health, timeout=5) as response:  # noqa: S310 - operator-configured localhost service
+    with urlopen(health, timeout=5) as response:  # noqa: S310
         payload = json.loads(response.read())
     if not payload.get("ok"):
         raise RuntimeError(f"unhealthy response: {payload}")
@@ -133,14 +151,29 @@ except Exception as exc:
         raise SystemExit(2)
 PY
 fi
-if [[ -n "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
+if [[ -n "${AGENTIC_VLLM_URL:-}" ]]; then
+  python3 - "${AGENTIC_VLLM_URL}" "${REQUIRE_REFLECT_VLM}" <<'PY'
+import json, sys
+from urllib.request import urlopen, Request
+
+base = sys.argv[1].rstrip("/")
+required = sys.argv[2] == "1"
+try:
+    req = Request(f"{base}/health", method="GET")
+    with urlopen(req, timeout=5) as resp:  # noqa: S310
+        payload = json.loads(resp.read())
+    print(f"[INFO] vLLM judge health OK: {payload}")
+except Exception as exc:
+    print(f"[ERROR] vLLM judge health check failed at {base}/health: {exc}", file=sys.stderr)
+    if required:
+        raise SystemExit(2)
+PY
+elif [[ -n "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
   python3 - "${AGENTIC_REFLECT_VLM_URL}" "${REQUIRE_REFLECT_VLM}" <<'PY'
-import json
-import sys
+import json, sys
 from urllib.request import Request, urlopen
 
 endpoint, required = sys.argv[1], sys.argv[2] == "1"
-# Prefer /health when present; otherwise a tiny POST proves the route is up.
 health = endpoint.rsplit("/", 1)[0] + "/health"
 try:
     with urlopen(health, timeout=5) as response:  # noqa: S310
@@ -210,6 +243,8 @@ keys = [
     "WANDB_SILENT",
     "WANDB_DIR",
     "WANDB_PROJECT",
+    "AGENTIC_VLLM_OMNI_URL",
+    "AGENTIC_VLLM_URL",
     "AGENTIC_QWEN_IMAGE_URL",
     "AGENTIC_REFLECT_VLM_URL",
     "AGENTIC_REFLECT_VLM_PATH",
@@ -227,6 +262,9 @@ keys = [
     "AGENTIC_LANCE_SEED",
     "AGENTIC_LANCE_CFG_TEXT_SCALE",
     "AGENTIC_FORCE_REFLECTION_AFTER_JUDGE",
+    "AGENTIC_MAX_GENERATE_IMAGE_PASSES",
+    "AGENTIC_REFLECT_VLM_TIMEOUT",
+    "AGENTIC_REFLECT_MAX_NEW_TOKENS",
 ]
 base = {}
 try:
