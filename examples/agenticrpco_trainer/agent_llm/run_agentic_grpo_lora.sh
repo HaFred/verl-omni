@@ -122,11 +122,26 @@ from urllib.request import urlopen, Request
 
 base = sys.argv[1].rstrip("/")
 required = sys.argv[2] == "1"
-try:
-    req = Request(f"{base}/health", method="GET")
+
+def _get(path: str):
+    req = Request(f"{base}{path}", method="GET")
     with urlopen(req, timeout=5) as resp:  # noqa: S310
-        payload = json.loads(resp.read())
-    print(f"[INFO] vLLM-omni health OK: {payload}")
+        return resp.status, resp.read()
+
+try:
+    # vLLM-Omni /health is often HTTP 200 with an empty body.
+    status, body = _get("/health")
+    if status != 200:
+        raise RuntimeError(f"HTTP {status}")
+    if body.strip():
+        print(f"[INFO] vLLM-omni health OK: {json.loads(body)}")
+    else:
+        status, body = _get("/v1/models")
+        if status != 200:
+            raise RuntimeError(f"/health empty and /v1/models HTTP {status}")
+        models = json.loads(body) if body.strip() else {}
+        n = len(models.get("data") or [])
+        print(f"[INFO] vLLM-omni health OK (empty /health); /v1/models count={n}")
 except Exception as exc:
     print(f"[ERROR] vLLM-omni health check failed at {base}/health: {exc}", file=sys.stderr)
     if required:
@@ -158,11 +173,25 @@ from urllib.request import urlopen, Request
 
 base = sys.argv[1].rstrip("/")
 required = sys.argv[2] == "1"
-try:
-    req = Request(f"{base}/health", method="GET")
+
+def _get(path: str):
+    req = Request(f"{base}{path}", method="GET")
     with urlopen(req, timeout=5) as resp:  # noqa: S310
-        payload = json.loads(resp.read())
-    print(f"[INFO] vLLM judge health OK: {payload}")
+        return resp.status, resp.read()
+
+try:
+    status, body = _get("/health")
+    if status != 200:
+        raise RuntimeError(f"HTTP {status}")
+    if body.strip():
+        print(f"[INFO] vLLM judge health OK: {json.loads(body)}")
+    else:
+        status, body = _get("/v1/models")
+        if status != 200:
+            raise RuntimeError(f"/health empty and /v1/models HTTP {status}")
+        models = json.loads(body) if body.strip() else {}
+        n = len(models.get("data") or [])
+        print(f"[INFO] vLLM judge health OK (empty /health); /v1/models count={n}")
 except Exception as exc:
     print(f"[ERROR] vLLM judge health check failed at {base}/health: {exc}", file=sys.stderr)
     if required:
