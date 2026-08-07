@@ -58,6 +58,7 @@ from verl_omni.agent_loop.agentic_trajectory_context import (  # noqa: F401
     get_active_user_prompt,
     get_latest_tool_image_path,
     register_tool_artifact,
+    resolve_tool_image_path,
     set_active_call_provenance,
     set_active_trajectory_name,
     set_active_trajectory_relpath,
@@ -508,3 +509,172 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     )
     text = f"[stub diffusion result] No image service is configured. The requested prompt was: {prompt}"
     return _pack_response(prompt, text, images=[], reward=0.0, backend="stub", tool_stubbed=True)
+
+
+JUDGE_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "judge_image",
+        "description": (
+            "Call a frozen vision model to judge the LAST generated image. "
+            "Returns structured feedback: correctness/aesthetics scores per dimension, "
+            "specific findings, suggested prompt fixes, and a good_enough verdict. "
+            "Call this AFTER every generate_image — the VL feedback tells you whether "
+            "to finish (Done.) or rewrite and generate again."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "user_request": {
+                    "type": "string",
+                    "description": "The original user request/task for the vision model to compare against.",
+                },
+                "image_prompt": {
+                    "type": "string",
+                    "description": "The exact diffusion prompt used to generate the image being evaluated.",
+                },
+            },
+            "required": ["user_request", "image_prompt"],
+        },
+    },
+}
+
+
+def _call_judge_vlm(
+    user_request: str,
+    image_prompt: str,
+) -> tuple[str, dict]:
+    """Call the frozen Qwen3-VL sidecar to judge the last generated image.
+
+    Returns ``(text, meta)`` where *text* is formatted for the agent to read
+    and *meta* carries per-dimension scores for logging.
+    """
+    image_path = resolve_tool_image_path(image_prompt=image_prompt)
+    endpoint = os.getenv("AGENTIC_REFLECT_VLM_URL", "").strip()
+    if not endpoint:
+        return (
+            "[judge stub] AGENTIC_REFLECT_VLM_URL unset — inspect the attached image yourself.",
+            {"stub": True},
+        )
+
+    if not image_path:
+        msg = (
+            "[judge error] no image on disk for this generate_image call "
+            f"(image_prompt={image_prompt[:120]!r}). "
+            "Refusing to call the VL sidecar without pixels. "
+            "Rewrite/generate again only if a prior generate_image succeeded."
+        )
+        logger.error("judge_image aborted: missing image path (prompt=%r)", image_prompt[:160])
+        return msg, {"error": "missing_image_path"}
+
+    payload: dict = {
+        "user_request": user_request,
+        "image_prompt": image_prompt,
+        "notes": "",
+        "image_path": image_path,
+    }
+    try:
+        payload["image_base64"] = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+    except OSError as exc:
+        msg = f"[judge error] cannot read image at {image_path}: {exc}"
+        logger.error("%s", msg)
+        return msg, {"error": str(exc), "image_path": image_path}
+
+    timeout = float(os.getenv("AGENTIC_REFLECT_VLM_TIMEOUT", "120"))
+    try:
+        req = Request(
+            endpoint,
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            data = json.loads(resp.read().decode())
+    except Exception as exc:  # noqa: BLE001
+        detail = str(exc)
+        body = ""
+        try:
+            from urllib.error import HTTPError
+
+            if isinstance(exc, HTTPError) and exc.fp is not None:
+                body = exc.read().decode("utf-8", errors="replace")[:300]
+                detail = f"{exc} body={body!r}"
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning("judge VLM call failed: %s", detail)
+        return (
+            f"[judge error] VL sidecar request failed ({detail}). "
+            "Inspect the attached image yourself and decide Done. or rewrite.",
+            {"error": detail, "image_path": image_path},
+        )
+
+    if not isinstance(data, dict):
+        return (
+            "[judge error] VLM returned unexpected response — inspect the attached image yourself.",
+            {"error": "not a dict", "image_path": image_path},
+        )
+
+    correctness = float(data.get("correctness", 0.0))
+    aesthetics = float(data.get("aesthetics", 0.0))
+    c_scores = data.get("correctness_scores") or {}
+    a_scores = data.get("aesthetics_scores") or {}
+    findings = str(data.get("findings") or "no specific findings")
+    fixes = str(data.get("suggested_fixes") or "none")
+    good = bool(data.get("good_enough", False))
+
+    c_parts = ", ".join(f"{k}={float(v):.2f}" for k, v in c_scores.items() if isinstance(v, int | float))
+    a_parts = ", ".join(f"{k}={float(v):.2f}" for k, v in a_scores.items() if isinstance(v, int | float))
+    text = (
+        f"VL judge / reflection feedback on the last generated image:\n"
+        f"  path={image_path}\n"
+        f"  correctness={correctness:.2f}  ({c_parts})\n"
+        f"  aesthetics ={aesthetics:.2f}  ({a_parts})\n"
+        f"  good_enough ={'YES' if good else 'NO'}\n"
+        f"  findings: {findings}\n"
+        f"  suggested_fixes: {fixes}\n"
+        f"  agentic_judge ok=1 stub=0\n"
+        f"\n"
+        f"REQUIRED NEXT ACTION (same assistant turn after reading this): "
+        f'write "Reflection: <brief notes on the VL scores/findings>". '
+        f"If good_enough=YES, end with Done. "
+        f"If good_enough=NO, continue in the SAME message with a rewritten "
+        f"generate_image call that incorporates suggested_fixes."
+    )
+
+    meta = {
+        "correctness": correctness,
+        "aesthetics": aesthetics,
+        "good_enough": good,
+        "findings": findings,
+        "suggested_fixes": fixes,
+        "image_path": image_path,
+    }
+    meta.update({f"correctness_{k}": float(v) for k, v in c_scores.items() if isinstance(v, int | float)})
+    meta.update({f"aesthetics_{k}": float(v) for k, v in a_scores.items() if isinstance(v, int | float)})
+    return text, meta
+
+
+@function_tool("judge_image", schema=JUDGE_TOOL_SCHEMA)
+def judge_image(user_request: str, image_prompt: str) -> tuple[ToolResponse, float, dict]:
+    """Call frozen Qwen3-VL to judge the last generated image in-turn.
+
+    Args:
+        user_request: Original user task for the vision model to compare against.
+        image_prompt: The diffusion prompt used to generate the image being judged.
+    """
+    text, meta = _call_judge_vlm(user_request, image_prompt)
+    metrics = {
+        "tool": "judge_image",
+        "judge_stub": meta.get("stub", False),
+        "judge_error": meta.get("error", ""),
+    }
+    for key in (
+        "correctness",
+        "aesthetics",
+        "good_enough",
+        "findings",
+        "suggested_fixes",
+    ):
+        if key in meta:
+            metrics[f"judge_{key}"] = meta[key]
+    return ToolResponse(text=text), 0.0, metrics

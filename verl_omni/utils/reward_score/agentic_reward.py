@@ -18,9 +18,10 @@ Protocol (gated):
   actor writes a short reflection, then either ``Done.`` OR rewrite +
   ``generate_image`` in the **same** assistant turn.
 
-Frozen Qwen3-VL at ``AGENTIC_REFLECT_VLM_URL`` is used **only** as the reward
-judge for ``reward_correctness`` / ``reward_aesthetics`` (and per-dimension
-rubric fields). It is not an agent tool.
+Frozen Qwen3-VL at ``AGENTIC_REFLECT_VLM_URL`` serves dual role: (1) in-turn
+``judge_image`` agent tool (structured VL feedback the agent reads before
+deciding Done / rewrite), and (2) reward judge for ``reward_correctness`` /
+``reward_aesthetics`` at score time.
 
 ``reward_reflection`` scores **agent prose** after generate (visual attributes /
 rewrite / Done) — not frozen-tool markers.
@@ -100,12 +101,11 @@ _VISUAL_ATTR_LEX = {
     "richer",
     "match",
     "matches",
-    "apple",
-    "red",
-    "cabin",
-    "sunset",
-    "snowy",
-    "mountains",
+    "visible",
+    "missing",
+    "present",
+    "figure",
+    "figures",
     "rewrite",
     "rewritten",
     "reflection",
@@ -320,12 +320,19 @@ def _score_format(text: str, calls: list[tuple[int, int, dict[str, Any]]]) -> fl
     if not calls:
         return 0.0
     valid = 0
+    gen_calls = 0
     for _, _, call in calls:
         name = str(call.get("name", "")).lower()
         args = _call_args(call)
-        if name == "generate_image" and "prompt" in args and str(args.get("prompt") or "").strip():
-            valid += 1
-    score = valid / max(1, len(calls))
+        if name == "generate_image":
+            gen_calls += 1
+            if "prompt" in args and str(args.get("prompt") or "").strip():
+                valid += 1
+        elif name == "judge_image":
+            # judge_image is always well-formed (user_request + image_prompt);
+            # don't penalize it in the format denominator.
+            pass
+    score = valid / max(1, gen_calls) if gen_calls else 0.0
     if _BARE_JSON.search(text or ""):
         score *= 0.5
     return float(min(1.0, score))
@@ -432,8 +439,9 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
         "reward_aesthetics": 0.0,
         "num_hermes_tool_calls": 0,
         "num_generate_image_prompts": 0,
-        "num_reflect_image_calls": 0,
+        "num_judge_image_calls": 0,
         "protocol_ok": 0,
+        "rollout_valid": 0,
         "method": method,
     }
     result.update({f"reward_correctness_{key}": 0.0 for key in _CORRECTNESS_DIMENSIONS})
@@ -460,17 +468,20 @@ def compute_score(
     calls = _extract_tool_calls(blob)
     prompts = _gen_image_prompts(calls)
     names = _ordered_tool_names(calls)
-    # Legacy metric: reflect_image is no longer an agent tool.
-    n_reflect = sum(1 for n in names if n == "reflect_image")
+    # Count judge_image tool calls alongside generate_image calls.
+    n_reflect = sum(1 for n in names if n == "judge_image")
     f_tool_call = 1.0 if calls else 0.0
     f_brevity = _score_brevity(blob)
 
     if not prompts:
-        out = _zero_result(method="agentic_hermes_tool_calls")
+        # No generate_image → invalid rollout for GRPO (masked out of the update).
+        out = _zero_result(method="agentic_no_generate")
         out["reward_tool_call"] = float(f_tool_call)
         out["reward_brevity"] = float(f_brevity)
         out["num_hermes_tool_calls"] = int(len(calls))
-        out["num_reflect_image_calls"] = int(n_reflect)
+        out["num_judge_image_calls"] = int(n_reflect)
+        out["rollout_valid"] = 0
+        out["score"] = 0.0
         return out
 
     user_request = _user_request_from_gt(gt, extra_info)
@@ -490,37 +501,12 @@ def compute_score(
         last_aesthetics=last_a,
     )
 
-    w_tool_call = float(extra_info.get("w_tool_call", gt.get("w_tool_call", 0.05)))
-    w_brevity = float(extra_info.get("w_brevity", gt.get("w_brevity", 0.05)))
-    w_format = float(extra_info.get("w_format", gt.get("w_format", 0.05)))
-    w_reflect = float(extra_info.get("w_reflect", gt.get("w_reflect", 0.10)))
-    w_tool = float(extra_info.get("w_tool", gt.get("w_tool", 0.10)))
-    w_result = float(extra_info.get("w_result", gt.get("w_result", 0.05)))
-    w_correctness = float(extra_info.get("w_correctness", gt.get("w_correctness", 0.30)))
-    w_aesthetics = float(extra_info.get("w_aesthetics", gt.get("w_aesthetics", 0.30)))
-    w_sum = w_tool_call + w_brevity + w_format + w_reflect + w_tool + w_result + w_correctness + w_aesthetics
+    w_tool_call = float(extra_info.get("w_tool_call", gt.get("w_tool_call", 0.10)))
+    w_correctness = float(extra_info.get("w_correctness", gt.get("w_correctness", 0.45)))
+    w_aesthetics = float(extra_info.get("w_aesthetics", gt.get("w_aesthetics", 0.45)))
+    w_sum = w_tool_call + w_correctness + w_aesthetics
     if w_sum <= 0:
-        (
-            w_tool_call,
-            w_brevity,
-            w_format,
-            w_reflect,
-            w_tool,
-            w_result,
-            w_correctness,
-            w_aesthetics,
-            w_sum,
-        ) = (
-            0.05,
-            0.05,
-            0.05,
-            0.10,
-            0.10,
-            0.05,
-            0.30,
-            0.30,
-            1.0,
-        )
+        w_tool_call, w_correctness, w_aesthetics, w_sum = 0.10, 0.45, 0.45, 1.0
 
     prose = _assistant_prose(blob)
     has_refl = _has_agent_reflection_prose(prose)
@@ -548,18 +534,12 @@ def compute_score(
         base, scale = 0.02, 0.03
         protocol_ok = 0
 
+    # Total uses only tool_call (binary gate) + VL-judge C/A.
+    # Brevity, format, reflection, tool_usage, and result are logged as
+    # metrics but excluded from the scalar reward — Qwen3.5 saturates them
+    # from step 1 and they add constant offset with zero gradient signal.
     total = base + scale * (
-        (
-            w_tool_call * f_tool_call
-            + w_brevity * f_brevity
-            + w_format * f_format
-            + w_reflect * f_reflect
-            + w_tool * f_tool
-            + w_result * f_result
-            + w_correctness * f_correctness
-            + w_aesthetics * f_aesthetics
-        )
-        / w_sum
+        (w_tool_call * f_tool_call + w_correctness * f_correctness + w_aesthetics * f_aesthetics) / w_sum
     )
 
     result: dict[str, float | str | int | None] = {
@@ -574,8 +554,9 @@ def compute_score(
         "reward_aesthetics": f_aesthetics,
         "num_hermes_tool_calls": int(len(calls)),
         "num_generate_image_prompts": int(len(prompts)),
-        "num_reflect_image_calls": int(n_reflect),
+        "num_judge_image_calls": int(n_reflect),
         "protocol_ok": int(protocol_ok),
+        "rollout_valid": 1,
         "method": "agentic_hermes_tool_calls",
     }
     result.update(

@@ -99,6 +99,9 @@ def register_tool_artifact(
         "backend": backend,
         "tool_stubbed": bool(tool_stubbed),
         "claimed": False,
+        # Thread id helps judge_image resolve the right PNG when several
+        # same-prompt rollouts interleave in one process (overfit GRPO).
+        "thread_id": threading.get_ident(),
     }
     with _artifact_registry_lock:
         _artifact_registry.append(entry)
@@ -144,20 +147,87 @@ def clear_tool_artifact_registry() -> None:
     with _artifact_registry_lock:
         _artifact_registry.clear()
     set_latest_tool_image_path(None)
+    _latest_tool_image_tls.path = None
 
 
 _latest_tool_image_path: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentic_latest_tool_image_path", default=None
 )
+# Stock ToolAgentLoop often drops ContextVars across tool calls; thread-local
+# survives same-thread generate → judge. Prefer resolve_tool_image_path().
+_latest_tool_image_tls = threading.local()
 
 
 def set_latest_tool_image_path(path: str | None) -> contextvars.Token:
-    """Remember the most recent generate_image PNG for reflect_image."""
+    """Remember the most recent generate_image PNG for judge_image."""
+    _latest_tool_image_tls.path = path
     return _latest_tool_image_path.set(path)
 
 
 def get_latest_tool_image_path() -> str | None:
-    return _latest_tool_image_path.get()
+    path = _latest_tool_image_path.get()
+    if path:
+        return path
+    return getattr(_latest_tool_image_tls, "path", None)
+
+
+def _first_existing_png(paths: list[str] | None) -> str | None:
+    for path in paths or []:
+        text = str(path)
+        if text.endswith(".png") and Path(text).is_file():
+            return text
+    return None
+
+
+def _normalize_prompt(text: str | None) -> str:
+    """Collapse whitespace/punctuation drift between generate and judge args."""
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _prompts_match(a: str | None, b: str | None) -> bool:
+    na, nb = _normalize_prompt(a), _normalize_prompt(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    # Agent often lightly rewrites commas/wording when echoing image_prompt.
+    return na[:96] == nb[:96] or na in nb or nb in na
+
+
+def resolve_tool_image_path(*, image_prompt: str | None = None) -> str | None:
+    """Resolve the PNG that ``judge_image`` should score.
+
+    Order:
+      1. ContextVar / thread-local set by the last ``generate_image`` on this thread
+      2. Artifact registry: same thread + fuzzy-matching ``image_prompt``
+      3. Artifact registry: same thread (most recent) — covers prompt wording drift
+      4. Artifact registry: fuzzy-matching ``image_prompt`` (most recent, any thread)
+    """
+    direct = get_latest_tool_image_path()
+    if direct and Path(direct).is_file():
+        return direct
+
+    want = image_prompt or ""
+    tid = threading.get_ident()
+    prompt_any_thread: str | None = None
+    same_thread_any: str | None = None
+    with _artifact_registry_lock:
+        for entry in reversed(_artifact_registry):
+            png = _first_existing_png(entry.get("paths"))
+            if not png:
+                continue
+            same_thread = entry.get("thread_id") == tid
+            same_prompt = _prompts_match(entry.get("prompt"), want)
+            if same_thread and same_prompt:
+                return png
+            if same_thread and same_thread_any is None:
+                same_thread_any = png
+            if same_prompt and prompt_any_thread is None:
+                prompt_any_thread = png
+    # Prefer same-thread recent over cross-thread prompt match (overfit concurrency).
+    if same_thread_any:
+        return same_thread_any
+    return prompt_any_thread
 
 
 # Back-compat aliases used by earlier smoke tests.

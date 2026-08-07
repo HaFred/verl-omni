@@ -63,15 +63,16 @@ REWARD_ARTIFACT_FIELDS = (
     *REWARD_COMPONENTS,
     "num_hermes_tool_calls",
     "num_generate_image_prompts",
-    "num_reflect_image_calls",
+    "num_judge_image_calls",
     "protocol_ok",
+    "rollout_valid",
 )
 _TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*(?:\{.*?\"name\"\s*:\s*\"[^\"]+\".*?\}|"
     r"<function=[^>\s]+\s*>.*?</function>)\s*</tool_call>",
     re.IGNORECASE | re.DOTALL,
 )
-_EXECUTED_TOOL_RESPONSE_RE = re.compile(r"\bagentic_(?:tool|reflect)\s+ok=[01]\b", re.IGNORECASE)
+_EXECUTED_TOOL_RESPONSE_RE = re.compile(r"\bagentic_(?:tool|reflect|judge)\s+ok=[01]\b", re.IGNORECASE)
 _TOOL_ARTIFACT_PATH_RE = re.compile(r"\bpath=([^\s<>]+)")
 _HERMES_PROMPT_RE = re.compile(
     r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
@@ -83,6 +84,37 @@ _QWEN_XML_PROMPT_RE = re.compile(
     r"</function>\s*</tool_call>",
     re.IGNORECASE | re.DOTALL,
 )
+_JUDGE_CALL_RE = re.compile(r"<function=judge_image\b|\"name\"\s*:\s*\"judge_image\"", re.IGNORECASE)
+_GEN_CALL_RE = re.compile(r"<function=generate_image\b|\"name\"\s*:\s*\"generate_image\"", re.IGNORECASE)
+_AGENT_REFLECTION_RE = re.compile(r"\bReflection\s*:", re.IGNORECASE)
+_VL_JUDGE_OBS_RE = re.compile(r"\b(?:VL judge|agentic_judge)\b", re.IGNORECASE)
+_FORCED_REFLECTION_RE = re.compile(r"\bagentic_forced_reflection=1\b", re.IGNORECASE)
+
+
+def _turn_kind(decode: str, turn_prompt: str) -> str:
+    """Label turns so trajectory dumps make protocol stages grep-able."""
+    if _JUDGE_CALL_RE.search(decode or ""):
+        return "call_judge_image"
+    if _GEN_CALL_RE.search(decode or ""):
+        # Forced Reflection (mask=0) precedes this rewrite in ``turn_prompt``.
+        if _FORCED_REFLECTION_RE.search(turn_prompt or ""):
+            return "forced_reflection_rewrite"
+        return "call_generate_image"
+    if _FORCED_REFLECTION_RE.search(decode or ""):
+        if re.search(r"\bDone\.", decode or ""):
+            return "forced_reflection_done"
+        return "forced_reflection_rewrite"
+    if _AGENT_REFLECTION_RE.search(decode or ""):
+        if _GEN_CALL_RE.search(decode or ""):
+            return "agent_reflection_rewrite"
+        return "agent_reflection_done"
+    if _VL_JUDGE_OBS_RE.search(turn_prompt or ""):
+        if _FORCED_REFLECTION_RE.search(turn_prompt or ""):
+            return "forced_reflection_rewrite"
+        return "after_judge_feedback"
+    if "path=" in (turn_prompt or "") and "agentic_tool" in (turn_prompt or ""):
+        return "after_generate_image"
+    return "other"
 
 
 def _extract_generate_image_prompts(decoded_response: str) -> list[str]:
@@ -145,8 +177,9 @@ def _artifact_reward_metrics(output: Any, index: int) -> dict[str, float | int]:
     integer_fields = {
         "num_hermes_tool_calls",
         "num_generate_image_prompts",
-        "num_reflect_image_calls",
+        "num_judge_image_calls",
         "protocol_ok",
+        "rollout_valid",
     }
     for key in REWARD_ARTIFACT_FIELDS:
         values = output.non_tensor_batch.get(key)
@@ -428,8 +461,11 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 )
                 for turn in rollout_turns:
                     t = int(turn["turn"])
-                    header = f"  turn={t} decode_has_tool_call={turn['decode_has_tool_call']}"
                     turn_prompt = turn.get("turn_prompt") or ""
+                    decode = turn.get("decode") or ""
+                    kind = _turn_kind(decode, turn_prompt)
+                    turn["turn_kind"] = kind
+                    header = f"  turn={t} kind={kind} decode_has_tool_call={turn['decode_has_tool_call']}"
                     trajectory_text.extend(
                         [
                             header,
@@ -446,20 +482,29 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                             "    decode:",
                         ]
                     )
-                    decode_lines = turn["decode"].splitlines() or [""]
+                    decode_lines = decode.splitlines() or [""]
                     trajectory_text.extend(f"      {line}" for line in decode_lines)
                     step_text.extend(f"      {line}" for line in decode_lines)
                     after = turn.get("tool_response_after") or ""
                     if after:
+                        after_kind = (
+                            "forced_reflection_done"
+                            if _FORCED_REFLECTION_RE.search(after)
+                            else "judge_feedback"
+                            if _VL_JUDGE_OBS_RE.search(after)
+                            else "image_obs"
+                            if "agentic_tool" in after
+                            else "tool_response"
+                        )
                         trajectory_text.extend(
                             [
-                                f"    turn_{t}_tool_response:",
+                                f"    turn_{t}_tool_response ({after_kind}):",
                                 *[f"      {line}" for line in after.splitlines() or [""]],
                             ]
                         )
                         step_text.extend(
                             [
-                                f"    turn_{t}_tool_response:",
+                                f"    turn_{t}_tool_response ({after_kind}):",
                                 *[f"      {line}" for line in after.splitlines() or [""]],
                             ]
                         )
@@ -487,6 +532,7 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
     def generate_sequences(self, prompts):
         step = prompts.meta_info.get("global_steps")
         output = super().generate_sequences(prompts)
+        self._discard_invalid_rollouts(output)
         self._dump_raw_rollouts(prompts, output, step)
         metrics = aggregate_agentic_reward_metrics(output.non_tensor_batch)
         if metrics:
@@ -500,3 +546,42 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 # Logging must never fail or alter rollout generation.
                 logger.warning("Failed to log agentic reward metrics to W&B: %s", exc)
         return output
+
+    @staticmethod
+    def _discard_invalid_rollouts(output: Any) -> None:
+        """Drop no-``generate_image`` rollouts from the policy update.
+
+        Sets ``response_mask`` to 0 so GRPO/PPO give them no gradient. Their
+        scalar reward is already 0 with ``rollout_valid=0`` from
+        ``agentic_reward``; they can still slightly affect the GRPO group mean,
+        which is acceptable (penalizes skip-gen relative to siblings).
+        """
+        valid = output.non_tensor_batch.get("rollout_valid")
+        n_gen = output.non_tensor_batch.get("num_generate_image_prompts")
+        response_mask = output.batch.get("response_mask")
+        if response_mask is None:
+            return
+        n = int(response_mask.shape[0])
+        dropped = 0
+        for i in range(n):
+            is_valid = True
+            if valid is not None:
+                try:
+                    is_valid = int(np.asarray(valid[i]).reshape(-1)[0]) == 1
+                except (TypeError, ValueError, IndexError):
+                    is_valid = True
+            elif n_gen is not None:
+                try:
+                    is_valid = int(np.asarray(n_gen[i]).reshape(-1)[0]) >= 1
+                except (TypeError, ValueError, IndexError):
+                    is_valid = True
+            if is_valid:
+                continue
+            response_mask[i].zero_()
+            dropped += 1
+        if dropped:
+            logger.info(
+                "Discarded %d/%d rollouts with no generate_image (response_mask=0, rollout_valid=0)",
+                dropped,
+                n,
+            )

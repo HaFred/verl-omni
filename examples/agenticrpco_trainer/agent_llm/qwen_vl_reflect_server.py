@@ -15,7 +15,7 @@
 """Frozen Qwen3-VL reflect sidecar: correctness + aesthetics vs user request.
 
 Loads the Instruct VL weights once at process start and keeps them resident.
-``reflect_image`` in the agent loop calls ``POST /reflect``.
+``judge_image`` in the agent loop calls ``POST /reflect``.
 """
 
 from __future__ import annotations
@@ -241,9 +241,26 @@ def _judge(image: Image.Image, user_request: str, image_prompt: str, notes: str)
         f"Diffusion prompt used (context only; never treat it as visual evidence): {image_prompt or '(none)'}\n"
         f"Notes: {notes or '(none)'}\n\n"
         f"{rubric}\n\n"
-        "CALIBRATION: 0.0=absent/broken, 0.25=major failure, 0.5=mixed/uncertain, "
-        "0.75=clearly good with flaws, 1.0=exceptional and unambiguous. Do not default to "
-        "0.9+. Use the full range. If pixels do not prove a requested detail, score it down.\n"
+        "CALIBRATION (HARSH — default LOW):\n"
+        "  0.00 = absent, broken, or completely wrong\n"
+        "  0.20 = severely deficient, majority of requested elements missing or wrong\n"
+        "  0.40 = several elements present but at least half are wrong, blurry, or misplaced\n"
+        "  0.55 = mostly correct BUT one or two notable flaws (missing entity, wrong color, bad layout)\n"
+        "  0.70 = clearly good, all key elements present, minor aesthetic issues only\n"
+        "  0.85+ = near-flawless, every detail exactly as requested (RARELY given)\n"
+        "MANDATORY ANTI-INFLATION RULES:\n"
+        "- For EVERY distinct entity/attribute/detail from the user request NOT visibly "
+        "confirmed in the pixels, score the relevant dimension ≤0.40.\n"
+        "- For complex user requests with 8+ distinct elements, the DEFAULT correctness "
+        "score is 0.35 unless the image clearly shows ALL of them.\n"
+        '- List at least THREE specific flaws, missing elements, or defects in "findings". '
+        "If you cannot find three, look harder — there are always flaws in generated images.\n"
+        "- Every score ≥0.70 MUST be justified with pixel-level evidence for every "
+        "sub-requirement in that dimension. If you hesitate, score ≤0.55.\n"
+        "- The median score across all ten dimensions should be ≤0.55. "
+        "A median above 0.60 means you are being too generous.\n"
+        "- Generated images are ALWAYS flawed. Start from 0.40 and require evidence to go UP, "
+        "not from 1.0 and deduct.\n"
         "Return ONLY this JSON shape (replace every 0.0 with an independently judged score):\n"
         "{\n"
         '  "correctness_scores": {\n'
@@ -252,7 +269,7 @@ def _judge(image: Image.Image, user_request: str, image_prompt: str, notes: str)
         '  "aesthetics_scores": {\n'
         f"{aesthetics_schema}\n"
         "  },\n"
-        '  "findings": "specific visual evidence for the lowest scores",\n'
+        '  "findings": "specific visual evidence for the lowest scores (at least three flaws)",\n'
         '  "suggested_fixes": "specific prompt rewrite hints"\n'
         "}\n"
     )

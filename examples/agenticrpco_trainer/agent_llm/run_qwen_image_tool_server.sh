@@ -13,6 +13,10 @@
 #   CUDA_VISIBLE_DEVICES=0 QWEN_IMAGE_MEMORY_MODE=sequential_offload \
 #     bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
 #
+# Co-locate with VL reflect server on one H800 (80 GB) — model_offload is the default:
+#   CUDA_VISIBLE_DEVICES=0 QWEN_IMAGE_MEMORY_MODE=model_offload \
+#     bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
+#
 # Quantized MMDiT (requires bitsandbytes):
 #   QWEN_IMAGE_MEMORY_MODE=mmdit_nf4
 set -euo pipefail

@@ -14,7 +14,9 @@
 """HTTP client for the frozen Qwen3-VL reflect sidecar (reward judge only).
 
 Used by ``agentic_reward`` for ``reward_correctness`` / ``reward_aesthetics``.
-The actor no longer calls a ``reflect_image`` tool during rollout.
+The actor calls ``judge_image`` tool (in ``diffusion_tool.py``) during rollout;
+this client is also used by ``agentic_reward`` for ``reward_correctness`` /
+``reward_aesthetics`` at score time.
 """
 
 from __future__ import annotations

@@ -4,31 +4,33 @@ Last updated: 08/06/2026
 
 Training recipes for **Mode (2a) Agentic LLM RL** ([#302](https://github.com/verl-project/verl-omni/issues/302)).
 
-- **Qwen3-VL Mode (2a) GRPO** (`agent_llm/`): train `Qwen/Qwen3-VL-2B-Instruct`
-  (Thinking is optional; Instruct is preferred for short tool-first decodes).
+- **Mode (2a) GRPO** (`agent_llm/`): train `Qwen/Qwen3.5`.
 - Frozen **Qwen-Image** is the external `generate_image` tool (`:8092`).
-- Frozen **Qwen3-VL** sidecar (`:8093`) is the **reward judge only** for
-  `reward_correctness` / `reward_aesthetics` (not an agent tool).
+- Frozen **Qwen3-VL** sidecar (`:8093`) serves dual role: (1) in-turn
+  `judge_image` tool called by the agent after every generation, and (2)
+  `reward_correctness` / `reward_aesthetics` scorer at reward time.
 - Reward: `pkg://verl_omni.utils.reward_score.agentic_reward` — parseable
-  `<tool_call>` protocol (Hermes JSON **or** Qwen3.5 XML) with actor
-  self-reflection + `Done.` (or rewrite + `generate_image`) gating.
+  `<tool_call>` protocol (Hermes JSON **or** Qwen3.5 XML) with VL-grounded
+  reflection + `Done.` (or rewrite for the next turn) gating.
 - Actor wire format is auto-selected from `MODEL_PATH`:
   - **Qwen3-VL** → `multi_turn.format=hermes` + Hermes JSON fewshots
   - **Qwen3.5** → `multi_turn.format=qwen3_coder` + XML fewshots
   Override with `TOOL_PARSER_FORMAT` / `--tool_call_format`.
 
-Target protocol (fewshot + on-policy):
+Target protocol (fewshot + on-policy) — see **Multi-turn Behaviors** diagrams:
 
 ```
-generate_image → (image obs attached)
-  actor writes brief reflection, then either:
-    Done.                                    OR
-    rewrite + generate_image  (same assistant turn)
+Turn k:
+  generate_image(prompt_k) → image_k
+  judge_image(user_request, prompt_k) → VL feedback        ┐ same logical turn
+  agent reads VL output, reflects, then decides:            ┘
+    "Reflection: … Done."                                OR
+    "Reflection: …" + rewritten generate_image(prompt_{k+1}) → Turn k+1 input
 ```
 
-Fewshot demos in `create_dummy_agentic_data.py` follow that order for all three
-classes (1-pass / 2-pass / 3-pass). They are **GRPO exploration examples**, not
-supervised targets. Regenerate parquet when switching actor family so fewshot
+Fewshot demos in `create_dummy_agentic_data.py` should follow that order for all
+three classes (1-pass / 2-pass / 3-pass). They are **GRPO exploration examples**,
+not supervised targets. Regenerate parquet when switching actor family so fewshot
 `<tool_call>` syntax matches the chat template.
 
 ## Reward components
@@ -36,18 +38,96 @@ supervised targets. Regenerate parquet when switching actor family so fewshot
 `compute_score` returns a scalar `score` plus per-component fields logged to
 WandB as `agentic_reward/<name>/mean` (via `agentic_metrics_manager.py`).
 
+
+## Multi-turn Behaviors (three turns max)
+
+**Target contract**:
+
+1. Every logical turn starts with `generate_image(prompt_k)`.
+2. In the **same** logical turn, after the image returns:
+   - agent calls `judge_image(user_request, prompt_k)` → frozen Qwen3-VL (`:8093`) returns structured feedback;
+   - agent reads that VL output, reflects, then either **`Done.`** or a **rewritten `generate_image`**.
+3. The next turn’s **input** is that reflection / rewrite (not a bare image `tool_response`).
+4. Branching stops at 1 / 2 / 3 turns based on the agent’s verdict (max 3 gens).
+
+### One logical turn (generate → judge → reflect & decide)
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant In as Turn input
+  participant A as Agent LLM
+  participant G as Qwen-Image :8092
+  participant V as Qwen3-VL :8093
+
+  Note over In,A: Turn k input =<br/>user task (k=1) OR prior reflection/rewrite (k>1)
+  In->>A: prompt_k context
+  A->>G: generate_image(prompt_k)
+  G-->>A: image_k + tool obs (path=…)
+  A->>V: judge_image(user_request, prompt_k)
+  V-->>A: scores / findings / suggested_fixes / good_enough
+  A->>A: read VL feedback, then reflect & decide
+  alt Verdict: good enough
+    A-->>In: Reflection: … Done.
+    Note over A: Stop — no turn k+1
+  else Verdict: needs rewrite
+    A-->>In: Reflection: … + rewritten prompt_{k+1}
+    Note over A: Turn k+1 input := this reflection/rewrite
+  end
+```
+
+### Branching: 1-pass / 2-pass / 3-pass (max)
+
+```mermaid
+flowchart TD
+  T1_in["Turn 1 input: user task"] --> T1_gen["Turn 1: generate_image(prompt_1)"]
+  T1_gen --> T1_vl["Turn 1 same: VL judge image_1"]
+  T1_vl --> T1_agent["Turn 1 same: agent reflects on VL"]
+  T1_agent -->|Done| Stop1["Stop — 1-pass success"]
+  T1_agent -->|rewrite prompt_2| T2_in["Turn 2 input: Turn-1 reflection/rewrite"]
+
+  T2_in --> T2_gen["Turn 2: generate_image(prompt_2)"]
+  T2_gen --> T2_vl["Turn 2 same: VL judge image_2"]
+  T2_vl --> T2_agent["Turn 2 same: agent reflects on VL"]
+  T2_agent -->|Done| Stop2["Stop — 2-pass refine"]
+  T2_agent -->|rewrite prompt_3| T3_in["Turn 3 input: Turn-2 reflection/rewrite"]
+
+  T3_in --> T3_gen["Turn 3: generate_image(prompt_3)"]
+  T3_gen --> T3_vl["Turn 3 same: VL judge image_3"]
+  T3_vl --> T3_agent["Turn 3 same: agent reflects on VL"]
+  T3_agent -->|Done or force stop| Stop3["Stop — 3-pass max"]
+```
+
+### What “turn input” must carry
+
+| Logical turn | Input to agent decode that emits `generate_image` | Same-turn after image |
+| --- | --- | --- |
+| 1 | User task (+ system / fewshot) | VL judge(`image_1`) → agent `Done.` **or** rewrite `prompt_2` |
+| 2 | **Turn-1 reflection results** (VL summary + agent rewrite), not only the raw image obs | VL judge(`image_2`) → `Done.` **or** rewrite `prompt_3` |
+| 3 | **Turn-2 reflection results** | VL judge(`image_3`) → `Done.` (cap) |
+
+### Current rollout behavior
+
+Each logical turn now follows the contract above:
+
+- Turn k: `generate_image(prompt_k)` → `judge_image(user_request, prompt_k)` → agent reads VL feedback, reflects, then either `Done.` or rewrite + `generate_image(prompt_{k+1})`.
+- Turn k+1 input is the agent's reflection/rewrite from turn k (not a bare image `tool_response`).
+
+Verify that rollout trajectories show `judge_image` tool calls between each
+`generate_image` and the agent's `Reflection: …` decision text.
+
 ### Primary fields (enter the weighted mix)
 
 | Field | Default weight | Physical meaning | Zero when |
 | --- | ---: | --- | --- |
-| `reward_tool_call` | 0.05 | Binary: trajectory contains ≥1 parseable JSON/XML `<tool_call>`. | No parseable tool call |
-| `reward_brevity` | 0.05 | Short assistant prose only (tool calls + tool obs stripped). | Long rambling / debate CoT |
-| `reward_format` | 0.05 | Fraction of calls with valid required arguments. | No / malformed calls |
-| `reward_reflection` | 0.10 | Quality of actor self-reflection prose (visual attrs / rewrite / Done). | No reflection prose after generate |
-| `reward_tool_usage` | 0.10 | Protocol shape and distinct rewritten prompts. | No `generate_image` |
-| `reward_result` | 0.05 | Closed-loop outcome quality. | No `generate_image` |
-| `reward_correctness` | 0.30 | Frozen-VL correctness via `AGENTIC_REFLECT_VLM_URL` on last image. | URL unset / VL call fails |
-| `reward_aesthetics` | 0.30 | Frozen-VL aesthetics via `AGENTIC_REFLECT_VLM_URL` on last image. | URL unset / VL call fails |
+| `reward_tool_call` | 0.10 | Binary: trajectory contains ≥1 parseable `<tool_call>`. **In scalar.** | No parseable tool call |
+| `reward_brevity` | — | Short assistant prose (≤4 sentences / ≤280 chars). **Metric only.** | Long rambling / debate CoT |
+| `reward_format` | — | Fraction of `generate_image` calls with valid arguments. **Metric only.** | No / malformed calls |
+| `reward_reflection` | — | Quality of agent self-reflection prose. **Metric only.** | No reflection prose |
+| `reward_tool_usage` | — | Protocol shape and distinct rewritten prompts. **Metric only.** | No `generate_image` |
+| `reward_result` | — | Closed-loop outcome quality. **Metric only.** | No `generate_image` |
+| `reward_correctness` | 0.45 | Frozen-VL correctness via `AGENTIC_REFLECT_VLM_URL` on last image. **In scalar.** | URL unset / VL call fails |
+| `reward_aesthetics` | 0.45 | Frozen-VL aesthetics via `AGENTIC_REFLECT_VLM_URL` on last image. **In scalar.** | URL unset / VL call fails |
 
 Weighted mix (then scaled by a protocol tier `base + scale * mix`):
 
@@ -64,8 +144,9 @@ score = base + scale * mix
 | Gen-only (starved) | ≥1 `generate_image`, **no** reflection prose | 0.02 | 0.03 | 0 |
 
 Weights are stored per row in parquet `ground_truth` / `extra_info` (`w_tool_call`,
-`w_brevity`, `w_format`, `w_reflect`, `w_tool`, `w_result`, `w_correctness`,
-`w_aesthetics`).
+`w_correctness`, `w_aesthetics`). Brevity, format, reflection, tool_usage, and
+result are logged as metrics but excluded from the scalar reward (saturated from
+step 1).
 
 ### Visual rubric diagnostics
 
@@ -76,7 +157,7 @@ Weights are stored per row in parquet `ground_truth` / `extra_info` (`w_tool_cal
 | `protocol_ok` | 1 iff closed loop (reflection + Done, single or distinct rewrite) |
 | `num_hermes_tool_calls` | Legacy field name: count of parseable JSON/XML `<tool_call>` blocks |
 | `num_generate_image_prompts` | Count of `generate_image` prompts |
-| `num_reflect_image_calls` | Legacy (always 0; `reflect_image` is no longer an agent tool) |
+| `num_judge_image_calls` | Count of `judge_image` tool calls in the trajectory |
 
 ## Prerequisites
 
@@ -114,7 +195,7 @@ CUDA_VISIBLE_DEVICES=0,1 \
 # trainer: export AGENTIC_QWEN_IMAGE_URL=http://127.0.0.1:8092/generate
 ```
 
-Pane B — reflect VLM (reward judge only; not an agent tool):
+Pane B — judge VLM sidecar (agent `judge_image` tool + reward scorer):
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 \
@@ -127,7 +208,7 @@ scores stay stuck at ~0.95/0.92 without `correctness_scores` fields, the old
 single-score process is still running.
 
 If C/A rewards stay at 0, check that `AGENTIC_REFLECT_VLM_URL` is set and the
-sidecar is healthy — the actor no longer calls a reflect tool during rollout.
+sidecar is healthy — the actor calls `judge_image` after every `generate_image`.
 
 Memory modes for Qwen-Image:
 

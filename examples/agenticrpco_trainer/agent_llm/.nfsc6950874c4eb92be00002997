@@ -46,6 +46,7 @@ export AGENTIC_E2E_RUN_NAME="${AGENTIC_E2E_RUN_NAME:-$EXPERIMENT_NAME}"
 export AGENTIC_DIFFUSION_IMAGE_DIR="${AGENTIC_DIFFUSION_IMAGE_DIR:-$E2E_RUN_DIR/rollout_images}"
 # Actor is vision-capable: return generated pixels for self-reflection.
 export AGENTIC_DIFFUSION_ATTACH_IMAGE="${AGENTIC_DIFFUSION_ATTACH_IMAGE:-1}"
+export AGENTIC_REFLECT_VLM_TIMEOUT=300
 REQUIRE_REAL_IMAGE_TOOL="${REQUIRE_REAL_IMAGE_TOOL:-1}"
 REQUIRE_REFLECT_VLM="${REQUIRE_REFLECT_VLM:-1}"
 GATE_SCRIPT="${GATE_SCRIPT:-$SCRIPT_DIR/check_overfit_gates.py}"
@@ -89,7 +90,8 @@ echo "[INFO] ckpt dir=${CKPT_DIR}"
 echo "[INFO] e2e rollout images -> ${AGENTIC_DIFFUSION_IMAGE_DIR}"
 echo "[INFO] e2e full trajectories -> ${E2E_RUN_DIR}/rollout_trajectories"
 echo "[INFO] e2e raw assistant rollouts -> ${E2E_RUN_DIR}/hermes_actions/"
-echo "[INFO] agent loop=stock tool_agent; no force/teacher implementation is loaded"
+export AGENTIC_FORCE_REFLECTION_AFTER_JUDGE="${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-1}"
+echo "[INFO] agent loop=agentic_tool_agent (forces Reflection: after successful judge_image; AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE})"
 echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
 echo "[INFO] reflect URL=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
 python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --expect-only --total-steps "${TOTAL_STEPS}" --no-force
@@ -224,6 +226,7 @@ keys = [
     "AGENTIC_LANCE_STEPS",
     "AGENTIC_LANCE_SEED",
     "AGENTIC_LANCE_CFG_TEXT_SCALE",
+    "AGENTIC_FORCE_REFLECTION_AFTER_JUDGE",
 ]
 base = {}
 try:
@@ -378,10 +381,14 @@ fi
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.12}"
 echo "[INFO] rollout.gpu_memory_utilization=${GPU_MEM_UTIL}"
 
-# Leave room for two generated images, two tool calls, reflection, and a final turn.
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-4096}"
-MAX_RESP_LEN="${MAX_RESP_LEN:-2048}"
-MAX_MODEL_LEN=$((MAX_PROMPT_LEN + MAX_RESP_LEN))
+# Context budget for all-3-class overfit fewshot (gen→judge→decide ≈6–7k toks)
+# plus live user turn / chat template / tool schemas. Override via env if needed.
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-8192}"
+MAX_RESP_LEN="${MAX_RESP_LEN:-4096}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LEN + MAX_RESP_LEN))}"
+# 3-pass protocol needs ~7 assistant msgs (gen/judge/rewrite…); leave margin.
+MAX_ASSISTANT_TURNS="${MAX_ASSISTANT_TURNS:-12}"
+MAX_USER_TURNS="${MAX_USER_TURNS:-12}"
 
 if [[ "${GATE_SIDECAR}" == "1" ]]; then
   echo "[GATE] starting watch sidecar -> ${E2E_RUN_DIR}/gate_watch.log"
@@ -440,12 +447,12 @@ python3 -m verl.trainer.main_ppo \
   "+actor_rollout_ref.rollout.engine_kwargs.vllm.gdn_prefill_backend=${GDN_PREFILL_BACKEND}" \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.rollout.multi_turn.enable=true \
-  actor_rollout_ref.rollout.multi_turn.max_assistant_turns=8 \
-  actor_rollout_ref.rollout.multi_turn.max_user_turns=8 \
+  "actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${MAX_ASSISTANT_TURNS}" \
+  "actor_rollout_ref.rollout.multi_turn.max_user_turns=${MAX_USER_TURNS}" \
   actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2048 \
   "actor_rollout_ref.rollout.multi_turn.format=${TOOL_PARSER_FORMAT}" \
   actor_rollout_ref.rollout.multi_turn.function_tool_path=verl_omni/agent_loop/diffusion_tool.py \
-  actor_rollout_ref.rollout.agent.default_agent_loop=tool_agent \
+  actor_rollout_ref.rollout.agent.default_agent_loop=agentic_tool_agent \
   +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.agentic_metrics_manager.AgenticMetricsAgentLoopManager \
   actor_rollout_ref.rollout.agent.num_workers=2 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
