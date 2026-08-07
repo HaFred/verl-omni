@@ -34,7 +34,7 @@ import os
 import re
 from typing import Any
 
-from verl.experimental.agent_loop.agent_loop import register
+from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 
 logger = logging.getLogger(__name__)
@@ -150,7 +150,17 @@ def build_forced_reflection(
 class AgenticToolAgentLoop(ToolAgentLoop):
     """Stock tool agent + forced Reflection after successful ``judge_image``."""
 
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        # Always emit these keys so DataProto.concat across workers does not
+        # drop/truncate sparse extra_fields (keys taken only from the first worker).
+        output = await super().run(sampling_params, **kwargs)
+        output.extra_fields.setdefault("forced_reflection", False)
+        output.extra_fields.setdefault("force_stop_max_passes", False)
+        return output
+
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
+        agent_data.extra_fields.setdefault("forced_reflection", False)
+        agent_data.extra_fields.setdefault("force_stop_max_passes", False)
         state = await super()._handle_processing_tools_state(agent_data)
         if not _force_enabled():
             return state
@@ -199,8 +209,9 @@ class AgenticToolAgentLoop(ToolAgentLoop):
             agent_data.response_logprobs += [0.0] * len(response_ids)
         agent_data.assistant_turns += 1
         agent_data.extra_fields["forced_reflection"] = True
-        if done and "agentic_force_stop_max_passes=1" in reflection_text:
-            agent_data.extra_fields["force_stop_max_passes"] = True
+        agent_data.extra_fields["force_stop_max_passes"] = bool(
+            done and "agentic_force_stop_max_passes=1" in reflection_text
+        )
         logger.info(
             "Forced Reflection after judge_image (done=%s, chars=%d)",
             done,

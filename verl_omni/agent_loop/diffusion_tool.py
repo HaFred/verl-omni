@@ -699,6 +699,10 @@ def _build_judge_prompt(user_request: str, image_prompt: str, notes: str = "") -
 def _parse_judge_json(text: str) -> dict | None:
     """Extract correctness/aesthetics scores from vLLM judge text response."""
     blob = (text or "").strip()
+    # Drop thinking blocks / markdown fences that Qwen3-VL often wraps around JSON.
+    blob = re.sub(r"<think>[\s\S]*?</think>", " ", blob, flags=re.IGNORECASE)
+    blob = re.sub(r"```(?:json)?\s*", "", blob, flags=re.IGNORECASE).replace("```", "")
+    blob = blob.strip()
     # Try to find JSON objects, preferring the outermost one.
     decoder = json.JSONDecoder()
     for index, char in enumerate(blob):
@@ -726,6 +730,18 @@ def _parse_judge_json(text: str) -> dict | None:
             "aesthetics_scores": {k: max(0.0, min(1.0, float(v))) for k, v in a_scores.items()},
             "findings": str(data.get("findings") or ""),
             "suggested_fixes": str(data.get("suggested_fixes") or ""),
+        }
+    # Last resort: regex for aggregate scalars if JSON is truncated.
+    c_m = re.search(r'"?correctness"?\s*[:=]\s*([0-9]*\.?[0-9]+)', blob, re.IGNORECASE)
+    a_m = re.search(r'"?aesthetics"?\s*[:=]\s*([0-9]*\.?[0-9]+)', blob, re.IGNORECASE)
+    if c_m or a_m:
+        return {
+            "correctness": float(c_m.group(1)) if c_m else 0.0,
+            "aesthetics": float(a_m.group(1)) if a_m else 0.0,
+            "correctness_scores": {},
+            "aesthetics_scores": {},
+            "findings": "parsed from truncated VLM text",
+            "suggested_fixes": "none",
         }
     return None
 
@@ -765,7 +781,7 @@ def _call_judge_vllm(
                 ],
             }
         ],
-        "max_tokens": 512,
+        "max_tokens": int(os.getenv("AGENTIC_REFLECT_MAX_NEW_TOKENS", "768")),
         "temperature": 0.0,
     }
     if not payload["model"]:
