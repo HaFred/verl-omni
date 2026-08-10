@@ -98,7 +98,6 @@ class TestStockToolAgentWiring:
         monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
         monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
         monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
-        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
         monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
         response, reward, metrics = generate_image("a blue hat")
         assert response.image is None
@@ -121,7 +120,6 @@ class TestStockToolAgentWiring:
         monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
         monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
         monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
-        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
         monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
         set_good_enough_yes_reached(True)
         response, reward, metrics = generate_image("should not run diffusion")
@@ -147,7 +145,6 @@ class TestStockToolAgentWiring:
         monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
         monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
         monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
-        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
         monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
 
         set_active_trajectory_relpath("step_000001/sample_0.00")
@@ -202,10 +199,11 @@ class TestStockToolAgentWiring:
         clear_tool_artifact_registry()
 
     def test_good_enough_yes_latch_is_isolated_across_asyncio_tasks(self, monkeypatch, tmp_path):
-        """Concurrent gather rollouts must not share the YES latch via TLS."""
+        """Concurrent gather rollouts must not share the YES latch via TLS/thread."""
         from verl_omni.agent_loop.agentic_trajectory_context import (
             clear_good_enough_yes_reached,
             get_good_enough_yes_reached,
+            set_active_trajectory_relpath,
             set_good_enough_yes_reached,
         )
 
@@ -213,10 +211,10 @@ class TestStockToolAgentWiring:
         monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
         monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
         monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
-        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
         monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
 
         async def yes_then_block():
+            set_active_trajectory_relpath("step_000001/sample_0.00")
             clear_good_enough_yes_reached()
             set_good_enough_yes_reached(True)
             await asyncio.sleep(0)
@@ -224,8 +222,9 @@ class TestStockToolAgentWiring:
             return metrics.get("blocked_after_yes", 0), get_good_enough_yes_reached()
 
         async def clear_then_allow():
-            # Start after sibling has set YES; our clear must not be overwritten by TLS.
+            # Sibling set YES on another rollout_id; our clear must stay isolated.
             await asyncio.sleep(0)
+            set_active_trajectory_relpath("step_000001/sample_0.01")
             clear_good_enough_yes_reached()
             assert get_good_enough_yes_reached() is False
             response, _, metrics = generate_image("allowed in fresh task")
@@ -238,6 +237,42 @@ class TestStockToolAgentWiring:
         assert blocked == (1, True)
         assert allowed[0] == 0
         assert allowed[1] == "stub"
+
+    def test_good_enough_yes_latch_isolated_across_shared_worker_thread(self, monkeypatch, tmp_path):
+        """Tool threads share a pool — YES must key by rollout_id, not thread id."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        from verl_omni.agent_loop.agentic_trajectory_context import (
+            clear_good_enough_yes_reached,
+            set_active_trajectory_relpath,
+            set_good_enough_yes_reached,
+        )
+
+        monkeypatch.setenv("AGENTIC_BLOCK_GENERATE_AFTER_YES", "1")
+        monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
+        monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
+
+        def yes_on_rollout_a():
+            set_active_trajectory_relpath("step_000002/sample_1.00")
+            clear_good_enough_yes_reached()
+            set_good_enough_yes_reached(True)
+            _, _, metrics = generate_image("should block")
+            return metrics.get("blocked_after_yes", 0)
+
+        def fresh_rollout_b():
+            set_active_trajectory_relpath("step_000002/sample_1.01")
+            clear_good_enough_yes_reached()
+            _, _, metrics = generate_image("should allow stub")
+            return metrics.get("blocked_after_yes", 0), metrics.get("diffusion_backend")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            # Same worker thread runs A then B sequentially (shared thread id).
+            blocked = pool.submit(yes_on_rollout_a).result()
+            allowed = pool.submit(fresh_rollout_b).result()
+        assert blocked == 1
+        assert allowed == (0, "stub")
 
     def test_qwen_image_backend_has_priority(self, monkeypatch):
         import verl_omni.agent_loop.diffusion_tool as module

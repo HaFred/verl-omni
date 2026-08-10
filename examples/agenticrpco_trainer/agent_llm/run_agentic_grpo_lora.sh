@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Qwen3.5 / Qwen3-VL Mode (2a) agentic GRPO overfit.
+# Agentic GRPO overfit.
 #
 # The actor is a pretrained tool-calling VLM (default: Qwen3.5-2B via MODEL_PATH).
 # Frozen tools (vLLM-omni Qwen-Image + vLLM Qwen3-VL) serve generate_image and
@@ -98,7 +98,6 @@ mkdir -p "$AGENTIC_DIFFUSION_IMAGE_DIR" "$E2E_RUN_DIR" "$WANDB_DIR"
 
 # Fixed diffusion seed for overfit visual stability (override to empty to randomize).
 export QWEN_IMAGE_SEED="${QWEN_IMAGE_SEED:-42}"
-export AGENTIC_LANCE_SEED="${AGENTIC_LANCE_SEED:-${QWEN_IMAGE_SEED}}"
 # Judge parse reliability (retry once by default; higher max tokens).
 export AGENTIC_JUDGE_PARSE_RETRIES="${AGENTIC_JUDGE_PARSE_RETRIES:-1}"
 export AGENTIC_REFLECT_MAX_NEW_TOKENS="${AGENTIC_REFLECT_MAX_NEW_TOKENS:-1024}"
@@ -156,7 +155,7 @@ fi
 echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
 echo "[INFO] reflect judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} legacy=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
 python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --expect-only --total-steps "${TOTAL_STEPS}" --no-force
-if [[ -z "${AGENTIC_VLLM_OMNI_URL:-}" && -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" && -z "${AGENTIC_LANCE_SERVER_URL:-}" ]]; then
+if [[ -z "${AGENTIC_VLLM_OMNI_URL:-}" && -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" ]]; then
   echo "[ERROR] No frozen image service is configured; visual reflection cannot be trained on stubs." >&2
   echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh" >&2
   if [[ "${REQUIRE_REAL_IMAGE_TOOL}" == "1" ]]; then
@@ -333,18 +332,12 @@ keys = [
     "AGENTIC_QWEN_IMAGE_URL",
     "AGENTIC_REFLECT_VLM_URL",
     "AGENTIC_REFLECT_VLM_PATH",
-    "AGENTIC_LANCE_SERVER_URL",
     "AGENTIC_DIFFUSION_TOOL_URL",
     "AGENTIC_DIFFUSION_TOOL_TOKEN",
     "AGENTIC_DIFFUSION_TOOL_TIMEOUT",
     "AGENTIC_DIFFUSION_IMAGE_DIR",
     "AGENTIC_E2E_ROOT",
     "AGENTIC_E2E_RUN_NAME",
-    "AGENTIC_LANCE_HEIGHT",
-    "AGENTIC_LANCE_WIDTH",
-    "AGENTIC_LANCE_STEPS",
-    "AGENTIC_LANCE_SEED",
-    "AGENTIC_LANCE_CFG_TEXT_SCALE",
     "AGENTIC_FORCE_REFLECTION_AFTER_JUDGE",
     "AGENTIC_MAX_GENERATE_IMAGE_PASSES",
     "AGENTIC_FORCE_FIRST_GENERATE",
@@ -504,7 +497,7 @@ PPO_EPOCHS="${PPO_EPOCHS:-2}"
 echo "[INFO] actor.optim.lr=${ACTOR_LR} weight_decay=${ACTOR_WD} ppo_epochs=${PPO_EPOCHS} rollout.temperature=${ROLLOUT_TEMPERATURE}"
 
 TRAIN_RC=0
-# Mode (2a): optimize only Qwen3-VL language projections; ViT stays pretrained.
+# Optimize only Qwen3-VL language projections; ViT stays pretrained.
 # layered_summon=false: FSDP LoRA leaf wraps + Qwen3-VL nesting produce names like
 # ...lora_A.default._fsdp_wrapped_module.weight that vLLM rejects. Full summon is fine at 2B.
 set +e

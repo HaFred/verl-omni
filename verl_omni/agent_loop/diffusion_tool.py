@@ -22,12 +22,12 @@ and then writes ``Reflection:`` / ``Done.`` or a rewritten ``generate_image``.
 
 
 Backends (first match wins):
-  1. ``AGENTIC_QWEN_IMAGE_URL`` — bundled Qwen-Image HTTP service
+  1. ``AGENTIC_VLLM_OMNI_URL`` — vLLM-Omni OpenAI image generations
+     (``/v1/images/generations``).
+  2. ``AGENTIC_QWEN_IMAGE_URL`` — bundled Qwen-Image HTTP service
      (POST ``{"prompt"}`` → base64 image JSON).
-  2. ``AGENTIC_DIFFUSION_TOOL_URL`` — generic service with the same response
+  3. ``AGENTIC_DIFFUSION_TOOL_URL`` — generic service with the same response
      contract.
-  3. ``AGENTIC_LANCE_SERVER_URL`` — legacy OpenAI-compatible Lance Omni serve
-     (``/v1/chat/completions``, ``modalities=["image"]``).
   4. Else text-only stub (acceptance smoke when no gen service is up).
 
 Observation modality is always text: PNGs are written under the rollout image
@@ -411,80 +411,6 @@ def _call_generic_http(
     return _pack_response(prompt, text, images, reward, backend=backend, tool_stubbed=False)
 
 
-def _call_lance_omni(prompt: str, server_url: str) -> tuple[ToolResponse, float, dict]:
-    """Call vLLM-Omni Lance OpenAI-compatible ``/v1/chat/completions`` (text2img)."""
-    base = server_url.rstrip("/")
-    height = int(os.getenv("AGENTIC_LANCE_HEIGHT", "512"))
-    width = int(os.getenv("AGENTIC_LANCE_WIDTH", "512"))
-    steps = int(os.getenv("AGENTIC_LANCE_STEPS", "30"))
-    seed = os.getenv("AGENTIC_LANCE_SEED")
-    # Default cfg_text_scale=1.0: vllm-omni Lance mRoPE + CFG batching
-    # (torch.cat of (3,S) pids → (6,S)) crashes with "tensor a (3) vs b (6)".
-    # Pass via extra_args (LancePipeline is not in model_extras registry, so
-    # top-level cfg_text_scale is silently dropped).
-    cfg_text_scale = float(os.getenv("AGENTIC_LANCE_CFG_TEXT_SCALE", "1.0"))
-    payload: dict = {
-        "messages": [
-            {
-                "role": "user",
-                # Match vLLM-Omni Lance online client formatting.
-                "content": [{"type": "text", "text": f"<|im_start|>{prompt}<|im_end|>"}],
-            }
-        ],
-        "modalities": ["image"],
-        "height": height,
-        "width": width,
-        "num_inference_steps": steps,
-        "extra_args": {"cfg_text_scale": cfg_text_scale},
-    }
-    if seed is not None and seed != "":
-        payload["seed"] = int(seed)
-
-    headers = {"Content-Type": "application/json"}
-    token = os.getenv("AGENTIC_DIFFUSION_TOOL_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    timeout = float(os.getenv("AGENTIC_DIFFUSION_TOOL_TIMEOUT", "300"))
-    request = Request(
-        f"{base}/v1/chat/completions",
-        data=json.dumps(payload).encode(),
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urlopen(request, timeout=timeout) as result:  # noqa: S310 - operator-configured
-            data = json.loads(result.read())
-    except Exception as exc:  # noqa: BLE001 - surface server errors as tool obs + artifacts
-        err = f"Lance Omni request failed: {exc}"
-        logger.error(err)
-        return _pack_response(prompt, err, images=[], reward=0.0, backend="lance_omni_error", tool_stubbed=True)
-
-    images: list[Image.Image] = []
-    text_bits: list[str] = []
-    for choice in data.get("choices") or []:
-        content = (choice.get("message") or {}).get("content")
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                img_url = (item.get("image_url") or {}).get("url") or ""
-                if img_url.startswith("data:image"):
-                    _, b64_data = img_url.split(",", 1)
-                    images.append(Image.open(io.BytesIO(base64.b64decode(b64_data))).convert("RGB"))
-                elif item.get("type") == "text" and item.get("text"):
-                    text_bits.append(str(item["text"]))
-        elif isinstance(content, str) and content:
-            text_bits.append(content)
-
-    if not images:
-        err = f"Lance Omni server returned no image for prompt={prompt!r}"
-        logger.error("%s; response keys=%s", err, list(data) if isinstance(data, dict) else type(data))
-        return _pack_response(prompt, err, images=[], reward=0.0, backend="lance_omni_empty", tool_stubbed=True)
-
-    text = " ".join(text_bits) if text_bits else "Lance frozen MoT tool generated the requested image."
-    return _pack_response(prompt, text, images, 0.0, backend="lance_omni", tool_stubbed=False)
-
-
 def _block_generate_after_yes_enabled() -> bool:
     return os.getenv("AGENTIC_BLOCK_GENERATE_AFTER_YES", "1").strip().lower() not in {
         "0",
@@ -588,11 +514,6 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     endpoint = os.getenv("AGENTIC_DIFFUSION_TOOL_URL", "").strip()
     if endpoint:
         return _call_generic_http(prompt, endpoint)
-
-    # Retained only so older runs remain reproducible.
-    lance_url = os.getenv("AGENTIC_LANCE_SERVER_URL", "").strip()
-    if lance_url:
-        return _call_lance_omni(prompt, lance_url)
 
     logger.warning(
         "AGENTIC_QWEN_IMAGE_URL / AGENTIC_VLLM_OMNI_URL unset; "

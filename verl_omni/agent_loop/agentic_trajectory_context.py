@@ -257,9 +257,11 @@ _latest_tool_image_path: contextvars.ContextVar[str | None] = contextvars.Contex
 _latest_tool_image_tls = threading.local()
 
 # After judge_image returns good_enough=YES, further generate_image is blocked
-# (env hard-stop — not token force). Prefer asyncio-task scope so concurrent
-# AgentLoopWorker gather() rollouts on one event-loop thread do not share a
-# thread-local latch (that leak blocked the next sample's first generate).
+# (env hard-stop — not token force). Key by **rollout_id** (not asyncio task /
+# thread): ``FunctionTool.call`` runs in ``asyncio.to_thread``, where
+# ``current_task()`` is None, so a thread-scoped latch leaked YES across
+# concurrent samples sharing a thread-pool worker and blocked the next sample's
+# first generate (then judge_image(…, "last") had no PNG).
 _good_enough_yes_reached: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "agentic_good_enough_yes_reached", default=False
 )
@@ -269,7 +271,10 @@ _good_enough_yes_by_scope: dict[object, bool] = {}
 
 
 def _rollout_scope_key() -> object:
-    """Stable key for the active agent rollout (asyncio task, else thread)."""
+    """Stable key for the active agent rollout (prefer rollout_id)."""
+    rid = get_active_rollout_id()
+    if rid:
+        return ("rollout", rid)
     try:
         import asyncio
 

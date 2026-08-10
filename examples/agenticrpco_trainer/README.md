@@ -2,8 +2,8 @@
 
 Last updated: 08/10/2026
 
-Training recipes for **Mode (2a) Agentic LLM RL** ([#302](https://github.com/verl-project/verl-omni/issues/302)).
-Agent LLM, diffusion tool, and VL judge can be swapped; this example uses:
+Training recipes for **Agentic LLM RL** ([#302](https://github.com/verl-project/verl-omni/issues/302)).
+Agent LLM, diffusion tool, and VL judge can be **changed** as you need; this example uses:
 
 - **Agent LLM** (`agent_llm/`): train `Qwen3-VL-2B-Instruct` (or `Qwen3.5` via `MODEL_PATH`).
 - Frozen **Qwen-Image** via vLLM-Omni is the external `generate_image` tool (`:8092`).
@@ -11,15 +11,13 @@ Agent LLM, diffusion tool, and VL judge can be swapped; this example uses:
   `judge_image` after every generation, and (2) `reward_correctness` /
   `reward_aesthetics` fallback at reward time (prefer last live judge obs).
 - Reward: `pkg://verl_omni.utils.reward_score.agentic_reward` — parseable
-  `<tool_call>` protocol (Hermes JSON **or** Qwen3.5 XML) with VL-grounded
+  `<tool_call>` protocol (Hermes JSON for Qwen3 **or** Qwen3.5 XML) with VL-grounded
   reflection + `Done.` (or rewrite) gating.
 - Actor wire format is auto-selected from `MODEL_PATH` in `data/qwen35_env.sh`
   (sourced by `run_agentic_grpo_lora.sh`):
   - **Qwen3-VL** → `multi_turn.format=hermes` + Hermes JSON fewshots
   - **Qwen3.5** → `multi_turn.format=qwen3_coder` + XML fewshots + GDN preflight
   Override with `TOOL_PARSER_FORMAT` / `--tool_call_format`.
-
-Hyperparameter sweeps: see [`hyperparam_tune_list.md`](./hyperparam_tune_list.md).
 
 Target protocol (fewshot + on-policy) — see **Multi-turn Behaviors** diagrams:
 
@@ -393,8 +391,7 @@ Frozen image backends in `diffusion_tool.py` (first match wins):
 1. `AGENTIC_VLLM_OMNI_URL` — vLLM-Omni image generations
 2. `AGENTIC_QWEN_IMAGE_URL` — bundled Qwen-Image HTTP service
 3. `AGENTIC_DIFFUSION_TOOL_URL` — generic POST `{"prompt"}` → image/text
-4. `AGENTIC_LANCE_SERVER_URL` — legacy Lance backend
-5. unset — text stub
+4. unset — text stub
 
 Judge backends:
 
