@@ -92,8 +92,12 @@ class TestStockToolAgentWiring:
         assert tool.tool_schema.function.name == DIFFUSION_TOOL_SCHEMA["function"]["name"]
 
     def test_diffusion_tool_stub_without_endpoint(self, monkeypatch, tmp_path):
+        from verl_omni.agent_loop.agentic_trajectory_context import clear_good_enough_yes_reached
+
+        clear_good_enough_yes_reached()
         monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
         monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
         monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
         monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
         response, reward, metrics = generate_image("a blue hat")
@@ -106,9 +110,32 @@ class TestStockToolAgentWiring:
         assert metrics["image_paths"]
         assert Path(metrics["image_paths"][0]).name == "STUB_NO_IMAGE.txt"
 
+    def test_generate_blocked_after_good_enough_yes(self, monkeypatch, tmp_path):
+        from verl_omni.agent_loop.agentic_trajectory_context import (
+            clear_good_enough_yes_reached,
+            set_good_enough_yes_reached,
+        )
+
+        clear_good_enough_yes_reached()
+        monkeypatch.setenv("AGENTIC_BLOCK_GENERATE_AFTER_YES", "1")
+        monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
+        monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
+        set_good_enough_yes_reached(True)
+        response, reward, metrics = generate_image("should not run diffusion")
+        assert "agentic_block_generate_after_yes=1" in response.text
+        assert metrics["blocked_after_yes"] == 1
+        assert metrics["diffusion_backend"] == "blocked_after_yes"
+        assert metrics["num_images"] == 0
+        assert reward == 0.0
+
     def test_qwen_image_backend_has_priority(self, monkeypatch):
         import verl_omni.agent_loop.diffusion_tool as module
+        from verl_omni.agent_loop.agentic_trajectory_context import clear_good_enough_yes_reached
 
+        clear_good_enough_yes_reached()
         seen = {}
 
         def fake_http(prompt, endpoint, *, backend="http"):
@@ -168,6 +195,7 @@ def test_agentic_reward_components_are_aggregated_for_wandb():
             "reward_done": np.array([0.0, 1.0]),
             "reward_correctness": np.array([0.72, 0.88]),
             "reward_aesthetics": np.array([0.65, 0.95]),
+            # Facet keys must not appear under agentic_reward/* (scalar mix only).
             "reward_correctness_subject_entities": np.array([0.8, 0.9]),
             "reward_aesthetics_composition": np.array([0.7, 0.85]),
             "method": np.array(["a", "b"]),
@@ -177,7 +205,9 @@ def test_agentic_reward_components_are_aggregated_for_wandb():
     assert metrics["agentic_reward/done/mean"] == 0.5
     assert metrics["agentic_reward/correctness/mean"] == 0.80
     assert metrics["agentic_reward/aesthetics/min"] == 0.65
-    assert metrics["agentic_reward/correctness_subject_entities/max"] == 0.9
+    assert "agentic_reward/correctness_subject_entities/max" not in metrics
+    assert "agentic_reward/aesthetics_composition/mean" not in metrics
+    assert len(metrics) == 12  # 4 components × mean/min/max
     assert all("method" not in key for key in metrics)
 
 
@@ -328,70 +358,55 @@ a detailed cat, sharp focus
     assert _extract_generate_image_prompts(text) == ["a cat", "a detailed cat, sharp focus"]
 
 
-def test_stock_tool_artifacts_are_moved_to_step_sample_layout(tmp_path):
-    source_dir = tmp_path / "rollout_images" / "call_abc"
-    source_dir.mkdir(parents=True)
-    source = source_dir / "image_00.png"
-    source.write_bytes(b"png")
-    (source_dir / "meta.json").write_text("{}")
+def test_tool_artifacts_are_indexed_in_direct_step_sample_layout(tmp_path):
+    target_dir = tmp_path / "rollout_images" / "step_000001/sample_3.00"
+    target_dir.mkdir(parents=True)
+    image = target_dir / "image_00.png"
+    image.write_bytes(b"png")
+    (target_dir / "meta.json").write_text('{"calls": [{"file": "image_00.png"}]}')
 
-    copied = _materialize_rollout_images(
-        decoded_response=f"tool result path={source} agentic_tool ok=1",
+    image_paths = _materialize_rollout_images(
+        decoded_response="tool result agentic_tool ok=1",
         run_dir=tmp_path,
         relpath="step_000001/sample_3.00",
         user_prompt="Generate a cat",
     )
 
-    assert copied == [str(tmp_path / "rollout_images/step_000001/sample_3.00/image_00.png")]
-    assert Path(copied[0]).read_bytes() == b"png"
-    assert not source_dir.exists()
+    assert image_paths == [str(image)]
+    assert image.read_bytes() == b"png"
+    meta = json.loads((target_dir / "meta.json").read_text())
+    assert meta["calls"] == [{"file": "image_00.png"}]
+    assert meta["source"] == "direct_tool_write"
 
 
-def test_two_turn_tool_images_materialize_as_image_00_and_01(tmp_path):
-    from verl_omni.agent_loop.agentic_trajectory_context import (
-        clear_tool_artifact_registry,
-        register_tool_artifact,
-    )
-
-    clear_tool_artifact_registry()
-    call0 = tmp_path / "rollout_images" / "call_first"
-    call1 = tmp_path / "rollout_images" / "call_second"
-    call0.mkdir(parents=True)
-    call1.mkdir(parents=True)
-    img0 = call0 / "image_00.png"
-    img1 = call1 / "image_00.png"
+def test_two_turn_tool_images_are_indexed_without_posthoc_move(tmp_path):
+    target_dir = tmp_path / "rollout_images" / "step_000001/sample_0.00"
+    target_dir.mkdir(parents=True)
+    img0 = target_dir / "image_00.png"
+    img1 = target_dir / "image_01.png"
     img0.write_bytes(b"png0")
     img1.write_bytes(b"png1")
-    (call0 / "meta.json").write_text("{}")
-    (call1 / "meta.json").write_text("{}")
     prompt0 = "a fluffy white cat wearing a blue knitted hat"
     prompt1 = "a fluffy white cat wearing a bright blue knitted hat with pom-pom"
-    register_tool_artifact(prompt=prompt0, paths=[str(img0)], backend="qwen_image")
-    register_tool_artifact(prompt=prompt1, paths=[str(img1)], backend="qwen_image")
 
-    # Only the first path= survives in the logged response (vision-token truncation).
     decoded = (
         f"turn1 <tool_call>\n"
         f'{{"name": "generate_image", "arguments": {{"prompt": "{prompt0}"}}}}\n'
         f"</tool_call>\n"
-        f"obs path={img0} agentic_tool ok=1\n"
         f"turn2 Reflection: darker\n"
         f"<tool_call>\n"
         f'{{"name": "generate_image", "arguments": {{"prompt": "{prompt1}"}}}}\n'
         f"</tool_call>\n"
     )
-    copied = _materialize_rollout_images(
+    image_paths = _materialize_rollout_images(
         decoded_response=decoded,
         run_dir=tmp_path,
         relpath="step_000001/sample_0.00",
         user_prompt="Generate an image of a cat wearing a blue hat",
     )
-    assert copied == [
-        str(tmp_path / "rollout_images/step_000001/sample_0.00/image_00.png"),
-        str(tmp_path / "rollout_images/step_000001/sample_0.00/image_01.png"),
-    ]
-    assert Path(copied[0]).read_bytes() == b"png0"
-    assert Path(copied[1]).read_bytes() == b"png1"
-    assert not call0.exists()
-    assert not call1.exists()
-    clear_tool_artifact_registry()
+    assert image_paths == [str(img0), str(img1)]
+    assert img0.read_bytes() == b"png0"
+    assert img1.read_bytes() == b"png1"
+    meta = json.loads((target_dir / "meta.json").read_text())
+    assert meta["tool_prompts"] == [prompt0, prompt1]
+    assert meta["source"] == "direct_tool_write"

@@ -63,6 +63,11 @@ def set_active_trajectory_relpath(relpath: str | None) -> contextvars.Token:
     return _active_trajectory_relpath.set(relpath)
 
 
+def reset_active_trajectory_relpath(token: contextvars.Token) -> None:
+    """Restore the trajectory path binding that preceded ``token``."""
+    _active_trajectory_relpath.reset(token)
+
+
 def get_active_trajectory_relpath() -> str | None:
     return _active_trajectory_relpath.get()
 
@@ -70,6 +75,11 @@ def get_active_trajectory_relpath() -> str | None:
 def set_active_user_prompt(prompt: str | None) -> contextvars.Token:
     """Bind the dataset user request so ``meta.json`` can record it per call."""
     return _active_user_prompt.set(prompt)
+
+
+def reset_active_user_prompt(token: contextvars.Token) -> None:
+    """Restore the user-prompt binding that preceded ``token``."""
+    _active_user_prompt.reset(token)
 
 
 def get_active_user_prompt() -> str | None:
@@ -148,6 +158,7 @@ def clear_tool_artifact_registry() -> None:
         _artifact_registry.clear()
     set_latest_tool_image_path(None)
     _latest_tool_image_tls.path = None
+    clear_good_enough_yes_reached()
 
 
 _latest_tool_image_path: contextvars.ContextVar[str | None] = contextvars.ContextVar(
@@ -156,6 +167,13 @@ _latest_tool_image_path: contextvars.ContextVar[str | None] = contextvars.Contex
 # Stock ToolAgentLoop often drops ContextVars across tool calls; thread-local
 # survives same-thread generate → judge. Prefer resolve_tool_image_path().
 _latest_tool_image_tls = threading.local()
+
+# After judge_image returns good_enough=YES, further generate_image is blocked
+# (env hard-stop — not token force). Thread-local + ContextVar like image path.
+_good_enough_yes_reached: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "agentic_good_enough_yes_reached", default=False
+)
+_good_enough_yes_tls = threading.local()
 
 
 def set_latest_tool_image_path(path: str | None) -> contextvars.Token:
@@ -169,6 +187,24 @@ def get_latest_tool_image_path() -> str | None:
     if path:
         return path
     return getattr(_latest_tool_image_tls, "path", None)
+
+
+def set_good_enough_yes_reached(reached: bool) -> contextvars.Token:
+    """Mark that a live judge returned good_enough=YES on this rollout thread."""
+    _good_enough_yes_tls.reached = bool(reached)
+    return _good_enough_yes_reached.set(bool(reached))
+
+
+def get_good_enough_yes_reached() -> bool:
+    if _good_enough_yes_reached.get():
+        return True
+    return bool(getattr(_good_enough_yes_tls, "reached", False))
+
+
+def clear_good_enough_yes_reached() -> None:
+    """Reset YES latch (call when a new trajectory starts)."""
+    _good_enough_yes_tls.reached = False
+    _good_enough_yes_reached.set(False)
 
 
 def _first_existing_png(paths: list[str] | None) -> str | None:

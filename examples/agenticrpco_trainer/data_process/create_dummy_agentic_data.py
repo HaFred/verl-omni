@@ -568,25 +568,28 @@ def build_prompt_messages(
 
 def build_ground_truth(user_text: str, *, class_id: int = 1, overfit: bool = False) -> dict:
     """Weights for ``agentic_reward.compute_score`` (actor self-reflection protocol)."""
+    # Done must be heavy enough that high frozen-judge C/A cannot plateau the
+    # scalar without Reflection:+Done. (C/A are also gated in compute_score.)
+    weights = {
+        "w_tool_call": 0.10,
+        "w_correctness": 0.35,
+        "w_aesthetics": 0.35,
+        "w_done": 0.20,
+        "forced_consolation": 0.0,
+    }
     if overfit:
         return {
             "user_request": user_text,
             "demo_class": "all",
             "expected_num_images": 2,
-            "w_tool_call": 0.10,
-            "w_correctness": 0.45,
-            "w_aesthetics": 0.45,
-            "forced_consolation": 0.0,
+            **weights,
         }
     expected = 1 + (class_id % 3)
     return {
         "user_request": user_text,
         "demo_class": int(class_id % 3),
         "expected_num_images": expected,
-        "w_tool_call": 0.10,
-        "w_correctness": 0.45,
-        "w_aesthetics": 0.45,
-        "forced_consolation": 0.0,
+        **weights,
     }
 
 
@@ -631,6 +634,7 @@ def build_rows(
                             "w_tool_call",
                             "w_correctness",
                             "w_aesthetics",
+                            "w_done",
                         )
                     },
                 },

@@ -2,9 +2,9 @@
 
 Last updated: 08/06/2026
 
-Training recipes for **Mode (2a) Agentic LLM RL** ([#302](https://github.com/verl-project/verl-omni/issues/302)).
+Training recipes for **Mode (2a) Agentic LLM RL** ([#302](https://github.com/verl-project/verl-omni/issues/302)). The agent llm, dit model, vl judge model, can be adjusted according to your needs. For this example we use:
 
-- **Mode (2a) GRPO** (`agent_llm/`): train `Qwen/Qwen3.5`.
+- **Agent LLM** (`agent_llm/`): train `Qwen/Qwen3.5`.
 - Frozen **Qwen-Image** is the external `generate_image` tool (`:8092`).
 - Frozen **Qwen3-VL** sidecar (`:8093`) serves dual role: (1) in-turn
   `judge_image` tool called by the agent after every generation, and (2)
@@ -33,10 +33,31 @@ three classes (1-pass / 2-pass / 3-pass). They are **GRPO exploration examples**
 not supervised targets. Regenerate parquet when switching actor family so fewshot
 `<tool_call>` syntax matches the chat template.
 
+## Rollout Trajectories
+[PLACEHOLDER]
+
 ## Reward components
 
-`compute_score` returns a scalar `score` plus per-component fields logged to
-WandB as `agentic_reward/<name>/mean` (via `agentic_metrics_manager.py`).
+`compute_score` returns a scalar `score` plus per-component fields. WandB
+`agentic_reward/*` logs **only the scalar mix terms** (via
+`agentic_metrics_manager.REWARD_COMPONENTS`):
+
+- `agentic_reward/tool_call/{mean,min,max}`
+- `agentic_reward/correctness/{mean,min,max}`
+- `agentic_reward/aesthetics/{mean,min,max}`
+- `agentic_reward/done/{mean,min,max}`
+
+`reward_correctness` / `reward_aesthetics` prefer the last successful
+`agentic_judge ok=1` observation already in the trajectory (same C/A the actor
+saw). If absent, reward falls back to `AGENTIC_VLLM_URL` / legacy
+`AGENTIC_REFLECT_VLM_URL`. Per-dimension facet fields may still appear in
+`hermes_actions` JSONL but are **not** logged under `agentic_reward/*`.
+
+**Overfit learning signal:** open `generate→judge` loops no longer keep a ~0.45
+plateau from high frozen-judge C/A. Scalar mix credits C/A fully only after
+agent `Reflection:` + `Done.`; the launch script sets LoRA
+`actor.optim.lr=1e-4` (verl default `1e-6` was too small to move reward in 100
+steps).
 
 
 ## Multi-turn Behaviors (three turns max)
@@ -108,16 +129,29 @@ flowchart TD
 
 ### Current rollout behavior
 
-Each logical turn now follows the contract above:
+Each logical turn follows the contract above. For **GRPO**, force-reflection is
+**off** (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=0`, the default):
 
-- Turn k: `generate_image(prompt_k)` → `judge_image(user_request, prompt_k)` → forced
-  `Reflection:` (injected by `agentic_tool_agent`) then either `Done.` or rewrite +
-  `generate_image(prompt_{k+1})`.
-- After `AGENTIC_MAX_GENERATE_IMAGE_PASSES` (default **3**) successful generates, the
-  next judge **force-stops** with `Done.` even if `good_enough=NO` (README 3-pass max).
-- Turn k+1 input is the agent's reflection/rewrite from turn k (not a bare image `tool_response`).
+- Turn k: `generate_image(prompt_k)` → `judge_image(user_request, prompt_k)` →
+  **policy-sampled** `Reflection:` then either `Done.` or rewrite +
+  `generate_image(prompt_{k+1})` (same assistant turn or the next decode).
+- Cap successful generates with `AGENTIC_MAX_GENERATE_IMAGE_PASSES` (default **3**);
+  the policy (or your reward) should stop — do not rely on env-injected `Done.`.
+- **Env hard-stop (default on):** after `good_enough=YES`, further
+  `generate_image` calls are refused (`agentic_block_generate_after_yes=1`) —
+  environment dynamics, not token force. Toggle with
+  `AGENTIC_BLOCK_GENERATE_AFTER_YES=0`.
+- **Harder YES (default 0.90):** `AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD` /
+  `AGENTIC_REFLECT_GOOD_ENOUGH` so first-pass often fails and rewrite can earn
+  `reward_delta_c` (C lift after first `NO`). Restart the judge sidecar after
+  changing the threshold.
+- **GRPO group size:** `ROLLOUT_N` defaults to **8** for stabler advantages.
+- Turn k+1 input is the prior tool obs + any **policy** reflection/rewrite.
 
-Verify trajectories for `agentic_forced_reflection=1` and, at pass 3,
+Do **not** enable `AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1` for RL. Injected
+`Reflection`/`Done.` uses `response_mask=0` (no gradient) but still looks like
+agent prose to the reward → **reward leakage**. Force=1 is debug/teacher only;
+if used, trajectories may show `agentic_forced_reflection=1` /
 `agentic_force_stop_max_passes=1`.
 
 ### Rollout trajectory JSON protocol
@@ -129,33 +163,39 @@ with this key order:
 | --- | --- |
 | `turn` | 1-based index in the response tensor |
 | `turn_kind` | Grepable stage label (`call_generate_image`, `call_judge_image`, …) |
-| `turn_prompt` | Env / tool observation the policy conditions on for this decode (image obs or VL judge scores). **Does not** include forced Reflection |
+| `turn_prompt` | Env / tool observation the policy conditions on for this decode (image obs or VL judge scores) |
 | `decode` | Policy-sampled assistant tokens for this turn (`<tool_call>…` or prose) |
-| `response` | Injected assistant text after the tool obs (forced `Reflection: …`), **not** sampled from the policy. Empty when none |
+| `response` | Injected assistant text after the tool obs (only when force=1). Empty in the default RL path |
 | `decode_has_tool_call` | `true` iff **`decode`** contains `<tool_call>` (ignores `response`) |
 
 Important: **`decode` of turn T need not equal `turn_prompt` of turn T+1`.**
-After `judge_image`, the loop injects `response=Reflection: …` (and may `Done.`);
-the next policy `decode` is the rewrite `generate_image` (or empty if force-stopped).
-Fewshot demos in `create_dummy_agentic_data.py` may still include a
-`REQUIRED NEXT ACTION` line; **live** `judge_image` observations do not — the
-agent loop supplies Reflection / Done / rewrite instead.
+With force off, after `judge_image` the next policy `decode` must contain
+Reflection / Done / rewrite itself. Fewshot demos in `create_dummy_agentic_data.py`
+may still include a `REQUIRED NEXT ACTION` line; live `judge_image` observations
+do not — the **policy** supplies Reflection / Done / rewrite.
+
+Each live `generate_image` writes directly to the matching
+`rollout_images/step_XXXXXX/sample_Y.ZZ/image_NN.png` directory while that
+rollout is running. The trajectory dumper only indexes those existing files
+and merges `meta.json`; it does not move or copy images from shared `call_*`
+staging directories. This keeps concurrent GRPO samples isolated.
 
 ### Primary fields (enter the weighted mix)
 
 | Field | Default weight | Physical meaning | Zero when |
 | --- | ---: | --- | --- |
 | `reward_tool_call` | 0.10 | Binary: trajectory contains ≥1 parseable `<tool_call>`. **In scalar.** | No parseable tool call |
-| `reward_done` | 0.10 | Closed loop: agent reflection prose + `Done.`. **In scalar.** | No `Done.` / no reflection |
+| `reward_done` | 0.20 | Closed loop: agent `Reflection:` + `Done.`. **In scalar.** | No `Done.` / no `Reflection:` |
 | `reward_brevity` | — | Short assistant prose (≤4 sentences / ≤280 chars). **Metric only.** | Long rambling / debate CoT |
 | `reward_format` | — | Fraction of `generate_image` calls with valid arguments. **Metric only.** | No / malformed calls |
 | `reward_reflection` | — | Quality of agent self-reflection prose. **Metric only.** | No reflection prose |
 | `reward_tool_usage` | — | Protocol shape and distinct rewritten prompts. **Metric only.** | No `generate_image` |
 | `reward_result` | — | Closed-loop outcome quality. **Metric only.** | No `generate_image` |
-| `reward_correctness` | 0.40 | Frozen-VL correctness via `AGENTIC_REFLECT_VLM_URL` on last image. **In scalar.** | URL unset / VL call fails |
-| `reward_aesthetics` | 0.40 | Frozen-VL aesthetics via `AGENTIC_REFLECT_VLM_URL` on last image. **In scalar.** | URL unset / VL call fails |
+| `reward_correctness` | 0.35 | Frozen-VL correctness (logged raw; **mix-gated** until closed). | URL unset / VL call fails |
+| `reward_aesthetics` | 0.35 | Frozen-VL aesthetics (logged raw; **mix-gated** until closed). | URL unset / VL call fails |
 
-Weighted mix (then scaled by a protocol tier `base + scale * mix`):
+Weighted mix (then scaled by a protocol tier `base + scale * mix`). C/A enter the
+mix at full weight only after `Reflection:` + `Done.`; open loops get 5% C/A:
 
 ```text
 mix = Σ w_i * reward_i  /  Σ w_i
@@ -164,10 +204,10 @@ score = base + scale * mix
 
 | Protocol tier | Condition | `base` | `scale` | `protocol_ok` |
 | --- | --- | ---: | ---: | ---: |
-| Closed + high C/A | reflection prose + `Done.`, single-pass or distinct rewrite, C/A ≥ 0.70 | 0.10 | 0.90 | 1 |
+| Closed + high C/A | `Reflection:` + `Done.`, single-pass or distinct rewrite, C/A ≥ 0.70 | 0.10 | 0.90 | 1 |
 | Closed, VL down / weak C/A | closed loop; VL missing or C/A &lt; 0.70 | 0.05 | 0.65 | 1 / 0 |
-| Reflection present | ≥1 `generate_image` + reflection prose, not fully closed | 0.05 | 0.45 | 0 |
-| Gen-only (starved) | ≥1 `generate_image`, **no** reflection prose | 0.02 | 0.03 | 0 |
+| Reflection present | ≥1 `generate_image` + `Reflection:`, not fully closed | 0.04 | 0.30 | 0 |
+| Gen-only (starved) | ≥1 `generate_image`, **no** `Reflection:` | 0.02 | 0.05 | 0 |
 
 Weights are stored per row in parquet `ground_truth` / `extra_info` (`w_tool_call`,
 `w_correctness`, `w_aesthetics`, `w_done`). Brevity, format, reflection, tool_usage, and
@@ -178,8 +218,8 @@ step 1).
 
 | Field | Physical meaning |
 | --- | --- |
-| `reward_correctness_{subject_entities,attributes,relations_layout,scene_context,completeness}` | Five frozen-VL correctness answers |
-| `reward_aesthetics_{composition,lighting,color,fidelity,appeal}` | Five frozen-VL aesthetics answers |
+| `reward_correctness` / `reward_aesthetics` | Last `agentic_judge ok=1` C/A (or VL fallback) — **logged to WandB** |
+| `reward_correctness_*` / `reward_aesthetics_*` | Optional per-dimension diagnostics in JSONL only (not WandB mix) |
 | `protocol_ok` | 1 iff closed loop (reflection + Done, single or distinct rewrite) |
 | `num_hermes_tool_calls` | Legacy field name: count of parseable JSON/XML `<tool_call>` blocks |
 | `num_generate_image_prompts` | Count of `generate_image` prompts |
@@ -288,6 +328,9 @@ Each row embeds one class demo:
 | 2 | three `generate` / reflection-rewrite passes until Reflection + Done |
 
 Then the live user turn (with brevity reminder). Runtime calls remain on-policy.
+
+## Convergence Examples: Before vs. After
+[PLACEHOLDER]
 
 ## File map
 

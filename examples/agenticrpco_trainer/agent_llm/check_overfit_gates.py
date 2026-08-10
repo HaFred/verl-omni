@@ -92,6 +92,9 @@ def _summarize(trajs: list[tuple[int, Path, dict]]) -> dict:
             "unknown_step_dirs": 0,
             "mean_voluntary": 0.0,
             "n_voluntary": 0,
+            "judge_parse_ok": 0,
+            "judge_parse_fail": 0,
+            "judge_parse_ok_rate": 1.0,
         }
     steps = sorted({s for s, _, _ in trajs})
     escapes = 0
@@ -100,6 +103,8 @@ def _summarize(trajs: list[tuple[int, Path, dict]]) -> dict:
     two_tool = 0
     voluntary = 0
     modes: Counter[str] = Counter()
+    judge_ok = 0
+    judge_fail = 0
     for _, _, data in trajs:
         executed = int(data.get("num_tool_calls_executed") or 0)
         forced = int(data.get("num_forced_tool_calls") or 0)
@@ -115,6 +120,11 @@ def _summarize(trajs: list[tuple[int, Path, dict]]) -> dict:
             )
             if re.search(r"(?im)^\s*Reflection\s*:", decodes):
                 protocol_like += 1
+        blob = json.dumps(data)
+        judge_ok += len(re.findall(r"agentic_judge\s+ok=1", blob, flags=re.IGNORECASE))
+        judge_fail += len(re.findall(r"agentic_judge\s+ok=0", blob, flags=re.IGNORECASE))
+        if judge_fail == 0 and re.search(r"unparseable response", blob, flags=re.IGNORECASE):
+            judge_fail += len(re.findall(r"unparseable response", blob, flags=re.IGNORECASE))
         for action in data.get("hermes_actions") or []:
             if isinstance(action, dict) and action.get("mode"):
                 modes[str(action["mode"])] += 1
@@ -126,6 +136,7 @@ def _summarize(trajs: list[tuple[int, Path, dict]]) -> dict:
     traj_root = trajs[0][1].parents[1] if trajs else None
     if traj_root is not None:
         unknown = 1 if (traj_root / "step_unknown").is_dir() and any((traj_root / "step_unknown").iterdir()) else 0
+    judge_attempts = judge_ok + judge_fail
     return {
         "n_traj": n,
         "steps": steps,
@@ -138,6 +149,9 @@ def _summarize(trajs: list[tuple[int, Path, dict]]) -> dict:
         "unknown_step_dirs": unknown,
         "mean_voluntary": voluntary / max(1, n),
         "n_voluntary": voluntary,
+        "judge_parse_ok": judge_ok,
+        "judge_parse_fail": judge_fail,
+        "judge_parse_ok_rate": (judge_ok / judge_attempts) if judge_attempts else 1.0,
     }
 
 
@@ -148,6 +162,7 @@ def evaluate(
     last_k_steps: int,
     min_last_mean_tools: float,
     no_force: bool,
+    min_judge_parse_ok_rate: float = 0.99,
 ) -> tuple[list[tuple[str, bool, str, bool]], dict]:
     """Return gates as (name, ok, detail, hard)."""
     trajs = _iter_traj_json(run_dir)
@@ -225,6 +240,20 @@ def evaluate(
             )
         )
 
+    parse_rate = float(summary.get("judge_parse_ok_rate", 1.0))
+    n_ok = int(summary.get("judge_parse_ok", 0))
+    n_fail = int(summary.get("judge_parse_fail", 0))
+    # Only enforce once we have observed judge attempts.
+    ok6 = summary["n_traj"] == 0 or (n_ok + n_fail) == 0 or parse_rate >= min_judge_parse_ok_rate
+    gates.append(
+        (
+            "G6_judge_parse_ok_rate",
+            ok6,
+            f"parse_ok_rate={parse_rate:.3f} (min {min_judge_parse_ok_rate:.2f}); ok={n_ok} fail={n_fail}",
+            True,
+        )
+    )
+
     summary["last_mean_tools"] = last_mean
     return gates, summary
 
@@ -261,6 +290,7 @@ def watch_loop(
     last_k_steps: int,
     min_last_mean_tools: float,
     no_force: bool,
+    min_judge_parse_ok_rate: float = 0.99,
 ) -> int:
     print(f"[GATE] watching {run_dir} every {interval_s:.0f}s (expect ~{total_steps} steps; no_force={no_force})")
     print_expected_behavior(total_steps, no_force=no_force)
@@ -273,6 +303,7 @@ def watch_loop(
             last_k_steps=last_k_steps,
             min_last_mean_tools=min_last_mean_tools,
             no_force=no_force,
+            min_judge_parse_ok_rate=min_judge_parse_ok_rate,
         )
         steps = set(summary.get("steps") or [])
         new = sorted(steps - seen_steps)
@@ -327,7 +358,13 @@ def main() -> int:
     parser.add_argument(
         "--no-force",
         action="store_true",
-        help="Voluntary overfit: only G0/G3 are hard; tool/teacher gates are soft",
+        help="Voluntary overfit: G0/G3/G6 hard; tool/teacher gates soft",
+    )
+    parser.add_argument(
+        "--min-judge-parse-ok-rate",
+        type=float,
+        default=0.99,
+        help="Hard gate G6: min agentic_judge parse_ok rate (default 0.99)",
     )
     parser.add_argument(
         "--allow-empty",
@@ -355,6 +392,7 @@ def main() -> int:
             last_k_steps=args.last_k_steps,
             min_last_mean_tools=args.min_last_mean_tools,
             no_force=no_force,
+            min_judge_parse_ok_rate=args.min_judge_parse_ok_rate,
         )
 
     print_expected_behavior(args.total_steps, no_force=no_force)
@@ -364,6 +402,7 @@ def main() -> int:
         last_k_steps=args.last_k_steps,
         min_last_mean_tools=args.min_last_mean_tools,
         no_force=no_force,
+        min_judge_parse_ok_rate=args.min_judge_parse_ok_rate,
     )
     if summary.get("n_traj", 0) == 0 and args.allow_empty:
         print(f"[GATE] no trajectories yet under {run_dir}; --allow-empty → pass")

@@ -57,6 +57,7 @@ from verl_omni.agent_loop.agentic_trajectory_context import (  # noqa: F401
     get_active_call_provenance,
     get_active_trajectory_relpath,
     get_active_user_prompt,
+    get_good_enough_yes_reached,
     get_latest_tool_image_path,
     register_tool_artifact,
     resolve_tool_image_path,
@@ -64,7 +65,14 @@ from verl_omni.agent_loop.agentic_trajectory_context import (  # noqa: F401
     set_active_trajectory_name,
     set_active_trajectory_relpath,
     set_active_user_prompt,
+    set_good_enough_yes_reached,
     set_latest_tool_image_path,
+)
+from verl_omni.utils.judge_parse import (
+    build_judge_prompt,
+    format_judge_observation,
+    format_judge_parse_error,
+    parse_judge_json,
 )
 
 logger = logging.getLogger(__file__)
@@ -484,6 +492,36 @@ def _call_lance_omni(prompt: str, server_url: str) -> tuple[ToolResponse, float,
     return _pack_response(prompt, text, images, 0.0, backend="lance_omni", tool_stubbed=False)
 
 
+def _block_generate_after_yes_enabled() -> bool:
+    return os.getenv("AGENTIC_BLOCK_GENERATE_AFTER_YES", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def _blocked_generate_after_yes(prompt: str) -> tuple[ToolResponse, float, dict]:
+    """Env hard-stop: refuse generate_image after good_enough=YES (no diffusion call)."""
+    prompt_snip = (prompt or "").replace("\n", " ")[:240]
+    text = (
+        "generate_image blocked: a prior judge_image already returned good_enough=YES. "
+        "Emit Reflection summarizing the VL feedback and end with Done. — do not rewrite. "
+        f"agentic_block_generate_after_yes=1 agentic_tool ok=0 stub=0 images=0 "
+        f"backend=blocked_after_yes prompt={prompt_snip!r}"
+    )
+    metrics = {
+        "tool_stubbed": False,
+        "diffusion_backend": "blocked_after_yes",
+        "image_paths": [],
+        "num_images": 0,
+        "prompt": prompt,
+        "blocked_after_yes": 1,
+    }
+    logger.info("Blocked generate_image after good_enough=YES (prompt=%r)", prompt_snip[:120])
+    return ToolResponse(text=text), 0.0, metrics
+
+
 @function_tool("generate_image", schema=DIFFUSION_TOOL_SCHEMA)
 def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     """Generate an image with a frozen external Qwen-Image service.
@@ -491,6 +529,9 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     Args:
         prompt: Complete text prompt for the diffusion model.
     """
+    if _block_generate_after_yes_enabled() and get_good_enough_yes_reached():
+        return _blocked_generate_after_yes(prompt)
+
     # vLLM-omni (continuous batching) — preferred.
     vllm_omni_url = os.getenv("AGENTIC_VLLM_OMNI_URL", "").strip()
     if vllm_omni_url:
@@ -626,151 +667,16 @@ def _call_judge_vlm(
 
 # ── vLLM judge path (OpenAI /v1/chat/completions, continuous batching) ──────
 
-# Rubric questions — keep in sync with qwen_vl_reflect_server.py.
-_JUDGE_CORRECTNESS_QUESTIONS = {
-    "subject_entities": "Are the requested primary subjects/entities visibly present and recognizable?",
-    "attributes": "Are requested attributes such as color, count, material, text, and identity correct?",
-    "relations_layout": "Are requested actions, spatial relations, and layout/composition constraints correct?",
-    "scene_context": "Does the environment, setting, style, and overall scene match the request?",
-    "completeness": "Is the request fully satisfied without missing requested details or contradictory extras?",
-}
-_JUDGE_AESTHETICS_QUESTIONS = {
-    "composition": "Is the composition balanced with a clear focal hierarchy and intentional framing?",
-    "lighting": "Are lighting, exposure, contrast, and depth visually effective?",
-    "color": "Are color harmony, saturation, and tonal relationships pleasing and coherent?",
-    "fidelity": "Is the image sharp and spatially coherent, without obvious generation artifacts or distortions?",
-    "appeal": "Does the image have strong overall visual appeal and professional finish?",
-}
 
-
-def _build_judge_prompt(user_request: str, image_prompt: str, notes: str = "") -> str:
-    """Build the VL judge prompt (same rubric as the custom FastAPI server)."""
-    c_schema = ",\n".join(f'    "{key}": 0.0' for key in _JUDGE_CORRECTNESS_QUESTIONS)
-    a_schema = ",\n".join(f'    "{key}": 0.0' for key in _JUDGE_AESTHETICS_QUESTIONS)
-    rubric = "\n".join(
-        [
-            "CORRECTNESS QUESTIONS:",
-            *[f"- {key}: {q}" for key, q in _JUDGE_CORRECTNESS_QUESTIONS.items()],
-            "AESTHETICS QUESTIONS:",
-            *[f"- {key}: {q}" for key, q in _JUDGE_AESTHETICS_QUESTIONS.items()],
-        ]
-    )
-    return (
-        "You are a strict, calibrated visual reward judge. Inspect the pixels, not merely the "
-        "diffusion prompt. Independently answer all ten rubric questions.\n"
-        f"User request: {user_request}\n"
-        f"Diffusion prompt used (context only; never treat it as visual evidence): {image_prompt or '(none)'}\n"
-        f"Notes: {notes or '(none)'}\n\n"
-        f"{rubric}\n\n"
-        "CALIBRATION (HARSH — default LOW):\n"
-        "  0.00 = absent, broken, or completely wrong\n"
-        "  0.20 = severely deficient, majority of requested elements missing or wrong\n"
-        "  0.40 = several elements present but at least half are wrong, blurry, or misplaced\n"
-        "  0.55 = mostly correct BUT one or two notable flaws (missing entity, wrong color, bad layout)\n"
-        "  0.70 = clearly good, all key elements present, minor aesthetic issues only\n"
-        "  0.85+ = near-flawless, every detail exactly as requested (RARELY given)\n"
-        "MANDATORY ANTI-INFLATION RULES:\n"
-        "- For EVERY distinct entity/attribute/detail from the user request NOT visibly "
-        "confirmed in the pixels, score the relevant dimension ≤0.40.\n"
-        "- For complex user requests with 8+ distinct elements, the DEFAULT correctness "
-        "score is 0.35 unless the image clearly shows ALL of them.\n"
-        '- List at least THREE specific flaws, missing elements, or defects in "findings". '
-        "If you cannot find three, look harder — there are always flaws in generated images.\n"
-        "- Every score ≥0.70 MUST be justified with pixel-level evidence for every "
-        "sub-requirement in that dimension. If you hesitate, score ≤0.55.\n"
-        "- The median score across all ten dimensions should be ≤0.55. "
-        "A median above 0.60 means you are being too generous.\n"
-        "- Generated images are ALWAYS flawed. Start from 0.40 and require evidence to go UP, "
-        "not from 1.0 and deduct.\n"
-        "Return ONLY this JSON shape (replace every 0.0 with an independently judged score):\n"
-        "{\n"
-        '  "correctness_scores": {\n'
-        f"{c_schema}\n"
-        "  },\n"
-        '  "aesthetics_scores": {\n'
-        f"{a_schema}\n"
-        "  },\n"
-        '  "findings": "specific visual evidence for the lowest scores (at least three flaws)",\n'
-        '  "suggested_fixes": "specific prompt rewrite hints"\n'
-        "}\n"
-    )
-
-
-def _parse_judge_json(text: str) -> dict | None:
-    """Extract correctness/aesthetics scores from vLLM judge text response."""
-    blob = (text or "").strip()
-    # Drop thinking blocks / markdown fences that Qwen3-VL often wraps around JSON.
-    blob = re.sub(r"<think>[\s\S]*?</think>", " ", blob, flags=re.IGNORECASE)
-    blob = re.sub(r"```(?:json)?\s*", "", blob, flags=re.IGNORECASE).replace("```", "")
-    blob = blob.strip()
-    # Try to find JSON objects, preferring the outermost one.
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(blob):
-        if char != "{":
-            continue
-        try:
-            data, _ = decoder.raw_decode(blob[index:])
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(data, dict):
-            continue
-        c_scores = data.get("correctness_scores")
-        a_scores = data.get("aesthetics_scores")
-        if not isinstance(c_scores, dict) or not isinstance(a_scores, dict):
-            # Fallback: treat top-level correctness/aesthetics scalars.
-            if "correctness" in data or "aesthetics" in data:
-                return data
-            continue
-        correctness = sum(float(v) for v in c_scores.values()) / max(1, len(c_scores))
-        aesthetics = sum(float(v) for v in a_scores.values()) / max(1, len(a_scores))
-        return {
-            "correctness": max(0.0, min(1.0, correctness)),
-            "aesthetics": max(0.0, min(1.0, aesthetics)),
-            "correctness_scores": {k: max(0.0, min(1.0, float(v))) for k, v in c_scores.items()},
-            "aesthetics_scores": {k: max(0.0, min(1.0, float(v))) for k, v in a_scores.items()},
-            "findings": str(data.get("findings") or ""),
-            "suggested_fixes": str(data.get("suggested_fixes") or ""),
-        }
-    # Last resort: regex for aggregate scalars if JSON is truncated.
-    c_m = re.search(r'"?correctness"?\s*[:=]\s*([0-9]*\.?[0-9]+)', blob, re.IGNORECASE)
-    a_m = re.search(r'"?aesthetics"?\s*[:=]\s*([0-9]*\.?[0-9]+)', blob, re.IGNORECASE)
-    if c_m or a_m:
-        return {
-            "correctness": float(c_m.group(1)) if c_m else 0.0,
-            "aesthetics": float(a_m.group(1)) if a_m else 0.0,
-            "correctness_scores": {},
-            "aesthetics_scores": {},
-            "findings": "parsed from truncated VLM text",
-            "suggested_fixes": "none",
-        }
-    return None
-
-
-def _call_judge_vllm(
-    user_request: str,
-    image_prompt: str,
+def _post_vllm_chat(
+    *,
     vllm_url: str,
-) -> tuple[str, dict]:
-    """Judge via vLLM's OpenAI-compatible ``/v1/chat/completions``."""
-    image_path = resolve_tool_image_path(image_prompt=image_prompt)
-    if not image_path:
-        msg = (
-            "[judge error] no image on disk for this generate_image call "
-            f"(image_prompt={image_prompt[:120]!r}). "
-            "Refusing to call the VL sidecar without pixels."
-        )
-        logger.error("judge_image aborted: missing image path (prompt=%r)", image_prompt[:160])
-        return msg, {"error": "missing_image_path"}
-
-    try:
-        image_b64 = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
-    except OSError as exc:
-        msg = f"[judge error] cannot read image at {image_path}: {exc}"
-        logger.error("%s", msg)
-        return msg, {"error": str(exc), "image_path": image_path}
-
-    prompt_text = _build_judge_prompt(user_request, image_prompt)
-    payload = {
+    image_b64: str,
+    prompt_text: str,
+    max_tokens: int,
+) -> tuple[str | None, str | None]:
+    """Returns ``(raw_text, error)``. Exactly one is non-None on success/failure."""
+    payload: dict = {
         "model": os.getenv("AGENTIC_VLLM_MODEL", "").strip() or "",
         "messages": [
             {
@@ -781,12 +687,11 @@ def _call_judge_vllm(
                 ],
             }
         ],
-        "max_tokens": int(os.getenv("AGENTIC_REFLECT_MAX_NEW_TOKENS", "768")),
+        "max_tokens": int(max_tokens),
         "temperature": 0.0,
     }
     if not payload["model"]:
         del payload["model"]
-
     timeout = float(os.getenv("AGENTIC_REFLECT_VLM_TIMEOUT", "120"))
     try:
         req = Request(
@@ -798,64 +703,90 @@ def _call_judge_vllm(
         with urlopen(req, timeout=timeout) as resp:  # noqa: S310
             data = json.loads(resp.read().decode())
     except Exception as exc:  # noqa: BLE001
-        logger.warning("vLLM judge call failed: %s", exc)
-        return (
-            f"[judge error] vLLM request failed ({exc}). "
-            "Inspect the attached image yourself and decide Done. or rewrite.",
-            {"error": str(exc), "image_path": image_path},
-        )
-
-    # vLLM response: choices[0].message.content
+        return None, str(exc)
     choices = data.get("choices") or []
     raw_text = ""
     if choices:
         raw_text = str(choices[0].get("message", {}).get("content", "") or "")
     if not raw_text:
-        return (
-            "[judge error] vLLM returned empty response — inspect the attached image yourself.",
-            {"error": "empty_response", "image_path": image_path},
+        return None, "empty_response"
+    return raw_text, None
+
+
+def _call_judge_vllm(
+    user_request: str,
+    image_prompt: str,
+    vllm_url: str,
+) -> tuple[str, dict]:
+    """Judge via vLLM's OpenAI-compatible ``/v1/chat/completions`` with parse retry."""
+    image_path = resolve_tool_image_path(image_prompt=image_prompt)
+    if not image_path:
+        msg = (
+            "[judge error] no image on disk for this generate_image call "
+            f"(image_prompt={image_prompt[:120]!r}). "
+            "Refusing to call the VL sidecar without pixels."
+        )
+        logger.error("judge_image aborted: missing image path (prompt=%r)", image_prompt[:160])
+        return msg, {"error": "missing_image_path", "parse_ok": 0}
+
+    try:
+        image_b64 = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+    except OSError as exc:
+        msg = f"[judge error] cannot read image at {image_path}: {exc}"
+        logger.error("%s", msg)
+        return msg, {"error": str(exc), "image_path": image_path, "parse_ok": 0}
+
+    base_tokens = int(os.getenv("AGENTIC_REFLECT_MAX_NEW_TOKENS", "1024"))
+    max_retries = max(0, int(os.getenv("AGENTIC_JUDGE_PARSE_RETRIES", "1")))
+
+    last_raw = ""
+    last_err = None
+    for attempt in range(max_retries + 1):
+        strict = attempt > 0
+        prompt_text = build_judge_prompt(user_request, image_prompt, strict_json=strict)
+        # Give truncated JSON more room on retry.
+        tokens = base_tokens if attempt == 0 else max(base_tokens, 1536)
+        raw_text, err = _post_vllm_chat(
+            vllm_url=vllm_url,
+            image_b64=image_b64,
+            prompt_text=prompt_text,
+            max_tokens=tokens,
+        )
+        if err is not None:
+            last_err = err
+            logger.warning("vLLM judge call failed (attempt=%d): %s", attempt, err)
+            continue
+        assert raw_text is not None
+        last_raw = raw_text
+        parsed = parse_judge_json(raw_text)
+        if parsed is not None:
+            return format_judge_observation(
+                image_path=image_path,
+                parsed=parsed,
+                backend="vllm",
+                parse_retries=attempt,
+            )
+        logger.warning(
+            "vLLM judge unparseable (attempt=%d/%d): %.200s",
+            attempt,
+            max_retries,
+            raw_text,
         )
 
-    parsed = _parse_judge_json(raw_text)
-    if parsed is None:
-        logger.warning("vLLM judge returned unparseable text: %.200s", raw_text)
+    if last_err and not last_raw:
         return (
-            "[judge error] VLM returned unparseable response — inspect the attached image yourself.",
-            {"error": "unparseable", "raw": raw_text[:300], "image_path": image_path},
+            f"[judge error] vLLM request failed ({last_err}). "
+            "Inspect the attached image yourself and decide Done. or rewrite.\n"
+            f"  path={image_path}\n"
+            f"  agentic_judge ok=0 parse_ok=0 stub=0 backend=vllm",
+            {"error": last_err, "image_path": image_path, "parse_ok": 0, "parse_retries": max_retries},
         )
-
-    correctness = float(parsed.get("correctness", 0.0))
-    aesthetics = float(parsed.get("aesthetics", 0.0))
-    c_scores = parsed.get("correctness_scores") or {}
-    a_scores = parsed.get("aesthetics_scores") or {}
-    findings = str(parsed.get("findings") or "no specific findings")
-    fixes = str(parsed.get("suggested_fixes") or "none")
-
-    findings_short = re.sub(r"\s+", " ", findings).strip()[:220]
-    fixes_short = re.sub(r"\s+", " ", fixes).strip()[:160]
-    text = (
-        f"VL judge on the last generated image:\n"
-        f"  path={image_path}\n"
-        f"  correctness={correctness:.2f}\n"
-        f"  aesthetics ={aesthetics:.2f}\n"
-        f"  good_enough ={'YES' if correctness >= 0.70 and aesthetics >= 0.70 else 'NO'}\n"
-        f"  findings: {findings_short}\n"
-        f"  suggested_fixes: {fixes_short}\n"
-        f"  agentic_judge ok=1 stub=0 backend=vllm"
+    return format_judge_parse_error(
+        image_path=image_path,
+        raw_text=last_raw,
+        backend="vllm",
+        parse_retries=max_retries,
     )
-
-    meta = {
-        "correctness": correctness,
-        "aesthetics": aesthetics,
-        "good_enough": correctness >= 0.70 and aesthetics >= 0.70,
-        "findings": findings,
-        "suggested_fixes": fixes,
-        "image_path": image_path,
-        "backend": "vllm",
-    }
-    meta.update({f"correctness_{k}": float(v) for k, v in c_scores.items() if isinstance(v, int | float)})
-    meta.update({f"aesthetics_{k}": float(v) for k, v in a_scores.items() if isinstance(v, int | float)})
-    return text, meta
 
 
 # ── Custom FastAPI fallback (original /reflect endpoint) ────────────────────
@@ -964,6 +895,9 @@ def judge_image(user_request: str, image_prompt: str) -> tuple[ToolResponse, flo
         image_prompt: The diffusion prompt used to generate the image being judged.
     """
     text, meta = _call_judge_vlm(user_request, image_prompt)
+    # Env hard-stop latch: after YES, later generate_image calls are refused.
+    if meta.get("good_enough") and meta.get("parse_ok", 1) != 0 and not meta.get("error"):
+        set_good_enough_yes_reached(True)
     metrics = {
         "tool": "judge_image",
         "judge_stub": meta.get("stub", False),

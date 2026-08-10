@@ -33,7 +33,7 @@ TRAIN_FILE="${TRAIN_FILE:-${REPO_ROOT}/data/agentic/train.parquet}"
 VAL_FILE="${VAL_FILE:-${REPO_ROOT}/data/agentic/val.parquet}"
 N_GPUS="${N_GPUS:-2}"
 TOTAL_STEPS="${TOTAL_STEPS:-100}"
-ROLLOUT_N="${ROLLOUT_N:-4}"
+ROLLOUT_N="${ROLLOUT_N:-8}"
 OVERFIT_DATA="${OVERFIT_DATA:-1}"
 # Unique WandB run + ckpt dir every launch (override with EXPERIMENT_NAME / RUN_TS).
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
@@ -52,9 +52,9 @@ REQUIRE_REAL_IMAGE_TOOL="${REQUIRE_REAL_IMAGE_TOOL:-1}"
 REQUIRE_REFLECT_VLM="${REQUIRE_REFLECT_VLM:-1}"
 GATE_SCRIPT="${GATE_SCRIPT:-$SCRIPT_DIR/check_overfit_gates.py}"
 DATA_SCRIPT="${DATA_SCRIPT:-$SCRIPT_DIR/../data_process/create_dummy_agentic_data.py}"
-# Sidecar gates for short overfit smokes (TOTAL_STEPS≤20 default on). Override GATE_SIDECAR=0 to skip.
+# Sidecar gates for overfit / smoke runs (TOTAL_STEPS≤50 default on). Override GATE_SIDECAR=0 to skip.
 if [[ -z "${GATE_SIDECAR:-}" ]]; then
-  if [[ "${TOTAL_STEPS}" -le 20 ]]; then
+  if [[ "${TOTAL_STEPS}" -le 50 ]]; then
     GATE_SIDECAR=1
   else
     GATE_SIDECAR=0
@@ -69,6 +69,21 @@ export WANDB_SERVICE_TRANSPORT="${WANDB_SERVICE_TRANSPORT:-tcp}"
 export WANDB_DIR="${WANDB_DIR:-$E2E_RUN_DIR/wandb}"
 export WANDB_PROJECT="${WANDB_PROJECT:-verl_omni_agentic}"
 mkdir -p "$AGENTIC_DIFFUSION_IMAGE_DIR" "$E2E_RUN_DIR" "$WANDB_DIR"
+
+# Fixed diffusion seed for overfit visual stability (override to empty to randomize).
+export QWEN_IMAGE_SEED="${QWEN_IMAGE_SEED:-42}"
+export AGENTIC_LANCE_SEED="${AGENTIC_LANCE_SEED:-${QWEN_IMAGE_SEED}}"
+# Judge parse reliability (retry once by default; higher max tokens).
+export AGENTIC_JUDGE_PARSE_RETRIES="${AGENTIC_JUDGE_PARSE_RETRIES:-1}"
+export AGENTIC_REFLECT_MAX_NEW_TOKENS="${AGENTIC_REFLECT_MAX_NEW_TOKENS:-1024}"
+# YES bar: 0.85 keeps first-pass headroom but is reachable (A often ~0.85–0.88).
+export AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD="${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-0.85}"
+export AGENTIC_REFLECT_GOOD_ENOUGH="${AGENTIC_REFLECT_GOOD_ENOUGH:-${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD}}"
+# Env hard-stop: refuse generate_image after good_enough=YES (default on).
+export AGENTIC_BLOCK_GENERATE_AFTER_YES="${AGENTIC_BLOCK_GENERATE_AFTER_YES:-1}"
+SAVE_FREQ="${SAVE_FREQ:-5}"
+MIN_JUDGE_PARSE_OK_RATE="${MIN_JUDGE_PARSE_OK_RATE:-0.99}"
+
 cat >"$E2E_RUN_DIR/README.txt" <<EOF
 e2e run: ${EXPERIMENT_NAME}
 wandb: mode=${WANDB_MODE} project=${WANDB_PROJECT} experiment=${EXPERIMENT_NAME}
@@ -83,7 +98,10 @@ vLLM judge URL:     ${AGENTIC_VLLM_URL:-<unset>}  legacy: ${AGENTIC_REFLECT_VLM_
 judge model path:   ${AGENTIC_REFLECT_VLM_PATH:-<defaults to MODEL_PATH / Qwen3-VL>}
 attach generated pixels to VLM: ${AGENTIC_DIFFUSION_ATTACH_IMAGE}
 overfit gates: GATE_SIDECAR=${GATE_SIDECAR} (see overfit_gates.json)
-agent loop: agentic_tool_agent (force Reflection after judge; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-3})
+agent loop: agentic_tool_agent (force Reflection OFF for RL; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-3})
+good_enough threshold: ${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-0.85} (headroom for multiturn ΔC)
+block generate after YES: ${AGENTIC_BLOCK_GENERATE_AFTER_YES:-1}
+rollout_n: ${ROLLOUT_N}
 EOF
 echo "[INFO] repo root=${REPO_ROOT}"
 echo "[INFO] wandb online experiment_name=${EXPERIMENT_NAME} (WANDB_SERVICE_TRANSPORT=${WANDB_SERVICE_TRANSPORT})"
@@ -91,9 +109,15 @@ echo "[INFO] ckpt dir=${CKPT_DIR}"
 echo "[INFO] e2e rollout images -> ${AGENTIC_DIFFUSION_IMAGE_DIR}"
 echo "[INFO] e2e full trajectories -> ${E2E_RUN_DIR}/rollout_trajectories"
 echo "[INFO] e2e raw assistant rollouts -> ${E2E_RUN_DIR}/hermes_actions/"
-export AGENTIC_FORCE_REFLECTION_AFTER_JUDGE="${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-1}"
+# Force OFF for GRPO: env-injected Reflection/Done is response_mask=0 but still
+# got scored as agent prose → reward leakage. Policy must emit protocol itself.
+export AGENTIC_FORCE_REFLECTION_AFTER_JUDGE="${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-0}"
 export AGENTIC_MAX_GENERATE_IMAGE_PASSES="${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-3}"
-echo "[INFO] agent loop=agentic_tool_agent (force Reflection after judge; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES}; AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE})"
+echo "[INFO] agent loop=agentic_tool_agent (AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES})"
+echo "[INFO] good_enough threshold=${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD} block_generate_after_yes=${AGENTIC_BLOCK_GENERATE_AFTER_YES} rollout_n=${ROLLOUT_N}"
+if [[ "${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}" != "0" ]]; then
+  echo "[WARN] AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}: forced Reflection/Done is NOT for RL (reward leakage). Use 0 for training." >&2
+fi
 echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
 echo "[INFO] reflect judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} legacy=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
 python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --expect-only --total-steps "${TOTAL_STEPS}" --no-force
@@ -242,7 +266,8 @@ _run_final_gates() {
     return 0
   fi
   echo "[GATE] running final overfit gates on ${E2E_RUN_DIR}"
-  if python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --final --total-steps "${TOTAL_STEPS}" --no-force; then
+  if python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --final --total-steps "${TOTAL_STEPS}" --no-force \
+      --min-judge-parse-ok-rate "${MIN_JUDGE_PARSE_OK_RATE}"; then
     echo "[GATE] final gates PASS (train_rc=${train_rc})"
     return 0
   else
@@ -294,6 +319,11 @@ keys = [
     "AGENTIC_MAX_GENERATE_IMAGE_PASSES",
     "AGENTIC_REFLECT_VLM_TIMEOUT",
     "AGENTIC_REFLECT_MAX_NEW_TOKENS",
+    "AGENTIC_JUDGE_PARSE_RETRIES",
+    "AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD",
+    "AGENTIC_REFLECT_GOOD_ENOUGH",
+    "AGENTIC_BLOCK_GENERATE_AFTER_YES",
+    "QWEN_IMAGE_SEED",
 ]
 base = {}
 try:
@@ -465,10 +495,19 @@ if [[ "${GATE_SIDECAR}" == "1" ]]; then
     --total-steps "${TOTAL_STEPS}" \
     --interval-s "${GATE_INTERVAL_S:-20}" \
     --no-force \
+    --min-judge-parse-ok-rate "${MIN_JUDGE_PARSE_OK_RATE}" \
     >"$E2E_RUN_DIR/gate_watch.log" 2>&1 &
   GATE_PID=$!
   echo "[GATE] watch pid=${GATE_PID}"
 fi
+
+# Overfit LoRA LR: verl default is 1e-6 (full-FT scale) which leaves the mean
+# reward flat for 100 steps. LoRA overfit needs ~1e-4 (override via ACTOR_LR).
+ACTOR_LR="${ACTOR_LR:-1e-4}"
+ACTOR_WD="${ACTOR_WD:-0.01}"
+ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.8}"
+PPO_EPOCHS="${PPO_EPOCHS:-2}"
+echo "[INFO] actor.optim.lr=${ACTOR_LR} weight_decay=${ACTOR_WD} ppo_epochs=${PPO_EPOCHS} rollout.temperature=${ROLLOUT_TEMPERATURE}"
 
 TRAIN_RC=0
 # Mode (2a): optimize only Qwen3-VL language projections; ViT stays pretrained.
@@ -493,8 +532,14 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.model.trust_remote_code=true \
   actor_rollout_ref.model.use_remove_padding=true \
   +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
+  "actor_rollout_ref.actor.optim.lr=${ACTOR_LR}" \
+  "actor_rollout_ref.actor.optim.weight_decay=${ACTOR_WD}" \
+  actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.0 \
+  actor_rollout_ref.actor.optim.clip_grad=1.0 \
+  "actor_rollout_ref.actor.ppo_epochs=${PPO_EPOCHS}" \
   actor_rollout_ref.actor.ppo_mini_batch_size=2 \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+  actor_rollout_ref.actor.entropy_coeff=0.001 \
   actor_rollout_ref.actor.fsdp_config.param_offload=true \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=true \
   actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
@@ -502,7 +547,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.load_format=safetensors \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
-  actor_rollout_ref.rollout.temperature=0.7 \
+  "actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   "actor_rollout_ref.rollout.gpu_memory_utilization=${GPU_MEM_UTIL}" \
   actor_rollout_ref.rollout.enable_chunked_prefill=true \
@@ -534,7 +579,7 @@ python3 -m verl.trainer.main_ppo \
   trainer.total_training_steps="${TOTAL_STEPS}" \
   trainer.total_epochs="${TOTAL_STEPS}" \
   trainer.test_freq=-1 \
-  trainer.save_freq=50 \
+  trainer.save_freq="${SAVE_FREQ}" \
   trainer.resume_mode="${RESUME_MODE:-disable}" \
   "trainer.default_local_dir=${CKPT_DIR}" \
   'trainer.logger=["console","wandb"]' \

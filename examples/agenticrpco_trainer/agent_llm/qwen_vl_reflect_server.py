@@ -41,7 +41,7 @@ logger = logging.getLogger("qwen_vl_reflect_server")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 MODEL_ID = os.getenv("AGENTIC_REFLECT_VLM_PATH") or os.getenv("MODEL_PATH") or "Qwen/Qwen3-VL-2B-Instruct"
-GOOD_ENOUGH_THRESHOLD = float(os.getenv("AGENTIC_REFLECT_GOOD_ENOUGH", "0.72"))
+GOOD_ENOUGH_THRESHOLD = float(os.getenv("AGENTIC_REFLECT_GOOD_ENOUGH", "0.90"))
 
 _model = None
 _processor = None

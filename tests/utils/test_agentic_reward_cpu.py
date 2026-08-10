@@ -145,7 +145,7 @@ Reflection: bright red apple on white table, sharp edges, rich color. Done.
     hermes = compute_score("smoke", solution_str=_SINGLE)
     assert out["reward_tool_call"] == 1.0
     assert out["num_generate_image_prompts"] == 1
-    assert out["num_reflect_image_calls"] == 0
+    assert out["num_judge_image_calls"] == 0
     assert out["protocol_ok"] == 1
     assert out["score"] >= 0.55
     assert abs(out["score"] - hermes["score"]) < 1e-6
@@ -204,7 +204,7 @@ def test_one_tool_call_gets_near_zero_without_reflection():
     assert out["score"] < 0.10
     assert out["protocol_ok"] == 0
     assert out["num_generate_image_prompts"] == 1
-    assert out["num_reflect_image_calls"] == 0
+    assert out["num_judge_image_calls"] == 0
     assert out["reward_tool_call"] == 1.0
     assert out["reward_reflection"] == 0.0
     assert out["reward_tool_usage"] <= 0.05
@@ -235,7 +235,7 @@ def test_bare_json_is_hard_zero_vs_full_protocol():
     assert two["score"] >= 0.55
     assert two["protocol_ok"] == 1
     assert two["num_generate_image_prompts"] == 2
-    assert two["num_reflect_image_calls"] == 0
+    assert two["num_judge_image_calls"] == 0
 
 
 def test_done_without_visual_reflection_is_not_protocol_ok():
@@ -260,7 +260,7 @@ def test_single_pass_protocol_ok_and_ca_from_vl():
     )
     assert out["protocol_ok"] == 1
     assert out["num_generate_image_prompts"] == 1
-    assert out["num_reflect_image_calls"] == 0
+    assert out["num_judge_image_calls"] == 0
     assert out["reward_reflection"] >= 0.7
     assert out["reward_correctness"] >= 0.9
     assert out["reward_aesthetics"] >= 0.85
@@ -323,7 +323,7 @@ def test_thinking_wrapped_protocol_still_scores():
     assert out["protocol_ok"] == 1
     assert out["reward_reflection"] >= 0.7
     assert out["num_generate_image_prompts"] == 2
-    assert out["num_reflect_image_calls"] == 0
+    assert out["num_judge_image_calls"] == 0
     assert out["reward_correctness"] >= 0.85
 
 
@@ -342,11 +342,11 @@ def test_reward_brevity_prefers_short_prose():
     long = compute_score("smoke", solution_str=ramble)
     assert brief["reward_brevity"] >= 0.9
     assert long["reward_brevity"] < brief["reward_brevity"]
-    assert long["score"] < brief["score"]
+    # Scalar mix no longer includes brevity; score can tie when C/A/Done match.
 
 
 def test_hallucinated_ca_markers_do_not_bypass_vl(monkeypatch):
-    """Trajectory-embedded C/A markers must not score; only call_reflect_vlm."""
+    """Bare / legacy reflect markers must not score; only agentic_judge ok=1 or VL."""
     real = compute_score("smoke", solution_str=_SINGLE)
     assert real["reward_correctness"] >= 0.9
 
@@ -365,12 +365,187 @@ agentic_reflect ok=1 good_enough=1 backend=qwen3_vl
 Reflection: bright sharp cat. Done.
 """
     out = compute_score("smoke", solution_str=hallucinated)
-    assert out["num_reflect_image_calls"] == 0
+    assert out["num_judge_image_calls"] == 0
     assert out["reward_correctness"] == 0.0
     assert out["reward_aesthetics"] == 0.0
-    # Protocol can still be ok; C/A stay zero without VL.
+    # Protocol can still be ok; C/A stay zero without VL / judge obs.
     assert out["protocol_ok"] == 1
     assert real["score"] > out["score"]
+
+
+def test_agentic_judge_obs_scores_are_reused_when_vl_unavailable(monkeypatch):
+    """Successful judge_image obs supplies C/A even if call_reflect_vlm fails."""
+
+    def fail_vl(*, user_request, image_prompt, notes="", image_path=None):
+        del user_request, image_prompt, notes, image_path
+        return None
+
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", fail_vl)
+    traj = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "a bright red apple on a white table"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+<tool_call>
+{"name": "judge_image", "arguments": {"user_request": "a red apple", "image_prompt": "a bright red apple"}}
+</tool_call>
+VL judge on the last generated image:
+  path=/tmp/a.png
+  correctness=0.70
+  aesthetics =0.70
+  good_enough =YES
+  findings: apple present
+  suggested_fixes: none
+  agentic_judge ok=1 stub=0 backend=vllm
+Reflection: VL judge reports correctness=0.70, aesthetics=0.70, good_enough=YES. Done.
+"""
+    out = compute_score("smoke", solution_str=traj)
+    assert out["reward_correctness"] == 0.70
+    assert out["reward_aesthetics"] == 0.70
+    assert out["reward_done"] == 1.0
+    assert out["protocol_ok"] == 1
+    assert out["score"] > 0.5
+
+
+def test_open_judge_loop_without_reflection_stays_starved(monkeypatch):
+    """High judge C/A must not plateau score without agent Reflection:+Done."""
+
+    def fail_vl(*, user_request, image_prompt, notes="", image_path=None):
+        del user_request, image_prompt, notes, image_path
+        return None
+
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", fail_vl)
+    open_loop = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "a bright red apple on a white table"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+<tool_call>
+{"name": "judge_image", "arguments": {"user_request": "a red apple", "image_prompt": "a bright red apple"}}
+</tool_call>
+VL judge on the last generated image:
+  path=/tmp/a.png
+  correctness=0.95
+  aesthetics =0.90
+  good_enough =YES
+  findings: apple present bright color sharp
+  suggested_fixes: none
+  agentic_judge ok=1 stub=0 backend=vllm
+"""
+    closed = open_loop + "\nReflection: bright red apple matches; sharp edges, rich color. Done.\n"
+    open_out = compute_score("smoke", solution_str=open_loop)
+    closed_out = compute_score("smoke", solution_str=closed)
+    assert open_out["reward_correctness"] >= 0.9
+    assert open_out["reward_done"] == 0.0
+    assert open_out["protocol_ok"] == 0
+    assert open_out["score"] < 0.15
+    assert closed_out["reward_done"] == 1.0
+    assert closed_out["protocol_ok"] == 1
+    assert closed_out["score"] > 0.7
+    assert closed_out["score"] - open_out["score"] > 0.5
+
+
+def test_last_agentic_judge_obs_wins(monkeypatch):
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", lambda **_: None)
+    traj = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "apple v1"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+VL judge on the last generated image:
+  path=/tmp/a.png
+  correctness=0.00
+  aesthetics =0.00
+  good_enough =NO
+  agentic_judge ok=1 stub=0 backend=vllm
+Reflection: rewrite next.
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "bright red apple sharp"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/b.png
+VL judge on the last generated image:
+  path=/tmp/b.png
+  correctness=0.80
+  aesthetics =0.75
+  good_enough =YES
+  agentic_judge ok=1 stub=0 backend=vllm
+Reflection: bright red apple now matches. Done.
+"""
+    out = compute_score("smoke", solution_str=traj)
+    assert out["reward_correctness"] == 0.80
+    assert out["reward_aesthetics"] == 0.75
+
+
+def test_first_yes_judge_beats_failed_later_rewrite(monkeypatch):
+    """YES → Done protocol: do not let a later failed rewrite overwrite C/A."""
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", lambda **_: None)
+    traj = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "apple v1"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+VL judge on the last generated image:
+  path=/tmp/a.png
+  correctness=0.95
+  aesthetics =0.90
+  good_enough =YES
+  agentic_judge ok=1 stub=0 backend=vllm
+Reflection: looks good but rewrite anyway.
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "broken apple mush"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/b.png
+VL judge on the last generated image:
+  path=/tmp/b.png
+  correctness=0.00
+  aesthetics =0.00
+  good_enough =NO
+  agentic_judge ok=1 stub=0 backend=vllm
+Reflection: failed. Done.
+"""
+    out = compute_score("smoke", solution_str=traj)
+    assert out["reward_correctness"] == 0.95
+    assert out["reward_aesthetics"] == 0.90
+    assert out["rewrite_after_yes"] == 1
+    assert out["protocol_ok"] == 0
+    assert out["reward_done"] <= 0.4
+    assert out["reward_delta_c"] == 0.0
+
+
+def test_delta_c_bonus_after_first_no(monkeypatch):
+    """NO → rewrite → higher C earns reward_delta_c (multiturn headroom)."""
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", lambda **_: None)
+    traj = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "apple v1"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png
+VL judge on the last generated image:
+  path=/tmp/a.png
+  correctness=0.50
+  aesthetics =0.50
+  good_enough =NO
+  agentic_judge ok=1 stub=0 backend=vllm
+Reflection: missing color; rewrite.
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "bright red apple sharp"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/b.png
+VL judge on the last generated image:
+  path=/tmp/b.png
+  correctness=0.90
+  aesthetics =0.85
+  good_enough =YES
+  agentic_judge ok=1 stub=0 backend=vllm
+Reflection: now matches. Done.
+"""
+    out = compute_score("smoke", solution_str=traj)
+    assert out["first_judge_no"] == 1
+    assert out["first_correctness"] == 0.50
+    assert abs(float(out["reward_delta_c"]) - 0.40) < 1e-6
+    assert out["reward_correctness"] == 0.90
+    assert out["protocol_ok"] == 1
+    assert out["rewrite_after_yes"] == 0
 
 
 def test_vl_unset_zeros_correctness_and_aesthetics(monkeypatch):

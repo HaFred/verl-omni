@@ -24,7 +24,6 @@ import json
 import logging
 import os
 import re
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -34,33 +33,35 @@ from verl.utils import hf_tokenizer
 
 from verl_omni.agent_loop.agentic_trajectory_context import (
     build_trajectory_relpath,
-    claim_tool_artifacts_for_prompts,
+    clear_good_enough_yes_reached,
+    reset_active_trajectory_relpath,
+    reset_active_user_prompt,
+    set_active_trajectory_relpath,
+    set_active_user_prompt,
 )
 
 logger = logging.getLogger(__name__)
 
+# WandB ``agentic_reward/*`` — only the scalar mix terms used in compute_score.
 REWARD_COMPONENTS = (
     "reward_tool_call",
-    "reward_done",
     "reward_correctness",
     "reward_aesthetics",
-    "reward_correctness_subject_entities",
-    "reward_correctness_attributes",
-    "reward_correctness_relations_layout",
-    "reward_correctness_scene_context",
-    "reward_correctness_completeness",
-    "reward_aesthetics_composition",
-    "reward_aesthetics_lighting",
-    "reward_aesthetics_color",
-    "reward_aesthetics_fidelity",
-    "reward_aesthetics_appeal",
+    "reward_done",
 )
 REWARD_ARTIFACT_FIELDS = (
     *REWARD_COMPONENTS,
     "num_hermes_tool_calls",
     "num_generate_image_prompts",
     "num_judge_image_calls",
+    "judge_parse_ok",
+    "judge_parse_fail",
+    "judge_parse_ok_rate",
     "protocol_ok",
+    "rewrite_after_yes",
+    "reward_delta_c",
+    "first_correctness",
+    "first_judge_no",
     "rollout_valid",
 )
 _TOOL_CALL_RE = re.compile(
@@ -69,7 +70,6 @@ _TOOL_CALL_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _EXECUTED_TOOL_RESPONSE_RE = re.compile(r"\bagentic_(?:tool|reflect|judge)\s+ok=[01]\b", re.IGNORECASE)
-_TOOL_ARTIFACT_PATH_RE = re.compile(r"\bpath=([^\s<>]+)")
 _HERMES_PROMPT_RE = re.compile(
     r"<tool_call>\s*(\{.*?\})\s*</tool_call>",
     re.IGNORECASE | re.DOTALL,
@@ -355,85 +355,32 @@ def _materialize_rollout_images(
     relpath: str,
     user_prompt: str,
 ) -> list[str]:
-    """Move live tool artifacts into ``step_*/sample_*/image_00.png``, ``image_01.png``, …
-
-    Stock ``ToolAgentLoop`` does not bind trajectory contextvars, so live saves land
-    under ``call_<ts>_<uuid>/``. Attached vision tokens also often truncate later
-    ``path=`` markers from the logged response. We therefore:
-
-    1. Claim registry rows by ordered Hermes ``generate_image`` prompts (preferred)
-    2. Fall back to any remaining ``path=`` markers in the decoded response
-    3. Remove the temporary ``call_*`` staging directory after all its files move
-    """
+    """Index images that the tool wrote directly into this rollout directory."""
     target_dir = run_dir / "rollout_images" / relpath
     target_dir.mkdir(parents=True, exist_ok=True)
-    copied: list[str] = []
-    seen: set[Path] = set()
-    staging_dirs: set[Path] = set()
-    image_n = 0
-    call_n = 0
-
-    def _copy_source(source: Path) -> None:
-        nonlocal image_n, call_n
-        if source in seen or not source.is_file():
-            return
-        seen.add(source)
-        if source.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}:
-            destination = target_dir / f"image_{image_n:02d}{source.suffix.lower()}"
-            image_n += 1
-        elif source.name.startswith("STUB_NO_IMAGE"):
-            destination = target_dir / f"STUB_NO_IMAGE_{call_n:02d}.txt"
-        else:
-            return
-        source_meta = source.parent / "meta.json"
-        if source_meta.is_file():
-            shutil.copy2(source_meta, target_dir / f"call_{call_n:02d}_meta.json")
-        # The call_* path is only a live staging location. Move instead of copy
-        # so every persisted generated image has one canonical step/sample path.
-        shutil.move(str(source), str(destination))
-        copied.append(str(destination))
-        if source.parent.name.startswith("call_"):
-            staging_dirs.add(source.parent)
-        call_n += 1
-
     prompts = _extract_generate_image_prompts(decoded_response)
-    for entry in claim_tool_artifacts_for_prompts(prompts):
-        for raw in entry.get("paths") or []:
-            _copy_source(Path(raw))
+    image_paths = [
+        str(path)
+        for path in sorted(target_dir.iterdir())
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+    ]
 
-    # Fallback / fill-in when registry was empty (e.g. manager-only dump of old run).
-    for raw_path in _TOOL_ARTIFACT_PATH_RE.findall(decoded_response):
-        source = Path(raw_path.rstrip("',\".;"))
-        # path= may point at the PNG or a stub file.
-        _copy_source(source)
-
-    for staging_dir in staging_dirs:
-        # Preserve per-call metadata above, then remove the staging envelope.
-        source_meta = staging_dir / "meta.json"
-        if source_meta.is_file():
-            source_meta.unlink()
-        try:
-            staging_dir.rmdir()
-        except OSError:
-            # A multi-image/concurrent call may still have an unclaimed file.
-            logger.debug("Keeping non-empty tool staging directory: %s", staging_dir)
-
-    if copied:
-        (target_dir / "meta.json").write_text(
-            json.dumps(
-                {
-                    "trajectory_relpath": relpath,
-                    "user_prompt": user_prompt,
-                    "image_paths": copied,
-                    "tool_prompts": prompts,
-                    "source": "stock_tool_agent_manager_copy",
-                },
-                indent=2,
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-    return copied
+    meta_path = target_dir / "meta.json"
+    try:
+        meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    except json.JSONDecodeError:
+        meta = {}
+    meta.update(
+        {
+            "trajectory_relpath": relpath,
+            "user_prompt": user_prompt,
+            "image_paths": image_paths,
+            "tool_prompts": prompts,
+            "source": "direct_tool_write",
+        }
+    )
+    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
+    return image_paths
 
 
 class AgenticMetricsAgentLoopManager(AgentLoopManager):
@@ -444,6 +391,39 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
         self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
+
+    async def _run_agent_loop(
+        self,
+        sampling_params,
+        trajectory,
+        *,
+        agent_name,
+        trace=True,
+        **kwargs,
+    ):
+        """Bind the final step/sample path before this rollout executes tools."""
+        relpath = build_trajectory_relpath(
+            step=trajectory["step"],
+            sample_index=trajectory["sample_index"],
+            rollout_n=trajectory["rollout_n"],
+        )
+        raw_prompt = kwargs.get("raw_prompt")
+        user_prompt = _last_user_prompt(raw_prompt) if raw_prompt is not None else ""
+        path_token = set_active_trajectory_relpath(relpath)
+        prompt_token = set_active_user_prompt(user_prompt)
+        # Fresh trajectory: allow generate_image until the first good_enough=YES.
+        clear_good_enough_yes_reached()
+        try:
+            return await super()._run_agent_loop(
+                sampling_params,
+                trajectory,
+                agent_name=agent_name,
+                trace=trace,
+                **kwargs,
+            )
+        finally:
+            reset_active_user_prompt(prompt_token)
+            reset_active_trajectory_relpath(path_token)
 
     def _dump_raw_rollouts(self, prompts, output, step) -> None:
         """Write user prompt + raw assistant turns only."""

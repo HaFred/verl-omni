@@ -24,7 +24,10 @@ After ``AGENTIC_MAX_GENERATE_IMAGE_PASSES`` successful ``generate_image`` calls
 (default 3 — README 3-pass max), the next successful judge always force-stops
 with ``Done.`` even if ``good_enough=NO``.
 
-Toggle force-reflection with ``AGENTIC_FORCE_REFLECTION_AFTER_JUDGE`` (default ``1``).
+Toggle force-reflection with ``AGENTIC_FORCE_REFLECTION_AFTER_JUDGE`` (default ``0``).
+Keep force **off** for GRPO: injected ``Reflection``/``Done.`` is masked from the
+policy (``response_mask=0``) but still pollutes reward if scored — that is reward
+leakage. Force=1 is debug/teacher scaffolding only, not for RL credit assignment.
 """
 
 from __future__ import annotations
@@ -56,11 +59,13 @@ _FIXES_RE = re.compile(r"\bsuggested_fixes:\s*(.+?)(?:\n\s*agentic_judge\b|\n\n|
 
 
 def _force_enabled() -> bool:
-    return os.getenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE", "1").strip().lower() not in {
+    # Default OFF: RL must sample Reflection / Done / rewrite itself.
+    return os.getenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE", "0").strip().lower() not in {
         "0",
         "false",
         "off",
         "no",
+        "",
     }
 
 
