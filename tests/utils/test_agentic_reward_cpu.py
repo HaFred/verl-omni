@@ -548,6 +548,35 @@ Reflection: now matches. Done.
     assert out["rewrite_after_yes"] == 0
 
 
+def test_forced_max_pass_done_does_not_earn_done_credit(monkeypatch):
+    """Env-injected Done at max passes must not inflate closed-loop reward."""
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", lambda **_: None)
+    open_loop = """\
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "soldier letter by lamp"}}
+</tool_call>
+agentic_tool ok=1 images=1 path=/tmp/a.png backend=vllm_omni
+VL judge on the last generated image:
+  path=/tmp/a.png
+  correctness=0.95
+  aesthetics =0.84
+  good_enough =NO
+  agentic_judge ok=1 stub=0 backend=vllm
+"""
+    forced = (
+        open_loop + "\nReflection: VL judge reports correctness=0.95, aesthetics=0.84, "
+        "good_enough=NO after generate_image pass 3/3. 3-pass max reached — stopping. "
+        "Done. agentic_force_stop_max_passes=1 agentic_forced_reflection=1\n"
+    )
+    policy_done = open_loop + "\nReflection: aesthetics still short of bar; stopping. Done.\n"
+    out_forced = compute_score("smoke", solution_str=forced)
+    out_policy = compute_score("smoke", solution_str=policy_done)
+    out_open = compute_score("smoke", solution_str=open_loop)
+    assert float(out_forced["reward_done"]) <= float(out_open["reward_done"]) + 1e-6
+    assert float(out_policy["reward_done"]) > float(out_forced["reward_done"])
+    assert float(out_policy["score"]) > float(out_forced["score"])
+
+
 def test_vl_unset_zeros_correctness_and_aesthetics(monkeypatch):
     monkeypatch.setattr(agentic_reward, "call_reflect_vlm", lambda **_: None)
     out = compute_score("smoke", solution_str=_SINGLE)

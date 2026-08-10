@@ -15,9 +15,10 @@
 """Frozen image-generation function tool for verl's stock ``ToolAgentLoop``.
 
 Mode (2a) keeps image generation **outside** the actor optimizer. GRPO trains
-the actor as the visual agent while a frozen Qwen-Image pipeline generates
-candidate images. Generated pixels are attached so the actor can self-reflect
-and either finish with Done. or rewrite + call generate_image again.
+the actor as the tool-calling agent while a frozen Qwen-Image pipeline generates
+candidate images. A separate frozen VL sidecar (``judge_image``) scores those
+PNGs; the actor only sees text tool observations (scores / findings / ``path=``)
+and then writes ``Reflection:`` / ``Done.`` or a rewritten ``generate_image``.
 
 
 Backends (first match wins):
@@ -29,10 +30,8 @@ Backends (first match wins):
      (``/v1/chat/completions``, ``modalities=["image"]``).
   4. Else text-only stub (acceptance smoke when no gen service is up).
 
-Observation modality:
-  Set ``AGENTIC_DIFFUSION_ATTACH_IMAGE=1`` for a VLM actor. Stock
-  ``ToolAgentLoop`` then adds the generated PIL image to the next model turn.
-  Set it to 0 only for a text-only actor or diagnostics.
+Observation modality is always text: PNGs are written under the rollout image
+dir for the sidecar judge; they are never attached to the actor context.
 """
 
 from __future__ import annotations
@@ -54,10 +53,14 @@ from verl.tools.schemas import ToolResponse
 
 # Trajectory binding for artifact paths (no monkey-patch; agent loop sets ContextVars).
 from verl_omni.agent_loop.agentic_trajectory_context import (  # noqa: F401
+    build_artifact_id,
+    count_live_generate_artifacts_for_active_rollout,
     get_active_call_provenance,
+    get_active_rollout_id,
     get_active_trajectory_relpath,
     get_active_user_prompt,
     get_good_enough_yes_reached,
+    get_latest_generate_prompt_for_active_rollout,
     get_latest_tool_image_path,
     register_tool_artifact,
     resolve_tool_image_path,
@@ -84,9 +87,7 @@ DIFFUSION_TOOL_SCHEMA = {
         "name": "generate_image",
         "description": (
             "Generate an image with the frozen diffusion model. After each generation, "
-            "inspect the attached image yourself: write a brief reflection, then either "
-            "finish with Done. if good enough, or rewrite the prompt and call "
-            "generate_image again in the same assistant turn."
+            "call `judge_image` on that image before deciding Done. or rewrite."
         ),
         "parameters": {
             "type": "object",
@@ -114,10 +115,6 @@ def _decode_images(payload: dict) -> list[Image.Image]:
     return [Image.open(io.BytesIO(base64.b64decode(item))).convert("RGB") for item in encoded]
 
 
-def _attach_images_enabled() -> bool:
-    return os.getenv("AGENTIC_DIFFUSION_ATTACH_IMAGE", "0").strip().lower() in {"1", "true", "yes"}
-
-
 def _e2e_run_root() -> Path:
     """Per-run artifact root: ``outputs/e2e/<experiment_name>/`` (or env override)."""
     explicit = os.getenv("AGENTIC_DIFFUSION_IMAGE_DIR", "").strip()
@@ -143,9 +140,12 @@ def _next_image_index(traj_dir: Path) -> int:
     """Next ``image_XX`` index under a trajectory folder."""
     idxs: list[int] = []
     for path in traj_dir.glob("image_*.png"):
+        m = re.match(r"image_(\d+)", path.stem, flags=re.IGNORECASE)
+        if not m:
+            continue
         try:
-            idxs.append(int(path.stem.split("_", 1)[1]))
-        except (IndexError, ValueError):
+            idxs.append(int(m.group(1)))
+        except ValueError:
             continue
     return (max(idxs) + 1) if idxs else 0
 
@@ -232,15 +232,22 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
         traj_dir = root / relpath
         traj_dir.mkdir(parents=True, exist_ok=True)
         start_idx = _next_image_index(traj_dir)
+        artifact_ids: list[str] = []
         if images:
             for offset, img in enumerate(images):
                 idx = start_idx + offset
-                path = traj_dir / f"image_{idx:02d}.png"
+                aid = build_artifact_id(relpath=relpath, index=idx, prompt=prompt)
+                path = traj_dir / f"image_{idx:02d}_{aid}.png"
                 img.save(path)
                 paths.append(str(path))
-                _update_traj_meta(traj_dir, _entry(idx, path, stubbed=tool_stubbed))
+                artifact_ids.append(aid)
+                meta_entry = _entry(idx, path, stubbed=tool_stubbed)
+                meta_entry["artifact_id"] = aid
+                meta_entry["rollout_id"] = get_active_rollout_id()
+                _update_traj_meta(traj_dir, meta_entry)
         else:
-            stub_path = traj_dir / f"STUB_NO_IMAGE_{start_idx:02d}.txt"
+            aid = build_artifact_id(relpath=relpath, index=start_idx, prompt=prompt)
+            stub_path = traj_dir / f"STUB_NO_IMAGE_{start_idx:02d}_{aid}.txt"
             stub_path.write_text(
                 "No PNG produced (text stub or empty tool response).\n"
                 f"user_prompt={user_prompt!r}\n"
@@ -248,10 +255,15 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
                 f"controlled_by_reflection={provenance.get('controlled_by_reflection')}\n"
                 f"reflection={provenance.get('reflection')!r}\n"
                 f"backend={backend}\n"
+                f"artifact_id={aid}\n"
                 "Set AGENTIC_QWEN_IMAGE_URL to a running Qwen-Image service for real images.\n"
             )
             paths.append(str(stub_path))
-            _update_traj_meta(traj_dir, _entry(start_idx, stub_path, stubbed=True))
+            artifact_ids.append(aid)
+            meta_entry = _entry(start_idx, stub_path, stubbed=True)
+            meta_entry["artifact_id"] = aid
+            meta_entry["rollout_id"] = get_active_rollout_id()
+            _update_traj_meta(traj_dir, meta_entry)
         logger.info(
             "diffusion tool artifacts (%d image(s), stub=%s, reflect_ctrl=%s) -> %s",
             len(images),
@@ -259,7 +271,15 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
             provenance.get("controlled_by_reflection"),
             traj_dir,
         )
-        register_tool_artifact(prompt=prompt, paths=paths, backend=backend, tool_stubbed=tool_stubbed)
+        register_tool_artifact(
+            prompt=prompt,
+            paths=paths,
+            backend=backend,
+            tool_stubbed=tool_stubbed,
+            artifact_id=artifact_ids[0] if artifact_ids else None,
+            trajectory_relpath=relpath,
+            rollout_id=get_active_rollout_id(),
+        )
         return paths
 
     # Legacy fallback (no active trajectory context).
@@ -297,36 +317,6 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
     return paths
 
 
-def _image_vis_summary(image_path: str | None) -> str:
-    """Compact measurable facts that complement the VLM's pixel observation."""
-    if not image_path or not str(image_path).endswith(".png"):
-        return ""
-    try:
-        from verl_omni.agent_loop.agentic_image_reflection import analyze_image
-
-        stats = analyze_image(image_path)
-    except Exception:  # noqa: BLE001 - never break the tool on viz failures
-        return ""
-    if not stats.get("ok"):
-        return ""
-    bright = float(stats.get("brightness") or 0.0)
-    contrast = float(stats.get("contrast") or 0.0)
-    edges = float(stats.get("edge_strength") or 0.0)
-    color = float(stats.get("colorfulness") or 0.0)
-    edge_tag = "soft" if edges < 0.04 else ("medium" if edges < 0.08 else "sharp")
-    color_tag = "muted" if color < 0.08 else ("moderate" if color < 0.16 else "rich")
-    luma_tag = "dark" if bright < 0.32 else ("bright" if bright > 0.82 else "mid")
-    bits = [
-        f"{stats.get('width')}x{stats.get('height')}",
-        f"mean_luma={int(round(bright * 255))}",
-        f"luma={luma_tag}",
-        f"edges={edge_tag}",
-        f"contrast={contrast:.2f}",
-        f"colors={color_tag}",
-    ]
-    return "image_vis=" + " ".join(str(b) for b in bits)
-
-
 def _pack_response(
     prompt: str,
     text: str,
@@ -349,23 +339,26 @@ def _pack_response(
     # Machine-readable markers for agentic_reward (R_tool / R_result) — survive
     # decode of the multi-turn response including tool-obs tokens.
     prompt_snip = (prompt or "").replace("\n", " ")[:240]
+    png0 = next((p for p in paths if str(p).endswith(".png")), None)
+    artifact_id = ""
+    if png0:
+        m = re.search(r"image_\d+_([0-9a-f]{12})\.png$", Path(png0).name, re.IGNORECASE)
+        if m:
+            artifact_id = m.group(1)
+        set_latest_tool_image_path(png0)
     marker = (
         f"agentic_tool ok={ok} stub={1 if tool_stubbed else 0} images={len(images)} "
         f"backend={backend} prompt={prompt_snip!r}"
     )
-    png0 = next((p for p in paths if str(p).endswith(".png")), None)
-    if png0:
-        set_latest_tool_image_path(png0)
-    vis = _image_vis_summary(png0)
+    if artifact_id:
+        marker = f"{marker} artifact={artifact_id}"
+    rid = get_active_rollout_id()
+    if rid:
+        marker = f"{marker} rollout={rid}"
     if paths and "path=" not in text:
         text = f"{text} path={paths[0]}"
-    if vis and "image_vis=" not in text:
-        text = f"{text} {vis}"
-        metrics["image_vis"] = vis
     text = f"{text} {marker}"
-    if images and _attach_images_enabled():
-        return ToolResponse(text=text, image=images), reward, metrics
-    # Text-only fallback for an actor without image_processor or diagnostics.
+    # Always text-only to the actor; PNGs stay on disk for the sidecar judge.
     return ToolResponse(text=text), reward, metrics
 
 
@@ -501,6 +494,22 @@ def _block_generate_after_yes_enabled() -> bool:
     }
 
 
+def _max_generate_passes() -> int:
+    try:
+        return max(1, int(os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")))
+    except ValueError:
+        return 3
+
+
+def _block_generate_after_max_passes_enabled() -> bool:
+    return os.getenv("AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
 def _blocked_generate_after_yes(prompt: str) -> tuple[ToolResponse, float, dict]:
     """Env hard-stop: refuse generate_image after good_enough=YES (no diffusion call)."""
     prompt_snip = (prompt or "").replace("\n", " ")[:240]
@@ -522,6 +531,35 @@ def _blocked_generate_after_yes(prompt: str) -> tuple[ToolResponse, float, dict]
     return ToolResponse(text=text), 0.0, metrics
 
 
+def _blocked_generate_after_max_passes(prompt: str, *, n_gen: int, max_passes: int) -> tuple[ToolResponse, float, dict]:
+    """Env hard-stop: refuse further generate_image after the pass cap."""
+    prompt_snip = (prompt or "").replace("\n", " ")[:240]
+    text = (
+        f"generate_image blocked: already completed {n_gen}/{max_passes} successful "
+        "generate_image passes. Emit Reflection summarizing the latest VL feedback and "
+        "end with Done. — do not rewrite again. "
+        f"agentic_block_generate_after_max_passes=1 agentic_tool ok=0 stub=0 images=0 "
+        f"backend=blocked_after_max_passes prompt={prompt_snip!r}"
+    )
+    metrics = {
+        "tool_stubbed": False,
+        "diffusion_backend": "blocked_after_max_passes",
+        "image_paths": [],
+        "num_images": 0,
+        "prompt": prompt,
+        "blocked_after_max_passes": 1,
+        "generate_passes": n_gen,
+        "max_generate_passes": max_passes,
+    }
+    logger.info(
+        "Blocked generate_image after max passes (%d/%d, prompt=%r)",
+        n_gen,
+        max_passes,
+        prompt_snip[:120],
+    )
+    return ToolResponse(text=text), 0.0, metrics
+
+
 @function_tool("generate_image", schema=DIFFUSION_TOOL_SCHEMA)
 def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     """Generate an image with a frozen external Qwen-Image service.
@@ -531,6 +569,12 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     """
     if _block_generate_after_yes_enabled() and get_good_enough_yes_reached():
         return _blocked_generate_after_yes(prompt)
+
+    if _block_generate_after_max_passes_enabled():
+        max_passes = _max_generate_passes()
+        n_gen = count_live_generate_artifacts_for_active_rollout()
+        if n_gen >= max_passes:
+            return _blocked_generate_after_max_passes(prompt, n_gen=n_gen, max_passes=max_passes)
 
     # vLLM-omni (continuous batching) — preferred.
     vllm_omni_url = os.getenv("AGENTIC_VLLM_OMNI_URL", "").strip()
@@ -626,24 +670,90 @@ JUDGE_TOOL_SCHEMA = {
             "Returns structured feedback: correctness/aesthetics scores per dimension, "
             "specific findings, suggested prompt fixes, and a good_enough verdict. "
             "Call this AFTER every generate_image — the VL feedback tells you whether "
-            "to finish (Done.) or rewrite and generate again."
+            "to finish (Done.) or rewrite and generate again. "
+            "Keep arguments SHORT: prefer user_request='same as user message' and "
+            "image_prompt='last' (the tool expands from the live task + latest image)."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "user_request": {
                     "type": "string",
-                    "description": "The original user request/task for the vision model to compare against.",
+                    "description": (
+                        "Compact task tag only. Prefer exactly 'same as user message' — "
+                        "do NOT paste the full multi-paragraph user task. The server "
+                        "expands this to the bound user request for the VL judge."
+                    ),
                 },
                 "image_prompt": {
                     "type": "string",
-                    "description": "The exact diffusion prompt used to generate the image being evaluated.",
+                    "description": (
+                        "Prefer exactly 'last', or a short echo of the diffusion prompt. "
+                        "Do NOT re-paste long prompts; the server resolves the latest "
+                        "generated image and full prompt for this rollout."
+                    ),
                 },
             },
             "required": ["user_request", "image_prompt"],
         },
     },
 }
+
+
+_JUDGE_USER_PLACEHOLDERS = {
+    "",
+    "same",
+    "same as user",
+    "same as user message",
+    "same as user task",
+    "same as the user message",
+    "same as the user task",
+    "user",
+    "user request",
+    "user_request",
+    "last",
+    "previous",
+}
+
+
+_JUDGE_PROMPT_PLACEHOLDERS = {
+    "",
+    "last",
+    "latest",
+    "same",
+    "previous",
+    "prior",
+    "image_prompt",
+}
+
+
+def _expand_judge_user_request(user_request: str) -> str:
+    """Expand compact / truncated judge args to the bound live user task."""
+    raw = (user_request or "").strip()
+    bound = (get_active_user_prompt() or "").strip()
+    if not bound:
+        return raw
+    low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
+    if low in _JUDGE_USER_PLACEHOLDERS:
+        return bound
+    # Truncated paste of the full task (common when response budget runs out).
+    if len(raw) < max(80, int(0.55 * len(bound))) and bound.lower().startswith(raw[:48].lower()):
+        return bound
+    if len(raw) <= 120 and raw.lower() in bound.lower():
+        return bound
+    return raw
+
+
+def _expand_judge_image_prompt(image_prompt: str) -> str:
+    """Expand compact / truncated image_prompt to the latest live generate prompt."""
+    raw = (image_prompt or "").strip()
+    latest = (get_latest_generate_prompt_for_active_rollout() or "").strip()
+    low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
+    if low in _JUDGE_PROMPT_PLACEHOLDERS:
+        return latest or raw
+    if latest and len(raw) < max(40, int(0.55 * len(latest))) and latest.lower().startswith(raw[:40].lower()):
+        return latest
+    return raw or latest
 
 
 def _call_judge_vlm(
@@ -659,6 +769,8 @@ def _call_judge_vlm(
     Returns ``(text, meta)`` where *text* is formatted for the agent to read
     and *meta* carries per-dimension scores for logging.
     """
+    user_request = _expand_judge_user_request(user_request)
+    image_prompt = _expand_judge_image_prompt(image_prompt)
     vllm_url = os.getenv("AGENTIC_VLLM_URL", "").strip()
     if vllm_url:
         return _call_judge_vllm(user_request, image_prompt, vllm_url)
@@ -776,7 +888,7 @@ def _call_judge_vllm(
     if last_err and not last_raw:
         return (
             f"[judge error] vLLM request failed ({last_err}). "
-            "Inspect the attached image yourself and decide Done. or rewrite.\n"
+            "Retry judge_image or rewrite the diffusion prompt and generate again.\n"
             f"  path={image_path}\n"
             f"  agentic_judge ok=0 parse_ok=0 stub=0 backend=vllm",
             {"error": last_err, "image_path": image_path, "parse_ok": 0, "parse_retries": max_retries},
@@ -801,7 +913,7 @@ def _call_judge_custom(
     endpoint = os.getenv("AGENTIC_REFLECT_VLM_URL", "").strip()
     if not endpoint:
         return (
-            "[judge stub] AGENTIC_REFLECT_VLM_URL / AGENTIC_VLLM_URL unset — inspect the attached image yourself.",
+            "[judge stub] AGENTIC_REFLECT_VLM_URL / AGENTIC_VLLM_URL unset — cannot score the image.",
             {"stub": True},
         )
 
@@ -842,13 +954,13 @@ def _call_judge_custom(
         logger.warning("judge VLM call failed: %s", exc)
         return (
             f"[judge error] VL sidecar request failed ({exc}). "
-            "Inspect the attached image yourself and decide Done. or rewrite.",
+            "Retry judge_image or rewrite the diffusion prompt and generate again.",
             {"error": str(exc), "image_path": image_path},
         )
 
     if not isinstance(data, dict):
         return (
-            "[judge error] VLM returned unexpected response — inspect the attached image yourself.",
+            "[judge error] VLM returned unexpected response — retry judge_image.",
             {"error": "not a dict", "image_path": image_path},
         )
 

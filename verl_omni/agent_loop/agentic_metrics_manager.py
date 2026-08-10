@@ -28,7 +28,9 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import ray
 from verl.experimental.agent_loop import AgentLoopManager
+from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.utils import hf_tokenizer
 
 from verl_omni.agent_loop.agentic_trajectory_context import (
@@ -231,16 +233,30 @@ def _split_env_blob(blob: str) -> tuple[str, str]:
     return text[:cut].strip(), text[cut:].strip()
 
 
+def _unpad_left_ids(token_ids, pad_token_id: int | None) -> list[int]:
+    """Strip left padding from prompt ids (verl left-pads prompts)."""
+    ids = token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
+    pads = {0}
+    if pad_token_id is not None:
+        pads.add(int(pad_token_id))
+    start = 0
+    while start < len(ids) and int(ids[start]) in pads:
+        start += 1
+    return [int(x) for x in ids[start:]]
+
+
 def _turn_record(
     *,
     turn: int,
     turn_prompt: str,
     response: str,
     decode: str,
+    turn_input: str = "",
 ) -> dict[str, Any]:
     return {
         "turn": turn,
         "turn_prompt": turn_prompt or "",
+        "turn_input": turn_input or "",
         "decode": decode or "",
         "response": response or "",
         "decode_has_tool_call": "<tool_call>" in (decode or "").lower(),
@@ -252,24 +268,43 @@ def split_assistant_rollouts(token_ids, response_mask, tokenizer) -> list[str]:
     return [turn["decode"] for turn in split_rollout_turns(token_ids, response_mask, tokenizer)]
 
 
-def split_rollout_turns(token_ids, response_mask, tokenizer) -> list[dict[str, Any]]:
+def split_rollout_turns(
+    token_ids,
+    response_mask,
+    tokenizer,
+    prompt_ids=None,
+) -> list[dict[str, Any]]:
     """Split response into turns with explicit prompt / response / decode fields.
 
     ``response_mask==1`` → model tokens (``decode``).
     ``response_mask==0`` → env tokens, split into:
-      - ``turn_prompt``: tool obs the policy conditions on
+      - ``turn_prompt``: tool obs the policy conditions on (short env delta)
       - ``response``: forced ``Reflection:…`` (injected, not policy-sampled)
 
-    Keys per turn: ``turn``, ``turn_prompt``, ``decode``, ``response``,
-    ``decode_has_tool_call``.
+    When ``prompt_ids`` is provided (unpadded chat-templated prompt tokens), each
+    turn also gets ``turn_input``: the exact decoded prefix the model saw before
+    generating that turn (system + Tools schema + history), including special tokens.
+
+    Keys per turn: ``turn``, ``turn_prompt``, ``turn_input``, ``decode``,
+    ``response``, ``decode_has_tool_call``.
     """
     ids = token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
     mask = response_mask.tolist() if hasattr(response_mask, "tolist") else list(response_mask)
+    prompt_prefix = (
+        _unpad_left_ids(prompt_ids, getattr(tokenizer, "pad_token_id", None)) if prompt_ids is not None else None
+    )
     turns: list[dict[str, Any]] = []
     current_model: list[int] = []
     current_tool: list[int] = []
     pending_prompt = ""
     pending_response = ""
+    model_start = 0
+
+    def _decode_input(response_prefix_len: int) -> str:
+        if prompt_prefix is None:
+            return ""
+        prefix = prompt_prefix + [int(x) for x in ids[:response_prefix_len]]
+        return tokenizer.decode(prefix, skip_special_tokens=False)
 
     def _flush_tool() -> None:
         nonlocal pending_prompt, pending_response, current_tool
@@ -292,16 +327,19 @@ def split_rollout_turns(token_ids, response_mask, tokenizer) -> list[dict[str, A
                 turn_prompt=pending_prompt,
                 response=pending_response,
                 decode=decode,
+                turn_input=_decode_input(model_start),
             )
         )
         pending_prompt = ""
         pending_response = ""
         current_model = []
 
-    for token_id, is_model_token in zip(ids, mask, strict=True):
+    for idx, (token_id, is_model_token) in enumerate(zip(ids, mask, strict=True)):
         if int(is_model_token) == 1:
             if current_tool:
                 _flush_tool()
+            if not current_model:
+                model_start = idx
             current_model.append(int(token_id))
         else:
             if current_model:
@@ -319,6 +357,7 @@ def split_rollout_turns(token_ids, response_mask, tokenizer) -> list[dict[str, A
                     turn_prompt=pending_prompt,
                     response=pending_response,
                     decode="",
+                    turn_input=_decode_input(len(ids)),
                 )
             )
         pending_prompt = ""
@@ -355,15 +394,24 @@ def _materialize_rollout_images(
     relpath: str,
     user_prompt: str,
 ) -> list[str]:
-    """Index images that the tool wrote directly into this rollout directory."""
+    """Index images already written by the live tool; never create empty folders."""
     target_dir = run_dir / "rollout_images" / relpath
-    target_dir.mkdir(parents=True, exist_ok=True)
+    # ``diffusion_tool._save_images`` creates this directory only after a real
+    # generate_image execution. A rollout with no generated artifact must not
+    # gain a confusing meta-only ``sample_*`` directory during post-processing.
+    if not target_dir.is_dir():
+        return []
+
     prompts = _extract_generate_image_prompts(decoded_response)
     image_paths = [
         str(path)
         for path in sorted(target_dir.iterdir())
         if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
     ]
+    if not image_paths:
+        # Preserve any live failure artifact (for example STUB_NO_IMAGE), but do
+        # not manufacture or update meta.json for a directory with no images.
+        return []
 
     meta_path = target_dir / "meta.json"
     try:
@@ -383,14 +431,12 @@ def _materialize_rollout_images(
     return image_paths
 
 
-class AgenticMetricsAgentLoopManager(AgentLoopManager):
-    """Use stock rollout management; observe outputs without changing them."""
+class AgenticAgentLoopWorker(AgentLoopWorker):
+    """Worker-side hooks: trajectory bind + step kwargs for force-first curriculum.
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
-        trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
-        self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
+    ``AgentLoopManager.generate_sequences`` dispatches to Ray ``AgentLoopWorker``s.
+    Overrides on the Manager class never run per-rollout — they must live here.
+    """
 
     async def _run_agent_loop(
         self,
@@ -401,7 +447,6 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         trace=True,
         **kwargs,
     ):
-        """Bind the final step/sample path before this rollout executes tools."""
         relpath = build_trajectory_relpath(
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
@@ -413,6 +458,11 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         prompt_token = set_active_user_prompt(user_prompt)
         # Fresh trajectory: allow generate_image until the first good_enough=YES.
         clear_good_enough_yes_reached()
+        # Force-first curriculum reads these inside AgenticToolAgentLoop.run().
+        kwargs["_agentic_step"] = trajectory["step"]
+        kwargs["_agentic_validate"] = trajectory["validate"]
+        # Same id used by diffusion_tool saves and post-hoc trajectory dumps.
+        kwargs["_agentic_trajectory_relpath"] = relpath
         try:
             return await super()._run_agent_loop(
                 sampling_params,
@@ -424,6 +474,18 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         finally:
             reset_active_user_prompt(prompt_token)
             reset_active_trajectory_relpath(path_token)
+
+
+class AgenticMetricsAgentLoopManager(AgentLoopManager):
+    """Use stock rollout management; observe outputs without changing them."""
+
+    def __init__(self, *args, **kwargs):
+        # Must set before AgentLoopManager.__init__ creates Ray workers.
+        self.agent_loop_workers_class = ray.remote(AgenticAgentLoopWorker)
+        super().__init__(*args, **kwargs)
+        model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
+        trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
+        self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
 
     def _dump_raw_rollouts(self, prompts, output, step) -> None:
         """Write user prompt + raw assistant turns only."""
@@ -443,21 +505,52 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             rollout_counts: dict[str, int] = {}
             step_text: list[str] = []
             jsonl_rows: list[str] = []
+            live_relpaths = output.non_tensor_batch.get("trajectory_relpath")
             for i in range(len(responses)):
                 sample_index = indices[i]
                 sample_key = str(int(sample_index)) if str(sample_index).lstrip("-").isdigit() else str(sample_index)
-                rollout_n = rollout_counts.get(sample_key, 0)
-                rollout_counts[sample_key] = rollout_n + 1
-                relpath = build_trajectory_relpath(
-                    step=step_i,
-                    sample_index=sample_index,
-                    rollout_n=rollout_n,
-                )
+                # Prefer the live artifact id stamped by AgenticToolAgentLoop so
+                # trajectory JSON / image folders match path= markers in tool obs.
+                # Fallback: renumber by batch order (legacy; can diverge if workers
+                # reorder outputs relative to dispatch).
+                live_relpath = None
+                if live_relpaths is not None:
+                    try:
+                        raw = live_relpaths[i]
+                        if raw:
+                            live_relpath = str(raw)
+                    except (TypeError, IndexError, KeyError):
+                        live_relpath = None
+                if live_relpath:
+                    relpath = live_relpath
+                    # Parse sample_index.rollout_n from ``…/sample_6.03`` when present.
+                    name = Path(relpath).name
+                    m = re.fullmatch(r"sample_(.+)\.(\d+)$", name)
+                    if m:
+                        sample_key = m.group(1)
+                        rollout_n = int(m.group(2))
+                    else:
+                        rollout_n = rollout_counts.get(sample_key, 0)
+                else:
+                    rollout_n = rollout_counts.get(sample_key, 0)
+                    relpath = build_trajectory_relpath(
+                        step=step_i,
+                        sample_index=sample_index,
+                        rollout_n=rollout_n,
+                    )
+                rollout_counts[sample_key] = max(rollout_counts.get(sample_key, 0), int(rollout_n) + 1)
                 user_prompt = _last_user_prompt(raw_prompts[i]) if raw_prompts is not None else ""
+                prompt_ids = None
+                if "prompts" in output.batch:
+                    prompt_ids = _unpad_left_ids(
+                        output.batch["prompts"][i],
+                        getattr(self._monitor_tokenizer, "pad_token_id", None),
+                    )
                 rollout_turns = split_rollout_turns(
                     responses[i],
                     response_masks[i],
                     self._monitor_tokenizer,
+                    prompt_ids=prompt_ids,
                 )
                 if rollout_turns and not rollout_turns[0].get("turn_prompt"):
                     rollout_turns[0]["turn_prompt"] = user_prompt
@@ -471,34 +564,18 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                     relpath=relpath,
                     user_prompt=user_prompt,
                 )
-                payload = {
-                    "trajectory_relpath": relpath,
-                    "step": step_i,
-                    "sample_index": int(sample_index) if str(sample_index).lstrip("-").isdigit() else str(sample_index),
-                    "rollout_n": rollout_n,
-                    "user_prompt": user_prompt,
-                    "rollout_turns": rollout_turns,
-                    "image_paths": image_paths,
-                    "num_tool_calls_executed": sum(
-                        len(_EXECUTED_TOOL_RESPONSE_RE.findall(turn.get("turn_prompt", "") or ""))
-                        for turn in rollout_turns
-                    ),
-                    "num_forced_tool_calls": 0,
-                    "num_voluntary_tool_calls": sum(
-                        len(_TOOL_CALL_RE.findall(turn.get("decode") or "")) for turn in rollout_turns
-                    ),
-                    # Legacy field name retained for downstream dashboards.
-                    "num_voluntary_hermes": sum(
-                        len(_TOOL_CALL_RE.findall(turn.get("decode") or "")) for turn in rollout_turns
-                    ),
-                }
-                reward_metrics = _artifact_reward_metrics(output, i)
-
-                # Stable key order for trajectory JSON.
+                image_dir = str(run_dir / "rollout_images" / relpath) if image_paths else ""
+                # Prefer the full chat-templated model input in ``turn_prompt`` (system +
+                # Tools schema + history). Keep the short env delta in ``turn_obs``.
                 for turn in rollout_turns:
+                    turn_obs = turn.get("turn_prompt") or ""
+                    turn_input = turn.get("turn_input") or ""
+                    turn["turn_obs"] = turn_obs
+                    if turn_input:
+                        turn["turn_prompt"] = turn_input
                     turn["turn_kind"] = _turn_kind(
                         turn.get("decode") or "",
-                        turn.get("turn_prompt") or "",
+                        turn_obs,
                         turn.get("response") or "",
                     )
                 ordered_turns = [
@@ -506,13 +583,46 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                         "turn": t.get("turn"),
                         "turn_kind": t.get("turn_kind"),
                         "turn_prompt": t.get("turn_prompt") or "",
+                        "turn_obs": t.get("turn_obs") or "",
                         "decode": t.get("decode") or "",
                         "response": t.get("response") or "",
                         "decode_has_tool_call": bool(t.get("decode_has_tool_call")),
                     }
                     for t in rollout_turns
                 ]
-                payload["rollout_turns"] = ordered_turns
+                payload = {
+                    "trajectory_relpath": relpath,
+                    "image_dir": image_dir,
+                    "step": step_i,
+                    "sample_index": int(sample_index) if str(sample_index).lstrip("-").isdigit() else str(sample_index),
+                    "rollout_n": rollout_n,
+                    "user_prompt": user_prompt,
+                    "rollout_turns": ordered_turns,
+                    "image_paths": image_paths,
+                    "image_paths_in_obs": sorted(
+                        {
+                            m.group(1)
+                            for turn in ordered_turns
+                            for m in re.finditer(
+                                r"path=((?:/|[A-Za-z]:\\)[^\s\"']+\.(?:png|jpg|jpeg|webp))",
+                                turn.get("turn_obs") or "",
+                                flags=re.IGNORECASE,
+                            )
+                        }
+                    ),
+                    "num_tool_calls_executed": sum(
+                        len(_EXECUTED_TOOL_RESPONSE_RE.findall(turn.get("turn_obs") or "")) for turn in ordered_turns
+                    ),
+                    "num_forced_tool_calls": 0,
+                    "num_voluntary_tool_calls": sum(
+                        len(_TOOL_CALL_RE.findall(turn.get("decode") or "")) for turn in ordered_turns
+                    ),
+                    # Legacy field name retained for downstream dashboards.
+                    "num_voluntary_hermes": sum(
+                        len(_TOOL_CALL_RE.findall(turn.get("decode") or "")) for turn in ordered_turns
+                    ),
+                }
+                reward_metrics = _artifact_reward_metrics(output, i)
 
                 name = Path(relpath).name
                 (trajectory_dir / f"{name}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
@@ -552,10 +662,18 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 # ``rollout_trajectories`` is the canonical home of raw
                 # decodes. Keep hermes_actions compact and focused on action
                 # metadata plus the exact per-rollout reward outputs.
+                # Hermes JSONL stays compact: short env obs only (not the full template).
                 monitor_payload = {
                     **payload,
                     "rollout_turns": [
-                        {key: value for key, value in turn.items() if key != "decode"} for turn in ordered_turns
+                        {
+                            "turn": turn["turn"],
+                            "turn_kind": turn["turn_kind"],
+                            "turn_prompt": turn.get("turn_obs") or "",
+                            "response": turn.get("response") or "",
+                            "decode_has_tool_call": bool(turn.get("decode_has_tool_call")),
+                        }
+                        for turn in ordered_turns
                     ],
                     "reward_metrics": reward_metrics,
                 }
@@ -570,8 +688,10 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
     def generate_sequences(self, prompts):
         step = prompts.meta_info.get("global_steps")
         output = super().generate_sequences(prompts)
-        self._discard_invalid_rollouts(output)
+        # Dump before discard so hermes_actions shows real policy decodes
+        # (discard zeros response_mask, which would hide tool-less prose as env text).
         self._dump_raw_rollouts(prompts, output, step)
+        self._discard_invalid_rollouts(output)
         metrics = aggregate_agentic_reward_metrics(output.non_tensor_batch)
         if metrics:
             try:
@@ -600,6 +720,9 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         if response_mask is None:
             return
         n = int(response_mask.shape[0])
+        # Keep a copy so we can restore if zeroing would empty the whole batch
+        # (verl rollout_corr raises: "response_mask must contain at least one valid token").
+        original_mask = response_mask.clone()
         dropped = 0
         for i in range(n):
             is_valid = True
@@ -617,7 +740,15 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 continue
             response_mask[i].zero_()
             dropped += 1
-        if dropped:
+        if dropped and not bool(response_mask.any()):
+            response_mask.copy_(original_mask)
+            logger.warning(
+                "All %d/%d rollouts lacked generate_image; kept response_mask intact "
+                "to avoid empty-mask crash in rollout_corr (rewards stay 0)",
+                dropped,
+                n,
+            )
+        elif dropped:
             logger.info(
                 "Discarded %d/%d rollouts with no generate_image (response_mask=0, rollout_valid=0)",
                 dropped,

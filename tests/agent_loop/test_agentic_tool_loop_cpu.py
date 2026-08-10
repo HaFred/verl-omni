@@ -49,10 +49,9 @@ class TestTrainMaskContract:
 class TestStockToolAgentWiring:
     def test_recipe_uses_stock_tool_agent(self):
         root = Path(__file__).resolve().parents[2]
-        recipe = (root / "examples/agenticrpco_trainer/agent_llm/run_agentic_grpo.sh").read_text()
-        assert "default_agent_loop=tool_agent" in recipe
+        recipe = (root / "examples/agenticrpco_trainer/agent_llm/run_agentic_grpo_lora.sh").read_text()
+        assert "default_agent_loop=agentic_tool_agent" in recipe
         assert "agentic_force_tool_agent" not in recipe
-        assert "AGENTIC_FORCE_" not in recipe
         assert "TEACHER_FORCE_HERMES" not in recipe
         assert (
             "+actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.agentic_metrics_manager."
@@ -62,10 +61,11 @@ class TestStockToolAgentWiring:
         assert "multi_turn.enable=true" in recipe
         assert "Qwen/Qwen3.5-2B" in recipe
         assert "multi_turn.format=${TOOL_PARSER_FORMAT}" in recipe
-        assert '"qwen3_coder"' in recipe and '"hermes"' in recipe
-        assert 'AGENTIC_DIFFUSION_ATTACH_IMAGE="${AGENTIC_DIFFUSION_ATTACH_IMAGE:-1}"' in recipe
+        assert "qwen3_coder" in recipe and "hermes" in recipe
         assert "Installed tool-aware chat template" not in recipe
         assert "function_tool_path=verl_omni/agent_loop/diffusion_tool.py" in recipe
+        assert "AGENTIC_DIFFUSION_ATTACH_IMAGE" not in recipe
+        assert "ToolResponse(text=text, image=" not in (root / "verl_omni/agent_loop/diffusion_tool.py").read_text()
 
     def test_stock_tool_agent_is_upstream(self):
         assert ToolAgentLoop.__module__ == "verl.experimental.agent_loop.tool_agent_loop"
@@ -131,6 +131,114 @@ class TestStockToolAgentWiring:
         assert metrics["num_images"] == 0
         assert reward == 0.0
 
+    def test_generate_blocked_after_max_passes(self, monkeypatch, tmp_path):
+        from verl_omni.agent_loop.agentic_trajectory_context import (
+            clear_good_enough_yes_reached,
+            clear_tool_artifact_registry,
+            register_tool_artifact,
+            set_active_trajectory_relpath,
+        )
+
+        clear_tool_artifact_registry()
+        clear_good_enough_yes_reached()
+        monkeypatch.setenv("AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES", "1")
+        monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "2")
+        monkeypatch.setenv("AGENTIC_BLOCK_GENERATE_AFTER_YES", "0")
+        monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
+        monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
+
+        set_active_trajectory_relpath("step_000001/sample_0.00")
+        for i in range(2):
+            png = tmp_path / f"img_{i}.png"
+            png.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes([i]))
+            register_tool_artifact(
+                prompt=f"prompt {i}",
+                paths=[str(png)],
+                backend="vllm_omni",
+                tool_stubbed=False,
+                trajectory_relpath="step_000001/sample_0.00",
+            )
+
+        response, reward, metrics = generate_image("fourth attempt should block")
+        assert "agentic_block_generate_after_max_passes=1" in response.text
+        assert metrics["blocked_after_max_passes"] == 1
+        assert metrics["diffusion_backend"] == "blocked_after_max_passes"
+        assert metrics["num_images"] == 0
+        assert reward == 0.0
+        clear_tool_artifact_registry()
+
+    def test_judge_args_expand_from_bound_context(self, monkeypatch, tmp_path):
+        from verl_omni.agent_loop.agentic_trajectory_context import (
+            clear_tool_artifact_registry,
+            register_tool_artifact,
+            set_active_trajectory_relpath,
+            set_active_user_prompt,
+        )
+        from verl_omni.agent_loop.diffusion_tool import (
+            _expand_judge_image_prompt,
+            _expand_judge_user_request,
+        )
+
+        clear_tool_artifact_registry()
+        long_user = "A" * 400 + " soldier letter scene"
+        set_active_user_prompt(long_user)
+        set_active_trajectory_relpath("step_000001/sample_1.00")
+        png = tmp_path / "live.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\nlive")
+        full_prompt = "realistic pencil sketch of a tall soldier with medals"
+        register_tool_artifact(
+            prompt=full_prompt,
+            paths=[str(png)],
+            backend="vllm_omni",
+            trajectory_relpath="step_000001/sample_1.00",
+        )
+        assert _expand_judge_user_request("same as user message") == long_user
+        assert _expand_judge_user_request(long_user[:60]) == long_user
+        assert _expand_judge_image_prompt("last") == full_prompt
+        assert _expand_judge_image_prompt(full_prompt[:20]) == full_prompt
+        clear_tool_artifact_registry()
+
+    def test_good_enough_yes_latch_is_isolated_across_asyncio_tasks(self, monkeypatch, tmp_path):
+        """Concurrent gather rollouts must not share the YES latch via TLS."""
+        from verl_omni.agent_loop.agentic_trajectory_context import (
+            clear_good_enough_yes_reached,
+            get_good_enough_yes_reached,
+            set_good_enough_yes_reached,
+        )
+
+        monkeypatch.setenv("AGENTIC_BLOCK_GENERATE_AFTER_YES", "1")
+        monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
+        monkeypatch.delenv("AGENTIC_LANCE_SERVER_URL", raising=False)
+        monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
+
+        async def yes_then_block():
+            clear_good_enough_yes_reached()
+            set_good_enough_yes_reached(True)
+            await asyncio.sleep(0)
+            response, _, metrics = generate_image("blocked in yes task")
+            return metrics.get("blocked_after_yes", 0), get_good_enough_yes_reached()
+
+        async def clear_then_allow():
+            # Start after sibling has set YES; our clear must not be overwritten by TLS.
+            await asyncio.sleep(0)
+            clear_good_enough_yes_reached()
+            assert get_good_enough_yes_reached() is False
+            response, _, metrics = generate_image("allowed in fresh task")
+            return metrics.get("blocked_after_yes", 0), metrics.get("diffusion_backend")
+
+        async def _run_pair():
+            return await asyncio.gather(yes_then_block(), clear_then_allow())
+
+        blocked, allowed = asyncio.run(_run_pair())
+        assert blocked == (1, True)
+        assert allowed[0] == 0
+        assert allowed[1] == "stub"
+
     def test_qwen_image_backend_has_priority(self, monkeypatch):
         import verl_omni.agent_loop.diffusion_tool as module
         from verl_omni.agent_loop.agentic_trajectory_context import clear_good_enough_yes_reached
@@ -143,6 +251,7 @@ class TestStockToolAgentWiring:
             return SimpleNamespace(text="ok", image=None), 0.0, {"diffusion_backend": backend}
 
         monkeypatch.setattr(module, "_call_generic_http", fake_http)
+        monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
         monkeypatch.setenv("AGENTIC_QWEN_IMAGE_URL", "http://127.0.0.1:8092/generate")
         monkeypatch.setenv("AGENTIC_DIFFUSION_TOOL_URL", "http://wrong.example/generate")
         _, _, metrics = generate_image("a reflective silver robot")
@@ -154,9 +263,11 @@ class TestStockToolAgentWiring:
         }
         assert metrics["diffusion_backend"] == "qwen_image"
 
-    def test_qwen_image_pixels_are_attached_for_vlm(self, monkeypatch, tmp_path):
+    def test_qwen_image_saves_png_text_only_to_actor(self, monkeypatch, tmp_path):
         import verl_omni.agent_loop.diffusion_tool as module
+        from verl_omni.agent_loop.agentic_trajectory_context import clear_good_enough_yes_reached
 
+        clear_good_enough_yes_reached()
         buffer = io.BytesIO()
         Image.new("RGB", (32, 32), (20, 80, 200)).save(buffer, format="PNG")
         payload = {
@@ -176,13 +287,14 @@ class TestStockToolAgentWiring:
                 return json.dumps(payload).encode()
 
         monkeypatch.setattr(module, "urlopen", lambda *_args, **_kwargs: FakeHTTPResponse())
+        monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
         monkeypatch.setenv("AGENTIC_QWEN_IMAGE_URL", "http://127.0.0.1:8092/generate")
-        monkeypatch.setenv("AGENTIC_DIFFUSION_ATTACH_IMAGE", "1")
         monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
 
         response, _, metrics = generate_image("a blue square")
 
-        assert response.image and response.image[0].size == (32, 32)
+        assert not getattr(response, "image", None)
+        assert "path=" in (response.text or "")
         assert metrics["diffusion_backend"] == "qwen_image"
         assert metrics["num_images"] == 1
         assert Path(metrics["image_paths"][0]).is_file()
@@ -225,6 +337,14 @@ def test_rollout_monitor_splits_model_turns_around_tool_observation():
     assert turns[0]["turn"] == 1 and turns[0]["turn_prompt"] == ""
     assert turns[1]["turn"] == 2 and turns[1]["turn_prompt"] == "OBS"
     assert turns[1]["decode"] == "reflect"
+    assert turns[0]["turn_input"] == "" and turns[1]["turn_input"] == ""
+
+    # With prompt_ids, turn_input is the exact decoded prefix before each model span.
+    prompt_ids = [ord(c) for c in "SYS#Tools"]
+    turns_full = split_rollout_turns(token_ids, response_mask, Tokenizer(), prompt_ids=prompt_ids)
+    assert turns_full[0]["turn_input"] == "SYS#Tools"
+    assert turns_full[1]["turn_input"] == "SYS#ToolscallOBS"
+    assert turns_full[1]["turn_prompt"] == "OBS"
 
 
 def test_rollout_monitor_writes_only_prompt_and_raw_decodes(monkeypatch, tmp_path):
@@ -277,8 +397,11 @@ def test_rollout_monitor_writes_only_prompt_and_raw_decodes(monkeypatch, tmp_pat
     assert "mode=" not in monitor
 
     traj = json.loads((tmp_path / "rollout_trajectories" / "step_000001" / "sample_3.00.json").read_text())
+    # Without batch["prompts"], turn_prompt stays the short env/user slice.
     assert traj["rollout_turns"][0]["turn_prompt"] == "Generate a cat"
+    assert traj["rollout_turns"][0]["turn_obs"] == "Generate a cat"
     assert traj["rollout_turns"][1]["turn_prompt"] == "OBS"
+    assert traj["rollout_turns"][1]["turn_obs"] == "OBS"
     assert traj["rollout_turns"][0]["decode"] == "first"
 
     action = json.loads((tmp_path / "hermes_actions" / "step_000001.jsonl").read_text())
@@ -295,6 +418,62 @@ def test_rollout_monitor_writes_only_prompt_and_raw_decodes(monkeypatch, tmp_pat
         "protocol_ok": 0,
         "rollout_valid": 1,
     }
+
+
+def test_rollout_monitor_writes_full_chat_template_input(monkeypatch, tmp_path):
+    """When batch prompts exist, trajectory turn_prompt is the full model input."""
+
+    class Tokenizer:
+        pad_token_id = 0
+
+        @staticmethod
+        def decode(ids, skip_special_tokens=False):
+            del skip_special_tokens
+            return "".join(chr(i) for i in ids if i)
+
+    text = "firstOBStool"
+    # Left-padded chat-templated prompt (pad=0).
+    prompt = [0, 0] + [ord(c) for c in "SYS#Tools<tool_call>"]
+    output = SimpleNamespace(
+        batch={
+            "prompts": torch.tensor([prompt]),
+            "responses": torch.tensor([[ord(c) for c in text]]),
+            "response_mask": torch.tensor([[1] * 5 + [0] * 3 + [1] * 4]),
+            "rm_scores": torch.tensor([[0.0, 0.0, 0.75]]),
+        },
+        non_tensor_batch={
+            "raw_prompt": np.array(
+                [[{"role": "user", "content": "Generate a cat"}]],
+                dtype=object,
+            ),
+            "index": np.array([7]),
+            "reward_tool_call": np.array([1.0]),
+            "reward_done": np.array([0.0]),
+            "reward_correctness": np.array([0.0]),
+            "reward_aesthetics": np.array([0.0]),
+            "num_hermes_tool_calls": np.array([1]),
+            "num_generate_image_prompts": np.array([1]),
+            "num_judge_image_calls": np.array([0]),
+            "protocol_ok": np.array([0]),
+            "rollout_valid": np.array([1]),
+        },
+    )
+    manager = AgenticMetricsAgentLoopManager.__new__(AgenticMetricsAgentLoopManager)
+    manager._monitor_tokenizer = Tokenizer()
+    monkeypatch.setenv("AGENTIC_DIFFUSION_IMAGE_DIR", str(tmp_path / "rollout_images"))
+
+    manager._dump_raw_rollouts(None, output, 2)
+
+    traj = json.loads((tmp_path / "rollout_trajectories" / "step_000002" / "sample_7.00.json").read_text())
+    assert traj["rollout_turns"][0]["turn_prompt"] == "SYS#Tools<tool_call>"
+    assert traj["rollout_turns"][0]["turn_obs"] == "Generate a cat"
+    assert traj["rollout_turns"][1]["turn_prompt"] == "SYS#Tools<tool_call>firstOBS"
+    assert traj["rollout_turns"][1]["turn_obs"] == "OBS"
+    # Hermes stays compact with short obs only.
+    action = json.loads((tmp_path / "hermes_actions" / "step_000002.jsonl").read_text())
+    assert action["rollout_turns"][0]["turn_prompt"] == "Generate a cat"
+    assert action["rollout_turns"][1]["turn_prompt"] == "OBS"
+    assert "turn_obs" not in action["rollout_turns"][0]
 
 
 def test_qwen35_xml_monitor_counts_tools_and_sums_token_reward(monkeypatch, tmp_path):
@@ -410,3 +589,98 @@ def test_two_turn_tool_images_are_indexed_without_posthoc_move(tmp_path):
     meta = json.loads((target_dir / "meta.json").read_text())
     assert meta["tool_prompts"] == [prompt0, prompt1]
     assert meta["source"] == "direct_tool_write"
+
+
+class TestForceFirstTeacherHermes:
+    def test_force_schedule_anneals(self, monkeypatch):
+        from verl_omni.agent_loop.agentic_tool_agent_loop import _force_first_generate_probability
+
+        monkeypatch.setenv("AGENTIC_FORCE_FIRST_GENERATE", "1")
+        monkeypatch.setenv("AGENTIC_FORCE_FIRST_WARMUP_STEPS", "10")
+        monkeypatch.setenv("AGENTIC_FORCE_FIRST_END_STEP", "20")
+        assert _force_first_generate_probability(0) == 1.0
+        assert _force_first_generate_probability(10) == 1.0
+        assert _force_first_generate_probability(15) == 0.5
+        assert _force_first_generate_probability(20) == 0.0
+        assert _force_first_generate_probability(5, validate=True) == 0.0
+
+    def test_forced_generate_prompt_must_not_be_sparse_across_workers(self):
+        """Reproduce the step-13 crash: sparse `_forced_generate_prompt` across workers.
+
+        DataProto.concat takes non_tensor keys from the first worker only; a key
+        present on worker0 but missing on worker1 concatenates to length 8 while
+        the tensor batch is 16.
+        """
+        from verl.protocol import DataProto
+
+        def _worker_batch(*, with_forced_prompt: bool, n: int = 8) -> DataProto:
+            batch = {"responses": torch.zeros(n, 4, dtype=torch.long)}
+            non_tensor = {
+                "forced_first_generate": np.array([False] * n, dtype=object),
+            }
+            if with_forced_prompt:
+                non_tensor["_forced_generate_prompt"] = np.array(["p"] * n, dtype=object)
+            return DataProto.from_dict(tensors=batch, non_tensors=non_tensor)
+
+        with pytest.raises(AssertionError, match="_forced_generate_prompt"):
+            DataProto.concat([_worker_batch(with_forced_prompt=True), _worker_batch(with_forced_prompt=False)])
+
+        # After AgenticToolAgentLoop.run pops the scratch key, both workers match.
+        ok = DataProto.concat([_worker_batch(with_forced_prompt=False), _worker_batch(with_forced_prompt=False)])
+        assert len(ok) == 16
+        assert "_forced_generate_prompt" not in ok.non_tensor_batch
+
+    def test_hermes_wire_format_matches_reward_parser(self):
+        from verl_omni.agent_loop.agentic_tool_agent_loop import _hermes_tool_call
+        from verl_omni.utils.reward_score.agentic_reward import _extract_tool_calls, _gen_image_prompts
+
+        gen = _hermes_tool_call("generate_image", prompt="a red fox")
+        judge = _hermes_tool_call(
+            "judge_image",
+            user_request="a red fox",
+            image_prompt="a red fox, detailed",
+        )
+        assert gen.startswith("<tool_call>\n") and gen.endswith("</tool_call>")
+        calls = _extract_tool_calls(gen + "\n" + judge)
+        assert [c[2]["name"] for c in calls] == ["generate_image", "judge_image"]
+        assert _gen_image_prompts(calls) == ["a red fox"]
+
+    def test_counts_live_vllm_omni_generate_not_fewshot(self):
+        from verl_omni.agent_loop.agentic_tool_agent_loop import (
+            _count_successful_generates,
+            _count_successful_judges,
+            _last_live_generate_prompt,
+        )
+
+        # Fewshot demo tools sit before the live user turn and must not block
+        # teacher-forced judge_image (fewshot judges lack backend=fewshot).
+        messages = [
+            {"role": "user", "content": "demo fox"},
+            {
+                "role": "tool",
+                "content": "demo agentic_tool ok=1 backend=fewshot prompt='fox'",
+            },
+            {
+                "role": "tool",
+                "content": "agentic_judge ok=1 correctness=0.9 aesthetics=0.8 good_enough=YES findings: demo",
+            },
+            {"role": "user", "content": "live soldier scene"},
+            {
+                "role": "tool",
+                "content": (
+                    "vLLM-Omni generated the requested image. "
+                    "path=/tmp/x.png agentic_tool ok=1 stub=0 backend=vllm_omni "
+                    "prompt='live soldier scene'"
+                ),
+            },
+        ]
+        assert _count_successful_generates(messages) == 1
+        assert _count_successful_judges(messages) == 0
+        assert _last_live_generate_prompt(messages) == "live soldier scene"
+        messages.append(
+            {
+                "role": "tool",
+                "content": ("agentic_judge ok=1 correctness=0.9 aesthetics=0.85 good_enough=YES findings: ok"),
+            }
+        )
+        assert _count_successful_judges(messages) == 1

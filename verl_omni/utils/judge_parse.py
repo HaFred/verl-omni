@@ -106,10 +106,10 @@ def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     thr = good_enough_threshold()
-    if "good_enough" in data:
-        good_enough = bool(data.get("good_enough"))
-    else:
-        good_enough = correctness >= thr and aesthetics >= thr
+    # Always derive YES/NO from scores × env threshold. Ignore any model-emitted
+    # ``good_enough`` flag so AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD actually controls
+    # rewrite pressure (VLM often returns true with A≈0.85).
+    good_enough = correctness >= thr and aesthetics >= thr
 
     return {
         "correctness": correctness,
@@ -277,7 +277,7 @@ def format_judge_parse_error(
     """Format a failed judge obs (``agentic_judge ok=0 parse_ok=0``) — no fake C/A."""
     text = (
         "[judge error] VLM returned unparseable response — do not invent scores. "
-        "Inspect the attached image yourself and decide Done. or rewrite.\n"
+        "Retry judge_image or rewrite the diffusion prompt and generate again.\n"
         f"  path={image_path}\n"
         f"  agentic_judge ok=0 parse_ok=0 stub=0 backend={backend} parse_retries={parse_retries}"
     )

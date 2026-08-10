@@ -242,7 +242,7 @@ def generate(request: GenerateRequest) -> GenerateResponse:
     elapsed = time.perf_counter() - started
     return GenerateResponse(
         image_base64=encoded,
-        text="Frozen Qwen-Image generated a candidate. Inspect the attached image before revising the prompt.",
+        text="Frozen Qwen-Image generated a candidate image.",
         model=MODEL_ID,
         memory_mode=MEMORY_MODE,
         seed=seed,

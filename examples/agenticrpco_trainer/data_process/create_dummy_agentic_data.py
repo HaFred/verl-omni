@@ -19,11 +19,11 @@ Supports both actor tool-call wire formats (must match multi_turn.format):
   --tool_call_format auto        → pick from MODEL_PATH (default)
 
 Protocol (one logical turn):
-  generate_image → (image obs attached)
+  generate_image → (text obs: path= + agentic_tool; PNGs stay on disk for the judge)
   judge_image    → (VL feedback: scores, findings, fixes, good_enough)
   agent reflects & decides: Reflection: ... Done.  OR  Reflection: ... + rewritten generate_image
 
-Three demonstration classes (concatenated for overfit, cycled otherwise):
+Three demonstration classes (optional fewshot; overfit: Class-1 on soldier only):
 0. Single-pass success  (comprehensive prompt → VL says YES)
 1. Two-pass refine      (lazy prompt → VL says NO → rewrite → VL says YES)
 2. Three-pass refine    (very lazy → NO → rewrite → NO → rewrite → YES)
@@ -47,19 +47,26 @@ SYSTEM_PROMPT = """You are a visual creation agent with two tools:
 
 Protocol (one logical turn = generate → judge → reflect & decide):
 1. Call generate_image with a complete diffusion prompt.
-2. After the image returns, call judge_image(user_request, image_prompt)
-   to get structured VL feedback on that image.
+2. After the image returns, call judge_image with SHORT args only:
+   user_request="same as user message"
+   image_prompt="last"
+   Do NOT paste the full user task or re-paste long diffusion prompts into
+   judge_image — the tool expands those from the live task and latest image.
 3. Read the VL feedback (correctness, aesthetics, good_enough, findings,
    suggested_fixes). Then write your reflection and decide:
    - If good_enough=YES → "Reflection: <summary> Done."
    - If good_enough=NO  → "Reflection: <what's wrong> + rewritten generate_image"
      call in the SAME assistant turn, using the suggested_fixes.
+   - After at most 3 successful generate_image calls, you MUST stop with
+     "Reflection: <summary> Done." even if good_enough=NO. Do not keep rewriting.
 
 HARD RULES (non-negotiable):
 - ALWAYS call judge_image after EVERY generate_image before deciding.
 - Never skip judge_image — you need the VL feedback to make an informed decision.
 - Never call tools other than generate_image and judge_image.
 - If you rewrite, the new prompt MUST differ from the previous one.
+- Keep judge_image arguments compact (placeholders above). Long pasted args
+  waste the response budget and truncate the tool call.
 
 Fewshot demos above/below (if present) are ONLY examples of the tool protocol for
 on-policy GRPO exploration. They are NOT supervised targets: do not continue,
@@ -172,58 +179,61 @@ USER_PROMPTS = [
     # ),
 ]
 
-OVERFIT_PROMPTS = USER_PROMPTS[:2]
+OVERFIT_PROMPTS = USER_PROMPTS[:2]  # soldier (idx=0) + fantasy wizard/elf (idx=1)
+
+# Fewshot Class-1 demos are authored against prompt 0 only. Other overfit prompts
+# get system+user (no baked trajectory) so the model does not copy soldier content.
+_FEWSHOT_TASK = USER_PROMPTS[0]
 
 # ── Shared task (same for all three demo classes) ────────────────────────────
-_SHARED_TASK = USER_PROMPTS[0]
+_SHARED_TASK = _FEWSHOT_TASK
 _SHARED_USER = _with_brevity(_SHARED_TASK)
+
+# Compact judge args taught by fewshot (server expands to the live task + latest prompt).
+_JUDGE_USER_ARG = "same as user message"
+_JUDGE_PROMPT_ARG = "last"
 
 # Fewshot demos — all three classes use the same task, differing only in the
 # number of generate→reflect→decide passes and the VL feedback scores.
 #
 # Each logical turn = generate_image → judge_image → reflect & decide (Done / rewrite).
-# The VL feedback tool_obs below matches the output format of the judge_image
-# tool in diffusion_tool.py (_call_judge_vlm).
+# Fewshot tool obs match live ``diffusion_tool`` text (path= + agentic_* markers; no image_vis).
 
-# ── Helper: format a judge_image tool observation ────────────────────────────
+
+def _gen_obs(path: str, prompt: str) -> str:
+    """Fewshot generate_image tool obs — same shape as live ``_pack_response`` text."""
+    prompt_snip = (prompt or "").replace("\n", " ")[:240]
+    return (
+        f"Frozen diffusion produced the image. path={path} "
+        f"agentic_tool ok=1 stub=0 images=1 backend=fewshot prompt={prompt_snip!r}"
+    )
 
 
 def _judge_obs(
+    *,
+    path: str,
     correctness: float,
     aesthetics: float,
     good_enough: bool,
     findings: str,
     suggested_fixes: str,
-    c_detail: str = "",
-    a_detail: str = "",
 ) -> str:
-    """Format a fewshot judge_image tool observation.
-
-    Live rollouts use ``diffusion_tool._call_judge_vlm`` (scores only; no
-    ``REQUIRED NEXT ACTION`` boilerplate — ``agentic_tool_agent`` injects
-    ``Reflection:`` / ``Done.``). This helper keeps the instructional line for
-    fewshot demonstrations only.
-    """
-    c_part = f"  correctness={correctness:.2f}  ({c_detail})" if c_detail else f"  correctness={correctness:.2f}"
-    a_part = f"  aesthetics ={aesthetics:.2f}  ({a_detail})" if a_detail else f"  aesthetics ={aesthetics:.2f}"
+    """Fewshot judge_image tool obs — same shape as live ``format_judge_observation``."""
+    findings_short = " ".join((findings or "no specific findings").split())[:220]
+    fixes_short = " ".join((suggested_fixes or "none").split())[:160]
     return (
-        "VL judge / reflection feedback on the last generated image:\n"
-        f"{c_part}\n"
-        f"{a_part}\n"
+        "VL judge on the last generated image:\n"
+        f"  path={path}\n"
+        f"  correctness={correctness:.2f}\n"
+        f"  aesthetics ={aesthetics:.2f}\n"
         f"  good_enough ={'YES' if good_enough else 'NO'}\n"
-        f"  findings: {findings}\n"
-        f"  suggested_fixes: {suggested_fixes}\n"
-        "  agentic_judge ok=1 stub=0\n"
-        "\n"
-        "REQUIRED NEXT ACTION (same assistant turn after reading this): "
-        'write "Reflection: <brief notes on the VL scores/findings>". '
-        "If good_enough=YES, end with Done. "
-        "If good_enough=NO, continue in the SAME message with a rewritten "
-        "generate_image call that incorporates suggested_fixes."
+        f"  findings: {findings_short}\n"
+        f"  suggested_fixes: {fixes_short}\n"
+        "  agentic_judge ok=1 parse_ok=1 stub=0 backend=fewshot parse_retries=0"
     )
 
 
-# --- Class 0: single-pass — comprehensive prompt, VL says YES immediately ----
+# --- Class 1: single-pass — comprehensive prompt, VL says YES immediately ----
 C1_USER = _SHARED_USER
 C1_GEN_PROMPT = (
     "realistic pencil sketch, heartwarming indoor scene under oil lamp glow, "
@@ -232,13 +242,10 @@ C1_GEN_PROMPT = (
     "teary eyes, soldier's wife standing behind with hand on his shoulder "
     "smiling reassuringly, faded family portrait on wall, dramatic lighting"
 )
-C1_GEN_OBS = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c1_pencilsketch_00.png "
-    "image_vis=512x512 mean_luma=142 edges=sharp scene=pencil_sketch "
-    "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
-    f"prompt='{C1_GEN_PROMPT}'"
-)
+C1_PATH = "/tmp/fewshot/c1_pencilsketch_00.png"
+C1_GEN_OBS = _gen_obs(C1_PATH, C1_GEN_PROMPT)
 C1_REFLECT_OBS = _judge_obs(
+    path=C1_PATH,
     correctness=0.82,
     aesthetics=0.78,
     good_enough=True,
@@ -248,15 +255,17 @@ C1_REFLECT_OBS = _judge_obs(
         "faded family portrait on wall; dramatic pencil shading present"
     ),
     suggested_fixes="none",
-    c_detail="subject_entities=0.90, attributes=0.80, relations_layout=0.80, scene_context=0.85, completeness=0.80",
-    a_detail="composition=0.80, lighting=0.85, color=0.75, fidelity=0.75, appeal=0.75",
 )
 C1_ASSISTANT_3 = (
     "Reflection: VL confirms all three figures, medals, oil lamp, and family portrait "
     "present with dramatic pencil shading. Done."
 )
 
-# --- Class 1: two-pass — lazy first prompt, VL says NO, rewrite fixes it ----
+# --- Class 2: compact two-pass demo on the same overfit soldier task ----------
+# The live task and demonstration intentionally match: this is a pure overfit
+# experiment where lower task variance should make tool/protocol learning and
+# frozen-judge score improvement visible within roughly 100 steps.
+C2_TASK = _SHARED_TASK
 C2_USER = _SHARED_USER
 C2_GEN1 = "a soldier showing a letter to an old woman by lamplight, sketch style"
 C2_GEN2 = (
@@ -267,63 +276,45 @@ C2_GEN2 = (
     "shoulder smiling reassuringly, warm oil lamp glow lighting faces and letter, "
     "faded family portrait on wall in background"
 )
-C2_GEN_OBS1 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c2_pencilsketch_00.png "
-    "image_vis=512x512 mean_luma=78 edges=soft scene=dim_interior "
-    "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
-    f"prompt='{C2_GEN1}'"
-)
+C2_PATH1 = "/tmp/fewshot/c2_pencilsketch_00.png"
+C2_PATH2 = "/tmp/fewshot/c2_pencilsketch_01.png"
+C2_GEN_OBS1 = _gen_obs(C2_PATH1, C2_GEN1)
 C2_REFLECT_OBS1 = _judge_obs(
+    path=C2_PATH1,
     correctness=0.38,
     aesthetics=0.42,
     good_enough=False,
     findings=(
-        "only two figures visible — soldier and elderly woman; wife entirely missing from scene; "
-        "no medals visible on uniform; family portrait on wall not rendered; "
-        "lighting is dim and flat, lacks dramatic oil lamp glow; letter detail indistinct"
+        "only two figures visible — soldier and elderly woman; wife entirely missing; "
+        "no medals or family portrait; lighting is flat and the letter is indistinct"
     ),
     suggested_fixes=(
-        "add wife figure standing behind soldier with hand on his shoulder, "
-        "render medals pinned to soldier's chest, "
-        "add glowing oil lamp as primary light source illuminating faces, "
-        "include faded family portrait on background wall, "
-        "increase contrast for dramatic pencil shading effect, "
-        "ensure yellowed letter is clearly visible with soldier pointing at it"
+        "add wife behind soldier with hand on shoulder, medals on his chest, "
+        "glowing oil lamp, faded family portrait, and a clearly visible yellowed letter"
     ),
-    c_detail="subject_entities=0.40, attributes=0.30, relations_layout=0.45, scene_context=0.35, completeness=0.30",
-    a_detail="composition=0.45, lighting=0.30, color=0.50, fidelity=0.40, appeal=0.35",
 )
 C2_REFLECT_REWRITE = (
-    "Reflection: VL finds only 2 of 3 figures — wife missing, no medals, no "
-    "portrait, dim lighting. Rewriting with full cast and dramatic oil lamp glow."
+    "Reflection: VL finds the wife, medals, portrait, and dramatic lamp lighting "
+    "missing. Rewriting with the full cast and scene details."
 )
-C2_GEN_OBS2 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c2_pencilsketch_01.png "
-    "image_vis=512x512 mean_luma=138 edges=medium scene=pencil_sketch "
-    "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
-    f"prompt='{C2_GEN2}'"
-)
+C2_GEN_OBS2 = _gen_obs(C2_PATH2, C2_GEN2)
 C2_REFLECT_OBS2 = _judge_obs(
+    path=C2_PATH2,
     correctness=0.80,
     aesthetics=0.76,
     good_enough=True,
     findings=(
-        "all three figures now present — soldier with medals, "
-        "silver-haired mother touching letter with tears, "
-        "wife behind with hand on shoulder; oil lamp glow effective; "
-        "family portrait visible on wall; dramatic pencil shading conveys emotion"
+        "all three figures now present with correct relations; medals, yellowed "
+        "letter, oil-lamp glow, family portrait, and dramatic pencil shading are visible"
     ),
     suggested_fixes="none",
-    c_detail="subject_entities=0.88, attributes=0.82, relations_layout=0.80, scene_context=0.80, completeness=0.78",
-    a_detail="composition=0.78, lighting=0.82, color=0.72, fidelity=0.74, appeal=0.74",
 )
 C2_ASSISTANT_4 = (
-    "Reflection: VL confirms all three figures present — soldier with medals, "
-    "elderly mother with tears touching letter, wife behind with hand on shoulder. "
-    "Oil lamp glow and family portrait now visible. Dramatic pencil shading. Done."
+    "Reflection: VL confirms all three figures, medals, letter, oil-lamp glow, "
+    "family portrait, and dramatic pencil shading are present. Done."
 )
 
-# --- Class 2: three-pass — progressive refinement across three iterations -----
+# --- Class 3: three-pass — progressive refinement across three iterations -----
 C3_USER = _SHARED_USER
 C3_GEN1 = "a soldier and an old woman indoors, pencil drawing"
 C3_GEN2 = (
@@ -341,13 +332,12 @@ C3_GEN3 = (
     "faded family portrait hangs on wall in background, dramatic lighting, "
     "profound family emotion"
 )
-C3_GEN_OBS1 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_pencilsketch_00.png "
-    "image_vis=512x512 mean_luma=65 edges=blurry scene=vague_interior "
-    "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
-    f"prompt='{C3_GEN1}'"
-)
+C3_PATH1 = "/tmp/fewshot/c3_pencilsketch_00.png"
+C3_PATH2 = "/tmp/fewshot/c3_pencilsketch_01.png"
+C3_PATH3 = "/tmp/fewshot/c3_pencilsketch_02.png"
+C3_GEN_OBS1 = _gen_obs(C3_PATH1, C3_GEN1)
 C3_REFLECT_OBS1 = _judge_obs(
+    path=C3_PATH1,
     correctness=0.22,
     aesthetics=0.25,
     good_enough=False,
@@ -363,21 +353,15 @@ C3_REFLECT_OBS1 = _judge_obs(
         "ensure indoor setting with shadows, "
         "include at least the primary two figures with clear attributes"
     ),
-    c_detail="subject_entities=0.25, attributes=0.15, relations_layout=0.20, scene_context=0.20, completeness=0.15",
-    a_detail="composition=0.25, lighting=0.15, color=0.30, fidelity=0.15, appeal=0.20",
 )
 C3_REFLECT_REWRITE_1 = (
     "Reflection: VL finds image blurry with only two vague figures — no pencil "
     "style, no uniform, no oil lamp. Rewriting with style, lighting, and character "
     "attributes."
 )
-C3_GEN_OBS2 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_pencilsketch_01.png "
-    "image_vis=512x512 mean_luma=105 edges=medium scene=pencil_sketch_interior "
-    "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
-    f"prompt='{C3_GEN2}'"
-)
+C3_GEN_OBS2 = _gen_obs(C3_PATH2, C3_GEN2)
 C3_REFLECT_OBS2 = _judge_obs(
+    path=C3_PATH2,
     correctness=0.48,
     aesthetics=0.52,
     good_enough=False,
@@ -396,21 +380,15 @@ C3_REFLECT_OBS2 = _judge_obs(
         "include yellowed letter with soldier pointing at it, "
         "ensure all three faces are illuminated by warm oil lamp glow"
     ),
-    c_detail="subject_entities=0.50, attributes=0.40, relations_layout=0.55, scene_context=0.50, completeness=0.40",
-    a_detail="composition=0.50, lighting=0.55, color=0.55, fidelity=0.45, appeal=0.50",
 )
 C3_REFLECT_REWRITE_2 = (
     "Reflection: VL finds pencil style present and two figures ok, but wife still "
     "missing, no medals, no tears, no portrait. Adding full cast with emotional "
     "detail and all scene elements."
 )
-C3_GEN_OBS3 = (
-    "Frozen diffusion produced the image. path=/tmp/fewshot/c3_pencilsketch_02.png "
-    "image_vis=512x512 mean_luma=140 edges=sharp scene=pencil_sketch "
-    "agentic_tool ok=1 stub=0 images=1 backend=fewshot "
-    f"prompt='{C3_GEN3}'"
-)
+C3_GEN_OBS3 = _gen_obs(C3_PATH3, C3_GEN3)
 C3_REFLECT_OBS3 = _judge_obs(
+    path=C3_PATH3,
     correctness=0.84,
     aesthetics=0.80,
     good_enough=True,
@@ -422,8 +400,6 @@ C3_REFLECT_OBS3 = _judge_obs(
         "dramatic pencil shading conveys profound family emotion"
     ),
     suggested_fixes="none",
-    c_detail="subject_entities=0.92, attributes=0.85, relations_layout=0.85, scene_context=0.82, completeness=0.82",
-    a_detail="composition=0.82, lighting=0.85, color=0.78, fidelity=0.78, appeal=0.80",
 )
 C3_ASSISTANT_5 = (
     "Reflection: VL confirms all elements present — three figures with correct "
@@ -432,22 +408,15 @@ C3_ASSISTANT_5 = (
 )
 
 
-def _demo_messages(class_id: int) -> list[dict]:
+def _demo_messages(class_id: int, *, omit_final_done: bool = False) -> list[dict]:
     """Fewshot trajectory following the generate → judge → reflect & decide protocol.
 
-    Each logical turn is:
-      assistant: generate_image(prompt_k)
-      tool:      gen observation (image + metadata)
-      assistant: judge_image(user_request, prompt_k)
-      tool:      VL feedback (scores, findings, fixes, good_enough)
-      assistant: Reflection: ... Done.  OR  Reflection: ... + rewritten generate_image
-
-    All three classes demonstrate the same shared task (soldier scene), differing
-    only in the number of generate→judge passes and initial prompt quality.
+    ``omit_final_done=True`` (overfit): keep tool protocol, drop the terminal
+    ``Reflection:…Done.`` assistant turn. Same-task demos that end in Done teach
+    Qwen3-VL to skip tools and copy Done on the live turn.
     """
     if class_id % 3 == 0:
-        # Single-pass: comprehensive prompt → VL says YES → Done.
-        return [
+        msgs = [
             {"role": "user", "content": C1_USER},
             {"role": "assistant", "content": _tc("generate_image", prompt=C1_GEN_PROMPT)},
             {"role": "tool", "content": C1_GEN_OBS},
@@ -455,16 +424,17 @@ def _demo_messages(class_id: int) -> list[dict]:
                 "role": "assistant",
                 "content": _tc(
                     "judge_image",
-                    user_request=_SHARED_TASK,
-                    image_prompt=C1_GEN_PROMPT,
+                    user_request=_JUDGE_USER_ARG,
+                    image_prompt=_JUDGE_PROMPT_ARG,
                 ),
             },
             {"role": "tool", "content": C1_REFLECT_OBS},
-            {"role": "assistant", "content": C1_ASSISTANT_3},
         ]
+        if not omit_final_done:
+            msgs.append({"role": "assistant", "content": C1_ASSISTANT_3})
+        return msgs
     if class_id % 3 == 1:
-        # Two-pass: lazy first prompt → VL says NO → rewrite → VL says YES → Done.
-        return [
+        msgs = [
             {"role": "user", "content": C2_USER},
             {"role": "assistant", "content": _tc("generate_image", prompt=C2_GEN1)},
             {"role": "tool", "content": C2_GEN_OBS1},
@@ -472,8 +442,8 @@ def _demo_messages(class_id: int) -> list[dict]:
                 "role": "assistant",
                 "content": _tc(
                     "judge_image",
-                    user_request=_SHARED_TASK,
-                    image_prompt=C2_GEN1,
+                    user_request=_JUDGE_USER_ARG,
+                    image_prompt=_JUDGE_PROMPT_ARG,
                 ),
             },
             {"role": "tool", "content": C2_REFLECT_OBS1},
@@ -486,15 +456,16 @@ def _demo_messages(class_id: int) -> list[dict]:
                 "role": "assistant",
                 "content": _tc(
                     "judge_image",
-                    user_request=_SHARED_TASK,
-                    image_prompt=C2_GEN2,
+                    user_request=_JUDGE_USER_ARG,
+                    image_prompt=_JUDGE_PROMPT_ARG,
                 ),
             },
             {"role": "tool", "content": C2_REFLECT_OBS2},
-            {"role": "assistant", "content": C2_ASSISTANT_4},
         ]
-    # Three-pass: very lazy prompt → VL says NO → rewrite → VL says NO → rewrite → VL says YES → Done.
-    return [
+        if not omit_final_done:
+            msgs.append({"role": "assistant", "content": C2_ASSISTANT_4})
+        return msgs
+    msgs = [
         {"role": "user", "content": C3_USER},
         {"role": "assistant", "content": _tc("generate_image", prompt=C3_GEN1)},
         {"role": "tool", "content": C3_GEN_OBS1},
@@ -502,8 +473,8 @@ def _demo_messages(class_id: int) -> list[dict]:
             "role": "assistant",
             "content": _tc(
                 "judge_image",
-                user_request=_SHARED_TASK,
-                image_prompt=C3_GEN1,
+                user_request=_JUDGE_USER_ARG,
+                image_prompt=_JUDGE_PROMPT_ARG,
             ),
         },
         {"role": "tool", "content": C3_REFLECT_OBS1},
@@ -516,8 +487,8 @@ def _demo_messages(class_id: int) -> list[dict]:
             "role": "assistant",
             "content": _tc(
                 "judge_image",
-                user_request=_SHARED_TASK,
-                image_prompt=C3_GEN2,
+                user_request=_JUDGE_USER_ARG,
+                image_prompt=_JUDGE_PROMPT_ARG,
             ),
         },
         {"role": "tool", "content": C3_REFLECT_OBS2},
@@ -530,21 +501,19 @@ def _demo_messages(class_id: int) -> list[dict]:
             "role": "assistant",
             "content": _tc(
                 "judge_image",
-                user_request=_SHARED_TASK,
-                image_prompt=C3_GEN3,
+                user_request=_JUDGE_USER_ARG,
+                image_prompt=_JUDGE_PROMPT_ARG,
             ),
         },
         {"role": "tool", "content": C3_REFLECT_OBS3},
-        {"role": "assistant", "content": C3_ASSISTANT_5},
     ]
+    if not omit_final_done:
+        msgs.append({"role": "assistant", "content": C3_ASSISTANT_5})
+    return msgs
 
 
 def _all_demo_messages() -> list[dict]:
-    """All three demo classes concatenated — single-pass, two-pass, three-pass.
-
-    Overfit mode uses this so every rollout in a group sees the identical fewshot
-    context, giving GRPO a level playing field for within-group advantage computation.
-    """
+    """All three demo classes concatenated — single-pass, two-pass, three-pass."""
     msgs: list[dict] = []
     for cid in range(3):
         msgs.extend(_demo_messages(cid))
@@ -556,20 +525,29 @@ def build_prompt_messages(
     *,
     class_id: int = 1,
     all_demos: bool = False,
+    include_demos: bool = True,
+    omit_final_done: bool = False,
 ) -> list[dict]:
-    """System + demonstration(s) + the live user turn (with brevity reminder)."""
-    demos = _all_demo_messages() if all_demos else _demo_messages(class_id)
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        *demos,
-        {"role": "user", "content": _with_brevity(user_text)},
-    ]
+    """System + optional demonstration(s) + the live user turn (with brevity reminder).
+
+    Overfit fewshot should set ``omit_final_done=True`` so the demo teaches tools,
+    not a copy-paste terminal Done on the same user request.
+    """
+    msgs: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if include_demos:
+        if all_demos:
+            demos: list[dict] = []
+            for cid in range(3):
+                demos.extend(_demo_messages(cid, omit_final_done=omit_final_done))
+        else:
+            demos = _demo_messages(class_id, omit_final_done=omit_final_done)
+        msgs.extend(demos)
+    msgs.append({"role": "user", "content": _with_brevity(user_text)})
+    return msgs
 
 
 def build_ground_truth(user_text: str, *, class_id: int = 1, overfit: bool = False) -> dict:
     """Weights for ``agentic_reward.compute_score`` (actor self-reflection protocol)."""
-    # Done must be heavy enough that high frozen-judge C/A cannot plateau the
-    # scalar without Reflection:+Done. (C/A are also gated in compute_score.)
     weights = {
         "w_tool_call": 0.10,
         "w_correctness": 0.35,
@@ -582,6 +560,7 @@ def build_ground_truth(user_text: str, *, class_id: int = 1, overfit: bool = Fal
             "user_request": user_text,
             "demo_class": "all",
             "expected_num_images": 2,
+            "w_delta_c": 0.25,
             **weights,
         }
     expected = 1 + (class_id % 3)
@@ -599,31 +578,47 @@ def build_rows(
     prompts: list[str] | None = None,
     *,
     overfit: bool = False,
+    with_fewshot: bool = False,
 ) -> list[dict]:
     prompt_pool = prompts or USER_PROMPTS
     rows = []
     for i in range(n):
         if overfit:
-            # First half of samples get prompt[0], second half get prompt[1], etc.
             chunk = max(1, n // len(prompt_pool))
-            prompt_text = prompt_pool[min(i // chunk, len(prompt_pool) - 1)]
-            class_id = -1  # all three fewshot classes included
+            prompt_index = min(i // chunk, len(prompt_pool) - 1)
+            prompt_text = prompt_pool[prompt_index]
+            class_id = 1  # compact two-pass Class 1 demo when fewshot is enabled
+            # Same-task fewshot only: mismatch (e.g. soldier demo + fantasy live)
+            # teaches the model to paste the wrong scene into generate_image.
+            include_demos = bool(with_fewshot) and prompt_text == _FEWSHOT_TASK
         else:
-            prompt_text = prompt_pool[i % len(prompt_pool)]
+            prompt_index = i % len(prompt_pool)
+            prompt_text = prompt_pool[prompt_index]
             class_id = i % 3
+            include_demos = True
         gt = build_ground_truth(prompt_text, class_id=class_id, overfit=overfit)
         rows.append(
             {
                 "data_source": DATA_SOURCE,
-                "prompt": build_prompt_messages(prompt_text, class_id=class_id, all_demos=overfit),
+                "prompt": build_prompt_messages(
+                    prompt_text,
+                    class_id=class_id,
+                    all_demos=False,
+                    include_demos=include_demos,
+                    # Overfit same-task fewshot must not end in Done — that induced
+                    # score=0 (Reflection+Done with zero tool calls) on Qwen3-VL.
+                    omit_final_done=bool(overfit and include_demos),
+                ),
                 "ability": ABILITY,
                 "reward_model": {"style": "rule", "ground_truth": gt},
                 "extra_info": {
                     "split": split,
                     "index": i,
+                    "prompt_index": prompt_index,
                     "raw_prompt": prompt_text,
                     "toy_agentic": True,
                     "overfit": overfit,
+                    "with_fewshot": include_demos,
                     "demo_class": gt["demo_class"],
                     "expected_num_images": gt["expected_num_images"],
                     "native_tool_template": True,
@@ -636,7 +631,9 @@ def build_rows(
                             "w_aesthetics",
                             "w_done",
                         )
+                        if k in gt
                     },
+                    **({"w_delta_c": gt["w_delta_c"]} if "w_delta_c" in gt else {}),
                 },
             }
         )
@@ -653,7 +650,16 @@ def main() -> None:
     parser.add_argument(
         "--overfit",
         action="store_true",
-        help="Chunked prompt assignment + all-3-class fewshot for short overfit e2e",
+        help="Chunked prompt assignment for short overfit e2e (GSM8K-style: system+user by default)",
+    )
+    parser.add_argument(
+        "--with_fewshot",
+        action="store_true",
+        help=(
+            "With --overfit, bake the compact Class 1 two-pass demonstration "
+            "of the same overfit task into each prompt. "
+            "Or set OVERFIT_FEWSHOT=1."
+        ),
     )
     parser.add_argument(
         "--tool_call_format",
@@ -677,8 +683,14 @@ def main() -> None:
     prompts = OVERFIT_PROMPTS if args.overfit else None
     train_n = args.train_size
     val_n = args.val_size
-    train_df = pd.DataFrame(build_rows("train", train_n, prompts, overfit=args.overfit))
-    val_df = pd.DataFrame(build_rows("val", val_n, prompts, overfit=args.overfit))
+    with_fewshot = bool(args.with_fewshot) or os.environ.get("OVERFIT_FEWSHOT", "").strip() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    train_df = pd.DataFrame(build_rows("train", train_n, prompts, overfit=args.overfit, with_fewshot=with_fewshot))
+    val_df = pd.DataFrame(build_rows("val", val_n, prompts, overfit=args.overfit, with_fewshot=with_fewshot))
     train_path = os.path.join(args.local_save_dir, "train.parquet")
     val_path = os.path.join(args.local_save_dir, "val.parquet")
     train_df.to_parquet(train_path)
@@ -686,7 +698,24 @@ def main() -> None:
     print(f"Wrote {len(train_df)} train samples to {train_path}")
     print(f"Wrote {len(val_df)} val samples to {val_path}")
     if args.overfit:
-        print(f"overfit: all-3-class fewshot × {len(prompts)} prompts chunked; tool_call_format={fmt}")
+        mode = (
+            "compact Class 1 two-pass fewshot (same-task rows only)"
+            if with_fewshot
+            else "system+user only (no fewshot)"
+        )
+        print(f"overfit: {mode} × {len(prompts)} prompts chunked; tool_call_format={fmt}")
+        for split_name, df in (("train", train_df), ("val", val_df)):
+            counts: dict[int, int] = {}
+            fewshot_counts: dict[int, int] = {}
+            for extra in df["extra_info"].tolist():
+                idx = int(extra.get("prompt_index", -1))
+                counts[idx] = counts.get(idx, 0) + 1
+                if extra.get("with_fewshot"):
+                    fewshot_counts[idx] = fewshot_counts.get(idx, 0) + 1
+            print(
+                f"  {split_name} prompt_index counts={dict(sorted(counts.items()))} "
+                f"fewshot={dict(sorted(fewshot_counts.items()))}"
+            )
     else:
         print(f"demo classes={{0:single,1:two-pass,2:three-pass}}; tool_call_format={fmt}")
 

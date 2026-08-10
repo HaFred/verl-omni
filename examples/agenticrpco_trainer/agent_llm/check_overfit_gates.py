@@ -329,7 +329,7 @@ def print_expected_behavior(total_steps: int, *, no_force: bool = True) -> None:
 [GATE] Expected behavior for this {total_steps}-step VOLUNTARY overfit (force OFF)
   • No teacher/force replace — Decode == Used for tool calls
   • Success signal: Decode contains Hermes <tool_call> generate_image (voluntary)
-  • Tool obs includes image_vis=... so Reflection can cite real PNG stats
+  • Tool obs includes path=... so the sidecar judge can load the PNG
   • Reward: ≥1 Hermes call scores; ≥2 distinct prompts scores higher
   • Soft in {total_steps} steps: cold und may still emit mostly prose
 """.rstrip()

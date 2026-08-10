@@ -37,16 +37,42 @@ ROLLOUT_N="${ROLLOUT_N:-8}"
 OVERFIT_DATA="${OVERFIT_DATA:-1}"
 # Unique WandB run + ckpt dir every launch (override with EXPERIMENT_NAME / RUN_TS).
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-qwen35_agentic_grpo_${RUN_TS}}"
+# Slug from MODEL_PATH: Hub id (Qwen/Qwen3-VL-2B-Instruct) or HF cache
+# (.../models--Qwen--Qwen3-VL-2B-Instruct/snapshots/...).
+if [[ -z "${EXPERIMENT_NAME:-}" ]]; then
+  MODEL_SLUG="$(
+    python3 - "$MODEL_PATH" <<'PY'
+import re, sys
+from pathlib import Path
+raw = (sys.argv[1] or "").strip().rstrip("/")
+p = Path(raw)
+text = raw
+for part in reversed(p.parts):
+    if part.startswith("models--") and "--" in part:
+        text = part[len("models--"):].replace("--", "/")
+        break
+    if part not in {"snapshots", "refs", "blobs"} and not re.fullmatch(r"[0-9a-f]{8,}", part):
+        # Prefer a leaf that looks like a model id/name.
+        if "/" in raw and not raw.startswith("/"):
+            text = raw
+        elif part:
+            text = part
+        break
+# Keep org/name if present; else bare name.
+name = text.split("/")[-1] if text else "model"
+slug = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
+print(slug or "model")
+PY
+  )"
+  EXPERIMENT_NAME="${MODEL_SLUG}_agentic_grpo_${RUN_TS}"
+fi
 CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints/verl_omni_agentic/${EXPERIMENT_NAME}}"
 # Per-run rollout artifacts: PNGs (or stub manifests) land here when generate_image fires.
-E2E_ROOT="${E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
+E2E_ROOT="${E2E_ROOT:-${REPO_ROOT}/outputs/e2e_qwen3_vl_2b_instruct_agentic_grpo}"
 E2E_RUN_DIR="${E2E_RUN_DIR:-${E2E_ROOT}/${EXPERIMENT_NAME}}"
 export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-$E2E_ROOT}"
 export AGENTIC_E2E_RUN_NAME="${AGENTIC_E2E_RUN_NAME:-$EXPERIMENT_NAME}"
 export AGENTIC_DIFFUSION_IMAGE_DIR="${AGENTIC_DIFFUSION_IMAGE_DIR:-$E2E_RUN_DIR/rollout_images}"
-# Actor is vision-capable: return generated pixels for self-reflection.
-export AGENTIC_DIFFUSION_ATTACH_IMAGE="${AGENTIC_DIFFUSION_ATTACH_IMAGE:-1}"
 export AGENTIC_REFLECT_VLM_TIMEOUT=300
 REQUIRE_REAL_IMAGE_TOOL="${REQUIRE_REAL_IMAGE_TOOL:-1}"
 REQUIRE_REFLECT_VLM="${REQUIRE_REFLECT_VLM:-1}"
@@ -76,11 +102,15 @@ export AGENTIC_LANCE_SEED="${AGENTIC_LANCE_SEED:-${QWEN_IMAGE_SEED}}"
 # Judge parse reliability (retry once by default; higher max tokens).
 export AGENTIC_JUDGE_PARSE_RETRIES="${AGENTIC_JUDGE_PARSE_RETRIES:-1}"
 export AGENTIC_REFLECT_MAX_NEW_TOKENS="${AGENTIC_REFLECT_MAX_NEW_TOKENS:-1024}"
-# YES bar: 0.85 keeps first-pass headroom but is reachable (A often ~0.85–0.88).
-export AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD="${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-0.85}"
+# YES bar: 0.9, if lower than this for the overfitting, a single turn mostly get the reflection returing Done. We want more turns incited by the RL.
+export AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD="${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-0.9}"
 export AGENTIC_REFLECT_GOOD_ENOUGH="${AGENTIC_REFLECT_GOOD_ENOUGH:-${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD}}"
+# YES bar: A≈0.84–0.86 under STEPS=8. thr 0.80 → first-judge YES → one-shot Done
+# and inflated early critic/score. thr 0.90 forces NO → rewrite multiturn.
 # Env hard-stop: refuse generate_image after good_enough=YES (default on).
 export AGENTIC_BLOCK_GENERATE_AFTER_YES="${AGENTIC_BLOCK_GENERATE_AFTER_YES:-1}"
+# Cap rewrite roulette at AGENTIC_MAX_GENERATE_IMAGE_PASSES (default on).
+export AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES="${AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES:-1}"
 SAVE_FREQ="${SAVE_FREQ:-5}"
 MIN_JUDGE_PARSE_OK_RATE="${MIN_JUDGE_PARSE_OK_RATE:-0.99}"
 
@@ -96,11 +126,11 @@ agent model: ${MODEL_PATH}
 vLLM-omni image URL: ${AGENTIC_VLLM_OMNI_URL:-<unset>}  legacy: ${AGENTIC_QWEN_IMAGE_URL:-<unset>}
 vLLM judge URL:     ${AGENTIC_VLLM_URL:-<unset>}  legacy: ${AGENTIC_REFLECT_VLM_URL:-<unset>}
 judge model path:   ${AGENTIC_REFLECT_VLM_PATH:-<defaults to MODEL_PATH / Qwen3-VL>}
-attach generated pixels to VLM: ${AGENTIC_DIFFUSION_ATTACH_IMAGE}
 overfit gates: GATE_SIDECAR=${GATE_SIDECAR} (see overfit_gates.json)
-agent loop: agentic_tool_agent (force Reflection OFF for RL; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-3})
+agent loop: agentic_tool_agent (force Reflection after judge ON; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-3})
 good_enough threshold: ${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-0.85} (headroom for multiturn ΔC)
 block generate after YES: ${AGENTIC_BLOCK_GENERATE_AFTER_YES:-1}
+block generate after max passes: ${AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES:-1}
 rollout_n: ${ROLLOUT_N}
 EOF
 echo "[INFO] repo root=${REPO_ROOT}"
@@ -109,22 +139,23 @@ echo "[INFO] ckpt dir=${CKPT_DIR}"
 echo "[INFO] e2e rollout images -> ${AGENTIC_DIFFUSION_IMAGE_DIR}"
 echo "[INFO] e2e full trajectories -> ${E2E_RUN_DIR}/rollout_trajectories"
 echo "[INFO] e2e raw assistant rollouts -> ${E2E_RUN_DIR}/hermes_actions/"
-# Force OFF for GRPO: env-injected Reflection/Done is response_mask=0 but still
-# got scored as agent prose → reward leakage. Policy must emit protocol itself.
-export AGENTIC_FORCE_REFLECTION_AFTER_JUDGE="${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-0}"
-export AGENTIC_MAX_GENERATE_IMAGE_PASSES="${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-3}"
+# After every successful judge_image, inject Reflection that carries the
+# stop/continue verdict (Done. on YES / max-pass; else rewrite next).
+# Tokens are response_mask=0; reward strips agentic_forced_reflection markers.
+export AGENTIC_FORCE_REFLECTION_AFTER_JUDGE="${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-1}"
+export AGENTIC_MAX_GENERATE_IMAGE_PASSES="${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-5}"
+export AGENTIC_FORCE_FIRST_GENERATE="${AGENTIC_FORCE_FIRST_GENERATE:-1}"
+export AGENTIC_FORCE_FIRST_WARMUP_STEPS="${AGENTIC_FORCE_FIRST_WARMUP_STEPS:-10}"
+export AGENTIC_FORCE_FIRST_END_STEP="${AGENTIC_FORCE_FIRST_END_STEP:-20}"
 echo "[INFO] agent loop=agentic_tool_agent (AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES})"
-echo "[INFO] good_enough threshold=${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD} block_generate_after_yes=${AGENTIC_BLOCK_GENERATE_AFTER_YES} rollout_n=${ROLLOUT_N}"
-if [[ "${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}" != "0" ]]; then
-  echo "[WARN] AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}: forced Reflection/Done is NOT for RL (reward leakage). Use 0 for training." >&2
+echo "[INFO] force-first generate=${AGENTIC_FORCE_FIRST_GENERATE} p=1 through step ${AGENTIC_FORCE_FIRST_WARMUP_STEPS}, linear -> 0 at step ${AGENTIC_FORCE_FIRST_END_STEP} (teacher-force Hermes gen+judge; response_mask=1)"
+echo "[INFO] good_enough threshold=${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD} block_generate_after_yes=${AGENTIC_BLOCK_GENERATE_AFTER_YES} block_after_max_passes=${AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES} rollout_n=${ROLLOUT_N}"
+if [[ "${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}" == "0" ]]; then
+  echo "[WARN] AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=0: Reflection after judge is policy-only; max-pass soft-stop still applies." >&2
 fi
 echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
 echo "[INFO] reflect judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} legacy=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
 python3 "$GATE_SCRIPT" --run-dir "$E2E_RUN_DIR" --expect-only --total-steps "${TOTAL_STEPS}" --no-force
-if [[ "${AGENTIC_DIFFUSION_ATTACH_IMAGE}" != "1" ]]; then
-  echo "[ERROR] This visual-reflection recipe requires AGENTIC_DIFFUSION_ATTACH_IMAGE=1." >&2
-  exit 2
-fi
 if [[ -z "${AGENTIC_VLLM_OMNI_URL:-}" && -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" && -z "${AGENTIC_LANCE_SERVER_URL:-}" ]]; then
   echo "[ERROR] No frozen image service is configured; visual reflection cannot be trained on stubs." >&2
   echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh" >&2
@@ -276,10 +307,10 @@ _run_final_gates() {
   fi
 }
 
-# Qwen3.5 GDN: this box's pip nvidia-cu13 is headers 13.3 + nvcc 13.2, so FlashInfer
-# GDN JIT dies with CCCL "CUDA compiler and CUDA toolkit headers are incompatible".
-# Force Triton/FLA prefill (vLLM --gdn-prefill-backend triton) and skip that JIT.
-GDN_PREFILL_BACKEND="${GDN_PREFILL_BACKEND:-triton}"
+# Qwen3.5 helpers (GDN_PREFILL_BACKEND + TOOL_PARSER_FORMAT + GDN preflight).
+# Safe no-op/preflight-skip when the actor is Qwen3-VL Hermes.
+# shellcheck source=../../../data/qwen35_env.sh
+source "${REPO_ROOT}/data/qwen35_env.sh"
 
 # Refresh Ray worker env so tool artifacts / Qwen-Image URL / WandB reach TaskRunner.
 export RAY_RUNTIME_ENV_JSON="$(python3 - <<'PY'
@@ -307,7 +338,6 @@ keys = [
     "AGENTIC_DIFFUSION_TOOL_TOKEN",
     "AGENTIC_DIFFUSION_TOOL_TIMEOUT",
     "AGENTIC_DIFFUSION_IMAGE_DIR",
-    "AGENTIC_DIFFUSION_ATTACH_IMAGE",
     "AGENTIC_E2E_ROOT",
     "AGENTIC_E2E_RUN_NAME",
     "AGENTIC_LANCE_HEIGHT",
@@ -317,12 +347,16 @@ keys = [
     "AGENTIC_LANCE_CFG_TEXT_SCALE",
     "AGENTIC_FORCE_REFLECTION_AFTER_JUDGE",
     "AGENTIC_MAX_GENERATE_IMAGE_PASSES",
+    "AGENTIC_FORCE_FIRST_GENERATE",
+    "AGENTIC_FORCE_FIRST_WARMUP_STEPS",
+    "AGENTIC_FORCE_FIRST_END_STEP",
     "AGENTIC_REFLECT_VLM_TIMEOUT",
     "AGENTIC_REFLECT_MAX_NEW_TOKENS",
     "AGENTIC_JUDGE_PARSE_RETRIES",
     "AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD",
     "AGENTIC_REFLECT_GOOD_ENOUGH",
     "AGENTIC_BLOCK_GENERATE_AFTER_YES",
+    "AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES",
     "QWEN_IMAGE_SEED",
 ]
 base = {}
@@ -355,60 +389,20 @@ if not getattr(processor, "image_processor", None):
 print(f"[INFO] Verified native tool template + image processor: {model_path}")
 PY
 
-# Tool-call wire format must match the actor chat template.
-# Qwen3.5 / Qwen3-Coder emit XML (<function=...><parameter=...>); Hermes is JSON.
-# Wrong parser → "Failed to decode tool call: Expecting value..." and tool_calls=0.
-if [[ -z "${TOOL_PARSER_FORMAT:-}" ]]; then
-  TOOL_PARSER_FORMAT="$(python3 - "$MODEL_PATH" <<'PY'
-import sys
-from transformers import AutoConfig, AutoProcessor
-
-path = sys.argv[1]
-model_type = str(getattr(AutoConfig.from_pretrained(path, trust_remote_code=True), "model_type", "") or "")
-if model_type in {"qwen3_5", "qwen3_5_moe", "qwen3_coder"}:
-    print("qwen3_coder")
-    raise SystemExit(0)
-proc = AutoProcessor.from_pretrained(path, trust_remote_code=True)
-tmpl = (getattr(proc, "chat_template", None) or getattr(getattr(proc, "tokenizer", None), "chat_template", None) or "")
-print("qwen3_coder" if "<function=" in tmpl else "hermes")
-PY
-)"
-fi
-echo "[INFO] multi_turn.format=${TOOL_PARSER_FORMAT}"
-
-# Qwen3.5 GDN backend: default triton avoids FlashInfer JIT (broken on mismatched CTK).
-python3 - "$MODEL_PATH" "${GDN_PREFILL_BACKEND}" <<'PY'
-import os
-import sys
-from pathlib import Path
-
-from transformers import AutoConfig
-
-model_path, backend = sys.argv[1], sys.argv[2].strip().lower()
-model_type = str(getattr(AutoConfig.from_pretrained(model_path, trust_remote_code=True), "model_type", "") or "")
-if model_type != "qwen3_5":
-    print(f"[INFO] model_type={model_type}; skipping Qwen3.5 GDN preflight")
-    raise SystemExit(0)
-print(f"[INFO] Qwen3.5 GDN prefill backend={backend}")
-if backend == "flashinfer":
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH") or ""
-    nvcc = Path(cuda_home) / "bin" / "nvcc" if cuda_home else Path()
-    if not cuda_home or not nvcc.is_file():
-        raise SystemExit(
-            "GDN_PREFILL_BACKEND=flashinfer needs CUDA_HOME with bin/nvcc "
-            f"(got CUDA_HOME={cuda_home!r}). Prefer GDN_PREFILL_BACKEND=triton on this box."
-        )
-    print(f"[WARN] flashinfer GDN JIT needs matching nvcc+headers; this box often mismatches.")
-    print(f"[INFO] CUDA_HOME={cuda_home} nvcc={nvcc}")
-PY
-
 # Keep the tiny overfit parquet synchronized with the actor's native tool format.
+# Default: GSM8K-style system+user only (no baked fewshot). Set OVERFIT_FEWSHOT=1
+# for Class-1 same-task fewshot on soldier rows only (epic rows stay system+user).
 if [[ "${OVERFIT_DATA}" == "1" ]]; then
+  FEWSHOT_ARGS=()
+  if [[ "${OVERFIT_FEWSHOT:-0}" == "1" ]]; then
+    FEWSHOT_ARGS+=(--with_fewshot)
+  fi
   python3 "${DATA_SCRIPT}" \
     --local_save_dir "$(dirname "$TRAIN_FILE")" \
     --overfit --train_size "${OVERFIT_TRAIN_SIZE:-8}" --val_size "${OVERFIT_VAL_SIZE:-2}" \
     --tool_call_format "${TOOL_PARSER_FORMAT}" \
-    --model_path "${MODEL_PATH}"
+    --model_path "${MODEL_PATH}" \
+    "${FEWSHOT_ARGS[@]}"
 fi
 
 # Colocated FSDP actor + vLLM: after actor init, free VRAM << gpu_memory_utilization
@@ -481,7 +475,7 @@ echo "[INFO] rollout.gpu_memory_utilization=${GPU_MEM_UTIL}"
 # Context budget for all-3-class overfit fewshot (gen→judge→decide ≈6–7k toks)
 # plus live user turn / chat template / tool schemas. Override via env if needed.
 MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-8192}"
-MAX_RESP_LEN="${MAX_RESP_LEN:-4096}"
+MAX_RESP_LEN="${MAX_RESP_LEN:-8192}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LEN + MAX_RESP_LEN))}"
 # 3-pass protocol needs ~7 assistant msgs (gen/judge/rewrite…); leave margin.
 MAX_ASSISTANT_TURNS="${MAX_ASSISTANT_TURNS:-12}"

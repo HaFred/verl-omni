@@ -239,6 +239,12 @@ def _assistant_prose(text: str) -> str:
     prose = _TOOL_CALL_RE.sub(" ", text or "")
     prose = _TOOL_OBS_LINE.sub(" ", prose)
     prose = re.sub(r"</?think>", " ", prose, flags=re.IGNORECASE)
+    # Env-injected Reflection/Done (response_mask=0) must not earn Done credit.
+    prose = re.sub(
+        r"(?is)\bReflection\s*:.*?(?:agentic_forced_reflection=1|agentic_force_stop_max_passes=1)\S*",
+        " ",
+        prose,
+    )
     return re.sub(r"\s+", " ", prose).strip()
 
 
