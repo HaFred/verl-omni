@@ -114,27 +114,27 @@ Example (`step_000011/sample_1.02.json`): physical 1=`call_generate_image`, 2=`c
 ```mermaid
 sequenceDiagram
   autonumber
-  participant In as Context (full history)
+  participant In as Context
   participant A as Agent LLM
-  participant G as Qwen-Image :8092
-  participant V as Qwen3-VL :8093
+  participant G as Qwen-Image
+  participant V as Qwen3-VL
 
-  Note over In,A: Physical turn t — call_generate_image<br/>(or agent_rewrite_after_forced_reflection)<br/>turn_prompt = full prefix; decode = generate_image
-  In->>A: turn_prompt (system+tools+history)
-  A->>G: generate_image(prompt_k)
-  G-->>A: tool obs path=… (becomes turn_obs of turn t+1)
+  Note over In,A: Physical turn t - call_generate_image or rewrite
+  In->>A: full turn_prompt
+  A->>G: generate_image prompt_k
+  G-->>A: tool obs with path
 
-  Note over In,A: Physical turn t+1 — call_judge_image<br/>turn_obs = generate tool_response; decode = judge_image
-  A->>V: judge_image(same as user message, last)
-  V-->>A: scores / findings / good_enough (becomes turn_obs of turn t+2)
+  Note over In,A: Physical turn t+1 - call_judge_image
+  A->>V: judge_image compact args
+  V-->>A: scores findings good_enough
 
-  Note over A: Forced Reflection (default) after successful judge
-  alt Physical turn t+2 — stop (YES or max passes)
-    Note over A: turn_kind = forced_reflection_*_done<br/>response = Reflection: … Done. ; decode empty
-    A-->>In: Reflection: … Done.
-  else Physical turn t+2 — continue (good_enough=NO)
-    Note over A: turn_kind = agent_rewrite_after_forced_reflection<br/>response = Reflection: … ; decode = generate_image(prompt_k+1)
-    A-->>In: Reflection: … + rewritten generate_image
+  Note over A: Forced Reflection after successful judge
+  alt stop YES or max passes
+    Note over A: forced_reflection done - response Done decode empty
+    A-->>In: Reflection Done
+  else continue good_enough NO
+    Note over A: agent_rewrite_after_forced_reflection
+    A-->>In: Reflection plus rewritten generate_image
   end
 ```
 
@@ -357,6 +357,8 @@ Then the live user turn (with brevity reminder). Runtime calls remain on-policy.
 
 ## Convergence Examples: Before vs. After
 [PLACEHOLDER]
+
+<img width="600" alt="Image" src="https://github.com/user-attachments/assets/f69bc365-b57e-4d15-b9c3-8643cf8336a3" />
 
 ## File map
 

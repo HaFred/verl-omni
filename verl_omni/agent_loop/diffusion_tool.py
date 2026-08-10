@@ -14,7 +14,7 @@
 
 """Frozen image-generation function tool for verl's stock ``ToolAgentLoop``.
 
-Mode (2a) keeps image generation **outside** the actor optimizer. GRPO trains
+Agentic LLM RL keeps image generation **outside** the actor optimizer. GRPO trains
 the actor as the tool-calling agent while a frozen Qwen-Image pipeline generates
 candidate images. A separate frozen VL sidecar (``judge_image``) scores those
 PNGs; the actor only sees text tool observations (scores / findings / ``path=``)
