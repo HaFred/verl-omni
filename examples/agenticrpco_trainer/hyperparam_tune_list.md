@@ -3,11 +3,16 @@
 Source of truth for knobs: `~/fred/fred_verlomni_agentic_multiturn_pr1.sh` (operator)
 and defaults in `agent_llm/run_agentic_grpo_lora.sh` / `run_qwen_image_tool_server.sh`.
 
-The `…_20260810_084206` score rise was contaminated by a cross-rollout YES-latch
-leak. The corrected protocol keeps rollout-scoped state and uses
-gen→judge→masked Reflection→**policy-sampled Done** (or rewrite).
+**Protocol (tip `95c7c3c`+):** rollout-scoped YES latch; after every successful
+judge, inject a masked Reflection (`response_mask=0`). On YES / max-pass that
+Reflection is a **stop cue** only — the policy then samples terminal `Done.`
+(`response_mask=1`) and earns Done credit. On NO, the policy rewrites
+`generate_image`. Do **not** reinject env `Done.` (that starved reward).
 
-### Current operator defaults (2026-08-10)
+Validated smoke (`…_stop_credit_seed_smoke_20260811_021810`, 5 steps):
+`reward_done/mean` 0.75→1.0, `critic/score/mean` 0.71→0.94, clip_ratio=0.
+
+### Current operator defaults (2026-08-11)
 
 | Knob | Current | Notes |
 | --- | --- | --- |
@@ -15,8 +20,9 @@ gen→judge→masked Reflection→**policy-sampled Done** (or rewrite).
 | `AGENTIC_REFLECT_GOOD_ENOUGH` | **0.86** | Keep locked to judge thr |
 | `QWEN_IMAGE_STEPS` | **16** | Restart image sidecar after change |
 | `QWEN_IMAGE_TRUE_CFG_SCALE` | **4.0** | |
-| `AGENTIC_FORCE_REFLECTION_AFTER_JUDGE` | **1** | Inject Reflection after every successful judge (`mask=0`) |
-| `AGENTIC_MAX_GENERATE_IMAGE_PASSES` | **3** (operator; launch fallback **5**) | Masked stop cue + one sampled Done decision; block further gen |
+| `QWEN_IMAGE_SEED` / `QWEN_IMAGE_DIVERSIFY_SEED` | **42** / **1** | Base seed + stable per-rollout/pass hash (GRPO group variance) |
+| `AGENTIC_FORCE_REFLECTION_AFTER_JUDGE` | **1** | Masked Reflection after every successful judge; YES/max-pass = stop cue |
+| `AGENTIC_MAX_GENERATE_IMAGE_PASSES` | **3** (operator; launch fallback **5**) | Masked stop cue + one sampled Done; block further gen |
 | `AGENTIC_BLOCK_GENERATE_AFTER_YES` | **1** | |
 | `AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES` | **1** | |
 | `OVERFIT_FEWSHOT` | **1** | Soldier Class-1 demo; **omit terminal Done** |
@@ -32,11 +38,12 @@ Tune **one axis at a time** after the protocol is stable.
 | --- | --- | --- | --- | --- | --- |
 | `AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD` | operator + Ray env | **0.86** | **0.84 → 0.86 → 0.88** | 0.86 gave ~51% early first-pass YES at STEPS=16, preserving stop/rewrite diversity | YES rate; `reward_done`; `protocol_ok`; `critic/score/mean` |
 | `AGENTIC_REFLECT_GOOD_ENOUGH` | operator (keep = judge thr) | **0.86** | **same as judge thr** | Legacy/FastAPI path; avoid split verdicts | same as above |
-| `AGENTIC_MAX_GENERATE_IMAGE_PASSES` | operator (override launch) | **3** | **2 / 3 / 4 / 5** | Caps successful gens; then supplies a masked stop cue and samples policy `Done.` | `nturns`; rewrite rate; traj `agent_done_after_max_passes` |
+| `AGENTIC_MAX_GENERATE_IMAGE_PASSES` | operator (override launch) | **3** | **2 / 3 / 4 / 5** | Caps successful gens; then stop cue + policy `Done.` | `nturns`; rewrite rate; traj `agent_done_after_max_passes` |
 | `AGENTIC_BLOCK_GENERATE_AFTER_YES` | operator | 1 | keep **1** | Hard-stops rewrite roulette after YES | `rewrite_after_yes` ≈ 0 |
-| `AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES` | operator | 1 | keep **1** | Hard-stops gen past the pass cap (env dynamics) | no 4th+ live PNG after cap |
+| `AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES` | operator | 1 | keep **1** | Hard-stops gen past the pass cap | no 4th+ live PNG after cap |
 
 Do **not** jump thr to ≤0.50 — first-pass YES collapses multiturn / ΔC signal.
+Reject runs where `agentic_reward/done/max` stays 0 (missing policy terminal credit).
 
 ## Priority B — frozen image quality vs throughput
 
@@ -47,10 +54,11 @@ Sidecar must be restarted after changing these (`run_qwen_image_tool_server.sh` 
 | `QWEN_IMAGE_STEPS` | operator → Omni sidecar | **16** | **8 → 12 → 16 → 20** | Denoise steps. Low = fast queue, often softer / lower aesthetics → harder to hit YES | step time; `reward_aesthetics`; YES rate; rollout PNGs |
 | `QWEN_IMAGE_TRUE_CFG_SCALE` | operator → Omni sidecar | **4.0** | **3.0 → 4.0 → 5.0** | Prompt adherence vs over-saturation / artifacts | C vs A balance; visual fidelity |
 | `QWEN_IMAGE_WIDTH` / `HEIGHT` | operator | 512² | keep 512 for overfit | Resolution vs VRAM / latency | OOM; queue depth |
-| `QWEN_IMAGE_SEED` / `QWEN_IMAGE_DIVERSIFY_SEED` | run script | 42 / 1 | keep | Base seed plus stable rollout/pass hash: reproducible candidates without collapsing each GRPO group to identical rewards | within-group score std |
+| `QWEN_IMAGE_SEED` / `QWEN_IMAGE_DIVERSIFY_SEED` | run script | 42 / 1 | keep | Reproducible candidates without collapsing each GRPO group to identical rewards | within-group score std |
 
-**Coupling note:** thr 0.90 + STEPS 16 often leaves A≈0.84–0.88 → NO → rewrite until max passes.
-If score stays open-loop gated, lower thr or raise STEPS; if too many first-pass YES, raise thr.
+**Coupling note:** thr **0.90** + STEPS 16 often leaves A≈0.84–0.88 → NO until max
+passes (weak Done signal). Default **0.86** balances early YES vs rewrite/ΔC.
+If score groups lose variance with diversify=1, raise temperature / `ROLLOUT_N`.
 
 ## Priority C — exploration / curriculum (already on)
 
@@ -60,7 +68,7 @@ If score stays open-loop gated, lower thr or raise STEPS; if too many first-pass
 | `AGENTIC_FORCE_FIRST_GENERATE` | operator | 1 | 0 / 1 | Teacher-force Hermes gen (+ compact judge if missing) with `mask=1` | early `tool_call`/`valid`; voluntary hermes after anneal |
 | `AGENTIC_FORCE_FIRST_WARMUP_STEPS` | operator | 10 | 5 / 10 / 15 | `p=1` through this global step | force rate early |
 | `AGENTIC_FORCE_FIRST_END_STEP` | operator | 20 | 15 / 20 / 30 | Linear decay to `p=0` | voluntary tool rate after end |
-| `AGENTIC_FORCE_REFLECTION_AFTER_JUDGE` | operator | **1** | keep **1** for overfit; 0 = policy emits Reflection | Injects Reflection after every successful judge (`mask=0`); reward strips force markers | traj `agentic_forced_reflection=1`; `agent_rewrite_after_forced_reflection` |
+| `AGENTIC_FORCE_REFLECTION_AFTER_JUDGE` | operator | **1** | keep **1** for overfit | Masked Reflection after judge; YES/max-pass stop cue → policy Done | traj `agentic_stop_decision_required=1`; `agent_done_after_*` |
 
 ## Priority D — GRPO / LoRA optim (secondary once score moves)
 
@@ -74,11 +82,11 @@ If score stays open-loop gated, lower thr or raise STEPS; if too many first-pass
 
 ## Suggested experiment order
 
-1. Keep protocol fixed: force-reflection **on**, compact judge args, omit fewshot Done, block after YES/max-pass.
+1. Keep protocol fixed: force-reflection **on**, policy-sampled Done, compact judge args, omit fewshot Done, block after YES/max-pass, diversify seed **on**.
 2. Tune **`AGENTIC_MAX_GENERATE_IMAGE_PASSES`** (2–5) for wall-clock vs rewrite depth.
-3. Start at **0.86**; if YES is rare use 0.84, and if first-pass YES dominates use 0.88.
-4. Reject any run where `protocol_ok` stays zero or score groups lose variance.
-5. If score rises but groups have no variance: raise **temperature** or **ROLLOUT_N**.
+3. Start at thr **0.86**; if YES is rare use 0.84; if first-pass YES dominates use 0.88.
+4. Reject any run where `protocol_ok` / `reward_done` stay zero, or score groups lose variance.
+5. If score rises but groups have no variance: check `QWEN_IMAGE_DIVERSIFY_SEED=1`, then raise **temperature** or **ROLLOUT_N**.
 6. If tools regress after force-first anneal: extend `FORCE_FIRST_END_STEP` (e.g. 30).
 
 ## Quick reference — edit sites
@@ -88,7 +96,9 @@ If score stays open-loop gated, lower thr or raise STEPS; if too many first-pass
 | good_enough thr / force / pass cap | `~/fred/fred_verlomni_agentic_multiturn_pr1.sh` |
 | image steps / CFG | same operator → restart Omni sidecar |
 | force-first curriculum | same operator |
-| launcher defaults / LoRA / Ray env | `examples/agenticrpco_trainer/agent_llm/run_agentic_grpo_lora.sh` |
+| launcher defaults / LoRA / Ray env / seed diversify | `examples/agenticrpco_trainer/agent_llm/run_agentic_grpo_lora.sh` |
 | Qwen3.5 parser + GDN | `data/qwen35_env.sh` (sourced by launcher) |
 | YES rule | `verl_omni/utils/judge_parse.py` (`correctness >= thr and aesthetics >= thr`) |
+| stop cue / policy Done loop | `verl_omni/agent_loop/agentic_tool_agent_loop.py` |
+| Done credit | `verl_omni/utils/reward_score/agentic_reward.py` |
 | image server defaults | `examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh` |
