@@ -60,7 +60,12 @@ _BARE_JSON = re.compile(
 )
 _TOOL_OK = re.compile(r"agentic_tool\s+ok=1", re.IGNORECASE)
 _PATH_RE = re.compile(r"path=([^\s'\"]+)", re.IGNORECASE)
-_DONE_RE = re.compile(r"\bDone\.?\b", re.IGNORECASE)
+_DONE_RE = re.compile(r"\bDone\.", re.IGNORECASE)
+_FORCED_REFLECTION_MARKER_RE = re.compile(r"\bagentic_forced_reflection=1\b", re.IGNORECASE)
+_BLOCKED_GENERATE_RE = re.compile(
+    r"\b(?:blocked_after_yes|blocked_after_max_passes)=1\b|generate_image blocked:",
+    re.IGNORECASE,
+)
 # Tool observations only — do NOT match agent prose that merely quotes "VL judge".
 _TOOL_OBS_LINE = re.compile(
     r"(?im)^(?!.*\bReflection\s*:).*\b("
@@ -281,6 +286,14 @@ def _last_successful_generate_image_path(text: str) -> str | None:
     return last_ok or last_png
 
 
+def _has_successful_generated_image(text: str) -> bool:
+    """Accept live tool lines regardless of whether ``path`` precedes ``ok=1``."""
+    for line in (text or "").splitlines():
+        if _TOOL_OK.search(line) and any(path.lower().endswith(".png") for path in _PATH_RE.findall(line)):
+            return True
+    return False
+
+
 def _user_request_from_gt(gt: dict[str, Any], extra_info: dict[str, Any]) -> str:
     for key in ("user_request", "raw_prompt"):
         val = extra_info.get(key) or gt.get(key)
@@ -342,6 +355,41 @@ def _iter_successful_judge_scores(text: str) -> list[tuple[float, float, bool | 
             continue
         out.append((c, a, _good_enough_from_window(window), match.end()))
     return out
+
+
+def _policy_terminal_decision(text: str) -> tuple[bool, bool, bool]:
+    """Return ``(terminal_done, policy_reflection, forced_reflection_context)``.
+
+    A credited Done must be a sampled terminal answer after the latest successful
+    judge.  Bare planning prose such as ``I'll stop when Done.`` is deliberately
+    rejected.  A policy may emit either ``Reflection: ... Done.`` directly or
+    exactly ``Done.`` after an injected, masked Reflection stop cue.
+    """
+    blob = text or ""
+    judges = _iter_successful_judge_scores(blob)
+    if not judges:
+        return False, False, False
+
+    judge_end = judges[-1][3]
+    line_end = blob.find("\n", judge_end)
+    anchor = len(blob) if line_end < 0 else line_end + 1
+    forced_context = False
+    for marker in _FORCED_REFLECTION_MARKER_RE.finditer(blob, anchor):
+        anchor = marker.end()
+        forced_context = True
+
+    suffix = blob[anchor:]
+    suffix = _assistant_prose(suffix)
+    suffix = re.sub(r"<\|[^>]+\|>|</?tool_response>|</?assistant>", " ", suffix, flags=re.IGNORECASE)
+    suffix = re.sub(r"^\s*(?:assistant|user)\s+", "", suffix, flags=re.IGNORECASE)
+    suffix = re.sub(r"\s+", " ", suffix).strip()
+    policy_reflection = bool(_AGENT_REFLECTION_MARKER_RE.search(suffix))
+
+    if policy_reflection:
+        terminal_done = bool(re.search(r"\bDone\.\s*$", suffix, re.IGNORECASE))
+    else:
+        terminal_done = bool(re.fullmatch(r"Done\.", suffix, re.IGNORECASE))
+    return terminal_done, policy_reflection, forced_context
 
 
 def _parse_last_agentic_judge_scores(
@@ -620,6 +668,17 @@ def compute_score(
         out["rollout_valid"] = 0
         out["score"] = 0.0
         return out
+    if not _has_successful_generated_image(blob):
+        # A parseable tool call is not enough: tool failures, blocked calls and
+        # stale-latch/no-PNG trajectories must never mint protocol or Done credit.
+        out = _zero_result(method="agentic_no_successful_image")
+        out["reward_tool_call"] = float(f_tool_call)
+        out["reward_brevity"] = float(f_brevity)
+        out["num_hermes_tool_calls"] = int(len(calls))
+        out["num_generate_image_prompts"] = int(len(prompts))
+        out["num_judge_image_calls"] = int(n_reflect)
+        out["rollout_valid"] = 0
+        return out
 
     user_request = _user_request_from_gt(gt, extra_info)
     last_c, last_a, correctness_scores, aesthetics_scores = _vl_judge_correctness_aesthetics(
@@ -657,8 +716,12 @@ def compute_score(
 
     prose = _assistant_prose(blob)
     has_refl = _has_agent_reflection_prose(prose)
-    has_done = bool(_DONE_RE.search(prose))
-    closed = has_refl and has_done
+    terminal_done, terminal_policy_reflection, forced_reflection_context = _policy_terminal_decision(blob)
+    n_rewrite_after_yes = _num_generate_after_first_yes(blob, calls)
+    valid_terminal_context = bool(n_judge_ok > 0 and not _BLOCKED_GENERATE_RE.search(blob) and n_rewrite_after_yes == 0)
+    closed = bool(
+        valid_terminal_context and terminal_done and (terminal_policy_reflection or forced_reflection_context)
+    )
     distinct = len(prompts) >= 2 and prompts[0].lower().strip() != prompts[-1].lower().strip()
     f_correctness = float(last_c if last_c is not None else 0.0)
     f_aesthetics = float(last_a if last_a is not None else 0.0)
@@ -668,9 +731,9 @@ def compute_score(
     ca_mix_scale = 1.0 if closed else 0.05
     f_correctness_mix = ca_mix_scale * f_correctness
     f_aesthetics_mix = ca_mix_scale * f_aesthetics
-    f_done = 1.0 if closed else (0.25 if has_done else 0.0)
+    # No partial reward for incidental prose such as "Stop when Done.".
+    f_done = 1.0 if closed else 0.0
     ca_ok = last_c is not None and last_a is not None and last_c >= 0.70 and last_a >= 0.70
-    n_rewrite_after_yes = _num_generate_after_first_yes(blob, calls)
     f_delta_c, first_c, first_judge_no = _delta_c_bonus(blob, f_correctness)
     if not closed:
         # ΔC is a multiturn bonus on top of a closed (or rewrite) protocol.
@@ -678,7 +741,7 @@ def compute_score(
 
     # High tier only for protocol_ok. Gen without Reflection: is starved.
     # protocol_ok = closed loop (Reflection: + Done; single-pass or distinct rewrite).
-    if closed and f_reflect >= 0.7 and (len(prompts) == 1 or distinct):
+    if closed and (f_reflect >= 0.7 or forced_reflection_context) and (len(prompts) == 1 or distinct):
         protocol_ok = 1
         if ca_ok:
             base, scale = 0.10, 0.90
@@ -699,7 +762,7 @@ def compute_score(
     if n_rewrite_after_yes > 0:
         protocol_ok = 0
         base, scale = min(base, 0.05), min(scale, 0.35)
-        f_done = min(float(f_done), 0.25)
+        f_done = 0.0
         # No ΔC credit for gambling after YES.
         f_delta_c = 0.0
 

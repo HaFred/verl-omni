@@ -96,16 +96,17 @@ export WANDB_DIR="${WANDB_DIR:-$E2E_RUN_DIR/wandb}"
 export WANDB_PROJECT="${WANDB_PROJECT:-verl_omni_agentic}"
 mkdir -p "$AGENTIC_DIFFUSION_IMAGE_DIR" "$E2E_RUN_DIR" "$WANDB_DIR"
 
-# Fixed diffusion seed for overfit visual stability (override to empty to randomize).
+# Base diffusion seed; workers derive stable per-rollout/per-pass seeds so each
+# GRPO group has reproducible image/reward diversity.
 export QWEN_IMAGE_SEED="${QWEN_IMAGE_SEED:-42}"
+export QWEN_IMAGE_DIVERSIFY_SEED="${QWEN_IMAGE_DIVERSIFY_SEED:-1}"
 # Judge parse reliability (retry once by default; higher max tokens).
 export AGENTIC_JUDGE_PARSE_RETRIES="${AGENTIC_JUDGE_PARSE_RETRIES:-1}"
 export AGENTIC_REFLECT_MAX_NEW_TOKENS="${AGENTIC_REFLECT_MAX_NEW_TOKENS:-1024}"
-# YES bar: 0.9, if lower than this for the overfitting, a single turn mostly get the reflection returing Done. We want more turns incited by the RL.
-export AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD="${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-0.9}"
+# Calibrated on Qwen-Image STEPS=16: ~51% early first-pass YES at 0.86,
+# preserving both sampled Done and NO→rewrite trajectories.
+export AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD="${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-0.86}"
 export AGENTIC_REFLECT_GOOD_ENOUGH="${AGENTIC_REFLECT_GOOD_ENOUGH:-${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD}}"
-# YES bar: A≈0.84–0.86 under STEPS=8. thr 0.80 → first-judge YES → one-shot Done
-# and inflated early critic/score. thr 0.90 forces NO → rewrite multiturn.
 # Env hard-stop: refuse generate_image after good_enough=YES (default on).
 export AGENTIC_BLOCK_GENERATE_AFTER_YES="${AGENTIC_BLOCK_GENERATE_AFTER_YES:-1}"
 # Cap rewrite roulette at AGENTIC_MAX_GENERATE_IMAGE_PASSES (default on).
@@ -138,9 +139,9 @@ echo "[INFO] ckpt dir=${CKPT_DIR}"
 echo "[INFO] e2e rollout images -> ${AGENTIC_DIFFUSION_IMAGE_DIR}"
 echo "[INFO] e2e full trajectories -> ${E2E_RUN_DIR}/rollout_trajectories"
 echo "[INFO] e2e raw assistant rollouts -> ${E2E_RUN_DIR}/hermes_actions/"
-# After every successful judge_image, inject Reflection that carries the
-# stop/continue verdict (Done. on YES / max-pass; else rewrite next).
-# Tokens are response_mask=0; reward strips agentic_forced_reflection markers.
+# After every successful judge_image, inject the Reflection context only.
+# YES/max-pass then gets one sampled policy turn for terminal Done credit.
+# Injected tokens are response_mask=0; policy Done remains response_mask=1.
 export AGENTIC_FORCE_REFLECTION_AFTER_JUDGE="${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-1}"
 export AGENTIC_MAX_GENERATE_IMAGE_PASSES="${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-5}"
 export AGENTIC_FORCE_FIRST_GENERATE="${AGENTIC_FORCE_FIRST_GENERATE:-1}"
@@ -351,6 +352,7 @@ keys = [
     "AGENTIC_BLOCK_GENERATE_AFTER_YES",
     "AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES",
     "QWEN_IMAGE_SEED",
+    "QWEN_IMAGE_DIVERSIFY_SEED",
 ]
 base = {}
 try:

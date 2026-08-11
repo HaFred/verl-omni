@@ -41,7 +41,7 @@ logger = logging.getLogger("qwen_vl_reflect_server")
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 
 MODEL_ID = os.getenv("AGENTIC_REFLECT_VLM_PATH") or os.getenv("MODEL_PATH") or "Qwen/Qwen3-VL-2B-Instruct"
-GOOD_ENOUGH_THRESHOLD = float(os.getenv("AGENTIC_REFLECT_GOOD_ENOUGH", "0.90"))
+GOOD_ENOUGH_THRESHOLD = float(os.getenv("AGENTIC_REFLECT_GOOD_ENOUGH", "0.86"))
 
 _model = None
 _processor = None
@@ -412,14 +412,23 @@ def reflect(request: ReflectRequest) -> ReflectResponse:
     if good_enough:
         fixes = fixes or "none"
     elapsed = time.perf_counter() - started
-    logger.info(
-        "reflect ok=1 parse_ok=%s correctness=%.2f aesthetics=%.2f good_enough=%s latency=%.2fs",
-        bool(scores.get("parse_ok", True)),
-        correctness,
-        aesthetics,
-        good_enough,
-        elapsed,
+    c_low = " ".join(
+        f"{k}={float(v):.2f}" for k, v in sorted(correctness_scores.items(), key=lambda kv: float(kv[1]))[:5]
     )
+    a_low = " ".join(
+        f"{k}={float(v):.2f}" for k, v in sorted(aesthetics_scores.items(), key=lambda kv: float(kv[1]))[:5]
+    )
+    user_snip = re.sub(r"\s+", " ", request.user_request).strip()[:100]
+    findings_snip = re.sub(r"\s+", " ", findings).strip()[:160]
+    line = (
+        f"[Qwen3-VL judge] parse_ok={int(bool(scores.get('parse_ok', True)))} "
+        f"C={correctness:.2f} A={aesthetics:.2f} "
+        f"good_enough={'YES' if good_enough else 'NO'} "
+        f"latency={elapsed:.2f}s user={user_snip!r} "
+        f"C_low[{c_low or '-'}] A_low[{a_low or '-'}]" + (f" findings={findings_snip!r}" if findings_snip else "")
+    )
+    print(line, flush=True)
+    logger.info("%s", line)
     return ReflectResponse(
         correctness=correctness,
         aesthetics=aesthetics,

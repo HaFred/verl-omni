@@ -31,10 +31,12 @@ from verl_omni.agent_loop.agentic_metrics_manager import (
     AgenticMetricsAgentLoopManager,
     _extract_generate_image_prompts,
     _materialize_rollout_images,
+    _turn_kind,
     aggregate_agentic_reward_metrics,
     split_assistant_rollouts,
     split_rollout_turns,
 )
+from verl_omni.agent_loop.agentic_tool_agent_loop import build_forced_reflection
 from verl_omni.agent_loop.diffusion_tool import DIFFUSION_TOOL_SCHEMA, generate_image
 
 
@@ -44,6 +46,43 @@ class TestTrainMaskContract:
         # assistant turn 0 | tool observation | assistant turn 1
         response_mask = [1, 1, 1] + [0, 0] + [1, 1]
         assert response_mask == [1, 1, 1, 0, 0, 1, 1]
+
+
+class TestForcedReflectionStopDecision:
+    def test_yes_builds_stop_cue_without_environment_terminal_action(self):
+        built = build_forced_reflection(
+            "correctness=0.95 aesthetics=0.90 good_enough=YES "
+            "findings: all requested subjects are present\n"
+            "agentic_judge ok=1"
+        )
+        assert built is not None
+        text, stop_required = built
+        assert stop_required is True
+        assert "agentic_stop_decision_required=1" in text
+        assert "Your next and only action must be exactly Done." in text
+        assert not text.rstrip().endswith("Done.")
+
+    def test_max_pass_builds_policy_stop_cue(self):
+        built = build_forced_reflection(
+            "correctness=0.95 aesthetics=0.84 good_enough=NO findings: improve the lighting\nagentic_judge ok=1",
+            force_done=True,
+            generate_pass=3,
+            max_passes=3,
+        )
+        assert built is not None
+        text, stop_required = built
+        assert stop_required is True
+        assert "3-pass max reached" in text
+        assert "agentic_force_stop_max_passes=1" in text
+        assert "agentic_stop_decision_required=1" in text
+
+    def test_turn_kinds_distinguish_stop_cue_and_sampled_done(self):
+        cue = (
+            "Reflection: stop now. agentic_force_stop_max_passes=1 "
+            "agentic_stop_decision_required=1 agentic_forced_reflection=1"
+        )
+        assert _turn_kind("", "", cue) == "forced_reflection_max_passes_stop_cue"
+        assert _turn_kind("Done.", cue) == "agent_done_after_max_passes"
 
 
 class TestStockToolAgentWiring:
@@ -61,7 +100,9 @@ class TestStockToolAgentWiring:
         assert "multi_turn.enable=true" in recipe
         assert "Qwen/Qwen3.5-2B" in recipe
         assert "multi_turn.format=${TOOL_PARSER_FORMAT}" in recipe
-        assert "qwen3_coder" in recipe and "hermes" in recipe
+        assert 'source "${REPO_ROOT}/data/qwen35_env.sh"' in recipe
+        parser_env = (root / "data/qwen35_env.sh").read_text()
+        assert "qwen3_coder" in parser_env and "hermes" in parser_env
         assert "Installed tool-aware chat template" not in recipe
         assert "function_tool_path=verl_omni/agent_loop/diffusion_tool.py" in recipe
         assert "AGENTIC_DIFFUSION_ATTACH_IMAGE" not in recipe
@@ -297,6 +338,23 @@ class TestStockToolAgentWiring:
             "backend": "qwen_image",
         }
         assert metrics["diffusion_backend"] == "qwen_image"
+
+    def test_qwen_omni_seed_is_reproducible_but_varies_by_rollout(self, monkeypatch):
+        from verl_omni.agent_loop.agentic_trajectory_context import set_active_trajectory_relpath
+        from verl_omni.agent_loop.diffusion_tool import _qwen_image_seed
+
+        monkeypatch.setenv("QWEN_IMAGE_SEED", "42")
+        monkeypatch.setenv("QWEN_IMAGE_DIVERSIFY_SEED", "1")
+        set_active_trajectory_relpath("step_000001/sample_0.00")
+        seed_a = _qwen_image_seed("a blue cat")
+        assert seed_a == _qwen_image_seed("a blue cat")
+
+        set_active_trajectory_relpath("step_000001/sample_0.01")
+        seed_b = _qwen_image_seed("a blue cat")
+        assert seed_a != seed_b
+
+        monkeypatch.setenv("QWEN_IMAGE_DIVERSIFY_SEED", "0")
+        assert _qwen_image_seed("a blue cat") == 42
 
     def test_qwen_image_saves_png_text_only_to_actor(self, monkeypatch, tmp_path):
         import verl_omni.agent_loop.diffusion_tool as module

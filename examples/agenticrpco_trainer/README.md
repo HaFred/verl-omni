@@ -49,7 +49,9 @@ Typical force-on trajectory (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
 | `call_generate_image` | First (or non-forced) `generate_image` in `decode` |
 | `call_judge_image` | Compact `judge_image` tool call |
 | `agent_rewrite_after_forced_reflection` | Forced Reflection in `response` + rewrite `generate_image` in `decode` (**counts as a live gen**) |
-| `forced_reflection_max_passes_done` | Cap reached → injected `Done.` (`agentic_force_stop_max_passes=1`) |
+| `forced_reflection_stop_cue` | YES → masked Reflection asks the policy to emit terminal `Done.` |
+| `forced_reflection_max_passes_stop_cue` | Cap reached → masked stop cue (`agentic_force_stop_max_passes=1`) |
+| `agent_done_after_forced_reflection` / `agent_done_after_max_passes` | Policy-sampled terminal `Done.` (**earns Done credit**) |
 
 Do not grep only `call_generate_image` when counting images — rewrites after forced
 Reflection use `agent_rewrite_after_forced_reflection` but still write PNGs.
@@ -72,10 +74,11 @@ saw). If absent, reward falls back to `AGENTIC_VLLM_URL` / legacy
 `hermes_actions` JSONL but are **not** logged under `agentic_reward/*`.
 
 **Overfit learning signal:** open `generate→judge` loops no longer keep a mid
-plateau from high frozen-judge C/A. Scalar mix credits C/A fully only after
-agent `Reflection:` + `Done.`; env-injected Reflection (`agentic_forced_reflection=1`
-/ `agentic_force_stop_max_passes=1`) is stripped from scored prose so GRPO does
-not credit forced stops. The launch script sets LoRA `actor.optim.lr=1e-4`
+plateau from high frozen-judge C/A. Scalar mix credits C/A fully only after a
+successful PNG + successful judge + policy-sampled terminal `Done.`. A masked
+forced Reflection may supply the reflection context, but never the terminal
+action. Incidental prose such as “Stop when Done.” earns zero Done credit, and
+blocked/no-PNG trajectories cannot close the protocol. The launch script sets LoRA `actor.optim.lr=1e-4`
 (verl default `1e-6` was too small to move reward in 100 steps).
 
 
@@ -105,11 +108,12 @@ One **logical** pass (generate → judge → decide) spans **2–3 physical turn
 | ---: | --- | --- | --- |
 | *t* | `call_generate_image` (first) **or** `agent_rewrite_after_forced_reflection` | `generate_image(…)` | empty on first gen; forced `Reflection:` on rewrite turns |
 | *t+1* | `call_judge_image` | `judge_image(same as user message, last)` | empty |
-| *t+2* if YES / max-pass | `forced_reflection_done` / `forced_reflection_max_passes_done` | empty | `Reflection: … Done.` |
+| *t+2* if YES / max-pass | `forced_reflection_stop_cue` / `forced_reflection_max_passes_stop_cue` | `Done.` on the following sampled decision | `Reflection: … stop now` |
 | *t+2* if NO | `agent_rewrite_after_forced_reflection` | rewrite `generate_image(…)` | `Reflection: …` (then this turn is also gen *t* of the next logical pass) |
 
 Example (`step_000011/sample_1.02.json`): physical 1=`call_generate_image`, 2=`call_judge_image`,
-3=`agent_rewrite_after_forced_reflection` (see `response` + rewrite `decode`), …, 7=`forced_reflection_max_passes_done`.
+3=`agent_rewrite_after_forced_reflection` (see `response` + rewrite `decode`), …,
+7=`forced_reflection_max_passes_stop_cue`, 8=`agent_done_after_max_passes`.
 
 ```mermaid
 sequenceDiagram
@@ -130,8 +134,8 @@ sequenceDiagram
 
   Note over A: Forced Reflection after successful judge
   alt stop YES or max passes
-    Note over A: forced_reflection done - response Done decode empty
-    A-->>In: Reflection Done
+    Note over A: masked Reflection supplies a stop cue
+    A-->>In: policy samples terminal Done
   else continue good_enough NO
     Note over A: agent_rewrite_after_forced_reflection
     A-->>In: Reflection plus rewritten generate_image
@@ -153,10 +157,9 @@ force-reflection **on** (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
 
 - Turn k: `generate_image(prompt_k)` → compact `judge_image(...)` → **injected**
   `Reflection:` carrying the stop/continue verdict from `good_enough`
-  (`Done.` on YES / max-pass; else continue so the policy can rewrite).
-  Injected tokens use `response_mask=0`. Reward strips
-  `agentic_forced_reflection` / `agentic_force_stop_max_passes` so GRPO does
-  not credit the injected prose.
+  (stop cue on YES / max-pass; else continue so the policy can rewrite).
+  Injected tokens use `response_mask=0`. On a stop cue, the next turn is a
+  policy-sampled `Done.` (`response_mask=1`) so GRPO receives real terminal credit.
 - Cap successful generates with `AGENTIC_MAX_GENERATE_IMAGE_PASSES` (operator
   default **3**; launch fallback **5** — tune freely).
   `AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES=1` also refuses further
@@ -166,9 +169,10 @@ force-reflection **on** (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
 - **Compact `judge_image` args:** prefer `user_request="same as user message"` and
   `image_prompt="last"`; the tool expands from the bound user task + latest
   artifact so long pasted args do not truncate Hermes tool calls.
-- **YES bar (default 0.90):** `AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD` /
+- **YES bar (default 0.86):** `AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD` /
   `AGENTIC_REFLECT_GOOD_ENOUGH` — YES iff `C≥thr` **and** `A≥thr` (model
-  `good_enough` flag ignored). High thr keeps rewrite / ΔC pressure.
+  `good_enough` flag ignored). This yielded about 51% early first-pass YES at
+  Qwen-Image STEPS=16, retaining both stop and rewrite exploration.
 - **GRPO group size:** `ROLLOUT_N` defaults to **8**.
 - Turn k+1 input is the prior tool obs + the forced Reflection (and any policy rewrite).
 

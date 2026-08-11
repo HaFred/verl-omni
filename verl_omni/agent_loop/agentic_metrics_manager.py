@@ -87,28 +87,35 @@ _GEN_CALL_RE = re.compile(r"<function=generate_image\b|\"name\"\s*:\s*\"generate
 _AGENT_REFLECTION_RE = re.compile(r"\bReflection\s*:", re.IGNORECASE)
 _VL_JUDGE_OBS_RE = re.compile(r"\b(?:VL judge|agentic_judge)\b", re.IGNORECASE)
 _FORCED_REFLECTION_RE = re.compile(r"\bagentic_forced_reflection=1\b", re.IGNORECASE)
+_STOP_DECISION_RE = re.compile(r"\bagentic_stop_decision_required=1\b", re.IGNORECASE)
+_TERMINAL_DONE_RE = re.compile(r"(?is)^\s*(?:Reflection\s*:.*?)?Done\.\s*(?:<\|im_end\|>)?\s*$")
 
 
 def _turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
     """Label turns so trajectory dumps make protocol stages grep-able."""
     resp = response or ""
+    forced_context = f"{turn_prompt or ''}\n{resp}"
     if _JUDGE_CALL_RE.search(decode or ""):
         return "call_judge_image"
     if _GEN_CALL_RE.search(decode or ""):
         if _FORCED_REFLECTION_RE.search(resp) or _FORCED_REFLECTION_RE.search(turn_prompt or ""):
             return "agent_rewrite_after_forced_reflection"
         return "call_generate_image"
+    if _TERMINAL_DONE_RE.search(decode or "") and _STOP_DECISION_RE.search(forced_context):
+        if re.search(r"\bagentic_force_stop_max_passes=1\b", forced_context):
+            return "agent_done_after_max_passes"
+        return "agent_done_after_forced_reflection"
     if re.search(r"\bagentic_force_stop_max_passes=1\b", resp) or (
         not (decode or "").strip() and re.search(r"\bagentic_force_stop_max_passes=1\b", turn_prompt or "")
     ):
-        return "forced_reflection_max_passes_done"
+        return "forced_reflection_max_passes_stop_cue"
     if _FORCED_REFLECTION_RE.search(resp):
-        if re.search(r"\bDone\.", resp):
-            return "forced_reflection_done"
+        if _STOP_DECISION_RE.search(resp):
+            return "forced_reflection_stop_cue"
         return "forced_reflection_continue"
     if not (decode or "").strip() and _FORCED_REFLECTION_RE.search(turn_prompt or ""):
-        if re.search(r"\bDone\.", turn_prompt or ""):
-            return "forced_reflection_done"
+        if _STOP_DECISION_RE.search(turn_prompt or ""):
+            return "forced_reflection_stop_cue"
         return "forced_reflection_continue"
     if _AGENT_REFLECTION_RE.search(decode or ""):
         if _GEN_CALL_RE.search(decode or ""):

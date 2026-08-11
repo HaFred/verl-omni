@@ -22,19 +22,20 @@ tools; execution-only injection left ``rollout_valid=0`` / ``score=0``.
 Separately, when ``judge_image`` returns ``agentic_judge ok=1`` (VL sidecar HTTP
 200 with scores), debug mode can inject an assistant message:
 
-  Reflection: <VL summary> Done.          # if good_enough=YES → then terminate
-  Reflection: <VL summary>                # if good_enough=NO  → then generate again
+  Reflection: <VL summary>; stop cue      # if good_enough=YES → policy samples Done
+  Reflection: <VL summary>                # if good_enough=NO  → policy generates again
 
 After every successful ``judge_image``, when
 ``AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`` (default for this overfit path), the
 loop injects ``Reflection:`` with the stop/continue verdict
-(``Done.`` on ``good_enough=YES`` or after ``AGENTIC_MAX_GENERATE_IMAGE_PASSES``
-successful generates; otherwise continue so the policy can rewrite).
+(``agentic_stop_decision_required=1`` on ``good_enough=YES`` or after
+``AGENTIC_MAX_GENERATE_IMAGE_PASSES`` successful generates; otherwise continue
+so the policy can rewrite).
 
 Injected tokens use ``response_mask=0``. Reward strips
 ``agentic_forced_reflection`` / ``agentic_force_stop_max_passes`` so GRPO does
-not credit the injected prose. With force off, only the max-pass ``Done.``
-soft-stop remains.
+not credit the injected prose. Terminal ``Done.`` is always sampled by the
+policy with ``response_mask=1``.
 """
 
 from __future__ import annotations
@@ -230,7 +231,12 @@ def build_forced_reflection(
     generate_pass: int = 0,
     max_passes: int = 3,
 ) -> tuple[str, bool] | None:
-    """Build ``(assistant_text, done)`` from a successful judge tool observation."""
+    """Build ``(assistant_text, stop_required)`` from a successful judge observation.
+
+    Forced text is context-only (response_mask=0).  Even when the judge says YES
+    or the pass cap is reached, leave ``Done.`` to one subsequent policy decode
+    so GRPO has a sampled terminal action to reinforce.
+    """
     if not _JUDGE_OK_RE.search(tool_text or ""):
         return None
     c_m = _CORRECTNESS_RE.search(tool_text)
@@ -249,14 +255,17 @@ def build_forced_reflection(
     if good_enough:
         text = (
             f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
-            f"good_enough=YES. {findings} Done."
+            f"good_enough=YES. {findings} Stop now; do not call another tool. "
+            f"Your next and only action must be exactly Done. agentic_stop_decision_required=1"
         )
         return text, True
     if force_done:
         text = (
             f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
             f"good_enough=NO after generate_image pass {generate_pass}/{max_passes}. "
-            f"{findings} 3-pass max reached — stopping. Done. agentic_force_stop_max_passes=1"
+            f"{findings} {max_passes}-pass max reached; stop now and do not call another tool. "
+            f"Your next and only action must be exactly Done. "
+            f"agentic_force_stop_max_passes=1 agentic_stop_decision_required=1"
         )
         return text, True
     fix_note = f" Suggested fixes: {fixes}." if fixes and fixes.lower() != "none" else ""
@@ -295,6 +304,7 @@ class AgenticToolAgentLoop(ToolAgentLoop):
             output.extra_fields.pop("_forced_generate_prompt", None)
             output.extra_fields.setdefault("forced_reflection", False)
             output.extra_fields.setdefault("force_stop_max_passes", False)
+            output.extra_fields.setdefault("stop_decision_required", False)
             output.extra_fields.setdefault("forced_first_generate", False)
             output.extra_fields.setdefault("forced_first_judge", False)
             output.extra_fields.setdefault("force_first_probability", 0.0)
@@ -459,6 +469,7 @@ class AgenticToolAgentLoop(ToolAgentLoop):
     async def _handle_processing_tools_state(self, agent_data: AgentData) -> AgentState:
         agent_data.extra_fields.setdefault("forced_reflection", False)
         agent_data.extra_fields.setdefault("force_stop_max_passes", False)
+        agent_data.extra_fields.setdefault("stop_decision_required", False)
         state = await super()._handle_processing_tools_state(agent_data)
         if state == AgentState.TERMINATED:
             return state
@@ -472,7 +483,7 @@ class AgenticToolAgentLoop(ToolAgentLoop):
                 break
             gen_passes = _count_successful_generates(agent_data.messages)
             force_done = gen_passes >= max_passes
-            # RL path (force off): only inject Done at the generate-pass cap so
+            # RL path (force off): only inject a stop cue at the generate-pass cap so
             # rollouts do not burn the response budget on a 4th rewrite loop.
             # Full YES/NO Reflection teacher remains opt-in via force=1.
             if not _force_enabled() and not force_done:
@@ -488,10 +499,10 @@ class AgenticToolAgentLoop(ToolAgentLoop):
         if forced is None:
             return state
 
-        reflection_text, done = forced
-        # When force is off, only keep the max-pass Done stop (not YES/NO rewrite coaching).
+        reflection_text, stop_required = forced
+        # When force is off, only keep the max-pass stop cue (not YES/NO rewrite coaching).
         if not _force_enabled():
-            if not done:
+            if not stop_required:
                 return state
             force_done = gen_passes >= max_passes
             if not force_done:
@@ -519,16 +530,16 @@ class AgenticToolAgentLoop(ToolAgentLoop):
         agent_data.assistant_turns += 1
         agent_data.extra_fields["forced_reflection"] = True
         agent_data.extra_fields["force_stop_max_passes"] = bool(
-            done and "agentic_force_stop_max_passes=1" in reflection_text
+            stop_required and "agentic_force_stop_max_passes=1" in reflection_text
         )
+        agent_data.extra_fields["stop_decision_required"] = bool(stop_required)
         logger.info(
-            "Forced Reflection after judge_image (done=%s, chars=%d, force_full=%s)",
-            done,
+            "Forced Reflection after judge_image (stop_required=%s, chars=%d, force_full=%s)",
+            stop_required,
             len(reflection_text),
             _force_enabled(),
         )
 
-        if done:
-            return AgentState.TERMINATED
-        # Not good enough: let the policy emit rewritten generate_image next.
+        # YES/max-pass: sample the policy's terminal Done.  NO: sample a rewritten
+        # generate_image.  Tool guards reject generation after YES/the pass cap.
         return AgentState.GENERATING

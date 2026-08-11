@@ -37,6 +37,7 @@ dir for the sidecar judge; they are never attached to the actor context.
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -523,6 +524,20 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     return _pack_response(prompt, text, images=[], reward=0.0, backend="stub", tool_stubbed=True)
 
 
+def _qwen_image_seed(prompt: str) -> int | None:
+    seed = os.getenv("QWEN_IMAGE_SEED")
+    if seed is None or seed == "":
+        return None
+    base_seed = int(seed)
+    relpath = get_active_trajectory_relpath() or get_active_rollout_id()
+    if not relpath or os.getenv("QWEN_IMAGE_DIVERSIFY_SEED", "1").strip().lower() in {"0", "false", "no"}:
+        return base_seed
+    generate_pass = count_live_generate_artifacts_for_active_rollout()
+    material = f"{relpath}|{generate_pass}|{prompt}".encode()
+    offset = int.from_bytes(hashlib.blake2s(material, digest_size=4).digest(), "big")
+    return (base_seed + offset) % (2**31)
+
+
 def _call_vllm_omni(
     prompt: str,
     vllm_omni_url: str,
@@ -533,7 +548,7 @@ def _call_vllm_omni(
     width = int(os.getenv("QWEN_IMAGE_WIDTH", "512"))
     steps = int(os.getenv("QWEN_IMAGE_STEPS", "20"))
     cfg = float(os.getenv("QWEN_IMAGE_TRUE_CFG_SCALE", "4.0"))
-    seed = os.getenv("QWEN_IMAGE_SEED")
+    seed = _qwen_image_seed(prompt)
 
     payload: dict = {
         "prompt": prompt,
@@ -543,8 +558,10 @@ def _call_vllm_omni(
         "num_inference_steps": steps,
         "true_cfg_scale": cfg,
     }
-    if seed is not None and seed != "":
-        payload["seed"] = int(seed)
+    if seed is not None:
+        # Stable per-rollout/per-pass derivation preserves reproducibility while
+        # giving GRPO non-identical candidates within each prompt group.
+        payload["seed"] = seed
 
     headers = {"Content-Type": "application/json"}
     token = os.getenv("AGENTIC_DIFFUSION_TOOL_TOKEN")

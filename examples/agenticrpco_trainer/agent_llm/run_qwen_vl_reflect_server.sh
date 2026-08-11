@@ -12,6 +12,9 @@
 # Colocation default: gpu_memory_utilization=0.12 (~10 GiB on H800) so Qwen-Image
 # keeps the rest. Override with AGENTIC_REFLECT_GPU_MEM_UTIL if needed.
 #
+# Per-request C/A score lines are printed to this process stdout (tmux pane) via
+# qwen_vl_judge_log_middleware.py. Disable with AGENTIC_REFLECT_LOG_RESPONSES=0.
+#
 # Or use the legacy FastAPI server for the custom /reflect endpoint:
 #   AGENTIC_REFLECT_VLM_URL=http://127.0.0.1:8093/reflect
 set -euo pipefail
@@ -24,6 +27,13 @@ export AGENTIC_REFLECT_VLM_PATH="${AGENTIC_REFLECT_VLM_PATH:-${MODEL_PATH:-Qwen/
 REFLECT_GPU_MEM_UTIL="${AGENTIC_REFLECT_GPU_MEM_UTIL:-0.12}"
 REFLECT_MAX_NUM_SEQS="${AGENTIC_REFLECT_MAX_NUM_SEQS:-4}"
 REFLECT_MAX_MODEL_LEN="${AGENTIC_REFLECT_MAX_MODEL_LEN:-4096}"
+# Print parsed correctness/aesthetics after each /v1/chat/completions (default on).
+REFLECT_LOG_RESPONSES="${AGENTIC_REFLECT_LOG_RESPONSES:-1}"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+# Middleware module lives next to this script; judge_parse needs repo on PYTHONPATH.
+export PYTHONPATH="${SCRIPT_DIR}:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 VLLM_BIN="${VLLM_BIN:-$(command -v vllm || true)}"
 if [[ -z "${VLLM_BIN}" ]]; then
@@ -47,7 +57,7 @@ if [[ -x "${_CUDA_HOME_CANDIDATE}/bin/nvcc" ]]; then
   export CUDA_PATH="${CUDA_PATH:-${CUDA_HOME}}"
   export PATH="${CUDA_HOME}/bin:${PATH}"
 fi
-_CUDA_COMPAT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/.cache/cuda-compat-13"
+_CUDA_COMPAT_DIR="${REPO_ROOT}/.cache/cuda-compat-13"
 export LD_LIBRARY_PATH="${_CUDA_COMPAT_DIR}:${_SP}/nvidia/cu13/lib:${_SP}/nvidia/cuda_runtime/lib:${_SP}/torch/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
 # Prefer Triton attention when FlashInfer JIT would otherwise recompile.
@@ -63,9 +73,21 @@ echo "[INFO]   gpu mem util: ${REFLECT_GPU_MEM_UTIL} (max_num_seqs=${REFLECT_MAX
 echo "[INFO]   CUDA_HOME   : ${CUDA_HOME:-<unset>}"
 echo "[INFO]   flashinfer sampler: ${VLLM_USE_FLASHINFER_SAMPLER}"
 echo "[INFO]   listen      : http://${HOST}:${PORT}"
+echo "[INFO]   log C/A     : ${REFLECT_LOG_RESPONSES} (AGENTIC_REFLECT_LOG_RESPONSES)"
 echo "[INFO] Trainer should export AGENTIC_VLLM_URL=http://${HOST}:${PORT}"
 echo "[INFO] (Legacy custom endpoint: AGENTIC_REFLECT_VLM_URL=http://${HOST}:${PORT}/reflect)"
 echo "[INFO] Colocate tip: start this first on GPU 7, then Qwen-Image with QWEN_IMAGE_ENABLE_CPU_OFFLOAD=1."
+
+VLLM_EXTRA=()
+case "${REFLECT_LOG_RESPONSES}" in
+  1|true|TRUE|yes|YES|on|ON)
+    VLLM_EXTRA+=(--middleware qwen_vl_judge_log_middleware.judge_score_log_middleware)
+    echo "[INFO] Per-response judge lines: [Qwen3-VL judge] C=.. A=.. good_enough=YES/NO ..."
+    ;;
+  *)
+    echo "[INFO] Response C/A logging disabled (set AGENTIC_REFLECT_LOG_RESPONSES=1 to enable)."
+    ;;
+esac
 
 exec "${VLLM_BIN}" serve "${AGENTIC_REFLECT_VLM_PATH}" \
   --host "${HOST}" \
@@ -74,4 +96,5 @@ exec "${VLLM_BIN}" serve "${AGENTIC_REFLECT_VLM_PATH}" \
   --gpu-memory-utilization "${REFLECT_GPU_MEM_UTIL}" \
   --max-model-len "${REFLECT_MAX_MODEL_LEN}" \
   --trust-remote-code \
+  "${VLLM_EXTRA[@]}" \
   "$@"
