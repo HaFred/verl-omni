@@ -11,11 +11,11 @@
 #   # pane A — vLLM-omni image gen server (GPUs 0,1):
 #   CUDA_VISIBLE_DEVICES=0,1 \
 #     bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
-#   # pane B — vLLM VL judge server (GPU 2):
-#   CUDA_VISIBLE_DEVICES=2 \
+#   # pane B — vLLM VL judge server (GPU 0):
+#   CUDA_VISIBLE_DEVICES=0 \
 #     bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh
-#   # pane C — training (GPUs 4-7):
-#   CUDA_VISIBLE_DEVICES=4,5,6,7 N_GPUS=4 TOTAL_STEPS=100 \
+#   # pane C — training (GPUs 2-3):
+#   CUDA_VISIBLE_DEVICES=2,3 N_GPUS=2 TOTAL_STEPS=100 \
 #     bash examples/agenticrpco_trainer/agent_llm/run_agentic_grpo_lora.sh
 #
 # Short smokes (TOTAL_STEPS≤20) auto-enable GATE_SIDECAR=1: prints expected
@@ -36,13 +36,17 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 cd "${REPO_ROOT}"
 
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-2B}"
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-VL-2B-Instruct}"
 TRAIN_FILE="${TRAIN_FILE:-${REPO_ROOT}/data/agentic/train.parquet}"
 VAL_FILE="${VAL_FILE:-${REPO_ROOT}/data/agentic/val.parquet}"
 N_GPUS="${N_GPUS:-2}"
 TOTAL_STEPS="${TOTAL_STEPS:-100}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 OVERFIT_DATA="${OVERFIT_DATA:-1}"
+CHECKS_PY="${CHECKS_PY:-$SCRIPT_DIR/checks.py}"
+ENV_CONFIG_PY="${ENV_CONFIG_PY:-$SCRIPT_DIR/env_config.py}"
+GATE_SCRIPT="${GATE_SCRIPT:-$SCRIPT_DIR/check_overfit_gates.py}"
+DATA_SCRIPT="${DATA_SCRIPT:-$SCRIPT_DIR/../data_process/create_dummy_agentic_data.py}"
 # Unique WandB run + ckpt dir every launch (override with EXPERIMENT_NAME / RUN_TS).
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 # Slug from MODEL_PATH: Hub id (Qwen/Qwen3-VL-2B-Instruct) or HF cache
@@ -61,10 +65,6 @@ export AGENTIC_DIFFUSION_IMAGE_DIR="${AGENTIC_DIFFUSION_IMAGE_DIR:-$E2E_RUN_DIR/
 export AGENTIC_REFLECT_VLM_TIMEOUT=300
 REQUIRE_REAL_IMAGE_TOOL="${REQUIRE_REAL_IMAGE_TOOL:-1}"
 REQUIRE_REFLECT_VLM="${REQUIRE_REFLECT_VLM:-1}"
-GATE_SCRIPT="${GATE_SCRIPT:-$SCRIPT_DIR/check_overfit_gates.py}"
-DATA_SCRIPT="${DATA_SCRIPT:-$SCRIPT_DIR/../data_process/create_dummy_agentic_data.py}"
-CHECKS_PY="${CHECKS_PY:-$SCRIPT_DIR/checks.py}"
-ENV_CONFIG_PY="${ENV_CONFIG_PY:-$SCRIPT_DIR/env_config.py}"
 # Sidecar gates for overfit / smoke runs (TOTAL_STEPS≤50 default on). Override GATE_SIDECAR=0 to skip.
 if [[ -z "${GATE_SIDECAR:-}" ]]; then
   if [[ "${TOTAL_STEPS}" -le 50 ]]; then
@@ -205,7 +205,7 @@ export RAY_RUNTIME_ENV_JSON="$(python3 "$ENV_CONFIG_PY" ray-env)"
 # an image processor so generate_image pixels can be attached for reflection.
 python3 "$CHECKS_PY" model "$MODEL_PATH"
 
-# Keep the tiny overfit parquet synchronized with the actor's native tool format.
+# Keep the tiny overfit parquet synchronized with the actor native tool format.
 # Default: GSM8K-style system+user only (no baked fewshot). Set OVERFIT_FEWSHOT=1
 # for Class-1 same-task fewshot on soldier rows only (epic rows stay system+user).
 if [[ "${OVERFIT_DATA}" == "1" ]]; then
@@ -213,8 +213,11 @@ if [[ "${OVERFIT_DATA}" == "1" ]]; then
   if [[ "${OVERFIT_FEWSHOT:-0}" == "1" ]]; then
     FEWSHOT_ARGS+=(--with_fewshot)
   fi
+  # Resolve save dir first — nested quotes in --local_save_dir="$(dirname ...)" are fragile
+  # under set -x / line continuations and can swallow following comments.
+  OVERFIT_SAVE_DIR="$(dirname "${TRAIN_FILE}")"
   python3 "${DATA_SCRIPT}" \
-    --local_save_dir "$(dirname "$TRAIN_FILE")" \
+    --local_save_dir "${OVERFIT_SAVE_DIR}" \
     --overfit --train_size "${OVERFIT_TRAIN_SIZE:-8}" --val_size "${OVERFIT_VAL_SIZE:-2}" \
     --tool_call_format "${TOOL_PARSER_FORMAT}" \
     --model_path "${MODEL_PATH}" \
@@ -223,14 +226,13 @@ fi
 
 # Colocated FSDP actor + vLLM: after actor init, free VRAM << gpu_memory_utilization
 # * total. Cap util from currently free memory. Also refuse to start if a prior
-# crashed VLLM::EngineCore still owns the GPU (seen as "Free memory ... less than
-# desired GPU memory utilization").
+# crashed VLLM::EngineCore still owns the GPU (Free memory less than desired util).
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-}"
 export MIN_FREE_GB="${MIN_FREE_GB:-24}"
 if command -v nvidia-smi >/dev/null 2>&1; then
   python3 "$CHECKS_PY" gpu
 fi
-if [[ -z "$GPU_MEM_UTIL" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+if [[ -z "${GPU_MEM_UTIL}" ]] && command -v nvidia-smi >/dev/null 2>&1; then
   GPU_MEM_UTIL="$(python3 "$ENV_CONFIG_PY" gpu-mem-util)"
 fi
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.12}"
