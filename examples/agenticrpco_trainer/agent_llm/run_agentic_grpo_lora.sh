@@ -21,6 +21,14 @@
 # Short smokes (TOTAL_STEPS≤20) auto-enable GATE_SIDECAR=1: prints expected
 # behavior, watches rollout_trajectories during train, then writes
 # overfit_gates.json. Force/teacher default OFF so voluntary Hermes is measurable.
+#
+# File call list:
+#   agent_llm/checks.py        — service/model/GPU preflight checks
+#   agent_llm/env_config.py    — model slug, tool format, GPU mem util, Ray env
+#   agent_llm/run_qwen_image_tool_server.sh   — frozen Qwen-Image via vLLM-Omni
+#   agent_llm/run_qwen_vl_reflect_server.sh   — frozen Qwen3-VL judge via vLLM
+#   agent_llm/check_overfit_gates.py          — overfit gate sidecar
+#   data_process/create_dummy_agentic_data.py — overfit train/val parquet
 set -euo pipefail
 set -x
 
@@ -40,30 +48,7 @@ RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 # Slug from MODEL_PATH: Hub id (Qwen/Qwen3-VL-2B-Instruct) or HF cache
 # (.../models--Qwen--Qwen3-VL-2B-Instruct/snapshots/...).
 if [[ -z "${EXPERIMENT_NAME:-}" ]]; then
-  MODEL_SLUG="$(
-    python3 - "$MODEL_PATH" <<'PY'
-import re, sys
-from pathlib import Path
-raw = (sys.argv[1] or "").strip().rstrip("/")
-p = Path(raw)
-text = raw
-for part in reversed(p.parts):
-    if part.startswith("models--") and "--" in part:
-        text = part[len("models--"):].replace("--", "/")
-        break
-    if part not in {"snapshots", "refs", "blobs"} and not re.fullmatch(r"[0-9a-f]{8,}", part):
-        # Prefer a leaf that looks like a model id/name.
-        if "/" in raw and not raw.startswith("/"):
-            text = raw
-        elif part:
-            text = part
-        break
-# Keep org/name if present; else bare name.
-name = text.split("/")[-1] if text else "model"
-slug = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
-print(slug or "model")
-PY
-  )"
+  MODEL_SLUG="$(python3 "$ENV_CONFIG_PY" slug "$MODEL_PATH")"
   EXPERIMENT_NAME="${MODEL_SLUG}_agentic_grpo_${RUN_TS}"
 fi
 CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints/verl_omni_agentic/${EXPERIMENT_NAME}}"
@@ -78,6 +63,8 @@ REQUIRE_REAL_IMAGE_TOOL="${REQUIRE_REAL_IMAGE_TOOL:-1}"
 REQUIRE_REFLECT_VLM="${REQUIRE_REFLECT_VLM:-1}"
 GATE_SCRIPT="${GATE_SCRIPT:-$SCRIPT_DIR/check_overfit_gates.py}"
 DATA_SCRIPT="${DATA_SCRIPT:-$SCRIPT_DIR/../data_process/create_dummy_agentic_data.py}"
+CHECKS_PY="${CHECKS_PY:-$SCRIPT_DIR/checks.py}"
+ENV_CONFIG_PY="${ENV_CONFIG_PY:-$SCRIPT_DIR/env_config.py}"
 # Sidecar gates for overfit / smoke runs (TOTAL_STEPS≤50 default on). Override GATE_SIDECAR=0 to skip.
 if [[ -z "${GATE_SIDECAR:-}" ]]; then
   if [[ "${TOTAL_STEPS}" -le 50 ]]; then
@@ -147,8 +134,10 @@ export AGENTIC_MAX_GENERATE_IMAGE_PASSES="${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-5
 export AGENTIC_FORCE_FIRST_GENERATE="${AGENTIC_FORCE_FIRST_GENERATE:-1}"
 export AGENTIC_FORCE_FIRST_WARMUP_STEPS="${AGENTIC_FORCE_FIRST_WARMUP_STEPS:-10}"
 export AGENTIC_FORCE_FIRST_END_STEP="${AGENTIC_FORCE_FIRST_END_STEP:-20}"
+export AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE="${AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE:-1}"
 echo "[INFO] agent loop=agentic_tool_agent (AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES})"
 echo "[INFO] force-first generate=${AGENTIC_FORCE_FIRST_GENERATE} p=1 through step ${AGENTIC_FORCE_FIRST_WARMUP_STEPS}, linear -> 0 at step ${AGENTIC_FORCE_FIRST_END_STEP} (teacher-force Hermes gen+judge; response_mask=1)"
+echo "[INFO] rewrite_judge_before_generate=${AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE} (hard order: no PNG → rewrite judge→generate)"
 echo "[INFO] good_enough threshold=${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD} block_generate_after_yes=${AGENTIC_BLOCK_GENERATE_AFTER_YES} block_after_max_passes=${AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES} rollout_n=${ROLLOUT_N}"
 if [[ "${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE}" == "0" ]]; then
   echo "[WARN] AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=0: Reflection after judge is policy-only; max-pass soft-stop still applies." >&2
@@ -171,120 +160,14 @@ if [[ -z "${AGENTIC_VLLM_URL:-}" && -z "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
   fi
 fi
 if [[ -n "${AGENTIC_VLLM_OMNI_URL:-}" ]]; then
-  python3 - "${AGENTIC_VLLM_OMNI_URL}" "${REQUIRE_REAL_IMAGE_TOOL}" <<'PY'
-import json, sys
-from urllib.request import urlopen, Request
-
-base = sys.argv[1].rstrip("/")
-required = sys.argv[2] == "1"
-
-def _get(path: str):
-    req = Request(f"{base}{path}", method="GET")
-    with urlopen(req, timeout=5) as resp:  # noqa: S310
-        return resp.status, resp.read()
-
-try:
-    # vLLM-Omni /health is often HTTP 200 with an empty body.
-    status, body = _get("/health")
-    if status != 200:
-        raise RuntimeError(f"HTTP {status}")
-    if body.strip():
-        print(f"[INFO] vLLM-omni health OK: {json.loads(body)}")
-    else:
-        status, body = _get("/v1/models")
-        if status != 200:
-            raise RuntimeError(f"/health empty and /v1/models HTTP {status}")
-        models = json.loads(body) if body.strip() else {}
-        n = len(models.get("data") or [])
-        print(f"[INFO] vLLM-omni health OK (empty /health); /v1/models count={n}")
-except Exception as exc:
-    print(f"[ERROR] vLLM-omni health check failed at {base}/health: {exc}", file=sys.stderr)
-    if required:
-        raise SystemExit(2)
-PY
+  python3 "$CHECKS_PY" vllm-omni "${AGENTIC_VLLM_OMNI_URL}" "${REQUIRE_REAL_IMAGE_TOOL}"
 elif [[ -n "${AGENTIC_QWEN_IMAGE_URL:-}" ]]; then
-  python3 - "${AGENTIC_QWEN_IMAGE_URL}" "${REQUIRE_REAL_IMAGE_TOOL}" <<'PY'
-import json, sys
-from urllib.request import urlopen
-
-endpoint, required = sys.argv[1], sys.argv[2] == "1"
-health = endpoint.rsplit("/", 1)[0] + "/health"
-try:
-    with urlopen(health, timeout=5) as response:  # noqa: S310
-        payload = json.loads(response.read())
-    if not payload.get("ok"):
-        raise RuntimeError(f"unhealthy response: {payload}")
-    print(f"[INFO] Qwen-Image health OK: {payload}")
-except Exception as exc:
-    print(f"[ERROR] Qwen-Image health check failed at {health}: {exc}", file=sys.stderr)
-    if required:
-        raise SystemExit(2)
-PY
+  python3 "$CHECKS_PY" qwen-image "${AGENTIC_QWEN_IMAGE_URL}" "${REQUIRE_REAL_IMAGE_TOOL}"
 fi
 if [[ -n "${AGENTIC_VLLM_URL:-}" ]]; then
-  python3 - "${AGENTIC_VLLM_URL}" "${REQUIRE_REFLECT_VLM}" <<'PY'
-import json, sys
-from urllib.request import urlopen, Request
-
-base = sys.argv[1].rstrip("/")
-required = sys.argv[2] == "1"
-
-def _get(path: str):
-    req = Request(f"{base}{path}", method="GET")
-    with urlopen(req, timeout=5) as resp:  # noqa: S310
-        return resp.status, resp.read()
-
-try:
-    status, body = _get("/health")
-    if status != 200:
-        raise RuntimeError(f"HTTP {status}")
-    if body.strip():
-        print(f"[INFO] vLLM judge health OK: {json.loads(body)}")
-    else:
-        status, body = _get("/v1/models")
-        if status != 200:
-            raise RuntimeError(f"/health empty and /v1/models HTTP {status}")
-        models = json.loads(body) if body.strip() else {}
-        n = len(models.get("data") or [])
-        print(f"[INFO] vLLM judge health OK (empty /health); /v1/models count={n}")
-except Exception as exc:
-    print(f"[ERROR] vLLM judge health check failed at {base}/health: {exc}", file=sys.stderr)
-    if required:
-        raise SystemExit(2)
-PY
+  python3 "$CHECKS_PY" vllm-judge "${AGENTIC_VLLM_URL}" "${REQUIRE_REFLECT_VLM}"
 elif [[ -n "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
-  python3 - "${AGENTIC_REFLECT_VLM_URL}" "${REQUIRE_REFLECT_VLM}" <<'PY'
-import json, sys
-from urllib.request import Request, urlopen
-
-endpoint, required = sys.argv[1], sys.argv[2] == "1"
-health = endpoint.rsplit("/", 1)[0] + "/health"
-try:
-    with urlopen(health, timeout=5) as response:  # noqa: S310
-        payload = json.loads(response.read())
-    print(f"[INFO] Reflect VLM health OK: {payload}")
-except Exception:
-    try:
-        req = Request(
-            endpoint,
-            data=json.dumps(
-                {
-                    "user_request": "health check",
-                    "image_prompt": "a red apple",
-                    "notes": "",
-                }
-            ).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(req, timeout=30) as response:  # noqa: S310
-            payload = json.loads(response.read())
-        print(f"[INFO] Reflect VLM endpoint reachable: keys={sorted(payload)[:8]}")
-    except Exception as exc:
-        print(f"[ERROR] Reflect VLM check failed at {endpoint}: {exc}", file=sys.stderr)
-        if required:
-            raise SystemExit(2)
-PY
+  python3 "$CHECKS_PY" legacy-reflect "${AGENTIC_REFLECT_VLM_URL}" "${REQUIRE_REFLECT_VLM}"
 fi
 
 _run_final_gates() {
@@ -307,82 +190,20 @@ _run_final_gates() {
   fi
 }
 
-# Qwen3.5 helpers (GDN_PREFILL_BACKEND + TOOL_PARSER_FORMAT + GDN preflight).
-# Safe no-op/preflight-skip when the actor is Qwen3-VL Hermes.
-# shellcheck source=../../../data/qwen35_env.sh
-source "${REPO_ROOT}/data/qwen35_env.sh"
+# Qwen3.5 GDN: pip nvidia-cu13 is often headers 13.3 + nvcc 13.2, so FlashInfer
+# GDN JIT dies with CCCL mismatch. Force Triton prefill; override via env.
+GDN_PREFILL_BACKEND="${GDN_PREFILL_BACKEND:-triton}"
+export GDN_PREFILL_BACKEND
+TOOL_PARSER_FORMAT="${TOOL_PARSER_FORMAT:-$(python3 "$ENV_CONFIG_PY" tool-format "$MODEL_PATH")}"
+export TOOL_PARSER_FORMAT
+echo "[INFO] multi_turn.format=${TOOL_PARSER_FORMAT}"
 
 # Refresh Ray worker env so tool artifacts / Qwen-Image URL / WandB reach TaskRunner.
-export RAY_RUNTIME_ENV_JSON="$(python3 - <<'PY'
-import json, os
-keys = [
-    "LD_LIBRARY_PATH",
-    "PATH",
-    "CUDA_HOME",
-    "CUDA_PATH",
-    "HF_HOME",
-    "VERL_USE_EXTERNAL_MODULES",
-    "WANDB_API_KEY",
-    "WANDB_MODE",
-    "WANDB_SERVICE_TRANSPORT",
-    "WANDB_SILENT",
-    "WANDB_DIR",
-    "WANDB_PROJECT",
-    "AGENTIC_VLLM_OMNI_URL",
-    "AGENTIC_VLLM_URL",
-    "AGENTIC_QWEN_IMAGE_URL",
-    "AGENTIC_REFLECT_VLM_URL",
-    "AGENTIC_REFLECT_VLM_PATH",
-    "AGENTIC_DIFFUSION_TOOL_URL",
-    "AGENTIC_DIFFUSION_TOOL_TOKEN",
-    "AGENTIC_DIFFUSION_TOOL_TIMEOUT",
-    "AGENTIC_DIFFUSION_IMAGE_DIR",
-    "AGENTIC_E2E_ROOT",
-    "AGENTIC_E2E_RUN_NAME",
-    "AGENTIC_FORCE_REFLECTION_AFTER_JUDGE",
-    "AGENTIC_MAX_GENERATE_IMAGE_PASSES",
-    "AGENTIC_FORCE_FIRST_GENERATE",
-    "AGENTIC_FORCE_FIRST_WARMUP_STEPS",
-    "AGENTIC_FORCE_FIRST_END_STEP",
-    "AGENTIC_REFLECT_VLM_TIMEOUT",
-    "AGENTIC_REFLECT_MAX_NEW_TOKENS",
-    "AGENTIC_JUDGE_PARSE_RETRIES",
-    "AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD",
-    "AGENTIC_REFLECT_GOOD_ENOUGH",
-    "AGENTIC_BLOCK_GENERATE_AFTER_YES",
-    "AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES",
-    "QWEN_IMAGE_SEED",
-    "QWEN_IMAGE_DIVERSIFY_SEED",
-]
-base = {}
-try:
-    base = json.loads(os.environ.get("RAY_RUNTIME_ENV_JSON") or "{}")
-except Exception:
-    base = {}
-env_vars = dict(base.get("env_vars") or {})
-for k in keys:
-    if os.environ.get(k):
-        env_vars[k] = os.environ[k]
-base["env_vars"] = env_vars
-print(json.dumps(base))
-PY
-)"
+export RAY_RUNTIME_ENV_JSON="$(python3 "$ENV_CONFIG_PY" ray-env)"
 
 # Never replace the model's native template. Actor must expose Hermes tools +
 # an image processor so generate_image pixels can be attached for reflection.
-python3 - "$MODEL_PATH" <<'PY'
-import sys
-from transformers import AutoProcessor
-
-model_path = sys.argv[1]
-processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
-template = getattr(processor, "chat_template", "") or getattr(processor.tokenizer, "chat_template", "")
-if "<tool_call>" not in template or "tools" not in template:
-    raise SystemExit(f"{model_path} does not expose the required tool-aware chat template")
-if not getattr(processor, "image_processor", None):
-    raise SystemExit(f"{model_path} does not expose an image_processor")
-print(f"[INFO] Verified native tool template + image processor: {model_path}")
-PY
+python3 "$CHECKS_PY" model "$MODEL_PATH"
 
 # Keep the tiny overfit parquet synchronized with the actor's native tool format.
 # Default: GSM8K-style system+user only (no baked fewshot). Set OVERFIT_FEWSHOT=1
@@ -407,62 +228,10 @@ fi
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-}"
 export MIN_FREE_GB="${MIN_FREE_GB:-24}"
 if command -v nvidia-smi >/dev/null 2>&1; then
-  python3 - <<PY
-import os, subprocess, sys
-raw = subprocess.check_output(
-    ["nvidia-smi", "--query-gpu=index,memory.total,memory.free,memory.used", "--format=csv,noheader,nounits"],
-    text=True,
-).strip().splitlines()
-vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-idxs = [int(x) for x in vis.split(",") if x.strip() != ""] if vis.strip() else list(range(len(raw)))
-min_free_gb = float(os.environ.get("MIN_FREE_GB", "24"))
-bad = []
-for i in idxs:
-    if i >= len(raw):
-        continue
-    parts = [x.strip() for x in raw[i].split(",")]
-    idx, total, free, used = int(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])
-    print(f"[INFO] GPU {idx}: used={used/1024:.1f}GiB free={free/1024:.1f}GiB / {total/1024:.1f}GiB")
-    if free / 1024.0 < min_free_gb:
-        bad.append((idx, free / 1024.0, used / 1024.0))
-if bad:
-    print("[ERROR] Training GPUs do not have enough free VRAM before launch.", file=sys.stderr)
-    print("[ERROR] A prior crashed VLLM::EngineCore often leaves ~60GiB occupied.", file=sys.stderr)
-    for idx, free, used in bad:
-        print(f"[ERROR]   GPU {idx}: free={free:.1f}GiB used={used:.1f}GiB (need >= {min_free_gb}GiB free)", file=sys.stderr)
-    print("[ERROR] Inspect: nvidia-smi", file=sys.stderr)
-    print("[ERROR] Free zombies (keep the separate Qwen-Image server GPU if running):", file=sys.stderr)
-    print("[ERROR]   nvidia-smi --query-compute-apps=pid,process_name,used_gpu_memory --format=csv", file=sys.stderr)
-    print("[ERROR]   kill <EngineCore/Worker pids on CUDA_VISIBLE_DEVICES>   # or pick empty GPUs", file=sys.stderr)
-    print("[ERROR] Override gate with MIN_FREE_GB=0 if you insist.", file=sys.stderr)
-    sys.exit(2)
-PY
+  python3 "$CHECKS_PY" gpu
 fi
 if [[ -z "$GPU_MEM_UTIL" ]] && command -v nvidia-smi >/dev/null 2>&1; then
-  GPU_MEM_UTIL="$(python3 - <<'PY'
-import os, subprocess
-raw = subprocess.check_output(
-    ["nvidia-smi", "--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"],
-    text=True,
-).strip().splitlines()
-vis = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-idxs = [int(x) for x in vis.split(",") if x.strip() != ""] if vis.strip() else list(range(len(raw)))
-free_fracs = []
-for i in idxs:
-    if i >= len(raw):
-        continue
-    total_s, free_s = [x.strip() for x in raw[i].split(",")]
-    total, free = float(total_s), float(free_s)
-    if total > 0:
-        # Leave headroom for FSDP residual + LoRA sync / wake_up fragmentation.
-        free_fracs.append(0.25 * free / total)
-if not free_fracs:
-    print("0.12")
-else:
-    util = max(0.08, min(0.15, min(free_fracs)))
-    print(f"{util:.2f}")
-PY
-)"
+  GPU_MEM_UTIL="$(python3 "$ENV_CONFIG_PY" gpu-mem-util)"
 fi
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.12}"
 echo "[INFO] rollout.gpu_memory_utilization=${GPU_MEM_UTIL}"

@@ -125,6 +125,29 @@ def _force_first_generate_probability(step: Any, *, validate: bool = False) -> f
     return float(end - step_i) / float(end - warmup)
 
 
+def _rewrite_judge_before_generate() -> bool:
+    """Hard protocol guard: rewrite premature ``judge_image`` → ``generate_image``.
+
+    Force-first only fires when the policy emits *no* tool call. After anneal,
+    weak VL often samples ``judge_image`` first (``image_prompt=last``) → missing
+    path aborts and log spam. Default on; set ``AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE=0``
+    to disable.
+    """
+    return os.getenv("AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+    }
+
+
+def _tool_calls_are_premature_judge(tool_calls: list[Any] | None) -> bool:
+    if not tool_calls:
+        return False
+    names = [getattr(tc, "name", None) for tc in tool_calls]
+    return bool(names) and all(n == "judge_image" for n in names)
+
+
 def _last_user_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
         if message.get("role") != "user":
@@ -307,6 +330,7 @@ class AgenticToolAgentLoop(ToolAgentLoop):
             output.extra_fields.setdefault("stop_decision_required", False)
             output.extra_fields.setdefault("forced_first_generate", False)
             output.extra_fields.setdefault("forced_first_judge", False)
+            output.extra_fields.setdefault("rewrote_judge_before_generate", False)
             output.extra_fields.setdefault("force_first_probability", 0.0)
             output.extra_fields["trajectory_relpath"] = self._agentic_trajectory_relpath or ""
             return output
@@ -323,6 +347,30 @@ class AgenticToolAgentLoop(ToolAgentLoop):
             set_active_trajectory_relpath(relpath)
             agent_data.extra_fields["trajectory_relpath"] = relpath
         return await super()._call_tool(tool_call, tools_kwargs, agent_data)
+
+    async def _rewrite_premature_judge_to_generate(self, agent_data: AgentData) -> AgentState | None:
+        """Replace a first-turn ``judge_image`` call with ``generate_image`` (mask=1)."""
+        active_tools = getattr(agent_data, "_active_tools", self.tools)
+        if "generate_image" not in active_tools:
+            return None
+        prompt = _last_user_text(agent_data.messages)
+        if not prompt:
+            return None
+        hermes = _hermes_tool_call("generate_image", prompt=prompt)
+        tool_call = FunctionCall(
+            name="generate_image",
+            arguments=json.dumps({"prompt": prompt}, ensure_ascii=False),
+        )
+        new_state = await self._replace_last_assistant_with_tool_call(agent_data, hermes, tool_call)
+        if new_state is None:
+            return None
+        agent_data.extra_fields["rewrote_judge_before_generate"] = True
+        agent_data.extra_fields["_forced_generate_prompt"] = prompt
+        logger.info(
+            "Rewrote premature judge_image → generate_image at global_step=%s (no live PNG yet)",
+            getattr(self, "_agentic_step", 0),
+        )
+        return new_state
 
     async def _encode_assistant_completion(self, text: str) -> list[int]:
         """Encode as a generation delta (content + EOS), matching server-sampled tokens.
@@ -396,7 +444,22 @@ class AgenticToolAgentLoop(ToolAgentLoop):
         )
         agent_data.extra_fields.setdefault("forced_first_generate", False)
         agent_data.extra_fields.setdefault("forced_first_judge", False)
+        agent_data.extra_fields.setdefault("rewrote_judge_before_generate", False)
         agent_data.extra_fields["force_first_probability"] = float(probability)
+
+        # Always-on ordering guard (independent of force-first anneal): policy
+        # sampled judge_image with no live generate yet → rewrite to generate.
+        n_gen = _count_successful_generates(agent_data.messages)
+        if (
+            _rewrite_judge_before_generate()
+            and state == AgentState.PROCESSING_TOOLS
+            and n_gen == 0
+            and _tool_calls_are_premature_judge(agent_data.tool_calls)
+            and len(agent_data.response_mask) < self.response_length
+        ):
+            rewritten = await self._rewrite_premature_judge_to_generate(agent_data)
+            if rewritten is not None:
+                return rewritten
 
         active_tools = getattr(agent_data, "_active_tools", self.tools)
         if (
@@ -408,7 +471,6 @@ class AgenticToolAgentLoop(ToolAgentLoop):
         ):
             return state
 
-        n_gen = _count_successful_generates(agent_data.messages)
         n_judge = _count_successful_judges(agent_data.messages)
 
         # 1) First turn: no tools → teacher-force generate_image (replace Done prose).

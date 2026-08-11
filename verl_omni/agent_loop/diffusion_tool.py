@@ -776,7 +776,7 @@ def _call_judge_vllm(
             f"(image_prompt={image_prompt[:120]!r}). "
             "Refusing to call the VL sidecar without pixels."
         )
-        logger.error("judge_image aborted: missing image path (prompt=%r)", image_prompt[:160])
+        logger.warning("judge_image aborted: missing image path (prompt=%r)", image_prompt[:160])
         return msg, {"error": "missing_image_path", "parse_ok": 0}
 
     try:
@@ -862,7 +862,7 @@ def _call_judge_custom(
             "Refusing to call the VL sidecar without pixels. "
             "Rewrite/generate again only if a prior generate_image succeeded."
         )
-        logger.error("judge_image aborted: missing image path (prompt=%r)", image_prompt[:160])
+        logger.warning("judge_image aborted: missing image path (prompt=%r)", image_prompt[:160])
         return msg, {"error": "missing_image_path"}
 
     payload: dict = {
