@@ -3,8 +3,8 @@
 Last updated: 08/11/2026
 
 Training recipes for **Agentic LLM RL** ([#302](https://github.com/verl-project/verl-omni/issues/302)).
-In this example, we conduct LoRA overfitting on this.
-Agent LLM, diffusion tool, and VL judge can be **changed** as you need; this example uses:
+In this example, we conduct LoRA overfitting on this, where the Agent LLM, diffusion tool, and VL judge 
+can be **changed** as you need; this example uses:
 
 - **Agent LLM** (`agent_llm/`): train `Qwen3-VL-2B-Instruct` (or `Qwen3.5` via `MODEL_PATH`).
 - Frozen **Qwen-Image** via vLLM-Omni is the external `generate_image` tool (`:8092`).
@@ -24,9 +24,9 @@ Target protocol (fewshot + on-policy) — see **Multi-turn Behaviors** diagrams:
 
 ```
 Turn k:
-  generate_image(prompt_k) → image_k
-  judge_image("same as user message", "last") → VL feedback
-  forced Reflection (mask=0) then:
+  1. generate_image(prompt_k) → image_k
+  2. judge_image("same as user message", "last") → VL feedback
+  3. forced Reflection (mask=0) then:
     YES / max-pass → stop cue → policy samples Done. (mask=1)   OR
     NO → policy rewrite + generate_image(prompt_{k+1}) → Turn k+1
 ```
@@ -388,7 +388,6 @@ examples/agenticrpco_trainer/
 │   ├── run_qwen_vl_reflect_server.sh
 │   ├── qwen_vl_reflect_server.py
 │   ├── qwen_vl_judge_log_middleware.py   # optional judge score logging
-│   └── check_overfit_gates.py
 └── data_process/create_dummy_agentic_data.py
 
 data/qwen35_env.sh                        # TOOL_PARSER_FORMAT + GDN preflight

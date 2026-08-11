@@ -20,6 +20,10 @@ import os
 import re
 from typing import Any
 
+# Discrete facet grid. Continuous VLM scores are snapped to nearest level
+# (ties → lower value) so good_enough flips only across 0.2 boundaries.
+_SCORE_GRID: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+
 _CORRECTNESS_KEYS = (
     "subject_entities",
     "attributes",
@@ -54,15 +58,15 @@ _AESTHETICS_QUESTIONS = {
 def good_enough_threshold() -> float:
     """Min C and A for good_enough=YES (client-side vLLM judge path).
 
-    Default 0.85: first-pass often fails (headroom) but reachable after a solid
-    rewrite so GRPO groups get enough high-reward rollouts. Override with
-    ``AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD`` or ``AGENTIC_REFLECT_GOOD_ENOUGH``.
+    Default 0.80: both axes must reach the 0.8 grid band (aligned with discrete
+    facet scores). Override with ``AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD`` or
+    ``AGENTIC_REFLECT_GOOD_ENOUGH``.
     """
-    raw = os.getenv("AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD") or os.getenv("AGENTIC_REFLECT_GOOD_ENOUGH") or "0.85"
+    raw = os.getenv("AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD") or os.getenv("AGENTIC_REFLECT_GOOD_ENOUGH") or "0.80"
     try:
         return float(raw)
     except ValueError:
-        return 0.85
+        return 0.80
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -72,6 +76,12 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def snap_score(value: Any, default: float = 0.0) -> float:
+    """Snap a score to the nearest value in ``_SCORE_GRID`` (ties → lower)."""
+    v = _safe_float(value, default)
+    return min(_SCORE_GRID, key=lambda g: (abs(g - v), g))
+
+
 def _mean_scores(scores: dict[str, float]) -> float:
     if not scores:
         return 0.0
@@ -79,7 +89,12 @@ def _mean_scores(scores: dict[str, float]) -> float:
 
 
 def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
-    """Normalize a parsed judge dict into the canonical scored shape."""
+    """Normalize a parsed judge dict into the canonical scored shape.
+
+    Facet scores are snapped onto ``_SCORE_GRID``; C/A are means of snapped
+    facets (or snapped scalars when facets are absent). ``good_enough`` is
+    derived from snapped C/A vs the env threshold — never from model flags.
+    """
     if not isinstance(data, dict):
         return None
 
@@ -90,25 +105,25 @@ def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(c_scores_raw, dict) and c_scores_raw:
         for key, value in c_scores_raw.items():
             if isinstance(value, int | float):
-                c_scores[str(key)] = _safe_float(value)
+                c_scores[str(key)] = snap_score(value)
     if isinstance(a_scores_raw, dict) and a_scores_raw:
         for key, value in a_scores_raw.items():
             if isinstance(value, int | float):
-                a_scores[str(key)] = _safe_float(value)
+                a_scores[str(key)] = snap_score(value)
 
     if c_scores and a_scores:
         correctness = _mean_scores(c_scores)
         aesthetics = _mean_scores(a_scores)
     elif "correctness" in data or "aesthetics" in data:
-        correctness = _safe_float(data.get("correctness", 0.0))
-        aesthetics = _safe_float(data.get("aesthetics", 0.0))
+        correctness = snap_score(data.get("correctness", 0.0))
+        aesthetics = snap_score(data.get("aesthetics", 0.0))
     else:
         return None
 
     thr = good_enough_threshold()
     # Always derive YES/NO from scores × env threshold. Ignore any model-emitted
     # ``good_enough`` flag so AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD actually controls
-    # rewrite pressure (VLM often returns true with A≈0.85).
+    # rewrite pressure.
     good_enough = correctness >= thr and aesthetics >= thr
 
     return {
@@ -186,11 +201,38 @@ def build_judge_prompt(user_request: str, image_prompt: str, notes: str = "", *,
         f"Notes: {notes or '(none)'}\n\n"
         f"{rubric}\n\n"
     )
+    calibration = (
+        "SCORE GRID (REQUIRED — each facet MUST be exactly one of these):\n"
+        "  {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}\n"
+        "Do NOT emit continuous mid values (e.g. 0.55, 0.84, 0.95). Pick the closest grid level.\n\n"
+        "CORRECTNESS LEVEL ANCHORS (apply per facet independently):\n"
+        "  0.0 = requested content absent, unrecognizable, or completely wrong\n"
+        "  0.2 = severely deficient; majority missing or wrong\n"
+        "  0.4 = partial; several elements present but many wrong/blurry/misplaced\n"
+        "  0.6 = subjects/entities mostly present BUT attributes, relations, or details weak "
+        "(presence alone → max 0.6 for subject_entities / completeness)\n"
+        "  0.8 = key attributes and relations clearly correct; only minor missing detail\n"
+        "  1.0 = no missing requested detail and no contradictory extras (RARE)\n\n"
+        "AESTHETICS LEVEL ANCHORS (apply per facet independently):\n"
+        "  0.0 = unusable (severe artifacts, collapse, or illegible)\n"
+        "  0.2 = major artifacts / broken anatomy / harsh clutter\n"
+        "  0.4 = typical rough sketch / flat fantasy render — acceptable but weak finish\n"
+        "  0.6 = readable composition and color, still soft lighting or mild artifacts\n"
+        "  0.8 = clear composition + effective lighting + low artifact (reserve for this)\n"
+        "  1.0 = near-professional finish (VERY RARE for diffusion sketches)\n"
+        "Default typical Qwen-Image / fantasy sketch renders to 0.4–0.6 on aesthetics facets.\n\n"
+        "INDEPENDENCE RULES:\n"
+        "- Score each facet from its own pixel evidence; do NOT copy the same number across "
+        "all five correctness facets unless each facet independently earns it.\n"
+        "- For any facet ≥ 0.8, findings MUST include one short sentence of concrete pixel evidence.\n"
+        "- Prefer under-scoring over generosity; mid-high saturation (all ~0.9) is a failure mode.\n"
+    )
     if strict_json:
         return (
             header + "CRITICAL RETRY: Your previous reply was not valid JSON.\n"
             "Reply with ONE JSON object only. No markdown, no <think>, no prose before/after.\n"
-            "Use this exact shape (numbers in [0,1]):\n"
+            "Each facet score MUST be exactly one of {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}.\n"
+            "Use this exact shape:\n"
             "{\n"
             '  "correctness_scores": {\n'
             f"{c_schema}\n"
@@ -203,14 +245,7 @@ def build_judge_prompt(user_request: str, image_prompt: str, notes: str = "", *,
             "}\n"
         )
     return (
-        header + "CALIBRATION (HARSH — default LOW):\n"
-        "  0.00 = absent, broken, or completely wrong\n"
-        "  0.20 = severely deficient, majority of requested elements missing or wrong\n"
-        "  0.40 = several elements present but at least half are wrong, blurry, or misplaced\n"
-        "  0.55 = mostly correct BUT one or two notable flaws\n"
-        "  0.70 = clearly good, all key elements present, minor aesthetic issues only\n"
-        "  0.85+ = near-flawless (RARELY given)\n"
-        "Return ONLY this JSON shape (replace every 0.0 with an independently judged score):\n"
+        header + calibration + "Return ONLY this JSON shape (replace every 0.0 with a grid score):\n"
         "{\n"
         '  "correctness_scores": {\n'
         f"{c_schema}\n"
@@ -218,7 +253,7 @@ def build_judge_prompt(user_request: str, image_prompt: str, notes: str = "", *,
         '  "aesthetics_scores": {\n'
         f"{a_schema}\n"
         "  },\n"
-        '  "findings": "specific visual evidence for the lowest scores",\n'
+        '  "findings": "specific visual evidence for the lowest scores (and for any ≥0.8)",\n'
         '  "suggested_fixes": "specific prompt rewrite hints"\n'
         "}\n"
     )

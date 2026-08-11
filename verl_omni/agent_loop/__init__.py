@@ -14,12 +14,15 @@
 
 # Register agentic_tool_agent (forces Reflection after successful judge_image).
 from . import agentic_tool_agent_loop as _agentic_tool_agent_loop  # noqa: F401
+from .agentic_manager_default import install_agentic_manager_default
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
 from .diffusion_agent_loop_tq import (
     DiffusionAgentLoopWorkerTQ,
     create_diffusion_agent_loop_manager,
 )
 from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop
+
+install_agentic_manager_default()
 
 __all__ = [
     "DiffusionAgentLoopOutput",

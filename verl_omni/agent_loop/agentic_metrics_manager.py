@@ -394,6 +394,15 @@ def _run_dir() -> Path:
     return root / os.getenv("AGENTIC_E2E_RUN_NAME", "agentic_run")
 
 
+def _bind_run_artifact_env(config) -> None:
+    """Derive the per-run artifact path from the trainer experiment name."""
+    experiment_name = config.trainer.get("experiment_name")
+    if experiment_name:
+        os.environ["AGENTIC_E2E_RUN_NAME"] = str(experiment_name)
+    # Avoid a stale explicit path from a previously sourced/run launcher.
+    os.environ.pop("AGENTIC_DIFFUSION_IMAGE_DIR", None)
+
+
 def _materialize_rollout_images(
     *,
     decoded_response: str,
@@ -443,7 +452,27 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
 
     ``AgentLoopManager.generate_sequences`` dispatches to Ray ``AgentLoopWorker``s.
     Overrides on the Manager class never run per-rollout — they must live here.
+
+    Also hard-binds agentic multi-turn defaults (Hermes + ``diffusion_tool``) so
+    launch recipes need not pass ``function_tool_path`` / ``format`` Hydra overrides.
     """
+
+    # Agentic Hermes wire format (teacher-force + parsers assume hermes).
+    _AGENTIC_TOOL_FORMAT = "hermes"
+
+    def __init__(self, config, *args, **kwargs):
+        from omegaconf import open_dict
+
+        # Resolve path without importing — importing would register @function_tool
+        # decorators, then load_function_tools_from_path would re-exec the file and
+        # raise "already registered".
+        _bind_run_artifact_env(config)
+        with open_dict(config.actor_rollout_ref.rollout.multi_turn):
+            config.actor_rollout_ref.rollout.multi_turn.function_tool_path = str(
+                Path(__file__).resolve().parent / "diffusion_tool.py"
+            )
+            config.actor_rollout_ref.rollout.multi_turn.format = self._AGENTIC_TOOL_FORMAT
+        super().__init__(config, *args, **kwargs)
 
     async def _run_agent_loop(
         self,
@@ -489,6 +518,11 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
     def __init__(self, *args, **kwargs):
         # Must set before AgentLoopManager.__init__ creates Ray workers.
         self.agent_loop_workers_class = ray.remote(AgenticAgentLoopWorker)
+        config = kwargs.get("config")
+        if config is None and args:
+            config = args[0]
+        if config is not None:
+            _bind_run_artifact_env(config)
         super().__init__(*args, **kwargs)
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
