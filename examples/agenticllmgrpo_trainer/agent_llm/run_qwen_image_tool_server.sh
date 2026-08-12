@@ -1,10 +1,5 @@
 #!/usr/bin/env bash
 # Frozen Qwen-Image service for agentic GRPO (vLLM-Omni).
-#
-#   source ~/fred/fred_verlomni_agentic_multiturn_pr1.sh
-#   CUDA_VISIBLE_DEVICES=7 \
-#     bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
-#
 # Qwen-Image is a diffusion model. ``--omni`` makes the CLI detect model_index.json
 # and serve POST /v1/images/generations.
 set -x

@@ -18,7 +18,7 @@ Protocol (gated):
   actor writes a short reflection, then either ``Done.`` OR rewrite +
   ``generate_image`` in the **same** assistant turn.
 
-Frozen Qwen3-VL serves dual role: (1) in-turn ``judge_image`` agent tool
+Frozen Qwen3-VL judge serves dual role: (1) in-turn ``judge_image`` agent tool
 (structured VL feedback the agent reads before deciding Done / rewrite), and
 (2) reward C/A for ``reward_correctness`` / ``reward_aesthetics``. Reward prefers
 scores from the first ``good_enough=YES`` ``agentic_judge ok=1`` observation
@@ -27,20 +27,32 @@ rewrite-after-YES roulette from replacing a good C/A with a failed last image.
 If absent, it falls back to ``call_reflect_vlm`` via ``AGENTIC_VLLM_URL``
 (OpenAI chat) or legacy ``AGENTIC_REFLECT_VLM_URL``.
 
-``reward_reflection`` scores **agent prose** after generate (visual attributes /
-rewrite / Done) — not frozen-tool markers.
+Scalar mix terms (enter ``score`` via weighted mix):
+  ``reward_tool_call``, ``reward_correctness`` (gated), ``reward_aesthetics``
+  (gated), ``reward_done``.
+Additive multiturn term (also enters ``score``):
+  ``reward_delta_c`` = C lift after first ``good_enough=NO`` → rewrite → closed;
+  applied as ``score += w_delta_c * f_delta_c`` (default ``w_delta_c=0.15``).
+  Zero when first judge is not NO, trajectory is not closed, or rewrite-after-YES.
 
-``reward_tool_call`` is a per-rollout binary (1 if the trajectory contains at
-least one parseable ``<tool_call>``, else 0), matching ``decode_has_tool_call``.
+Final score (before ΔC):
+  score = base + scale * mix
+  mix   = (w_tool_call * f_tool_call
+         + w_correctness * f_correctness_mix
+         + w_aesthetics * f_aesthetics_mix
+         + w_done * f_done) / w_sum
+  then score = min(1, score + w_delta_c * f_delta_c)
 
-``reward_brevity`` scores assistant prose only (tool calls and tool
-observations stripped). Target: ≤4 short sentences / ≤~280 chars of prose.
+``base``/``scale`` are a protocol tier: Qwen3-VL often returns C/A ≈ 0.9 even on
+mediocre images. Open loops use a tiny ``scale`` so high VL C/A cannot plateau the
+mean reward without learning Done.
 
-Tiers:
-  0 generate_image                        → 0
-  gen without reflection prose            → ~0.02–0.05 (starved)
-  gen + reflection, open (no Done)        → mid
-  closed loop (reflection + Done) + C/A   → high (protocol_ok)
+Tiers (mix ∈ [0, 1]; open-loop C/A enter mix at 5%):
+  no generate_image / no successful PNG     → score = 0
+  gen, no Reflection:     base=0.02 scale=0.05 → ≈0.02–0.07
+  Reflection:, open       base=0.04 scale=0.30 → ≈0.04–0.34
+  closed, weak C/A        base=0.05 scale=0.65 → ≈0.05–0.70  (protocol_ok=1)
+  closed, C/A ≥ 0.70      base=0.10 scale=0.90 → ≈0.10–1.00  (protocol_ok=1)
 """
 
 from __future__ import annotations
@@ -54,13 +66,8 @@ from verl_omni.utils.reward_score.vl_reflect_client import call_reflect_vlm
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
 _FUNCTION_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.IGNORECASE | re.DOTALL)
 _PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", re.IGNORECASE | re.DOTALL)
-_BARE_JSON = re.compile(
-    r'(?<!<tool_call>\s)\{\s*"name"\s*:\s*"generate_image"',
-    re.IGNORECASE,
-)
 _TOOL_OK = re.compile(r"agentic_tool\s+ok=1", re.IGNORECASE)
 _PATH_RE = re.compile(r"path=([^\s'\"]+)", re.IGNORECASE)
-_DONE_RE = re.compile(r"\bDone\.", re.IGNORECASE)
 _FORCED_REFLECTION_MARKER_RE = re.compile(r"\bagentic_forced_reflection=1\b", re.IGNORECASE)
 _BLOCKED_GENERATE_RE = re.compile(
     r"\b(?:blocked_after_yes|blocked_after_max_passes)=1\b|generate_image blocked:",
@@ -89,71 +96,6 @@ _AESTHETICS_DIMENSIONS = (
     "fidelity",
     "appeal",
 )
-_VISUAL_ATTR_LEX = {
-    "bright",
-    "brighter",
-    "dark",
-    "color",
-    "colors",
-    "sharp",
-    "sharper",
-    "soft",
-    "muted",
-    "vivid",
-    "lighting",
-    "light",
-    "edge",
-    "edges",
-    "composition",
-    "contrast",
-    "focus",
-    "blur",
-    "luma",
-    "detail",
-    "detailed",
-    "rich",
-    "richer",
-    "match",
-    "matches",
-    "visible",
-    "missing",
-    "present",
-    "figure",
-    "figures",
-    "rewrite",
-    "rewritten",
-    "reflection",
-    "aesthetics",
-    "correctness",
-}
-_REWRITE_LEX = {
-    "rewrite",
-    "rewritten",
-    "brighter",
-    "sharper",
-    "richer",
-    "increase",
-    "add",
-    "fix",
-    "refine",
-    "vivid",
-    "detailed",
-    "contrast",
-}
-_REFINE_LEX = {
-    "detailed",
-    "lighting",
-    "composition",
-    "focus",
-    "texture",
-    "color",
-    "sharp",
-    "richer",
-    "coherent",
-    "bright",
-    "vivid",
-    "contrast",
-}
 
 
 def _as_dict(ground_truth: Any) -> dict[str, Any]:
@@ -253,17 +195,12 @@ def _assistant_prose(text: str) -> str:
     return re.sub(r"\s+", " ", prose).strip()
 
 
-def _prose_tokens(prose: str) -> set[str]:
-    return set(re.findall(r"[a-z0-9]+", (prose or "").lower()))
-
-
 def _has_agent_reflection_prose(prose: str) -> bool:
     """True only for explicit agent ``Reflection:`` prose.
 
-    Visual-attribute lexicon matches alone are *not* enough: VL ``judge_image``
-    observations also contain correctness/aesthetics wording and used to falsely
-    promote open gen→judge loops into the mid reward tier (~0.4), starving the
-    Done. learning signal.
+    VL ``judge_image`` observations also contain correctness/aesthetics wording;
+    requiring the ``Reflection:`` marker avoids promoting open gen→judge loops
+    into the mid reward tier (~0.4) and starving the Done. learning signal.
     """
     if not prose:
         return False
@@ -479,139 +416,10 @@ def _vl_judge_correctness_aesthetics(
     )
 
 
-def _score_brevity(text: str) -> float:
-    """Reward short assistant prose; pure tool-call trajectories score 1.0."""
-    prose = _assistant_prose(text)
-    if not prose:
-        return 1.0
-    sentences = [s for s in re.split(r"[.!?]+", prose) if s.strip()]
-    n_sent = len(sentences)
-    n_chars = len(prose)
-    # Soft target matches the ≤4-sentence prompt reminder.
-    sent_score = 1.0 if n_sent <= 4 else max(0.0, 1.0 - 0.15 * (n_sent - 4))
-    char_score = 1.0 if n_chars <= 280 else max(0.0, 1.0 - (n_chars - 280) / 720.0)
-    return float(min(1.0, 0.5 * sent_score + 0.5 * char_score))
-
-
-def _score_format(text: str, calls: list[tuple[int, int, dict[str, Any]]]) -> float:
-    if not calls:
-        return 0.0
-    valid = 0
-    gen_calls = 0
-    for _, _, call in calls:
-        name = str(call.get("name", "")).lower()
-        args = _call_args(call)
-        if name == "generate_image":
-            gen_calls += 1
-            if "prompt" in args and str(args.get("prompt") or "").strip():
-                valid += 1
-        elif name == "judge_image":
-            # judge_image is always well-formed (user_request + image_prompt);
-            # don't penalize it in the format denominator.
-            pass
-    score = valid / max(1, gen_calls) if gen_calls else 0.0
-    if _BARE_JSON.search(text or ""):
-        score *= 0.5
-    return float(min(1.0, score))
-
-
-def _score_reflection(text: str, prompts: list[str]) -> float:
-    """Score actor self-reflection prose (visual attrs / rewrite / Done)."""
-    if not prompts:
-        return 0.0
-    prose = _assistant_prose(text)
-    if not _has_agent_reflection_prose(prose):
-        return 0.0
-
-    score = 0.45
-    tokens = _prose_tokens(prose)
-    if "reflection:" in prose.lower():
-        score += 0.10
-    if tokens & _VISUAL_ATTR_LEX:
-        score += 0.15
-    if _DONE_RE.search(prose):
-        score += 0.20
-    if len(prompts) >= 2:
-        distinct = prompts[0].lower().strip() != prompts[-1].lower().strip()
-        if distinct and (tokens & _REWRITE_LEX or tokens & _REFINE_LEX):
-            score += 0.10
-        elif distinct:
-            score += 0.05
-    else:
-        score += 0.05
-    return float(min(1.0, score))
-
-
-def _score_tool_usage(prompts: list[str], text: str) -> float:
-    if len(prompts) == 0:
-        return 0.0
-    prose = _assistant_prose(text)
-    has_refl = _has_agent_reflection_prose(prose)
-    # Gen-only / Done-without-reflection is near-zero so GRPO cannot plateau.
-    if not has_refl:
-        return 0.05
-
-    score = 0.55
-    if _DONE_RE.search(prose):
-        score = 0.75
-    if len(prompts) >= 2:
-        distinct = prompts[0].lower().strip() != prompts[-1].lower().strip()
-        if distinct:
-            t0 = set(re.findall(r"[a-z0-9]+", prompts[0].lower()))
-            t1 = set(re.findall(r"[a-z0-9]+", prompts[-1].lower()))
-            if len(t1) > len(t0) or (t1 & _REFINE_LEX):
-                score = 1.0 if _DONE_RE.search(prose) else 0.90
-            else:
-                score = max(score, 0.85)
-        else:
-            score = min(score, 0.40)
-    elif len(prompts) == 1:
-        score = 0.90 if _DONE_RE.search(prose) else 0.60
-    return float(min(1.0, score))
-
-
-def _score_result(
-    text: str,
-    prompts: list[str],
-    *,
-    last_correctness: float | None,
-    last_aesthetics: float | None,
-) -> float:
-    if not prompts:
-        return 0.0
-    ok = len(_TOOL_OK.findall(text or ""))
-    prose = _assistant_prose(text)
-    has_refl = _has_agent_reflection_prose(prose)
-    if not has_refl:
-        return 0.05 if (len(prompts) >= 1 and ok >= 1) else 0.0
-
-    closed = bool(_DONE_RE.search(prose))
-    ca = None
-    if last_correctness is not None and last_aesthetics is not None:
-        ca = 0.5 * (last_correctness + last_aesthetics)
-
-    if ca is not None and closed:
-        return float(min(1.0, 0.35 + 0.65 * ca))
-    if ca is not None and ok >= 1:
-        return float(min(1.0, 0.25 + 0.55 * ca))
-    if closed:
-        return 0.70
-    if ok >= 1:
-        return 0.45
-    if len(prompts) >= 1 and ok >= 1:
-        return 0.25
-    return 0.10 if len(prompts) >= 1 else 0.0
-
-
 def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
     result: dict[str, float | str | int | None] = {
         "score": 0.0,
         "reward_tool_call": 0.0,
-        "reward_brevity": 0.0,
-        "reward_format": 0.0,
-        "reward_reflection": 0.0,
-        "reward_tool_usage": 0.0,
-        "reward_result": 0.0,
         "reward_correctness": 0.0,
         "reward_aesthetics": 0.0,
         "reward_done": 0.0,
@@ -656,13 +464,11 @@ def compute_score(
     # Count judge_image tool calls alongside generate_image calls.
     n_reflect = sum(1 for n in names if n == "judge_image")
     f_tool_call = 1.0 if calls else 0.0
-    f_brevity = _score_brevity(blob)
 
     if not prompts:
         # No generate_image → invalid rollout for GRPO (masked out of the update).
         out = _zero_result(method="agentic_no_generate")
         out["reward_tool_call"] = float(f_tool_call)
-        out["reward_brevity"] = float(f_brevity)
         out["num_hermes_tool_calls"] = int(len(calls))
         out["num_judge_image_calls"] = int(n_reflect)
         out["rollout_valid"] = 0
@@ -673,7 +479,6 @@ def compute_score(
         # stale-latch/no-PNG trajectories must never mint protocol or Done credit.
         out = _zero_result(method="agentic_no_successful_image")
         out["reward_tool_call"] = float(f_tool_call)
-        out["reward_brevity"] = float(f_brevity)
         out["num_hermes_tool_calls"] = int(len(calls))
         out["num_generate_image_prompts"] = int(len(prompts))
         out["num_judge_image_calls"] = int(n_reflect)
@@ -691,16 +496,6 @@ def compute_score(
     if last_c is None and last_a is None and n_judge_fail > 0 and n_judge_ok == 0:
         last_c, last_a = 0.0, 0.0
         correctness_scores, aesthetics_scores = {}, {}
-
-    f_format = _score_format(blob, calls)
-    f_reflect = _score_reflection(blob, prompts)
-    f_tool = _score_tool_usage(prompts, blob)
-    f_result = _score_result(
-        blob,
-        prompts,
-        last_correctness=last_c,
-        last_aesthetics=last_a,
-    )
 
     w_tool_call = float(extra_info.get("w_tool_call", gt.get("w_tool_call", 0.10)))
     w_correctness = float(extra_info.get("w_correctness", gt.get("w_correctness", 0.35)))
@@ -736,12 +531,12 @@ def compute_score(
     ca_ok = last_c is not None and last_a is not None and last_c >= 0.70 and last_a >= 0.70
     f_delta_c, first_c, first_judge_no = _delta_c_bonus(blob, f_correctness)
     if not closed:
-        # ΔC is a multiturn bonus on top of a closed (or rewrite) protocol.
+        # ΔC is a multiturn bonus on top of a closed protocol.
         f_delta_c = 0.0
 
     # High tier only for protocol_ok. Gen without Reflection: is starved.
-    # protocol_ok = closed loop (Reflection: + Done; single-pass or distinct rewrite).
-    if closed and (f_reflect >= 0.7 or forced_reflection_context) and (len(prompts) == 1 or distinct):
+    # closed already requires policy Reflection: or forced-reflection context + Done.
+    if closed and (len(prompts) == 1 or distinct):
         protocol_ok = 1
         if ca_ok:
             base, scale = 0.10, 0.90
@@ -781,11 +576,6 @@ def compute_score(
     result: dict[str, float | str | int | None] = {
         "score": float(total),
         "reward_tool_call": float(f_tool_call),
-        "reward_brevity": float(f_brevity),
-        "reward_format": float(f_format),
-        "reward_reflection": float(f_reflect),
-        "reward_tool_usage": float(f_tool),
-        "reward_result": float(f_result),
         # Log raw VL C/A (pre-gate) so WandB tracks image quality separately.
         "reward_correctness": f_correctness,
         "reward_aesthetics": f_aesthetics,

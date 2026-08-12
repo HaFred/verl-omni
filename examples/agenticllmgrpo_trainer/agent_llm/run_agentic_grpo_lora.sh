@@ -8,17 +8,15 @@
 #
 #   # pane A — vLLM-omni image gen server (GPUs 0,1):
 #   CUDA_VISIBLE_DEVICES=0,1 \
-#     bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
+#     bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_image_tool_server.sh
 #   # pane B — vLLM VL judge server (GPU 0):
 #   CUDA_VISIBLE_DEVICES=0 \
-#     bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh
+#     bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_vl_reflect_server.sh
 #   # pane C — training (GPUs 2-3):
 #   CUDA_VISIBLE_DEVICES=2,3 N_GPUS=2 TOTAL_STEPS=100 \
-#     bash examples/agenticrpco_trainer/agent_llm/run_agentic_grpo_lora.sh
+#     bash examples/agenticllmgrpo_trainer/agent_llm/run_agentic_grpo_lora.sh
 #
 # File call list:
-#   agent_llm/checks.py        — sidecar health preflight
-#   agent_llm/env_config.py    — model slug for experiment/ckpt names
 #   agent_llm/run_qwen_image_tool_server.sh   — frozen Qwen-Image via vLLM-Omni
 #   agent_llm/run_qwen_vl_reflect_server.sh   — frozen Qwen3-VL judge via vLLM
 #   data_process/create_dummy_agentic_data.py — overfit train/val parquet
@@ -32,8 +30,6 @@ VAL_FILE="${VAL_FILE:-${REPO_ROOT}/data/agentic/val.parquet}"
 N_GPUS="${N_GPUS:-2}"
 TOTAL_STEPS="${TOTAL_STEPS:-100}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
-CHECKS_PY="${CHECKS_PY:-$SCRIPT_DIR/checks.py}"
-ENV_CONFIG_PY="${ENV_CONFIG_PY:-$SCRIPT_DIR/env_config.py}"
 RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
 EXPERIMENT_NAME="agentic_grpo_${RUN_TS}"
 CKPT_DIR="${CKPT_DIR:-${REPO_ROOT}/checkpoints/verl_omni_agentic/${EXPERIMENT_NAME}}"
@@ -54,28 +50,17 @@ echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
 echo "[INFO] reflect judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} legacy=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
 if [[ -z "${AGENTIC_VLLM_OMNI_URL:-}" && -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" ]]; then
   echo "[ERROR] No frozen image service is configured; visual reflection cannot be trained on stubs." >&2
-  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh" >&2
+  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_image_tool_server.sh" >&2
   exit 2
 fi
 if [[ -z "${AGENTIC_VLLM_URL:-}" && -z "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
   echo "[ERROR] AGENTIC_VLLM_URL and AGENTIC_REFLECT_VLM_URL are both unset; judge_image has no backend." >&2
-  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh" >&2
+  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_vl_reflect_server.sh" >&2
   exit 2
-fi
-# Health-check the manually launched sidecars; these commands do not start them.
-if [[ -n "${AGENTIC_VLLM_OMNI_URL:-}" ]]; then
-  python3 "$CHECKS_PY" vllm-omni "${AGENTIC_VLLM_OMNI_URL}" 1
-elif [[ -n "${AGENTIC_QWEN_IMAGE_URL:-}" ]]; then
-  python3 "$CHECKS_PY" qwen-image "${AGENTIC_QWEN_IMAGE_URL}" 1
-fi
-if [[ -n "${AGENTIC_VLLM_URL:-}" ]]; then
-  python3 "$CHECKS_PY" vllm-judge "${AGENTIC_VLLM_URL}" 1
-elif [[ -n "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
-  python3 "$CHECKS_PY" legacy-reflect "${AGENTIC_REFLECT_VLM_URL}" 1
 fi
 
 # Create tiny overfit dataset: Hermes-format with same-task fewshot.
-python3 "${REPO_ROOT}/examples/agenticrpco_trainer/data_process/create_dummy_agentic_data.py" \
+python3 "${REPO_ROOT}/examples/agenticllmgrpo_trainer/data_process/create_dummy_agentic_data.py" \
     --local_save_dir "${REPO_ROOT}/data/agentic" \
     --overfit --train_size 8 --val_size 2 \
     --tool_call_format hermes \

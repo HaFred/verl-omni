@@ -1,9 +1,11 @@
-# Agentic LLM Reflection-Plan Co-Optimization (RPCO)
+# Agentic LLM GRPO trainer
 
-Last updated: 08/11/2026
+Last updated: 08/12/2026
 
-Training recipes for **Agentic LLM RL** ([#302](https://github.com/verl-project/verl-omni/issues/302)).
-In this example, we conduct LoRA overfitting on this, where the Agent LLM, diffusion tool, and VL judge 
+Training recipes for **Agentic LLM RL** with GRPO ([#302](https://github.com/verl-project/verl-omni/issues/302)).
+This folder covers the agent-LLM + frozen-tool loop (gen → judge → reflect / Done), not the full
+Reflection–Plan Co-Optimization (RPCO) design from the RFC.
+In this example, we conduct LoRA overfitting on this, where the Agent LLM, diffusion tool, and VL judge
 can be **changed** as you need; this example uses:
 
 - **Agent LLM** (`agent_llm/`): train `Qwen3-VL-2B-Instruct` (or `Qwen3.5` via `MODEL_PATH`).
@@ -14,11 +16,9 @@ can be **changed** as you need; this example uses:
 - Reward: `pkg://verl_omni.utils.reward_score.agentic_reward` — parseable
   `<tool_call>` protocol (Hermes JSON for Qwen3 **or** Qwen3.5 XML) with
   policy-sampled terminal `Done.` (or rewrite) gating.
-- Actor wire format is auto-selected from `MODEL_PATH` in `data/qwen35_env.sh`
-  (sourced by `run_agentic_grpo_lora.sh`):
-  - **Qwen3-VL** → `multi_turn.format=hermes` + Hermes JSON fewshots
-  - **Qwen3.5** → `multi_turn.format=qwen3_coder` + XML fewshots + GDN preflight
-  Override with `TOOL_PARSER_FORMAT` / `--tool_call_format`.
+- Default overfit recipe uses Hermes (`--tool_call_format hermes`). Override via
+  `create_dummy_agentic_data.py` when switching actor family so fewshot syntax
+  matches the chat template.
 
 Target protocol (fewshot + on-policy) — see **Multi-turn Behaviors** diagrams:
 
@@ -227,35 +227,28 @@ from the live agent loop so dump names match `path=` markers in tool obs.
 | Field | Default weight | Physical meaning | Zero when |
 | --- | ---: | --- | --- |
 | `reward_tool_call` | 0.10 | Binary: trajectory contains ≥1 parseable `<tool_call>`. **In scalar.** | No parseable tool call |
-| `reward_done` | 0.20 | Closed loop: successful PNG + successful judge + **policy-sampled** terminal `Done.` (forced Reflection may supply context; never the terminal). **In scalar.** | No policy terminal / blocked / no judge |
-| `reward_brevity` | — | Short assistant prose (≤4 sentences / ≤280 chars). **Metric only.** | Long rambling / debate CoT |
-| `reward_format` | — | Fraction of `generate_image` calls with valid arguments. **Metric only.** | No / malformed calls |
-| `reward_reflection` | — | Quality of agent self-reflection prose. **Metric only.** | No reflection prose |
-| `reward_tool_usage` | — | Protocol shape and distinct rewritten prompts. **Metric only.** | No `generate_image` |
-| `reward_result` | — | Closed-loop outcome quality. **Metric only.** | No `generate_image` |
 | `reward_correctness` | 0.35 | Frozen-VL correctness (logged raw; **mix-gated** until closed). | URL unset / VL call fails |
 | `reward_aesthetics` | 0.35 | Frozen-VL aesthetics (logged raw; **mix-gated** until closed). | URL unset / VL call fails |
+| `reward_done` | 0.20 | Closed loop: successful PNG + successful judge + **policy-sampled** terminal `Done.` (forced Reflection may supply context; never the terminal). **In scalar.** | No policy terminal / blocked / no judge |
+| `reward_delta_c` | 0.15 (additive) | Multiturn bonus: C lift after first `good_enough=NO` → rewrite → closed. Added as `w_delta_c * f_delta_c` on top of the mix. | First judge not NO / not closed / rewrite-after-YES |
 
 Weighted mix (then scaled by a protocol tier `base + scale * mix`). C/A enter the
 mix at full weight only after a closed policy terminal; open loops get 5% C/A:
 
 ```text
-mix = Σ w_i * reward_i  /  Σ w_i
-score = base + scale * mix
+mix = Σ w_i * reward_i  /  Σ w_i   # tool_call, correctness, aesthetics, done
+score = min(1, base + scale * mix + w_delta_c * reward_delta_c)
 ```
 
 | Protocol tier | Condition | `base` | `scale` | `protocol_ok` |
 | --- | --- | ---: | ---: | ---: |
 | Closed + high C/A | policy terminal `Done.` (+ policy or forced Reflection context), single-pass or distinct rewrite, C/A ≥ 0.70 | 0.10 | 0.90 | 1 |
-| Closed, VL down / weak C/A | closed loop; VL missing or C/A &lt; 0.70 | 0.05 | 0.65 | 1 / 0 |
+| Closed, VL down / weak C/A | closed loop; VL missing or C/A &lt; 0.70 | 0.05 | 0.65 | 1 |
 | Reflection present | ≥1 `generate_image` + `Reflection:`, not fully closed | 0.04 | 0.30 | 0 |
 | Gen-only (starved) | ≥1 `generate_image`, **no** closed terminal | 0.02 | 0.05 | 0 |
 
 Weights are stored per row in parquet `ground_truth` / `extra_info` (`w_tool_call`,
-`w_correctness`, `w_aesthetics`, `w_done`). Brevity, format, reflection, tool_usage, and
-result are logged as metrics but excluded from the scalar reward (saturated from
-step 1).
-
+`w_correctness`, `w_aesthetics`, `w_done`, `w_delta_c`).
 ### Visual rubric diagnostics
 
 | Field | Physical meaning |
@@ -269,13 +262,12 @@ step 1).
 
 ## Prerequisites
 
-- Launch from the **verl-omni repo root** (repo-relative `function_tool_path`).
-  `run_agentic_grpo_lora.sh` auto-`cd`s to the repo root.
+- Launch from the **verl-omni repo root** (repo-relative paths in the recipe).
 - Set **`MODEL_PATH`** to a Qwen3-VL Instruct (or Qwen3.5) snapshot.
 - Prefer **2–4 free GPUs** for GRPO, **2 GPUs** for Qwen-Image/Omni, **1 GPU** for the
   VL judge sidecar.
-- The launcher verifies the native tool template and image processor, then
-  sources `data/qwen35_env.sh` for parser/GDN helpers.
+- Start the frozen image + VL judge sidecars before training; the launcher only
+  checks that their URL env vars are set.
 
 ## 100-step overfit e2e (recommended)
 
@@ -298,7 +290,7 @@ Pane A — Qwen-Image / vLLM-Omni (`generate_image`):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
-  bash examples/agenticrpco_trainer/agent_llm/run_qwen_image_tool_server.sh
+  bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_image_tool_server.sh
 # trainer: export AGENTIC_VLLM_OMNI_URL=http://127.0.0.1:8092
 ```
 
@@ -306,7 +298,7 @@ Pane B — judge VLM sidecar (agent `judge_image` tool + reward fallback):
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 \
-  bash examples/agenticrpco_trainer/agent_llm/run_qwen_vl_reflect_server.sh
+  bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_vl_reflect_server.sh
 # trainer: export AGENTIC_VLLM_URL=http://127.0.0.1:8093
 ```
 
@@ -323,7 +315,7 @@ Without an image service, `generate_image` returns a text stub. Set
 TOTAL_STEPS=100 \
   N_GPUS=4 \
   OVERFIT_DATA=1 \
-  bash examples/agenticrpco_trainer/agent_llm/run_agentic_grpo_lora.sh
+  bash examples/agenticllmgrpo_trainer/agent_llm/run_agentic_grpo_lora.sh
 ```
 
 | Step | Behavior |
@@ -346,7 +338,7 @@ ls outputs/e2e_qwen3_vl_2b_instruct_agentic_grpo/*/rollout_trajectories/step_*/
 ### Data-only refresh (no train)
 
 ```bash
-python3 examples/agenticrpco_trainer/data_process/create_dummy_agentic_data.py \
+python3 examples/agenticllmgrpo_trainer/data_process/create_dummy_agentic_data.py \
   --local_save_dir data/agentic \
   --overfit --train_size 8 --val_size 2 \
   --with_fewshot --tool_call_format hermes
@@ -364,44 +356,35 @@ Non-overfit rows still cycle demo classes 0/1/2. Compact fewshot
 
 Then the live user turn (with brevity reminder). Runtime calls remain on-policy.
 
-## Convergence Examples: Before vs. After
-
-Healthy signal after the Done-credit fix (5-step smoke
-`…_stop_credit_seed_smoke_20260811_021810`): `agentic_reward/done/mean`
-0.75→1.0 and `critic/score/mean` 0.71→0.94 with `response_length/clip_ratio=0`.
-Older runs that injected env `Done.` and stripped it from reward stayed flat
-at `reward_done≈0`.
-
-<img width="600" alt="Image" src="https://github.com/user-attachments/assets/f69bc365-b57e-4d15-b9c3-8643cf8336a3" />
 
 ## File map
 
 ```
-examples/agenticrpco_trainer/
+examples/agenticllmgrpo_trainer/
 ├── README.md
-├── hyperparam_tune_list.md
-├── migrate.md                            # port tip → clean checklist
 ├── agent_llm/
-│   ├── run_agentic_grpo_lora.sh          # main GRPO launcher (sources data/qwen35_env.sh)
-│   ├── run_qwen_image_tool_server.sh
-│   ├── qwen_image_tool_server.py
-│   ├── run_qwen_vl_reflect_server.sh
-│   ├── qwen_vl_reflect_server.py
-│   ├── qwen_vl_judge_log_middleware.py   # optional judge score logging
+│   ├── run_agentic_grpo_lora.sh          # GRPO LoRA launcher (Hermes overfit)
+│   ├── run_qwen_image_tool_server.sh     # frozen Qwen-Image via vLLM-Omni
+│   ├── run_qwen_vl_reflect_server.sh     # frozen Qwen3-VL judge via vLLM
+│   └── qwen_vl_judge_log_middleware.py   # optional sidecar C/A log lines
 └── data_process/create_dummy_agentic_data.py
 
-data/qwen35_env.sh                        # TOOL_PARSER_FORMAT + GDN preflight
-
+# Live multiturn path (builds on verl ToolAgentLoop / AgentLoopOutput / ToolResponse)
 verl_omni/agent_loop/
-├── agentic_tool_agent_loop.py            # forced Reflection stop cue + policy Done / force-first
-├── diffusion_tool.py                     # generate_image + judge_image + seed diversify
-├── agentic_metrics_manager.py            # traj dumps + WandB reward components
-└── agentic_trajectory_context.py         # rollout-scoped artifact / YES latch
+├── agentic_tool_agent_loop.py            # ToolAgentLoop subclass: force-first / Reflection stop cue / policy Done
+├── diffusion_tool.py                     # @function_tool generate_image + judge_image → ToolResponse
+├── agentic_metrics_manager.py            # AgentLoopManager: traj/image dumps + WandB agentic_reward/*
+├── agentic_manager_default.py            # wires agentic_tool_agent + metrics manager
+└── agentic_trajectory_context.py         # rollout-scoped artifact paths / YES latch / image binding
 
-verl_omni/utils/judge_parse.py
-verl_omni/utils/reward_score/agentic_reward.py   # policy-terminal Done credit
-verl_omni/utils/reward_score/vl_reflect_client.py
+verl_omni/utils/judge_parse.py            # VL judge prompt + discrete 0.2-grid snap + good_enough
+verl_omni/utils/reward_score/
+├── agentic_reward.py                     # scalar: tool_call + gated C/A + Done + ΔC
+└── vl_reflect_client.py                  # HTTP fallback when traj lacks agentic_judge ok=1
 ```
+
+Upstream verl types used (not reimplemented here):
+`ToolResponse`, `AgentLoopOutput`, `ToolAgentLoop` / `AgentData` — see `verl/experimental/agent_loop/` and `verl/tools/schemas.py`.
 
 Frozen image backends in `diffusion_tool.py` (first match wins):
 
@@ -412,6 +395,7 @@ Frozen image backends in `diffusion_tool.py` (first match wins):
 
 Judge backends:
 
-1. `AGENTIC_VLLM_URL` — OpenAI `/v1/chat/completions` (preferred)
-2. `AGENTIC_REFLECT_VLM_URL` — legacy FastAPI `/reflect`
-3. unset / failure — judge obs error / C/A rewards 0.0 on fallback path
+1. Live `judge_image` obs (`agentic_judge ok=1`) — preferred for reward C/A
+2. `AGENTIC_VLLM_URL` — OpenAI `/v1/chat/completions` fallback
+3. `AGENTIC_REFLECT_VLM_URL` — legacy FastAPI `/reflect`
+4. unset / failure — C/A rewards 0.0 on fallback path
