@@ -49,7 +49,7 @@ def _mean(scores: dict[str, float]) -> float:
 def _parse_scores(text: str) -> dict[str, Any] | None:
     """Prefer shared ``parse_judge_json``; fall back to a tiny local parser."""
     try:
-        from verl_omni.utils.judge_parse import parse_judge_json
+        from verl_omni.utils.agentic_image_judge_parse import parse_judge_json
 
         return parse_judge_json(text)
     except Exception:  # noqa: BLE001
@@ -101,7 +101,7 @@ def _good_enough(parsed: dict[str, Any]) -> bool:
     if "good_enough" in parsed and parsed.get("correctness_scores") and parsed.get("aesthetics_scores"):
         # Prefer shared normalize path's YES when available.
         try:
-            from verl_omni.utils.judge_parse import normalize_judge_payload
+            from verl_omni.utils.agentic_image_judge_parse import normalize_judge_payload
 
             norm = normalize_judge_payload(
                 {
@@ -136,10 +136,10 @@ def format_judge_log_line(
         if user_snip:
             base += f" user={user_snip!r}"
         return base
-    yes = _good_enough(parsed)
+    yes = bool(parsed.get("good_enough")) if "rubber_stamp" in parsed else _good_enough(parsed)
     c = float(parsed.get("correctness", 0.0))
     a = float(parsed.get("aesthetics", 0.0))
-    findings = re.sub(r"\s+", " ", str(parsed.get("findings") or "")).strip()[:160]
+    findings = re.sub(r"\s+", " ", str(parsed.get("findings") or "")).strip()[:220]
     parts = [
         "[Qwen3-VL judge]",
         "parse_ok=1",
@@ -147,6 +147,8 @@ def format_judge_log_line(
         f"A={a:.2f}",
         f"good_enough={'YES' if yes else 'NO'}",
     ]
+    if parsed.get("rubber_stamp"):
+        parts.append("rubber_stamp=1")
     if latency_hint:
         parts.append(latency_hint)
     if user_snip:
@@ -158,6 +160,15 @@ def format_judge_log_line(
     if findings:
         parts.append(f"findings={findings!r}")
     return " ".join(parts)
+
+
+def format_judge_parse_fail_line(*, user_snip: str = "", raw: str = "") -> str:
+    """parse_ok=0 line plus a short raw head (helps spot thinking/truncation)."""
+    base = format_judge_log_line(parsed=None, user_snip=user_snip)
+    snip = re.sub(r"\s+", " ", (raw or "").strip())[:160]
+    if snip:
+        base += f" raw={snip!r}"
+    return base
 
 
 def _user_snip_from_request_body(body: bytes) -> str:
@@ -198,6 +209,41 @@ def _assistant_text(response_body: bytes) -> str:
     return str(message.get("content") or "")
 
 
+def _judge_enable_thinking_from_env() -> bool:
+    return os.getenv("AGENTIC_JUDGE_ENABLE_THINKING", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _rewrite_chat_body_disable_thinking(body: bytes) -> bytes:
+    """Force ``chat_template_kwargs.enable_thinking`` so old trainer clients still work.
+
+    Qwen3.5 burns ``max_tokens`` on CoT and never emits JSON → parse_ok=0. Client
+    may omit the flag until restarted; the sidecar enforces the default here.
+    """
+    if not body:
+        return body
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        return body
+    if not isinstance(payload, dict):
+        return body
+    enable = _judge_enable_thinking_from_env()
+    kwargs = payload.get("chat_template_kwargs")
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+    if kwargs.get("enable_thinking") is enable:
+        return body
+    kwargs = dict(kwargs)
+    kwargs["enable_thinking"] = enable
+    payload["chat_template_kwargs"] = kwargs
+    return json.dumps(payload).encode()
+
+
 async def judge_score_log_middleware(request, call_next):
     """Starlette/FastAPI HTTP middleware entrypoint for ``vllm serve --middleware``."""
     from starlette.requests import Request
@@ -207,6 +253,7 @@ async def judge_score_log_middleware(request, call_next):
     req_body = b""
     if is_chat and str(request.method).upper() == "POST":
         req_body = await request.body()
+        req_body = _rewrite_chat_body_disable_thinking(req_body)
 
         async def receive():
             return {"type": "http.request", "body": req_body, "more_body": False}
@@ -225,7 +272,10 @@ async def judge_score_log_middleware(request, call_next):
         user_snip = _user_snip_from_request_body(req_body)
         raw = _assistant_text(resp_body)
         parsed = _parse_scores(raw) if raw else None
-        line = format_judge_log_line(parsed=parsed, user_snip=user_snip)
+        if parsed is None:
+            line = format_judge_parse_fail_line(user_snip=user_snip, raw=raw)
+        else:
+            line = format_judge_log_line(parsed=parsed, user_snip=user_snip)
         # print + logger: uvicorn may filter logger names; print hits the tmux pane.
         print(line, flush=True)
         logger.info("%s", line)

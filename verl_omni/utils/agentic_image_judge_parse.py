@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared VL judge JSON parse + prompt helpers (tool path and reward fallback)."""
+"""Shared agentic image-judge JSON parse + prompt helpers (tool + reward)."""
 
 from __future__ import annotations
 
@@ -40,7 +40,8 @@ _AESTHETICS_KEYS = (
 )
 
 _CORRECTNESS_QUESTIONS = {
-    "subject_entities": "Are the requested primary subjects/entities visibly present and recognizable?",
+    "subject_entities": "Are the requested primary subjects/entities visibly present and recognizable? If the "
+    "subject is a person, is their gender, age, and ethnicity correct? Is he/she facially recognizable?",
     "attributes": "Are requested attributes such as color, count, material, text, and identity correct?",
     "relations_layout": "Are requested actions, spatial relations, and layout/composition constraints correct?",
     "scene_context": "Does the environment, setting, style, and overall scene match the request?",
@@ -77,8 +78,17 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def snap_score(value: Any, default: float = 0.0) -> float:
-    """Snap a score to the nearest value in ``_SCORE_GRID`` (ties → lower)."""
+    """Snap a score to ``_SCORE_GRID``.
+
+    Values in ``[0.9, 1.0)`` map to ``0.8`` so mid-high continuous scores cannot
+    become max. Only an exact ``1.0`` stays ``1.0``. Other values use nearest
+    grid point (ties → lower).
+    """
     v = _safe_float(value, default)
+    if v >= 1.0:
+        return 1.0
+    if v >= 0.9:
+        return 0.8
     return min(_SCORE_GRID, key=lambda g: (abs(g - v), g))
 
 
@@ -88,52 +98,124 @@ def _mean_scores(scores: dict[str, float]) -> float:
     return sum(scores.values()) / max(1, len(scores))
 
 
+# Soft symmetric ceiling after a rubber-stamp detection. Keeps C/A usable for
+# reward learning while still below a "perfect" 1.0 band.
+_RUBBER_STAMP_SCORE_CEILING = 0.8
+_RUBBER_STAMP_FINDINGS_NOTE = (
+    "[client] rubber-stamp flat high facets: good_enough forced NO; "
+    f"C/A facets capped at {_RUBBER_STAMP_SCORE_CEILING:.1f}"
+)
+
+
+def _is_flat_high_facets(scores: dict[str, float], *, min_value: float = 0.9) -> bool:
+    """True when ≥2 facets are identical and each is ≥ ``min_value`` (rubber-stamp).
+
+    Default ``min_value=0.9`` so a legitimate discrete-grid ``0.8`` across facets
+    can still earn ``good_enough=YES``. Only near-max flat copies are stamped.
+    """
+    if len(scores) < 2:
+        return False
+    values = list(scores.values())
+    first = values[0]
+    if first < min_value:
+        return False
+    return all(abs(v - first) <= 1e-9 for v in values[1:])
+
+
+def _cap_facets(scores: dict[str, float], *, ceiling: float) -> dict[str, float]:
+    """Clamp each facet to ``ceiling`` (symmetric soft demotion)."""
+    return {k: min(v, ceiling) for k, v in scores.items()}
+
+
+def _annotate_rubber_stamp_findings(findings: str) -> str:
+    note = _RUBBER_STAMP_FINDINGS_NOTE
+    text = (findings or "").strip()
+    if not text:
+        return note
+    if note in text:
+        return text
+    return f"{text} {note}"
+
+
 def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize a parsed judge dict into the canonical scored shape.
 
-    Facet scores are snapped onto ``_SCORE_GRID``; C/A are means of snapped
-    facets (or snapped scalars when facets are absent). ``good_enough`` is
-    derived from snapped C/A vs the env threshold — never from model flags.
+    Facet scores are snapped onto ``_SCORE_GRID``. Rubber-stamps (flat identical
+    near-max facets on the *raw* pre-snap values, default ≥0.9) are handled
+    model-agnostically:
+
+    - ``good_enough`` is forced ``False`` (blocks Done on undifferentiated maxing),
+    - C and A facets share a soft symmetric cap at 0.8 (keeps reward signal),
+    - ``findings`` gains an explicit ``[client]`` note so obs match the scores.
+
+    A uniform discrete ``0.8`` grid is *not* a stamp — that path must remain able
+    to return YES so the agent can learn NO→rewrite→YES without max-pass stops.
+    Detection uses raw facets so ``snap_score``'s ``[0.9, 1.0)→0.8`` path does
+    not itself create a flat group that then gets double-penalized. Model-emitted
+    ``good_enough`` flags are ignored; YES requires snapped C/A ≥ env threshold
+    and no rubber-stamp.
     """
     if not isinstance(data, dict):
         return None
 
     c_scores_raw = data.get("correctness_scores")
     a_scores_raw = data.get("aesthetics_scores")
+    c_raw: dict[str, float] = {}
+    a_raw: dict[str, float] = {}
     c_scores: dict[str, float] = {}
     a_scores: dict[str, float] = {}
     if isinstance(c_scores_raw, dict) and c_scores_raw:
         for key, value in c_scores_raw.items():
             if isinstance(value, int | float):
+                c_raw[str(key)] = _safe_float(value)
                 c_scores[str(key)] = snap_score(value)
     if isinstance(a_scores_raw, dict) and a_scores_raw:
         for key, value in a_scores_raw.items():
             if isinstance(value, int | float):
+                a_raw[str(key)] = _safe_float(value)
                 a_scores[str(key)] = snap_score(value)
 
+    rubber_stamp = False
     if c_scores and a_scores:
+        # Detect on raw continuous facets (before snap) to avoid double penalty.
+        rubber_stamp = _is_flat_high_facets(c_raw) or _is_flat_high_facets(a_raw)
+        if rubber_stamp:
+            c_scores = _cap_facets(c_scores, ceiling=_RUBBER_STAMP_SCORE_CEILING)
+            a_scores = _cap_facets(a_scores, ceiling=_RUBBER_STAMP_SCORE_CEILING)
         correctness = _mean_scores(c_scores)
         aesthetics = _mean_scores(a_scores)
     elif "correctness" in data or "aesthetics" in data:
         correctness = snap_score(data.get("correctness", 0.0))
         aesthetics = snap_score(data.get("aesthetics", 0.0))
+        # Scalar-only: treat both axes ≥ 0.9 as an undifferentiated stamp.
+        rubber_stamp = (
+            _safe_float(data.get("correctness", 0.0)) >= 0.9 and _safe_float(data.get("aesthetics", 0.0)) >= 0.9
+        )
+        if rubber_stamp:
+            correctness = min(correctness, _RUBBER_STAMP_SCORE_CEILING)
+            aesthetics = min(aesthetics, _RUBBER_STAMP_SCORE_CEILING)
     else:
         return None
 
     thr = good_enough_threshold()
     # Always derive YES/NO from scores × env threshold. Ignore any model-emitted
     # ``good_enough`` flag so AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD actually controls
-    # rewrite pressure.
-    good_enough = correctness >= thr and aesthetics >= thr
+    # rewrite pressure. Rubber-stamps never count as YES.
+    good_enough = (not rubber_stamp) and correctness >= thr and aesthetics >= thr
+
+    findings = str(data.get("findings") or "")
+    if rubber_stamp:
+        findings = _annotate_rubber_stamp_findings(findings)
 
     return {
         "correctness": correctness,
         "aesthetics": aesthetics,
         "correctness_scores": c_scores,
         "aesthetics_scores": a_scores,
-        "findings": str(data.get("findings") or ""),
+        "findings": findings,
         "suggested_fixes": str(data.get("suggested_fixes") or ""),
         "good_enough": good_enough,
+        "rubber_stamp": rubber_stamp,
     }
 
 
@@ -293,6 +375,8 @@ def format_judge_observation(
         "parse_ok": 1,
         "parse_retries": int(parse_retries),
     }
+    if "rubber_stamp" in parsed:
+        meta["rubber_stamp"] = bool(parsed.get("rubber_stamp"))
     for key, value in (parsed.get("correctness_scores") or {}).items():
         if isinstance(value, int | float):
             meta[f"correctness_{key}"] = float(value)

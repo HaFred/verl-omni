@@ -42,6 +42,59 @@ import re
 import threading
 from pathlib import Path
 
+
+def default_e2e_root() -> Path:
+    """Repo ``outputs/e2e`` (absolute). Prefer ``VERLOMNI_ROOT`` when set."""
+    verlomni = os.getenv("VERLOMNI_ROOT", "").strip()
+    if verlomni:
+        return Path(verlomni).expanduser().resolve() / "outputs" / "e2e"
+    # <repo>/verl_omni/agent_loop/this_file.py → parents[2] == repo root
+    return Path(__file__).resolve().parents[2] / "outputs" / "e2e"
+
+
+def resolve_e2e_root() -> Path:
+    """Shared e2e artifact root for traj / images / hermes_actions."""
+    explicit = os.getenv("AGENTIC_E2E_ROOT", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return default_e2e_root()
+
+
+def resolve_run_dir() -> Path:
+    """Per-run dir: ``<e2e_root>/<experiment_name>/``."""
+    image_dir = os.getenv("AGENTIC_DIFFUSION_IMAGE_DIR", "").strip()
+    if image_dir:
+        return Path(image_dir).expanduser().resolve().parent
+    run = os.getenv("AGENTIC_E2E_RUN_NAME", "").strip() or "agentic_run"
+    return resolve_e2e_root() / run
+
+
+def resolve_rollout_images_root() -> Path:
+    """``<run_dir>/rollout_images`` (or explicit ``AGENTIC_DIFFUSION_IMAGE_DIR``)."""
+    explicit = os.getenv("AGENTIC_DIFFUSION_IMAGE_DIR", "").strip()
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    return resolve_run_dir() / "rollout_images"
+
+
+def bind_run_artifact_env(config) -> None:
+    """Bind ``AGENTIC_E2E_{ROOT,RUN_NAME}`` so driver + Ray workers share one run dir.
+
+    Must run on each AgentLoop worker before ``generate_image``: Ray's
+    ``runtime_env`` is snapshotted at job start (often without RUN_NAME), while
+    traj dumps use the manager's process env. Without this, images historically
+    fell back to ``/tmp/agentic_qwen_image_t2i/...`` while traj landed under
+    ``outputs/e2e/<experiment>/``.
+    """
+    if config is not None:
+        experiment_name = config.trainer.get("experiment_name")
+        if experiment_name:
+            os.environ["AGENTIC_E2E_RUN_NAME"] = str(experiment_name)
+    # Avoid a stale explicit image path from a previously sourced launcher.
+    os.environ.pop("AGENTIC_DIFFUSION_IMAGE_DIR", None)
+    os.environ["AGENTIC_E2E_ROOT"] = str(resolve_e2e_root())
+
+
 # Relative path under the images/trajectories roots.
 _active_trajectory_relpath: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentic_active_trajectory_relpath", default=None

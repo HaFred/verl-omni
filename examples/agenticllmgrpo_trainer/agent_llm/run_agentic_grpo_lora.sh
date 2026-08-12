@@ -1,24 +1,23 @@
 #!/usr/bin/env bash
 # Agentic GRPO overfit.
 #
-# The actor is a pretrained tool-calling VLM (default: Qwen3.5-2B via MODEL_PATH).
-# Frozen tools (vLLM-omni Qwen-Image + vLLM Qwen3-VL) serve generate_image and
-# judge_image with continuous batching. The agent follows the gen→judge→reflect
-# protocol: generate_image → judge_image(VL feedback) → Done / rewrite.
+# The actor is a pretrained tool-calling VLM (default via MODEL_PATH).
+# Frozen image-gen + image-judge sidecars serve generate_image and judge_image.
+# Protocol: generate_image → judge_image → Done / rewrite.
 #
-#   # pane A — vLLM-omni image gen server (GPUs 0,1):
+#   # pane A — image gen server (GPUs 0,1):
 #   CUDA_VISIBLE_DEVICES=0,1 \
-#     bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_image_tool_server.sh
-#   # pane B — vLLM VL judge server (GPU 0):
+#     bash examples/agenticllmgrpo_trainer/agent_llm/run_image_gen_tool_server.sh
+#   # pane B — image judge server (GPU 0):
 #   CUDA_VISIBLE_DEVICES=0 \
-#     bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_vl_reflect_server.sh
+#     bash examples/agenticllmgrpo_trainer/agent_llm/run_judge_image_tool_server.sh
 #   # pane C — training (GPUs 2-3):
 #   CUDA_VISIBLE_DEVICES=2,3 N_GPUS=2 TOTAL_STEPS=100 \
 #     bash examples/agenticllmgrpo_trainer/agent_llm/run_agentic_grpo_lora.sh
 #
 # File call list:
-#   agent_llm/run_qwen_image_tool_server.sh   — frozen Qwen-Image via vLLM-Omni
-#   agent_llm/run_qwen_vl_reflect_server.sh   — frozen Qwen3-VL judge via vLLM
+#   agent_llm/run_image_gen_tool_server.sh   — frozen image gen (default Qwen-Image / vLLM-Omni)
+#   agent_llm/run_judge_image_tool_server.sh      — frozen image judge (default Qwen3.5 / vLLM)
 #   data_process/create_dummy_agentic_data.py — overfit train/val parquet
 set -x
 
@@ -40,6 +39,10 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-$((MAX_PROMPT_LEN + MAX_RESP_LEN))}"
 MAX_ASSISTANT_TURNS="${MAX_ASSISTANT_TURNS:-12}"
 MAX_USER_TURNS="${MAX_USER_TURNS:-12}"
 
+# Co-locate images with traj/hermes under outputs/e2e/<experiment>/ (not /tmp).
+export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
+export AGENTIC_E2E_RUN_NAME="${EXPERIMENT_NAME}"
+
 echo "[INFO] wandb online experiment_name=${EXPERIMENT_NAME} (WANDB_SERVICE_TRANSPORT=${WANDB_SERVICE_TRANSPORT})"
 echo "[INFO] ckpt dir=${CKPT_DIR}"
 echo "[INFO] agent loop=agentic_tool_agent (AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-<unset>}; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-<unset>})"
@@ -47,15 +50,15 @@ echo "[INFO] force-first generate=${AGENTIC_FORCE_FIRST_GENERATE:-<unset>} warmu
 echo "[INFO] rewrite_judge_before_generate=${AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE:-<unset>}"
 echo "[INFO] good_enough threshold=${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-<unset>} block_generate_after_yes=${AGENTIC_BLOCK_GENERATE_AFTER_YES:-<unset>} block_after_max_passes=${AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES:-<unset>} rollout_n=${ROLLOUT_N}"
 echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
-echo "[INFO] reflect judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} legacy=${AGENTIC_REFLECT_VLM_URL:-<unset>} path=${AGENTIC_REFLECT_VLM_PATH:-<unset>}"
+echo "[INFO] image judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} legacy=${AGENTIC_REFLECT_VLM_URL:-<unset>} model=${JUDGE_IMAGE_MODEL:-${AGENTIC_REFLECT_VLM_PATH:-<unset>}}"
 if [[ -z "${AGENTIC_VLLM_OMNI_URL:-}" && -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" ]]; then
   echo "[ERROR] No frozen image service is configured; visual reflection cannot be trained on stubs." >&2
-  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_image_tool_server.sh" >&2
+  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticllmgrpo_trainer/agent_llm/run_image_gen_tool_server.sh" >&2
   exit 2
 fi
 if [[ -z "${AGENTIC_VLLM_URL:-}" && -z "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
   echo "[ERROR] AGENTIC_VLLM_URL and AGENTIC_REFLECT_VLM_URL are both unset; judge_image has no backend." >&2
-  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_vl_reflect_server.sh" >&2
+  echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticllmgrpo_trainer/agent_llm/run_judge_image_tool_server.sh" >&2
   exit 2
 fi
 

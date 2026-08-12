@@ -291,7 +291,38 @@ def test_delta_c_bonus_adds_to_final_score_after_no_then_rewrite():
     baseline = compute_score("smoke", solution_str=single_high)
     assert out["first_judge_no"] == 1
     assert out["reward_delta_c"] == pytest.approx(0.40)
+    assert out["reward_rewrite_yes"] == pytest.approx(1.0)
     assert out["reward_done"] == 1.0
     assert out["protocol_ok"] == 1
-    # Same final C/A/Done mix, but ΔC bonus pushes score above single-pass.
+    # Same final C/A/Done mix, but ΔC + rewrite-YES bonuses push above single-pass.
     assert out["score"] > baseline["score"]
+
+
+def test_rewrite_yes_beats_max_pass_done_without_yes():
+    """Preferred path NO→rewrite→YES should outscore max-pass Done with all NO."""
+    rewrite_yes = (
+        _gen(prompt="apple v1", path="/tmp/a.png")
+        + _judge(path="/tmp/a.png", correctness=0.50, aesthetics=0.50, good_enough="NO")
+        + "Reflection: missing color; rewrite.\n"
+        + _gen(prompt="bright red apple sharp", path="/tmp/b.png")
+        + _judge(path="/tmp/b.png", correctness=0.80, aesthetics=0.80, good_enough="YES")
+        + "Reflection: now matches. Done.\n"
+    )
+    max_pass_no = (
+        _gen(prompt="apple v1", path="/tmp/a.png")
+        + _judge(path="/tmp/a.png", correctness=0.50, aesthetics=0.50, good_enough="NO")
+        + "Reflection: rewrite.\n"
+        + _gen(prompt="apple v2", path="/tmp/b.png")
+        + _judge(path="/tmp/b.png", correctness=0.55, aesthetics=0.55, good_enough="NO")
+        + "Reflection: VL judge reports good_enough=NO after generate_image pass 2/2. "
+        "stop now. Your next and only action must be exactly Done. "
+        "agentic_force_stop_max_passes=1 agentic_stop_decision_required=1 "
+        "agentic_forced_reflection=1\n"
+        "Done.\n"
+    )
+    good = compute_score("smoke", solution_str=rewrite_yes)
+    weak = compute_score("smoke", solution_str=max_pass_no)
+    assert good["reward_rewrite_yes"] == pytest.approx(1.0)
+    assert weak["reward_rewrite_yes"] == pytest.approx(0.0)
+    assert good["reward_done"] == weak["reward_done"] == 1.0
+    assert good["score"] > weak["score"]

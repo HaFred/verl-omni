@@ -72,7 +72,7 @@ from verl_omni.agent_loop.agentic_trajectory_context import (  # noqa: F401
     set_good_enough_yes_reached,
     set_latest_tool_image_path,
 )
-from verl_omni.utils.judge_parse import (
+from verl_omni.utils.agentic_image_judge_parse import (
     build_judge_prompt,
     format_judge_observation,
     format_judge_parse_error,
@@ -117,15 +117,10 @@ def _decode_images(payload: dict) -> list[Image.Image]:
 
 
 def _e2e_run_root() -> Path:
-    """Per-run artifact root: ``outputs/e2e/<experiment_name>/`` (or env override)."""
-    explicit = os.getenv("AGENTIC_DIFFUSION_IMAGE_DIR", "").strip()
-    if explicit:
-        return Path(explicit)
-    run = os.getenv("AGENTIC_E2E_RUN_NAME", "").strip() or "default"
-    repo_out = os.getenv("AGENTIC_E2E_ROOT", "").strip()
-    if repo_out:
-        return Path(repo_out) / run / "rollout_images"
-    return Path("/tmp/agentic_qwen_image_t2i") / run / "rollout_images"
+    """``<e2e_root>/<experiment>/rollout_images`` — same tree as traj/hermes."""
+    from verl_omni.agent_loop.agentic_trajectory_context import resolve_rollout_images_root
+
+    return resolve_rollout_images_root()
 
 
 def _next_call_dir(root: Path) -> Path:
@@ -718,6 +713,14 @@ def _call_judge_vlm(
 # ── vLLM judge path (OpenAI /v1/chat/completions, continuous batching) ──────
 
 
+def _judge_enable_thinking() -> bool:
+    """Qwen3.5 defaults to long chain-of-thought; that burns ``max_tokens`` before JSON.
+
+    Leave off unless debugging. Override with ``AGENTIC_JUDGE_ENABLE_THINKING=1``.
+    """
+    return os.getenv("AGENTIC_JUDGE_ENABLE_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _post_vllm_chat(
     *,
     vllm_url: str,
@@ -739,6 +742,8 @@ def _post_vllm_chat(
         ],
         "max_tokens": int(max_tokens),
         "temperature": 0.0,
+        # Disable thinking so the reply is JSON-first (avoids finish=length → parse_ok=0).
+        "chat_template_kwargs": {"enable_thinking": _judge_enable_thinking()},
     }
     if not payload["model"]:
         del payload["model"]

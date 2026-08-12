@@ -5,20 +5,13 @@ Last updated: 08/12/2026
 Training recipes for **Agentic LLM RL** with GRPO ([#302](https://github.com/verl-project/verl-omni/issues/302)).
 This folder covers the agent-LLM + frozen-tool loop (gen → judge → reflect / Done), not the full
 Reflection–Plan Co-Optimization (RPCO) design from the RFC.
-In this example, we conduct LoRA overfitting on this, where the Agent LLM, diffusion tool, and VL judge
-can be **changed** as you need; this example uses:
+In this example, we conduct LoRA overfitting on this, where the Agent LLM, image
+gen tool, and image judge can be **changed** as you need; this example uses:
 
-- **Agent LLM** (`agent_llm/`): train `Qwen3-VL-2B-Instruct` (or `Qwen3.5` via `MODEL_PATH`).
-- Frozen **Qwen-Image** via vLLM-Omni is the external `generate_image` tool (`:8092`).
-- Frozen **Qwen3-VL** via vLLM (`:8093`) serves dual role: (1) in-turn
-  `judge_image` after every generation, and (2) `reward_correctness` /
-  `reward_aesthetics` fallback at reward time (prefer last live judge obs).
-- Reward: `pkg://verl_omni.utils.reward_score.agentic_reward` — parseable
-  `<tool_call>` protocol (Hermes JSON for Qwen3 **or** Qwen3.5 XML) with
-  policy-sampled terminal `Done.` (or rewrite) gating.
-- Default overfit recipe uses Hermes (`--tool_call_format hermes`). Override via
-  `create_dummy_agentic_data.py` when switching actor family so fewshot syntax
-  matches the chat template.
+- **Agent LLM** (`agent_llm/`): LoRA-train via `MODEL_PATH` (default `Qwen3-VL-2B-Instruct`; `Qwen3.5` also works).
+- **Image gen** (`:8092`, `run_image_gen_tool_server.sh`): frozen diffusion — `generate_image` (model via `IMAGE_GEN_MODEL`, default Qwen-Image / vLLM-Omni).
+- **Image judge** (`:8093`, `run_judge_image_tool_server.sh`): frozen VLM — live `judge_image`; reward prefers that C/A obs (model via `JUDGE_IMAGE_MODEL`, default Qwen3-VL).
+- **Reward** (`agentic_reward`): Hermes/`<tool_call>` protocol + gated C/A + Done / ΔC (fewshot format must match the actor template).
 
 Target protocol (fewshot + on-policy) — see **Multi-turn Behaviors** diagrams:
 
@@ -40,7 +33,7 @@ chat template.
 ## Rollout Trajectories
 
 Each training step dumps per-rollout JSON under
-`outputs/e2e_…/<run>/rollout_trajectories/step_XXXXXX/sample_{dataset}.{rollout_n}.json`
+`outputs/e2e/<run>/rollout_trajectories/step_XXXXXX/sample_{dataset}.{rollout_n}.json`
 and matching PNGs under `rollout_images/…/sample_Y.ZZ/image_NN_<artifact_id>.png`.
 
 Typical force-on trajectory (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
@@ -272,7 +265,7 @@ Weights are stored per row in parquet `ground_truth` / `extra_info` (`w_tool_cal
 ## 100-step overfit e2e (recommended)
 
 Goal: overfit a tiny prompt pool so the policy learns
-**`generate_image` → judge_image → (forced Reflection) → policy Done. or rewrite**.
+**`generate_image` → judge_image → (forced agent llm Reflection) → policy Done. or rewrite**.
 
 ### 1) Operator env (example)
 
@@ -286,19 +279,19 @@ export VAL_FILE=$PWD/data/agentic/val.parquet
 
 ### 2) Start frozen tools
 
-Pane A — Qwen-Image / vLLM-Omni (`generate_image`):
+Pane A — image gen (`generate_image`):
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 \
-  bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_image_tool_server.sh
+  bash examples/agenticllmgrpo_trainer/agent_llm/run_image_gen_tool_server.sh
 # trainer: export AGENTIC_VLLM_OMNI_URL=http://127.0.0.1:8092
 ```
 
-Pane B — judge VLM sidecar (agent `judge_image` tool + reward fallback):
+Pane B — image judge (`judge_image` + reward C/A fallback):
 
 ```bash
 CUDA_VISIBLE_DEVICES=2 \
-  bash examples/agenticllmgrpo_trainer/agent_llm/run_qwen_vl_reflect_server.sh
+  bash examples/agenticllmgrpo_trainer/agent_llm/run_judge_image_tool_server.sh
 # trainer: export AGENTIC_VLLM_URL=http://127.0.0.1:8093
 ```
 
@@ -326,13 +319,14 @@ TOTAL_STEPS=100 \
 | Tools | `diffusion_tool.py`: `generate_image` + `judge_image` |
 | Observation | text tool obs (`path=`, judge C/A); sidecar VL scores PNGs |
 | Reward | See tables above; prefer live judge C/A in traj |
-| Artifacts | `outputs/e2e_…/<experiment>/{rollout_trajectories,rollout_images,hermes_actions}/` |
+| Artifacts | `outputs/e2e/<experiment>/{rollout_trajectories,rollout_images,hermes_actions}/` |
 
 Inspect learning:
 
 ```bash
-ls outputs/e2e_qwen3_vl_2b_instruct_agentic_grpo/*/hermes_actions/
-ls outputs/e2e_qwen3_vl_2b_instruct_agentic_grpo/*/rollout_trajectories/step_*/
+ls outputs/e2e/*/hermes_actions/
+ls outputs/e2e/*/rollout_trajectories/step_*/
+ls outputs/e2e/*/rollout_images/step_*/
 ```
 
 ### Data-only refresh (no train)
@@ -364,8 +358,8 @@ examples/agenticllmgrpo_trainer/
 ├── README.md
 ├── agent_llm/
 │   ├── run_agentic_grpo_lora.sh          # GRPO LoRA launcher (Hermes overfit)
-│   ├── run_qwen_image_tool_server.sh     # frozen Qwen-Image via vLLM-Omni
-│   ├── run_qwen_vl_reflect_server.sh     # frozen Qwen3-VL judge via vLLM
+│   ├── run_image_gen_tool_server.sh      # frozen image gen (default: Qwen-Image / vLLM-Omni)
+│   ├── run_judge_image_tool_server.sh    # frozen image judge (default: Qwen3-VL / vLLM)
 │   └── qwen_vl_judge_log_middleware.py   # optional sidecar C/A log lines
 └── data_process/create_dummy_agentic_data.py
 
@@ -377,7 +371,7 @@ verl_omni/agent_loop/
 ├── agentic_manager_default.py            # wires agentic_tool_agent + metrics manager
 └── agentic_trajectory_context.py         # rollout-scoped artifact paths / YES latch / image binding
 
-verl_omni/utils/judge_parse.py            # VL judge prompt + discrete 0.2-grid snap + good_enough
+verl_omni/utils/agentic_image_judge_parse.py  # VL judge: 0.2-grid snap + rubber-stamp gate (soft 0.8 cap, force NO)
 verl_omni/utils/reward_score/
 ├── agentic_reward.py                     # scalar: tool_call + gated C/A + Done + ΔC
 └── vl_reflect_client.py                  # HTTP fallback when traj lacks agentic_judge ok=1

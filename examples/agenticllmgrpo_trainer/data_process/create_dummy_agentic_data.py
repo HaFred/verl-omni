@@ -166,9 +166,17 @@ USER_PROMPTS = [
         "through the cracks in his armor. He raises a massive black runic sword, poised to strike. "
         "Dynamic poses, dramatic lighting, digital painting, intricate details, cinematic feel."
     ),
+    (
+        'A vertical artistic cafe poster. The headline at the top reads "ARTISAN ROAST". '
+        "The center features a detailed, warm-toned illustration of a ceramic coffee cup sitting "
+        "on a rustic wooden table with soft steam rising and gentle morning sunlight coming through "
+        'a nearby window. Surrounding text at the bottom reads "Freshly Brewed Daily — Open at 7 AM". '
+        "Cozy, warm amber and brown color grading, shallow depth of field, cozy aesthetic."
+    ),
 ]
 
-OVERFIT_PROMPTS = USER_PROMPTS[:2]  # soldier (idx=0) + fantasy wizard/elf (idx=1)
+# OVERFIT_PROMPTS = USER_PROMPTS[:2]  # soldier (idx=0) + fantasy wizard/elf (idx=1)
+OVERFIT_PROMPTS = USER_PROMPTS[0::2]  # soldier (idx=0) + cafe poster (idx=2)
 
 # Fewshot Class-1 demos are authored against prompt 0 only. Other overfit prompts
 # get system+user (no baked trajectory) so the model does not copy soldier content.

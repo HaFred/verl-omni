@@ -29,7 +29,7 @@ import os
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from verl_omni.utils.judge_parse import build_judge_prompt, parse_judge_json
+from verl_omni.utils.agentic_image_judge_parse import build_judge_prompt, parse_judge_json
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +93,12 @@ def _call_vllm_openai(
     for attempt in range(max_retries + 1):
         strict = attempt > 0
         tokens = base_tokens if attempt == 0 else max(base_tokens, 1536)
+        enable_thinking = os.getenv("AGENTIC_JUDGE_ENABLE_THINKING", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         payload: dict = {
             "model": os.getenv("AGENTIC_VLLM_MODEL", "").strip() or "",
             "messages": [
@@ -109,6 +115,8 @@ def _call_vllm_openai(
             ],
             "max_tokens": tokens,
             "temperature": 0.0,
+            # Match judge_image: thinking burns the token budget before JSON lands.
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
         }
         if not payload["model"]:
             del payload["model"]

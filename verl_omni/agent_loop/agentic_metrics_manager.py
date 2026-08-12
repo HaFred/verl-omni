@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -34,10 +33,12 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.utils import hf_tokenizer
 
 from verl_omni.agent_loop.agentic_trajectory_context import (
+    bind_run_artifact_env,
     build_trajectory_relpath,
     clear_good_enough_yes_reached,
     reset_active_trajectory_relpath,
     reset_active_user_prompt,
+    resolve_run_dir,
     set_active_trajectory_relpath,
     set_active_user_prompt,
 )
@@ -62,6 +63,7 @@ REWARD_ARTIFACT_FIELDS = (
     "protocol_ok",
     "rewrite_after_yes",
     "reward_delta_c",
+    "reward_rewrite_yes",
     "first_correctness",
     "first_judge_no",
     "rollout_valid",
@@ -387,20 +389,12 @@ def _last_user_prompt(raw_prompt: Any) -> str:
 
 
 def _run_dir() -> Path:
-    image_dir = os.getenv("AGENTIC_DIFFUSION_IMAGE_DIR", "").strip()
-    if image_dir:
-        return Path(image_dir).parent
-    root = Path(os.getenv("AGENTIC_E2E_ROOT", "outputs/e2e"))
-    return root / os.getenv("AGENTIC_E2E_RUN_NAME", "agentic_run")
+    return resolve_run_dir()
 
 
 def _bind_run_artifact_env(config) -> None:
     """Derive the per-run artifact path from the trainer experiment name."""
-    experiment_name = config.trainer.get("experiment_name")
-    if experiment_name:
-        os.environ["AGENTIC_E2E_RUN_NAME"] = str(experiment_name)
-    # Avoid a stale explicit path from a previously sourced/run launcher.
-    os.environ.pop("AGENTIC_DIFFUSION_IMAGE_DIR", None)
+    bind_run_artifact_env(config)
 
 
 def _materialize_rollout_images(

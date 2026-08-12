@@ -34,6 +34,9 @@ Additive multiturn term (also enters ``score``):
   ``reward_delta_c`` = C lift after first ``good_enough=NO`` → rewrite → closed;
   applied as ``score += w_delta_c * f_delta_c`` (default ``w_delta_c=0.15``).
   Zero when first judge is not NO, trajectory is not closed, or rewrite-after-YES.
+  ``reward_rewrite_yes`` = 1 when closed after first-NO → ≤2 gens → YES (the
+  preferred overfit path); applied as ``score += w_rewrite_yes * f_rewrite_yes``
+  (default ``w_rewrite_yes=0.12``). Max-pass ``Done`` without YES is discounted.
 
 Final score (before ΔC):
   score = base + scale * mix
@@ -260,10 +263,15 @@ def _judge_parse_stats(text: str) -> tuple[int, int, float]:
 
 
 def _good_enough_from_window(window: str) -> bool | None:
-    m = _GOOD_ENOUGH_EQ_RE.search(window or "")
-    if m is None:
+    """Parse ``good_enough`` from a judge window.
+
+    Prefer the *last* match so a prior NO in the same lookback does not shadow
+    a later YES (C/A already use the last hit in the window).
+    """
+    matches = list(_GOOD_ENOUGH_EQ_RE.finditer(window or ""))
+    if not matches:
         return None
-    tok = m.group(1).strip().lower()
+    tok = matches[-1].group(1).strip().lower()
     if tok in {"yes", "1", "true"}:
         return True
     if tok in {"no", "0", "false"}:
@@ -382,6 +390,26 @@ def _delta_c_bonus(text: str, preferred_c: float) -> tuple[float, float | None, 
     return delta, float(first_c), True
 
 
+def _rewrite_then_yes(text: str, *, n_generate: int) -> bool:
+    """True for the preferred path: first judge NO → ≤2 gens → some later YES."""
+    if n_generate < 2 or n_generate > 2:
+        return False
+    hits = _iter_successful_judge_scores(text)
+    if len(hits) < 2:
+        return False
+    if hits[0][2] is not False:
+        return False
+    return any(ge is True for _, _, ge, _ in hits[1:])
+
+
+def _closed_via_max_pass_without_yes(text: str) -> bool:
+    """Max-pass stop cue + no YES anywhere — weaker than rewrite→YES."""
+    blob = text or ""
+    if "agentic_force_stop_max_passes=1" not in blob:
+        return False
+    return not any(ge is True for _, _, ge, _ in _iter_successful_judge_scores(blob))
+
+
 def _vl_judge_correctness_aesthetics(
     text: str,
     *,
@@ -432,6 +460,7 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
         "protocol_ok": 0,
         "rewrite_after_yes": 0,
         "reward_delta_c": 0.0,
+        "reward_rewrite_yes": 0.0,
         "first_correctness": 0.0,
         "first_judge_no": 0,
         "rollout_valid": 0,
@@ -505,6 +534,7 @@ def compute_score(
     w_done = float(extra_info.get("w_done", gt.get("w_done", 0.20)))
     # Multiturn headroom: reward C lift after a failed first judge (NO → rewrite).
     w_delta_c = float(extra_info.get("w_delta_c", gt.get("w_delta_c", 0.15)))
+    w_rewrite_yes = float(extra_info.get("w_rewrite_yes", gt.get("w_rewrite_yes", 0.12)))
     w_sum = w_tool_call + w_correctness + w_aesthetics + w_done
     if w_sum <= 0:
         w_tool_call, w_correctness, w_aesthetics, w_done, w_sum = 0.10, 0.35, 0.35, 0.20, 1.0
@@ -533,6 +563,7 @@ def compute_score(
     if not closed:
         # ΔC is a multiturn bonus on top of a closed protocol.
         f_delta_c = 0.0
+    f_rewrite_yes = 1.0 if closed and _rewrite_then_yes(blob, n_generate=len(prompts)) else 0.0
 
     # High tier only for protocol_ok. Gen without Reflection: is starved.
     # closed already requires policy Reflection: or forced-reflection context + Done.
@@ -558,8 +589,14 @@ def compute_score(
         protocol_ok = 0
         base, scale = min(base, 0.05), min(scale, 0.35)
         f_done = 0.0
-        # No ΔC credit for gambling after YES.
+        # No ΔC / rewrite-YES credit for gambling after YES.
         f_delta_c = 0.0
+        f_rewrite_yes = 0.0
+
+    # Prefer NO→one rewrite→YES over surviving to max-pass Done with all NO.
+    if closed and _closed_via_max_pass_without_yes(blob):
+        scale = min(scale, 0.55)
+        f_rewrite_yes = 0.0
 
     # Scalar: tool_call gate + (gated) VL C/A + closed-loop Done + multiturn ΔC.
     total = base + scale * (
@@ -571,7 +608,7 @@ def compute_score(
         )
         / w_sum
     )
-    total = float(min(1.0, total + w_delta_c * f_delta_c))
+    total = float(min(1.0, total + w_delta_c * f_delta_c + w_rewrite_yes * f_rewrite_yes))
 
     result: dict[str, float | str | int | None] = {
         "score": float(total),
@@ -581,6 +618,7 @@ def compute_score(
         "reward_aesthetics": f_aesthetics,
         "reward_done": float(f_done),
         "reward_delta_c": float(f_delta_c),
+        "reward_rewrite_yes": float(f_rewrite_yes),
         "first_correctness": float(first_c if first_c is not None else 0.0),
         "first_judge_no": int(bool(first_judge_no)),
         "num_hermes_tool_calls": int(len(calls)),
