@@ -141,30 +141,6 @@ with this key order:
 | `response` | Injected assistant text after the tool obs (forced Reflection when force=1) |
 | `decode_has_tool_call` | `true` iff **`decode`** contains `<tool_call>` (ignores `response`) |
 
-Important: **`decode` of turn T need not equal `turn_prompt` of turn T+1`.**
-Fewshot demos in `create_dummy_agentic_data.py` match live tool obs (`path=` +
-`agentic_tool` / `agentic_judge` markers; no `image_vis` or instructional
-`REQUIRED NEXT ACTION` lines).
-
-Each live `generate_image` writes directly to the matching
-`rollout_images/step_XXXXXX/sample_Y.ZZ/image_NN_<artifact_id>.png` directory
-while that rollout is running. ``artifact_id`` is a sha12 of
-`(trajectory_relpath, index, prompt)` so concurrent same-prompt overfit
-rollouts never collide in judge lookup. Trajectory dumps use the **same**
-`sample_Y.ZZ` id:
-
-| Dump | Images |
-| --- | --- |
-| `rollout_trajectories/step_S/sample_Y.ZZ.json` | `rollout_images/step_S/sample_Y.ZZ/` |
-
-The JSON field `image_dir` is the absolute path to that folder; `image_paths`
-lists PNGs found there. Both are empty when that rollout generated no image,
-and post-processing does not create a meta-only image folder. Prefer
-`image_dir` over guessing from `sample_index` alone — GRPO uses
-`sample_{dataset_index}.{rollout_n:02d}` (e.g. `sample_6.00` … `sample_6.07`
-are eight rollouts of the same prompt). The dumper stamps `trajectory_relpath`
-from the live agent loop so dump names match `path=` markers in tool obs.
-
 
 ## Judge `good_enough` Gate
 ```
@@ -238,13 +214,6 @@ The launcher regenerates overfit parquet (`--with_fewshot`, Hermes) then runs
 | Reward | `agentic_reward`: tool_call + gated C/A + Done + ΔC + `reward_rewrite_yes`; prefer live `agentic_judge ok=1` |
 | Artifacts | `outputs/e2e/<experiment>/{rollout_trajectories,rollout_images,hermes_actions}/` |
 
-Inspect learning:
-
-```bash
-ls outputs/e2e/*/hermes_actions/
-ls outputs/e2e/*/rollout_trajectories/step_*/
-ls outputs/e2e/*/rollout_images/step_*/
-```
 
 ### Data-only refresh (no train)
 
