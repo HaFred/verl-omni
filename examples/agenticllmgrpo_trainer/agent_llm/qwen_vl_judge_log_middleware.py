@@ -139,16 +139,16 @@ def format_judge_log_line(
     yes = bool(parsed.get("good_enough")) if "rubber_stamp" in parsed else _good_enough(parsed)
     c = float(parsed.get("correctness", 0.0))
     a = float(parsed.get("aesthetics", 0.0))
+    stamp = 1 if parsed.get("rubber_stamp") else 0
     findings = re.sub(r"\s+", " ", str(parsed.get("findings") or "")).strip()[:220]
     parts = [
         "[Qwen3-VL judge]",
         "parse_ok=1",
         f"C={c:.2f}",
         f"A={a:.2f}",
+        f"rubber_stamp={stamp}",
         f"good_enough={'YES' if yes else 'NO'}",
     ]
-    if parsed.get("rubber_stamp"):
-        parts.append("rubber_stamp=1")
     if latency_hint:
         parts.append(latency_hint)
     if user_snip:

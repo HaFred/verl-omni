@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""HTTP client for the frozen Qwen3-VL reflect sidecar (reward judge fallback).
+"""HTTP client for the frozen agentic image-judge sidecar (reward C/A fallback).
 
 Primary reward C/A comes from ``agentic_judge ok=1`` observations already in the
 trajectory. This client is the fallback when those markers are missing.

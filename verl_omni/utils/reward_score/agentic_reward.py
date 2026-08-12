@@ -64,7 +64,7 @@ import json
 import re
 from typing import Any
 
-from verl_omni.utils.reward_score.vl_reflect_client import call_reflect_vlm
+from verl_omni.utils.reward_score.agentic_image_judge_client import call_reflect_vlm
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
 _FUNCTION_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.IGNORECASE | re.DOTALL)

@@ -253,6 +253,24 @@ Weights are stored per row in parquet `ground_truth` / `extra_info` (`w_tool_cal
 | `num_generate_image_prompts` | Count of `generate_image` prompts |
 | `num_judge_image_calls` | Count of `judge_image` tool calls in the trajectory |
 
+
+## Judge Gate
+```
+VLM JSON
+  → parse facets (or scalar C/A)
+  → snap each facet to {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}
+       ([0.9, 1.0) → 0.8; only exact 1.0 stays 1.0)
+  → rubber_stamp?
+       raw C facets all identical & ≥0.9
+       OR raw A facets all identical & ≥0.9
+       OR (scalar-only) raw C≥0.9 and raw A≥0.9
+     if yes: cap snapped facets at 0.8, annotate findings, stamp=1
+  → C = mean(correctness facets), A = mean(aesthetics facets)
+  → YES ⇔ (not rubber_stamp) AND C ≥ thr AND A ≥ thr
+       thr = AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD (default 0.80)
+```
+
+
 ## Prerequisites
 
 - Launch from the **verl-omni repo root** (repo-relative paths in the recipe).
@@ -374,7 +392,7 @@ verl_omni/agent_loop/
 verl_omni/utils/agentic_image_judge_parse.py  # VL judge: 0.2-grid snap + rubber-stamp gate (soft 0.8 cap, force NO)
 verl_omni/utils/reward_score/
 ├── agentic_reward.py                     # scalar: tool_call + gated C/A + Done + ΔC
-└── vl_reflect_client.py                  # HTTP fallback when traj lacks agentic_judge ok=1
+└── agentic_image_judge_client.py         # HTTP fallback when traj lacks agentic_judge ok=1
 ```
 
 Upstream verl types used (not reimplemented here):
