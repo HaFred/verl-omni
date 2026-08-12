@@ -20,8 +20,8 @@ Turn k:
   1. generate_image(prompt_k) → image_k
   2. judge_image("same as user message", "last") → VL feedback
   3. forced Reflection (mask=0) then:
-    YES / max-pass → stop cue → policy samples Done. (mask=1)   OR
-    NO → policy rewrite + generate_image(prompt_{k+1}) → Turn k+1
+    good_enough: YES / max-pass → stop cue → policy samples Done. (mask=1)  OR
+    good_enough: NO → policy rewrite + generate_image(prompt_{k+1}) → Turn k+1
 ```
 
 Fewshot demos in `create_dummy_agentic_data.py` follow that order. They are
@@ -38,17 +38,6 @@ and matching PNGs under `rollout_images/…/sample_Y.ZZ/image_NN_<artifact_id>.p
 
 Typical force-on trajectory (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
 
-| `turn_kind` | Meaning |
-| --- | --- |
-| `call_generate_image` | First (or non-forced) `generate_image` in `decode` |
-| `call_judge_image` | Compact `judge_image` tool call |
-| `agent_rewrite_after_forced_reflection` | Forced Reflection in `response` + rewrite `generate_image` in `decode` (**counts as a live gen**) |
-| `forced_reflection_stop_cue` | YES → masked Reflection asks the policy to emit terminal `Done.` |
-| `forced_reflection_max_passes_stop_cue` | Cap reached → masked stop cue (`agentic_force_stop_max_passes=1`) |
-| `agent_done_after_forced_reflection` / `agent_done_after_max_passes` | Policy-sampled terminal `Done.` (**earns Done credit**) |
-
-Do not grep only `call_generate_image` when counting images — rewrites after forced
-Reflection use `agent_rewrite_after_forced_reflection` but still write PNGs.
 
 ## Reward components
 
@@ -78,104 +67,65 @@ blocked/no-PNG trajectories cannot close the protocol. The launch script sets Lo
 
 ## Multi-turn Behaviors (three turns max)
 
-**Target contract**:
+### Physical turns (trajectory JSON) in gen→judge→reflect
 
-1. Every logical turn starts with `generate_image(prompt_k)`.
-2. In the **same** logical turn, after the image returns:
-   - agent calls compact `judge_image` → frozen Qwen3-VL (`:8093`) returns structured feedback;
-   - env injects masked Reflection (stop cue on YES/max-pass; continue on NO).
-3. On a stop cue, the **next** physical turn is a policy-sampled `Done.` (`mask=1`).
-   On NO, the policy rewrites `generate_image` in the same decision turn.
-4. Branching stops at 1 / 2 / … / N gens (`AGENTIC_MAX_GENERATE_IMAGE_PASSES`,
-   typically 3; tunable).
+A **physical turn** is one object in `rollout_turns[]` with
+`turn`, `turn_kind`, `turn_prompt`, `turn_obs`, `decode`, and `response`.
+Dumps look like `rollout_trajectories/step_XXXXXX/sample_{dataset}.{rollout_n}.json`
+(e.g. `sample_1.00.json`). On a rewrite after NO
+(`turn_kind=agent_rewrite_after_forced_reflection`): `turn_prompt` is the full
+chat prefix, `turn_obs` is the latest `judge_image` tool response, masked env
+`response` holds the forced `Reflection: … agentic_forced_reflection=1` continue
+cue, and policy `decode` is the rewritten Hermes `generate_image` call.
+On YES / max-pass stop, the stop cue lands in `response` and the policy samples
+terminal `Done.` (or `Reflection: … Done.`) in `decode`
+(`agent_done_after_forced_reflection` / `agent_done_after_max_passes`).
 
-### Physical turns (trajectory JSON) vs one logical gen→judge→reflect
+One **logical** pass (generate → judge → decide) is usually **2 physical turns**,
+or **3** when the post-judge decision is its own row:
 
-A **physical turn** is one entry in `rollout_turns[]` (`turn`, `turn_kind`,
-`turn_prompt`, `turn_obs`, `decode`, `response`) — e.g. turn 3 in
-`sample_1.02.json` with `turn_kind=agent_rewrite_after_forced_reflection`:
-full chat prefix in `turn_prompt`, latest judge obs in `turn_obs`, forced
-`Reflection:` in `response`, rewrite `generate_image` in `decode`.
-
-One **logical** pass (generate → judge → decide) spans **2–3 physical turns**:
-
-| Physical `turn` | Typical `turn_kind` | Policy `decode` | Env `response` |
+| Physical `turn` | Typical `turn_kind` | Policy `decode` | Env `response` (often mask=0) |
 | ---: | --- | --- | --- |
-| *t* | `call_generate_image` (first) **or** `agent_rewrite_after_forced_reflection` | `generate_image(…)` | empty on first gen; forced `Reflection:` on rewrite turns |
-| *t+1* | `call_judge_image` | `judge_image(same as user message, last)` | empty |
-| *t+2* if YES / max-pass | `forced_reflection_stop_cue` / `forced_reflection_max_passes_stop_cue` then `agent_done_after_*` | policy `Done.` (or `Reflection: … Done.`) | masked stop cue in `response` |
-| *t+2* if NO | `agent_rewrite_after_forced_reflection` | rewrite `generate_image(…)` | `Reflection: …` (then this turn is also gen *t* of the next logical pass) |
+| *t* | `call_generate_image` (first pass) **or** `agent_rewrite_after_forced_reflection` | Hermes `generate_image(…)` | empty on first gen; on rewrite, forced `Reflection: … good_enough=NO … agentic_forced_reflection=1` |
+| *t+1* | `call_judge_image` | Hermes `judge_image("same as user message", "last")` | empty (`turn_obs` carries the VL judge text) |
+| *t+2* if YES | usually `agent_done_after_forced_reflection` | policy `Done.` or `Reflection: … Done.` | forced stop cue in the same turn (`agentic_stop_decision_required=1`); a lone `forced_reflection_stop_cue` row is rare |
+| *t+2* if NO | `agent_rewrite_after_forced_reflection` | rewritten `generate_image(…)` | forced continue `Reflection:` (this row is also gen *t* of the next logical pass) |
+| *t+2* if max-pass | usually `agent_done_after_max_passes` | policy `Done.` / `Reflection: … Done.` | stop cue with `agentic_force_stop_max_passes=1` (occasionally a dangling `forced_reflection_max_passes_stop_cue` if Done was not sampled) |
 
-Example: physical 1=`call_generate_image`, 2=`call_judge_image`,
-3=`agent_rewrite_after_forced_reflection`, …,
-7=`forced_reflection_max_passes_stop_cue`, 8=`agent_done_after_max_passes`.
+Examples from `rollout_trajectories/` (max `AGENTIC_MAX_GENERATE_IMAGE_PASSES=3`):
+
+- Early YES: `call_generate_image` → `call_judge_image` → `agent_done_after_forced_reflection`
+- One rewrite then YES: `call_generate_image` → `call_judge_image` → `agent_rewrite_after_forced_reflection` → `call_judge_image` → `agent_done_after_forced_reflection`
+- All-NO to cap: `…` → `agent_rewrite_after_forced_reflection` → `call_judge_image` → `agent_done_after_max_passes`
 
 ```mermaid
 sequenceDiagram
   autonumber
   participant In as Context
   participant A as Agent LLM
-  participant G as Qwen-Image
-  participant V as Qwen3-VL
+  participant G as Image gen
+  participant V as Image judge
 
-  Note over In,A: Physical turn t - call_generate_image or rewrite
-  In->>A: full turn_prompt
-  A->>G: generate_image prompt_k
-  G-->>A: tool obs with path
+  Note over In,A: Physical turn t — call_generate_image or agent_rewrite_after_forced_reflection
+  In->>A: turn_prompt (full chat prefix)
+  Note over A: On rewrite turns, masked response already holds forced Reflection NO cue
+  A->>G: decode generate_image(prompt_k)
+  G-->>A: tool obs path=… (feeds turn_obs / next prompt)
 
-  Note over In,A: Physical turn t+1 - call_judge_image
-  A->>V: judge_image compact args
-  V-->>A: scores findings good_enough
+  Note over In,A: Physical turn t+1 — call_judge_image
+  A->>V: decode judge_image("same as user message", "last")
+  V-->>A: C/A findings good_enough (turn_obs)
 
-  Note over A: Forced Reflection after successful judge
-  alt stop YES or max passes
-    Note over A: masked Reflection supplies a stop cue
-    A-->>In: policy samples terminal Done
-  else continue good_enough NO
-    Note over A: agent_rewrite_after_forced_reflection
-    A-->>In: Reflection plus rewritten generate_image
+  alt good_enough YES or max-pass
+    Note over In,A: Usually one physical turn — agent_done_after_forced_reflection / agent_done_after_max_passes
+    In->>A: masked stop cue in response (agentic_stop_decision_required=1)
+    A-->>In: decode Done. (or Reflection: … Done.)
+  else good_enough NO (under pass cap)
+    Note over In,A: agent_rewrite_after_forced_reflection (= gen t of next logical pass)
+    In->>A: masked continue Reflection in response
+    A-->>In: decode rewritten generate_image(prompt_k+1)
   end
 ```
-
-### What “turn input” must carry
-
-| Logical turn | Input to agent decode that emits `generate_image` | Same-turn after image |
-| --- | --- | --- |
-| 1 | User task (+ system / fewshot) | VL judge(`image_1`) → stop cue → policy `Done.` **or** rewrite `prompt_2` |
-| 2 | **Turn-1 reflection results** (VL summary + rewrite), not only the raw image obs | VL judge(`image_2`) → stop cue → policy `Done.` **or** rewrite `prompt_3` |
-| 3 | **Turn-2 reflection results** | VL judge(`image_3`) → max-pass stop cue → policy `Done.` |
-
-### Current rollout behavior
-
-Each logical turn follows the contract above. Default for this overfit path is
-force-reflection **on** (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
-
-- Turn k: `generate_image(prompt_k)` → compact `judge_image(...)` → **injected**
-  `Reflection:` carrying the stop/continue verdict from `good_enough`
-  (stop cue on YES / max-pass; else continue so the policy can rewrite).
-  Injected tokens use `response_mask=0`. On a stop cue, the next turn is a
-  policy-sampled `Done.` (`response_mask=1`) so GRPO receives real terminal credit.
-- Cap successful generates with `AGENTIC_MAX_GENERATE_IMAGE_PASSES` (operator
-  default **3**; launch fallback **5** — tune freely).
-  `AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES=1` also refuses further
-  `generate_image` calls past the cap.
-- **Env hard-stop (default on):** after `good_enough=YES`, further
-  `generate_image` calls are refused (`agentic_block_generate_after_yes=1`).
-- **Compact `judge_image` args:** prefer `user_request="same as user message"` and
-  `image_prompt="last"`; the tool expands from the bound user task + latest
-  artifact so long pasted args do not truncate Hermes tool calls.
-- **YES bar (default 0.86):** `AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD` /
-  `AGENTIC_REFLECT_GOOD_ENOUGH` — YES iff `C≥thr` **and** `A≥thr` (model
-  `good_enough` flag ignored). This yielded about 51% early first-pass YES at
-  Qwen-Image STEPS=16, retaining both stop and rewrite exploration.
-- **Image seeds:** `QWEN_IMAGE_SEED=42` with `QWEN_IMAGE_DIVERSIFY_SEED=1`
-  (default) derives a stable per-rollout/per-pass seed so GRPO groups keep
-  reward variance without fully randomizing images.
-- **GRPO group size:** `ROLLOUT_N` defaults to **8**.
-- Turn k+1 input is the prior tool obs + the forced Reflection (and any policy rewrite).
-
-Set `AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=0` only if you want the **policy** to
-emit Reflection itself (max-pass stop cue + policy Done still apply).
 
 ### Rollout trajectory JSON protocol
 
@@ -215,46 +165,8 @@ and post-processing does not create a meta-only image folder. Prefer
 are eight rollouts of the same prompt). The dumper stamps `trajectory_relpath`
 from the live agent loop so dump names match `path=` markers in tool obs.
 
-### Primary fields (enter the weighted mix)
 
-| Field | Default weight | Physical meaning | Zero when |
-| --- | ---: | --- | --- |
-| `reward_tool_call` | 0.10 | Binary: trajectory contains ≥1 parseable `<tool_call>`. **In scalar.** | No parseable tool call |
-| `reward_correctness` | 0.35 | Frozen-VL correctness (logged raw; **mix-gated** until closed). | URL unset / VL call fails |
-| `reward_aesthetics` | 0.35 | Frozen-VL aesthetics (logged raw; **mix-gated** until closed). | URL unset / VL call fails |
-| `reward_done` | 0.20 | Closed loop: successful PNG + successful judge + **policy-sampled** terminal `Done.` (forced Reflection may supply context; never the terminal). **In scalar.** | No policy terminal / blocked / no judge |
-| `reward_delta_c` | 0.15 (additive) | Multiturn bonus: C lift after first `good_enough=NO` → rewrite → closed. Added as `w_delta_c * f_delta_c` on top of the mix. | First judge not NO / not closed / rewrite-after-YES |
-
-Weighted mix (then scaled by a protocol tier `base + scale * mix`). C/A enter the
-mix at full weight only after a closed policy terminal; open loops get 5% C/A:
-
-```text
-mix = Σ w_i * reward_i  /  Σ w_i   # tool_call, correctness, aesthetics, done
-score = min(1, base + scale * mix + w_delta_c * reward_delta_c)
-```
-
-| Protocol tier | Condition | `base` | `scale` | `protocol_ok` |
-| --- | --- | ---: | ---: | ---: |
-| Closed + high C/A | policy terminal `Done.` (+ policy or forced Reflection context), single-pass or distinct rewrite, C/A ≥ 0.70 | 0.10 | 0.90 | 1 |
-| Closed, VL down / weak C/A | closed loop; VL missing or C/A &lt; 0.70 | 0.05 | 0.65 | 1 |
-| Reflection present | ≥1 `generate_image` + `Reflection:`, not fully closed | 0.04 | 0.30 | 0 |
-| Gen-only (starved) | ≥1 `generate_image`, **no** closed terminal | 0.02 | 0.05 | 0 |
-
-Weights are stored per row in parquet `ground_truth` / `extra_info` (`w_tool_call`,
-`w_correctness`, `w_aesthetics`, `w_done`, `w_delta_c`).
-### Visual rubric diagnostics
-
-| Field | Physical meaning |
-| --- | --- |
-| `reward_correctness` / `reward_aesthetics` | Last `agentic_judge ok=1` C/A (or VL fallback) — **logged to WandB** |
-| `reward_correctness_*` / `reward_aesthetics_*` | Optional per-dimension diagnostics in JSONL only (not WandB mix) |
-| `protocol_ok` | 1 iff closed loop (policy terminal Done after gen+judge, single or distinct rewrite) |
-| `num_hermes_tool_calls` | Legacy field name: count of parseable JSON/XML `<tool_call>` blocks |
-| `num_generate_image_prompts` | Count of `generate_image` prompts |
-| `num_judge_image_calls` | Count of `judge_image` tool calls in the trajectory |
-
-
-## Judge Gate
+## Judge `good_enough` Gate
 ```
 VLM JSON
   → parse facets (or scalar C/A)
@@ -270,73 +182,60 @@ VLM JSON
        thr = AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD (default 0.80)
 ```
 
-
-## Prerequisites
-
-- Launch from the **verl-omni repo root** (repo-relative paths in the recipe).
-- Set **`MODEL_PATH`** to a Qwen3-VL Instruct (or Qwen3.5) snapshot.
-- Prefer **2–4 free GPUs** for GRPO, **2 GPUs** for Qwen-Image/Omni, **1 GPU** for the
-  VL judge sidecar.
-- Start the frozen image + VL judge sidecars before training; the launcher only
-  checks that their URL env vars are set.
-
 ## 100-step overfit e2e (recommended)
 
 Goal: overfit a tiny prompt pool so the policy learns
-**`generate_image` → judge_image → (forced agent llm Reflection) → policy Done. or rewrite**.
+**`generate_image` → `judge_image` → (forced Reflection, mask=0) → policy `Done.` or rewrite**.
+Preferred closed path is **NO → one rewrite → YES → Done** (`reward_rewrite_yes`);
+all-NO through `AGENTIC_MAX_GENERATE_IMAGE_PASSES` (default 3) then max-pass Done
+remains allowed but scores lower.
 
-### 1) Operator env (example)
+### 1) Start frozen tools
 
-```bash
-source ~/fred/fred_verlomni_agentic_multiturn_pr1.sh   # or your local env
-export CUDA_VISIBLE_DEVICES=4,5,6,7   # train GPUs; keep others for image + reflect
-export MODEL_PATH=.../Qwen3-VL-2B-Instruct/...
-export TRAIN_FILE=$PWD/data/agentic/train.parquet
-export VAL_FILE=$PWD/data/agentic/val.parquet
-```
+Prefer **judge first**, then image gen, when they share a GPU (CPU-offload image gen).
 
-### 2) Start frozen tools
-
-Pane A — image gen (`generate_image`):
+Pane A — image judge (`judge_image` + reward C/A fallback):
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 \
-  bash examples/agenticllmgrpo_trainer/agent_llm/run_image_gen_tool_server.sh
-# trainer: export AGENTIC_VLLM_OMNI_URL=http://127.0.0.1:8092
-```
-
-Pane B — image judge (`judge_image` + reward C/A fallback):
-
-```bash
-CUDA_VISIBLE_DEVICES=2 \
   bash examples/agenticllmgrpo_trainer/agent_llm/run_judge_image_tool_server.sh
-# trainer: export AGENTIC_VLLM_URL=http://127.0.0.1:8093
+# listens on :8093; middleware forces enable_thinking=false by default
 ```
 
-Restart the image sidecar after changing `QWEN_IMAGE_STEPS` / CFG. Judge thr is
-client-side (`AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD`) and does not require a judge
-restart.
-
-Without an image service, `generate_image` returns a text stub. Set
-`REQUIRE_REAL_IMAGE_TOOL=0` only for plumbing diagnostics.
-
-### 3) Run GRPO — pane C
+Pane B — image gen (`generate_image`):
 
 ```bash
-TOTAL_STEPS=100 \
-  N_GPUS=4 \
-  OVERFIT_DATA=1 \
+  bash examples/agenticllmgrpo_trainer/agent_llm/run_image_gen_tool_server.sh
+# listens on :8092 (vLLM-Omni / Qwen-Image)
+```
+
+Restart the **image** sidecar after changing `QWEN_IMAGE_STEPS` / CFG / resolution.
+Restart the **judge** sidecar after changing `JUDGE_IMAGE_MODEL` / GDN / middleware.
+`AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD` is client-side (trainer parse) — restart
+**trainer** only to pick up thr / rubber-stamp / reward changes.
+
+Without an image service, `generate_image` returns a text stub and the launcher
+refuses to train (set `REQUIRE_REAL_IMAGE_TOOL=0` only for plumbing diagnostics).
+
+### 2) Run GRPO — pane C
+
+```bash
+TOTAL_STEPS=100 N_GPUS=2 \
   bash examples/agenticllmgrpo_trainer/agent_llm/run_agentic_grpo_lora.sh
 ```
 
+The launcher regenerates overfit parquet (`--with_fewshot`, Hermes) then runs
+`python3 -m verl.trainer.main_ppo` with `default_agent_loop=agentic_tool_agent`
+(registered via `VERL_USE_EXTERNAL_MODULES=verl_omni`).
+
 | Step | Behavior |
 | --- | --- |
+| Entry | `verl.trainer.main_ppo` + `VERL_USE_EXTERNAL_MODULES=verl_omni` |
 | Template | Native tool template (Hermes for Qwen3-VL; XML for Qwen3.5) |
-| Data | `TRAIN_FILE` / `VAL_FILE` (defaults: `data/agentic/{train,val}.parquet`) |
-| Agent loop | `agentic_tool_agent` — forced Reflection stop cue + policy Done (default on); force-first gen curriculum |
+| Data | Regenerated `TRAIN_FILE` / `VAL_FILE` (`data/agentic/{train,val}.parquet`) |
+| Agent loop | `agentic_tool_agent`: force-first gen curriculum; forced Reflection after judge; YES/max-pass → policy `Done.` |
 | Tools | `diffusion_tool.py`: `generate_image` + `judge_image` |
-| Observation | text tool obs (`path=`, judge C/A); sidecar VL scores PNGs |
-| Reward | See tables above; prefer live judge C/A in traj |
+| Observation | text tool obs (`path=`, judge C/A / `good_enough`); PNGs under `rollout_images/` |
+| Reward | `agentic_reward`: tool_call + gated C/A + Done + ΔC + `reward_rewrite_yes`; prefer live `agentic_judge ok=1` |
 | Artifacts | `outputs/e2e/<experiment>/{rollout_trajectories,rollout_images,hermes_actions}/` |
 
 Inspect learning:
@@ -353,61 +252,13 @@ ls outputs/e2e/*/rollout_images/step_*/
 python3 examples/agenticllmgrpo_trainer/data_process/create_dummy_agentic_data.py \
   --local_save_dir data/agentic \
   --overfit --train_size 8 --val_size 2 \
-  --with_fewshot --tool_call_format hermes
+  --with_fewshot --tool_call_format hermes \
+  --model_path "$MODEL_PATH"
 ```
 
-Each overfit row uses one of two prompts. With `OVERFIT_FEWSHOT=1`:
+Overfit pool is `USER_PROMPTS[0::2]` (soldier + cafe poster). With `--with_fewshot`:
 
 | Prompt | Fewshot |
 | --- | --- |
-| soldier (idx=0) | Class-1 two-pass same-task demo (ends on YES judge, no terminal `Done.`) |
-| epic fantasy (idx=1) | system + user only (no baked demo) |
-
-Non-overfit rows still cycle demo classes 0/1/2. Compact fewshot
-`judge_image` args match live (`same as user message` / `last`).
-
-Then the live user turn (with brevity reminder). Runtime calls remain on-policy.
-
-
-## File map
-
-```
-examples/agenticllmgrpo_trainer/
-├── README.md
-├── agent_llm/
-│   ├── run_agentic_grpo_lora.sh          # GRPO LoRA launcher (Hermes overfit)
-│   ├── run_image_gen_tool_server.sh      # frozen image gen (default: Qwen-Image / vLLM-Omni)
-│   ├── run_judge_image_tool_server.sh    # frozen image judge (default: Qwen3-VL / vLLM)
-│   └── qwen_vl_judge_log_middleware.py   # optional sidecar C/A log lines
-└── data_process/create_dummy_agentic_data.py
-
-# Live multiturn path (builds on verl ToolAgentLoop / AgentLoopOutput / ToolResponse)
-verl_omni/agent_loop/
-├── agentic_tool_agent_loop.py            # ToolAgentLoop subclass: force-first / Reflection stop cue / policy Done
-├── diffusion_tool.py                     # @function_tool generate_image + judge_image → ToolResponse
-├── agentic_metrics_manager.py            # AgentLoopManager: traj/image dumps + WandB agentic_reward/*
-├── agentic_manager_default.py            # wires agentic_tool_agent + metrics manager
-└── agentic_trajectory_context.py         # rollout-scoped artifact paths / YES latch / image binding
-
-verl_omni/utils/agentic_image_judge_parse.py  # VL judge: 0.2-grid snap + rubber-stamp gate (soft 0.8 cap, force NO)
-verl_omni/utils/reward_score/
-├── agentic_reward.py                     # scalar: tool_call + gated C/A + Done + ΔC
-└── agentic_image_judge_client.py         # HTTP fallback when traj lacks agentic_judge ok=1
-```
-
-Upstream verl types used (not reimplemented here):
-`ToolResponse`, `AgentLoopOutput`, `ToolAgentLoop` / `AgentData` — see `verl/experimental/agent_loop/` and `verl/tools/schemas.py`.
-
-Frozen image backends in `diffusion_tool.py` (first match wins):
-
-1. `AGENTIC_VLLM_OMNI_URL` — vLLM-Omni image generations
-2. `AGENTIC_QWEN_IMAGE_URL` — bundled Qwen-Image HTTP service
-3. `AGENTIC_DIFFUSION_TOOL_URL` — generic POST `{"prompt"}` → image/text
-4. unset — text stub
-
-Judge backends:
-
-1. Live `judge_image` obs (`agentic_judge ok=1`) — preferred for reward C/A
-2. `AGENTIC_VLLM_URL` — OpenAI `/v1/chat/completions` fallback
-3. `AGENTIC_REFLECT_VLM_URL` — legacy FastAPI `/reflect`
-4. unset / failure — C/A rewards 0.0 on fallback path
+| soldier (idx=0) | Class-1 two-pass same-task demo (ends on YES judge, **no** terminal `Done.`) |
+| cafe poster (idx=2) | system + user only (no baked demo; avoids copying soldier content) |
