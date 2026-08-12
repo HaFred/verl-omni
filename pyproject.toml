@@ -26,9 +26,10 @@ dependencies = [
     "diffusers>=0.37.1",
     "dill",
     "hydra-core",
+    "imageio[ffmpeg]>=2.37.2",
     "pandas",
     "peft",
-    "pyarrow>=19.0.0",
+    "pyarrow>=19.0.0,<25.0.0",  # 25.0.0 breaks pd.read_parquet with ArrowInvalid: column length mismatch
     "pybind11",
     "pylatexenc",
     "ray[default]",
@@ -51,6 +52,9 @@ dependencies = [
 vllm-omni = [
     "vllm-omni==0.24.0",
     "qwen-vl-utils>=0.0.14",
+]
+audio = [
+    "qwen-omni-utils>=0.0.9",
 ]
 # CUDA rollout backend (vllm) + actor FA3 (kernels) + liger-kernel. Install in step 1 on GPU.
 gpu = [
