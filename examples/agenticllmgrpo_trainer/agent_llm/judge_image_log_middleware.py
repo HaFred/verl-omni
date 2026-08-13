@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM ASGI middleware: print parsed VL judge C/A scores per response.
+"""vLLM ASGI middleware: print parsed image-judge C/A scores per response.
 
-Wire via ``vllm serve ... --middleware qwen_vl_judge_log_middleware.judge_score_log_middleware``.
+Wire via ``vllm serve ... --middleware judge_image_log_middleware.judge_score_log_middleware``.
 Keeps the sidecar tmux pane useful: access logs alone only show ``200 OK``.
 """
 
@@ -28,7 +28,7 @@ from typing import Any
 
 from starlette.responses import Response
 
-logger = logging.getLogger("qwen_vl_judge")
+logger = logging.getLogger("judge_image")
 
 _USER_REQUEST_RE = re.compile(r"User request:\s*(.+?)(?:\nDiffusion prompt|\nNotes:|\n\n)", re.I | re.S)
 
@@ -132,7 +132,7 @@ def format_judge_log_line(
 ) -> str:
     """One-line monitor summary for sidecar stdout."""
     if parsed is None:
-        base = "[Qwen3-VL judge] parse_ok=0"
+        base = "[judge_image] parse_ok=0"
         if user_snip:
             base += f" user={user_snip!r}"
         return base
@@ -142,7 +142,7 @@ def format_judge_log_line(
     stamp = 1 if parsed.get("rubber_stamp") else 0
     findings = re.sub(r"\s+", " ", str(parsed.get("findings") or "")).strip()[:220]
     parts = [
-        "[Qwen3-VL judge]",
+        "[judge_image]",
         "parse_ok=1",
         f"C={c:.2f}",
         f"A={a:.2f}",
@@ -280,7 +280,7 @@ async def judge_score_log_middleware(request, call_next):
         print(line, flush=True)
         logger.info("%s", line)
     except Exception as exc:  # noqa: BLE001
-        print(f"[Qwen3-VL judge] log_failed err={exc}", flush=True)
+        print(f"[judge_image] log_failed err={exc}", flush=True)
 
     headers = {
         key.decode() if isinstance(key, bytes) else str(key): (

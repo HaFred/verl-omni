@@ -52,8 +52,8 @@ Typical force-on trajectory (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
 
 `reward_correctness` / `reward_aesthetics` prefer the last successful
 `agentic_judge ok=1` observation already in the trajectory (same C/A the actor
-saw). If absent, reward falls back to `AGENTIC_VLLM_URL` / legacy
-`AGENTIC_REFLECT_VLM_URL`. Per-dimension facet fields may still appear in
+saw). If absent, reward falls back to `AGENTIC_VLLM_URL` (OpenAI chat).
+Per-dimension facet fields may still appear in
 `hermes_actions` JSONL but are **not** logged under `agentic_reward/*`.
 
 **Overfit learning signal:** open `generate→judge` loops no longer keep a mid

@@ -16,8 +16,8 @@
 Primary reward C/A comes from ``agentic_judge ok=1`` observations already in the
 trajectory. This client is the fallback when those markers are missing.
 
-Prefers ``AGENTIC_VLLM_URL`` (OpenAI ``/v1/chat/completions``, same as
-``judge_image``) and falls back to legacy ``AGENTIC_REFLECT_VLM_URL`` (``/reflect``).
+Uses ``AGENTIC_VLLM_URL`` (OpenAI ``/v1/chat/completions``, same as ``judge_image``).
+E2E runs require the vLLM judge sidecar; there is no legacy ``/reflect`` path.
 """
 
 from __future__ import annotations
@@ -143,43 +143,6 @@ def _call_vllm_openai(
     return None
 
 
-def _call_legacy_reflect(
-    *,
-    user_request: str,
-    image_prompt: str,
-    notes: str,
-    image_path: str | None,
-    endpoint: str,
-) -> dict | None:
-    payload: dict = {
-        "user_request": user_request,
-        "image_prompt": image_prompt,
-        "notes": notes or "",
-    }
-    if image_path and Path(image_path).is_file():
-        payload["image_path"] = image_path
-        try:
-            payload["image_base64"] = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
-        except OSError:
-            pass
-    timeout = float(os.getenv("AGENTIC_REFLECT_VLM_TIMEOUT", "120"))
-    try:
-        req = Request(
-            endpoint,
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured
-            data = json.loads(resp.read().decode())
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("reflect VLM call failed (%s); C/A will be zeroed", exc)
-        return None
-    if not isinstance(data, dict):
-        return None
-    return _normalize_scored(data, backend="qwen3_vl")
-
-
 def call_reflect_vlm(
     *,
     user_request: str,
@@ -187,31 +150,21 @@ def call_reflect_vlm(
     notes: str = "",
     image_path: str | None = None,
 ) -> dict | None:
-    """Score an image via frozen VL; return scored dict or ``None`` on failure.
+    """Score an image via frozen VL on ``AGENTIC_VLLM_URL``; ``None`` on failure.
 
-    Order: ``AGENTIC_VLLM_URL`` OpenAI chat → legacy ``AGENTIC_REFLECT_VLM_URL``.
-    On unset URL or any transport/parse error, returns ``None`` so the reward
-    scorer can zero C/A (no heuristic fallback for reward).
+    Requires a running vLLM OpenAI chat sidecar. On unset URL, missing image, or
+    any transport/parse error, returns ``None`` so the reward scorer can zero C/A
+    (no heuristic / legacy ``/reflect`` fallback).
     """
     vllm_url = os.getenv("AGENTIC_VLLM_URL", "").strip()
-    if vllm_url:
-        if not image_path or not Path(image_path).is_file():
-            return None
-        return _call_vllm_openai(
-            user_request=user_request,
-            image_prompt=image_prompt,
-            notes=notes,
-            image_path=image_path,
-            vllm_url=vllm_url,
-        )
-
-    endpoint = os.getenv("AGENTIC_REFLECT_VLM_URL", "").strip()
-    if not endpoint:
+    if not vllm_url:
         return None
-    return _call_legacy_reflect(
+    if not image_path or not Path(image_path).is_file():
+        return None
+    return _call_vllm_openai(
         user_request=user_request,
         image_prompt=image_prompt,
         notes=notes,
         image_path=image_path,
-        endpoint=endpoint,
+        vllm_url=vllm_url,
     )

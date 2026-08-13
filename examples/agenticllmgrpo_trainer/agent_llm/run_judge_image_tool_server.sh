@@ -2,7 +2,7 @@
 # Frozen image-judge sidecar for agentic GRPO (vLLM continuous batching).
 # Requires sourced JUDGE_IMAGE_MODEL (see fred_verlomni_agentic_multiturn_pr1.sh).
 # Per-request C/A score lines go to this process stdout via
-# qwen_vl_judge_log_middleware.py.
+# judge_image_log_middleware.py.
 #
 # Qwen3.5 GDN: on H800, vLLM ``auto`` selects FlashInfer JIT which often fails
 # here. Pass ``--gdn-prefill-backend triton`` (env GDN_PREFILL_BACKEND alone is
@@ -30,5 +30,5 @@ exec vllm serve "${MODEL}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --gdn-prefill-backend "${GDN_BACKEND}" \
   --trust-remote-code \
-  --middleware qwen_vl_judge_log_middleware.judge_score_log_middleware \
+  --middleware judge_image_log_middleware.judge_score_log_middleware \
   "$@"

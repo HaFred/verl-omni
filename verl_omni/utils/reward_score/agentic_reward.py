@@ -25,7 +25,7 @@ scores from the first ``good_enough=YES`` ``agentic_judge ok=1`` observation
 (protocol: YES → Done); otherwise the last successful judge. This blocks
 rewrite-after-YES roulette from replacing a good C/A with a failed last image.
 If absent, it falls back to ``call_reflect_vlm`` via ``AGENTIC_VLLM_URL``
-(OpenAI chat) or legacy ``AGENTIC_REFLECT_VLM_URL``.
+(OpenAI chat). There is no legacy ``/reflect`` path.
 
 Scalar mix terms (enter ``score`` via weighted mix):
   ``reward_tool_call``, ``reward_correctness`` (gated), ``reward_aesthetics``

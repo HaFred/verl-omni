@@ -50,14 +50,14 @@ echo "[INFO] force-first generate=${AGENTIC_FORCE_FIRST_GENERATE:-<unset>} warmu
 echo "[INFO] rewrite_judge_before_generate=${AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE:-<unset>}"
 echo "[INFO] good_enough threshold=${AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD:-<unset>} block_generate_after_yes=${AGENTIC_BLOCK_GENERATE_AFTER_YES:-<unset>} block_after_max_passes=${AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES:-<unset>} rollout_n=${ROLLOUT_N}"
 echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
-echo "[INFO] image judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} legacy=${AGENTIC_REFLECT_VLM_URL:-<unset>} model=${JUDGE_IMAGE_MODEL:-${AGENTIC_REFLECT_VLM_PATH:-<unset>}}"
+echo "[INFO] image judge vLLM URL=${AGENTIC_VLLM_URL:-<unset>} model=${JUDGE_IMAGE_MODEL:-<unset>}"
 if [[ -z "${AGENTIC_VLLM_OMNI_URL:-}" && -z "${AGENTIC_QWEN_IMAGE_URL:-}" && -z "${AGENTIC_DIFFUSION_TOOL_URL:-}" ]]; then
   echo "[ERROR] No frozen image service is configured; visual reflection cannot be trained on stubs." >&2
   echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticllmgrpo_trainer/agent_llm/run_image_gen_tool_server.sh" >&2
   exit 2
 fi
-if [[ -z "${AGENTIC_VLLM_URL:-}" && -z "${AGENTIC_REFLECT_VLM_URL:-}" ]]; then
-  echo "[ERROR] AGENTIC_VLLM_URL and AGENTIC_REFLECT_VLM_URL are both unset; judge_image has no backend." >&2
+if [[ -z "${AGENTIC_VLLM_URL:-}" ]]; then
+  echo "[ERROR] AGENTIC_VLLM_URL is unset; judge_image requires the vLLM OpenAI sidecar." >&2
   echo "[ERROR] Start: CUDA_VISIBLE_DEVICES=<free_gpu> bash examples/agenticllmgrpo_trainer/agent_llm/run_judge_image_tool_server.sh" >&2
   exit 2
 fi
