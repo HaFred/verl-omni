@@ -158,6 +158,15 @@ VLM JSON
        thr = AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD (default 0.80)
 ```
 
+### The rubber stamp for meaningful rewards
+Frozen VLMs (Qwen3.5-9B in our case) sometimes emit identical near-max facets (all ~0.95/1.0) with vague “perfectly matches” findings. Without a gate, that becomes an easy first-pass good_enough=YES → forced stop → Done., so the policy never learns rewrite. Rubber-stamp does the following:
+
+1. Detects flat raw facets ≥ 0.9 (or scalar C/A both ≥ 0.9)
+2. Soft-caps snapped facets to 0.8 (keeps C/A for reward)
+3. Forces good_enough=NO even if means still look like 0.8
+4. Annotates findings with [client] rubber-stamp…
+5. Legitimate discrete flat 0.8 is not stamped (so rewrite→YES remains possible).
+
 ## 100-step overfit e2e (recommended)
 
 Goal: overfit a tiny prompt pool so the policy learns

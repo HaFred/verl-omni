@@ -42,10 +42,17 @@ _AESTHETICS_KEYS = (
 _CORRECTNESS_QUESTIONS = {
     "subject_entities": "Are the requested primary subjects/entities visibly present and recognizable? If the "
     "subject is a person, is their gender, age, and ethnicity correct? Is he/she facially recognizable?",
-    "attributes": "Are requested attributes such as color, count, material, text, and identity correct?",
-    "relations_layout": "Are requested actions, spatial relations, and layout/composition constraints correct?",
+    "attributes": "Are non-text attributes (color, count, material, identity) correct? When the request "
+    "specifies any text/typography (headlines, slogans, labels, numbers, logo lettering), OCR the "
+    "pixels: are the exact requested strings fully legible and spelled correctly — no gibberish, "
+    "substitutions, missing/extra words, or wrong script? Scene beauty alone does not pass this facet.",
+    "relations_layout": "Are requested actions, spatial relations, and layout/composition constraints correct "
+    "(including poster hierarchy when requested: e.g. headline at top, main subject center, "
+    "footer/tagline at bottom)?",
     "scene_context": "Does the environment, setting, style, and overall scene match the request?",
-    "completeness": "Is the request fully satisfied without missing requested details or contradictory extras?",
+    "completeness": "Is the request fully satisfied without missing requested details or contradictory extras? "
+    "If text was requested, treat missing, truncated, illegible, or wrong strings as incompleteness "
+    "even when the rest of the scene looks right.",
 }
 _AESTHETICS_QUESTIONS = {
     "composition": "Is the composition balanced with a clear focal hierarchy and intentional framing?",
@@ -291,10 +298,16 @@ def build_judge_prompt(user_request: str, image_prompt: str, notes: str = "", *,
         "  0.0 = requested content absent, unrecognizable, or completely wrong\n"
         "  0.2 = severely deficient; majority missing or wrong\n"
         "  0.4 = partial; several elements present but many wrong/blurry/misplaced\n"
-        "  0.6 = subjects/entities mostly present BUT attributes, relations, or details weak "
-        "(presence alone → max 0.6 for subject_entities / completeness)\n"
+        "  0.6 = subjects/entities mostly present BUT attributes (incl. OCR text), relations, or "
+        "details weak (presence alone → max 0.6 for subject_entities / completeness)\n"
         "  0.8 = key attributes and relations clearly correct; only minor missing detail\n"
-        "  1.0 = no missing requested detail and no contradictory extras (RARE)\n\n"
+        "  1.0 = no missing requested detail and no contradictory extras (RARE)\n"
+        "TEXT/OCR RULE (when the user request quotes or requires specific wording):\n"
+        "  - Illegible, gibberish, or wrong strings → attributes ≤ 0.4 and completeness ≤ 0.6 "
+        "(do NOT inflate from cozy lighting / nice cup / matching style).\n"
+        "  - findings MUST quote the glyphs actually visible vs the requested strings.\n"
+        "  - suggested_fixes MUST give concrete typography/legibility rewrite hints "
+        "(e.g. exact quoted text, 'highly legible poster typography', placement).\n\n"
         "AESTHETICS LEVEL ANCHORS (apply per facet independently):\n"
         "  0.0 = unusable (severe artifacts, collapse, or illegible)\n"
         "  0.2 = major artifacts / broken anatomy / harsh clutter\n"
