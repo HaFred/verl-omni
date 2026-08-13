@@ -447,12 +447,16 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
     ``AgentLoopManager.generate_sequences`` dispatches to Ray ``AgentLoopWorker``s.
     Overrides on the Manager class never run per-rollout — they must live here.
 
-    Also hard-binds agentic multi-turn defaults (Hermes + ``agentic_tool``) so
-    launch recipes need not pass ``function_tool_path`` / ``format`` Hydra overrides.
+    Also hard-binds agentic multi-turn defaults (Hermes + recipe ``function_tools``)
+    so launch recipes need not pass ``function_tool_path`` / ``format`` Hydra overrides.
     """
 
     # Agentic Hermes wire format (teacher-force + parsers assume hermes).
     _AGENTIC_TOOL_FORMAT = "hermes"
+    # Repo-root-relative tools live under the recipe, not inside ``verl_omni``.
+    _AGENTIC_FUNCTION_TOOLS = (
+        Path(__file__).resolve().parents[2] / "examples" / "agenticllmgrpo_trainer" / "function_tools" / "tools.py"
+    )
 
     def __init__(self, config, *args, **kwargs):
         from omegaconf import open_dict
@@ -461,10 +465,14 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
         # decorators, then load_function_tools_from_path would re-exec the file and
         # raise "already registered".
         _bind_run_artifact_env(config)
-        with open_dict(config.actor_rollout_ref.rollout.multi_turn):
-            config.actor_rollout_ref.rollout.multi_turn.function_tool_path = str(
-                Path(__file__).resolve().parent / "agentic_tool.py"
+        tool_path = self._AGENTIC_FUNCTION_TOOLS
+        if not tool_path.is_file():
+            raise FileNotFoundError(
+                f"agentic function tools not found at {tool_path}. "
+                "Expected examples/agenticllmgrpo_trainer/function_tools/tools.py"
             )
+        with open_dict(config.actor_rollout_ref.rollout.multi_turn):
+            config.actor_rollout_ref.rollout.multi_turn.function_tool_path = str(tool_path)
             config.actor_rollout_ref.rollout.multi_turn.format = self._AGENTIC_TOOL_FORMAT
         super().__init__(config, *args, **kwargs)
 

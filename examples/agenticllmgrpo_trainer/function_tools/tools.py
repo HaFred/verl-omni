@@ -14,6 +14,9 @@
 
 """Frozen agentic function tools for verl's stock ``ToolAgentLoop``.
 
+Recipe path: ``examples/agenticllmgrpo_trainer/function_tools/tools.py``.
+Bound automatically via ``AgenticAgentLoopWorker`` (``function_tool_path``).
+
 Provides ``generate_image`` + ``judge_image``. Agentic LLM RL keeps image
 generation **outside** the actor optimizer. GRPO trains the actor as the
 tool-calling agent while a frozen image-gen sidecar produces candidate PNGs.
