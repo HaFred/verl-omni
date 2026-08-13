@@ -406,7 +406,7 @@ def _materialize_rollout_images(
 ) -> list[str]:
     """Index images already written by the live tool; never create empty folders."""
     target_dir = run_dir / "rollout_images" / relpath
-    # ``diffusion_tool._save_images`` creates this directory only after a real
+    # ``agentic_tool._save_images`` creates this directory only after a real
     # generate_image execution. A rollout with no generated artifact must not
     # gain a confusing meta-only ``sample_*`` directory during post-processing.
     if not target_dir.is_dir():
@@ -447,7 +447,7 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
     ``AgentLoopManager.generate_sequences`` dispatches to Ray ``AgentLoopWorker``s.
     Overrides on the Manager class never run per-rollout — they must live here.
 
-    Also hard-binds agentic multi-turn defaults (Hermes + ``diffusion_tool``) so
+    Also hard-binds agentic multi-turn defaults (Hermes + ``agentic_tool``) so
     launch recipes need not pass ``function_tool_path`` / ``format`` Hydra overrides.
     """
 
@@ -463,7 +463,7 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
         _bind_run_artifact_env(config)
         with open_dict(config.actor_rollout_ref.rollout.multi_turn):
             config.actor_rollout_ref.rollout.multi_turn.function_tool_path = str(
-                Path(__file__).resolve().parent / "diffusion_tool.py"
+                Path(__file__).resolve().parent / "agentic_tool.py"
             )
             config.actor_rollout_ref.rollout.multi_turn.format = self._AGENTIC_TOOL_FORMAT
         super().__init__(config, *args, **kwargs)
@@ -491,7 +491,7 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
         # Force-first curriculum reads these inside AgenticToolAgentLoop.run().
         kwargs["_agentic_step"] = trajectory["step"]
         kwargs["_agentic_validate"] = trajectory["validate"]
-        # Same id used by diffusion_tool saves and post-hoc trajectory dumps.
+        # Same id used by agentic_tool saves and post-hoc trajectory dumps.
         kwargs["_agentic_trajectory_relpath"] = relpath
         try:
             return await super()._run_agent_loop(

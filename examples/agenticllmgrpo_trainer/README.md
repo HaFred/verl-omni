@@ -209,7 +209,7 @@ The launcher regenerates overfit parquet (`--with_fewshot`, Hermes) then runs
 | Template | Native tool template (Hermes for Qwen3-VL; XML for Qwen3.5) |
 | Data | Regenerated `TRAIN_FILE` / `VAL_FILE` (`data/agentic/{train,val}.parquet`) |
 | Agent loop | `agentic_tool_agent`: force-first gen curriculum; forced Reflection after judge; YES/max-pass → policy `Done.` |
-| Tools | `diffusion_tool.py`: `generate_image` + `judge_image` |
+| Tools | `agentic_tool.py`: `generate_image` + `judge_image` |
 | Observation | text tool obs (`path=`, judge C/A / `good_enough`); PNGs under `rollout_images/` |
 | Reward | `agentic_reward`: tool_call + gated C/A + Done + ΔC + `reward_rewrite_yes`; prefer live `agentic_judge ok=1` |
 | Artifacts | `outputs/e2e/<experiment>/{rollout_trajectories,rollout_images,hermes_actions}/` |

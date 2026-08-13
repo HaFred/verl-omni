@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen image-generation function tool for verl's stock ``ToolAgentLoop``.
+"""Frozen agentic function tools for verl's stock ``ToolAgentLoop``.
 
-Agentic LLM RL keeps image generation **outside** the actor optimizer. GRPO trains
-the actor as the tool-calling agent while a frozen Qwen-Image pipeline generates
-candidate images. A separate frozen VL sidecar (``judge_image``) scores those
-PNGs; the actor only sees text tool observations (scores / findings / ``path=``)
-and then writes ``Reflection:`` / ``Done.`` or a rewritten ``generate_image``.
+Provides ``generate_image`` + ``judge_image``. Agentic LLM RL keeps image
+generation **outside** the actor optimizer. GRPO trains the actor as the
+tool-calling agent while a frozen image-gen sidecar produces candidate PNGs.
+A separate frozen VL sidecar (``judge_image``) scores those images; the actor
+only sees text tool observations (scores / findings / ``path=``) and then
+writes ``Reflection:`` / ``Done.`` or a rewritten ``generate_image``.
 
 
 Backends (first match wins):
