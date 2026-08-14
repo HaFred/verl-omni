@@ -107,14 +107,8 @@ _active_rollout_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _active_user_prompt: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentic_active_user_prompt", default=None
 )
-# Provenance for the *next* generate_image call (reflection → rewrite linkage).
-_active_call_provenance: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
-    "agentic_active_call_provenance", default=None
-)
 
-_rollout_alloc_lock = threading.Lock()
-
-# Live tool saves register here for judge lookup + optional materialization.
+# Live tool saves register here for judge lookup.
 _artifact_registry_lock = threading.Lock()
 _artifact_registry: list[dict] = []
 # Direct artifact_id → png path (survives thread hops better than prompt match).
@@ -174,15 +168,6 @@ def get_active_user_prompt() -> str | None:
     return _active_user_prompt.get()
 
 
-def set_active_call_provenance(meta: dict | None) -> contextvars.Token:
-    """Bind per-call reflection/rewrite provenance for the next tool save."""
-    return _active_call_provenance.set(meta)
-
-
-def get_active_call_provenance() -> dict | None:
-    return _active_call_provenance.get()
-
-
 def register_tool_artifact(
     *,
     prompt: str,
@@ -208,7 +193,6 @@ def register_tool_artifact(
         "paths": [str(p) for p in paths],
         "backend": backend,
         "tool_stubbed": bool(tool_stubbed),
-        "claimed": False,
         "thread_id": threading.get_ident(),
         "trajectory_relpath": relpath,
         "rollout_id": rid,
@@ -220,52 +204,6 @@ def register_tool_artifact(
             _artifact_by_id[aid] = png
         if rid and png:
             _latest_image_by_rollout[rid] = png
-
-
-def claim_tool_artifacts_for_prompts(prompts: list[str]) -> list[dict]:
-    """FIFO-claim unclaimed registry rows matching each prompt (exact, then stripped).
-
-    Returns one dict per successfully claimed prompt (may be shorter than ``prompts``).
-    """
-    claimed: list[dict] = []
-    with _artifact_registry_lock:
-        for prompt in prompts:
-            want = (prompt or "").strip()
-            if not want:
-                continue
-            hit = None
-            for entry in _artifact_registry:
-                if entry.get("claimed"):
-                    continue
-                got = (entry.get("prompt") or "").strip()
-                if got == want:
-                    hit = entry
-                    break
-            if hit is None:
-                # Soft fallback: allow trailing punctuation / whitespace drift.
-                for entry in _artifact_registry:
-                    if entry.get("claimed"):
-                        continue
-                    got = (entry.get("prompt") or "").strip().rstrip(".,; ")
-                    if got == want.rstrip(".,; "):
-                        hit = entry
-                        break
-            if hit is None:
-                continue
-            hit["claimed"] = True
-            claimed.append(dict(hit))
-    return claimed
-
-
-def clear_tool_artifact_registry() -> None:
-    """Test helper."""
-    with _artifact_registry_lock:
-        _artifact_registry.clear()
-        _artifact_by_id.clear()
-        _latest_image_by_rollout.clear()
-    set_latest_tool_image_path(None)
-    _latest_tool_image_tls.path = None
-    clear_good_enough_yes_reached()
 
 
 def count_live_generate_artifacts_for_active_rollout() -> int:
@@ -487,11 +425,6 @@ def resolve_tool_image_path(
     return latest_hit
 
 
-# Back-compat aliases used by earlier smoke tests.
-set_active_trajectory_name = set_active_trajectory_relpath
-get_active_trajectory_name = get_active_trajectory_relpath
-
-
 def _sanitize_sample_index(sample_index: object | None) -> str:
     if sample_index is None:
         return "unknown"
@@ -511,27 +444,3 @@ def build_trajectory_relpath(*, step: int | None, sample_index: object | None, r
     step_part = f"step_{step_i:06d}" if step_i >= 0 else "step_unknown"
     sample_part = f"sample_{_sanitize_sample_index(sample_index)}.{int(rollout_n):02d}"
     return f"{step_part}/{sample_part}"
-
-
-def allocate_rollout_n(*, artifacts_root: Path | str, step: int | None, sample_index: object | None) -> int:
-    """Allocate a unique rollout index under ``step_*/`` via exclusive markers."""
-    try:
-        step_i = int(step) if step is not None else -1
-    except (TypeError, ValueError):
-        step_i = -1
-    step_part = f"step_{step_i:06d}" if step_i >= 0 else "step_unknown"
-    sample_key = _sanitize_sample_index(sample_index)
-    step_dir = Path(artifacts_root) / step_part
-    step_dir.mkdir(parents=True, exist_ok=True)
-
-    with _rollout_alloc_lock:
-        n = 0
-        while n < 10_000:
-            marker = step_dir / f".alloc_sample_{sample_key}.{n:02d}"
-            try:
-                fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.close(fd)
-                return n
-            except FileExistsError:
-                n += 1
-    raise RuntimeError(f"exhausted rollout_n allocation under {step_dir} for sample {sample_key}")

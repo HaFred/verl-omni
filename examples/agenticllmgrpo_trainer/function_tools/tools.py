@@ -60,19 +60,13 @@ from verl.tools.schemas import ToolResponse
 from verl_omni.agent_loop.agentic_trajectory_context import (  # noqa: F401
     build_artifact_id,
     count_live_generate_artifacts_for_active_rollout,
-    get_active_call_provenance,
     get_active_rollout_id,
     get_active_trajectory_relpath,
     get_active_user_prompt,
     get_good_enough_yes_reached,
     get_latest_generate_prompt_for_active_rollout,
-    get_latest_tool_image_path,
     register_tool_artifact,
     resolve_tool_image_path,
-    set_active_call_provenance,
-    set_active_trajectory_name,
-    set_active_trajectory_relpath,
-    set_active_user_prompt,
     set_good_enough_yes_reached,
     set_latest_tool_image_path,
 )
@@ -151,28 +145,20 @@ def _next_image_index(traj_dir: Path) -> int:
 
 
 def _call_meta_fields(prompt: str, *, user_prompt: str) -> dict:
-    """Explicit reflection→rewrite provenance for meta.json call entries."""
-    prov = dict(get_active_call_provenance() or {})
-    controlled = bool(prov.get("controlled_by_reflection"))
-    call_role = prov.get("call_role") or ("reflection_rewrite" if controlled else "initial")
-    reflection = prov.get("reflection") or ""
-    prev_prompt = prov.get("prev_tool_prompt") or ""
-    source_image = prov.get("source_image") or ""
-    rewritten = prov.get("rewritten_prompt") or (prompt if controlled else "")
+    """Default meta.json call-entry fields (reflection provenance is not bound)."""
     return {
-        "call_role": call_role,
-        "controlled_by_reflection": controlled,
-        "reflection": reflection,
-        "prev_tool_prompt": prev_prompt,
-        "source_image_for_reflection": source_image,
-        "rewritten_prompt": rewritten if controlled else "",
-        # Explicit: this PNG was generated from the reflected/rewritten prompt.
-        "image_generated_from_reflected_prompt": bool(controlled and prompt == rewritten),
-        "tool_prompt_equals_rewritten_prompt": bool(controlled and prompt == rewritten),
-        "content_source": prov.get("content_source") or ("teacher" if controlled else "initial"),
-        "llm_reflection": prov.get("llm_reflection") or "",
-        "llm_prompt": prov.get("llm_prompt") or "",
-        "model_decode": prov.get("model_decode") or "",
+        "call_role": "initial",
+        "controlled_by_reflection": False,
+        "reflection": "",
+        "prev_tool_prompt": "",
+        "source_image_for_reflection": "",
+        "rewritten_prompt": "",
+        "image_generated_from_reflected_prompt": False,
+        "tool_prompt_equals_rewritten_prompt": False,
+        "content_source": "initial",
+        "llm_reflection": "",
+        "llm_prompt": "",
+        "model_decode": "",
         "user_prompt": user_prompt,
         "tool_prompt": prompt,
     }

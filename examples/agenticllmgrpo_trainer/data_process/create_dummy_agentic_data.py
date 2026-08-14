@@ -23,10 +23,10 @@ Protocol (one logical turn):
   judge_image    → (VL feedback: scores, findings, fixes, good_enough)
   agent reflects & decides: Reflection: ... Done.  OR  Reflection: ... + rewritten generate_image
 
-Three demonstration classes (optional fewshot; overfit: Class-1 on soldier only):
-0. Single-pass success  (comprehensive prompt → VL says YES)
-1. Two-pass refine      (lazy prompt → VL says NO → rewrite → VL says YES)
-2. Three-pass refine    (very lazy → NO → rewrite → NO → rewrite → YES)
+Three demonstration classes:
+1. Single-pass success  (comprehensive prompt → VL says YES)
+2. Two-pass refine      (lazy prompt → VL says NO → rewrite → VL says YES)
+3. Three-pass refine    (very lazy → NO → rewrite → NO → rewrite → YES)
 """
 
 from __future__ import annotations
@@ -497,14 +497,6 @@ def _demo_messages(class_id: int, *, omit_final_done: bool = False) -> list[dict
     ]
     if not omit_final_done:
         msgs.append({"role": "assistant", "content": C3_ASSISTANT_5})
-    return msgs
-
-
-def _all_demo_messages() -> list[dict]:
-    """All three demo classes concatenated — single-pass, two-pass, three-pass."""
-    msgs: list[dict] = []
-    for cid in range(3):
-        msgs.extend(_demo_messages(cid))
     return msgs
 
 
