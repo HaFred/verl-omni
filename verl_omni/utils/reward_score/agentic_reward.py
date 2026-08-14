@@ -391,8 +391,8 @@ def _delta_c_bonus(text: str, preferred_c: float) -> tuple[float, float | None, 
 
 
 def _rewrite_then_yes(text: str, *, n_generate: int) -> bool:
-    """True for the preferred path: first judge NO → ≤2 gens → some later YES."""
-    if n_generate < 2 or n_generate > 2:
+    """True for the preferred path: first judge NO → exactly 2 gens → later YES."""
+    if n_generate != 2:
         return False
     hits = _iter_successful_judge_scores(text)
     if len(hits) < 2:

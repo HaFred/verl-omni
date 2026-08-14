@@ -131,16 +131,33 @@ def build_artifact_id(*, relpath: str, index: int, prompt: str) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
 
-def set_active_trajectory_relpath(relpath: str | None) -> contextvars.Token:
-    """Bind (or clear) the relative artifact path for subsequent tool saves."""
+def set_active_trajectory_relpath(
+    relpath: str | None,
+) -> tuple[contextvars.Token, contextvars.Token]:
+    """Bind (or clear) the relative artifact path + matching rollout_id.
+
+    Returns ``(path_token, rollout_token)`` for ``reset_active_trajectory_relpath``.
+    Both must be restored together so judge/artifact lookups do not leak across
+    rollouts after the path ContextVar alone is reset.
+    """
     rid = rollout_id_from_relpath(relpath)
-    _active_rollout_id.set(rid)
-    return _active_trajectory_relpath.set(relpath)
+    path_token = _active_trajectory_relpath.set(relpath)
+    rollout_token = _active_rollout_id.set(rid)
+    return path_token, rollout_token
 
 
-def reset_active_trajectory_relpath(token: contextvars.Token) -> None:
-    """Restore the trajectory path binding that preceded ``token``."""
-    _active_trajectory_relpath.reset(token)
+def reset_active_trajectory_relpath(
+    tokens: tuple[contextvars.Token, contextvars.Token] | contextvars.Token,
+) -> None:
+    """Restore trajectory path + rollout_id bindings that preceded ``tokens``."""
+    if isinstance(tokens, tuple):
+        path_token, rollout_token = tokens
+        _active_trajectory_relpath.reset(path_token)
+        _active_rollout_id.reset(rollout_token)
+        return
+    # Legacy single-token callers: still clear stale rollout_id from this set().
+    _active_trajectory_relpath.reset(tokens)
+    _active_rollout_id.set(rollout_id_from_relpath(_active_trajectory_relpath.get()))
 
 
 def get_active_trajectory_relpath() -> str | None:

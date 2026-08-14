@@ -110,8 +110,18 @@ def _decode_images(payload: dict) -> list[Image.Image]:
     if not encoded:
         return []
     if not isinstance(encoded, list):
-        raise ValueError("diffusion tool response 'images_base64' must be a list")
-    return [Image.open(io.BytesIO(base64.b64decode(item))).convert("RGB") for item in encoded]
+        logger.warning(
+            "diffusion tool response 'images_base64' must be a list, got %s",
+            type(encoded).__name__,
+        )
+        return []
+    images: list[Image.Image] = []
+    for item in encoded:
+        try:
+            images.append(Image.open(io.BytesIO(base64.b64decode(item))).convert("RGB"))
+        except Exception as exc:  # noqa: BLE001 — soft-fail external tool payloads
+            logger.warning("failed to decode diffusion image payload: %s", exc)
+    return images
 
 
 def _e2e_run_root() -> Path:
