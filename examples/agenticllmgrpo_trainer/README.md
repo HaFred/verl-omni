@@ -210,6 +210,7 @@ TOTAL_STEPS=100 N_GPUS=2 \
 
 The launcher regenerates overfit parquet (`--with_fewshot`, Hermes) then runs
 `python3 -m verl.trainer.main_ppo` with `default_agent_loop=agentic_tool_agent`
+and an explicit `+…agent_loop_manager_class=…AgenticMetricsAgentLoopManager`
 (registered via `VERL_USE_EXTERNAL_MODULES=verl_omni`).
 
 | Step | Behavior |
@@ -217,7 +218,7 @@ The launcher regenerates overfit parquet (`--with_fewshot`, Hermes) then runs
 | Entry | `verl.trainer.main_ppo` + `VERL_USE_EXTERNAL_MODULES=verl_omni` |
 | Template | Native tool template (Hermes for Qwen3-VL; XML for Qwen3.5) |
 | Data | Regenerated `TRAIN_FILE` / `VAL_FILE` (`data/agentic/{train,val}.parquet`) |
-| Agent loop | `agentic_tool_agent`: force-first gen curriculum; forced Reflection after judge; YES/max-pass → policy `Done.` |
+| Agent loop | `agentic_tool_agent` + `AgenticMetricsAgentLoopManager` (Hydra): force-first gen; forced Reflection after judge; YES/max-pass → policy `Done.` |
 | Tools | `examples/agenticllmgrpo_trainer/function_tools/tools.py`: `generate_image` + `judge_image` |
 | Observation | text tool obs (`path=`, judge C/A / `good_enough`); PNGs under `rollout_images/` |
 | Reward | `agentic_reward`: tool_call + gated C/A + Done + ΔC + `reward_rewrite_yes`; prefer live `agentic_judge ok=1` |
