@@ -101,23 +101,23 @@ flowchart LR
 
     subgraph S3[" "]
         direction TB
-        T3d["<b>DIFF decode</b><br/>warm amber headline<br/>serif footer<br/>centered cup"]
+        T3d["<b>DIFF decode vs T1</b><br/>warm amber headline<br/>serif footer<br/>centered cup"]
         T3["<b>T3 · agent_rewrite_after_forced_reflection</b><br/>in: VL judge on image_00 — C=0.76 A=0.76 NO; findings: layout OK, footer text degraded; fixes: legible serif typography<br/>forced/response: Reflection: … NO … Rewriting next. agentic_forced_reflection=1<br/>tool/decode: generate_image rewrite #1 = same scene"]
         T3d -.-> T3
     end
 
     subgraph S4[" "]
         direction TB
-        T4d["<b>DIFF in</b><br/>path=image_01<br/>prompt echo of rewrite #1"]
+        T4d["<b>DIFF in vs T2</b><br/>path=image_01<br/>prompt echo of rewrite #1"]
         T4["<b>T4 · call_judge_image</b><br/>in: same shape as T2<br/>tool/decode: same as T2"]
         T4d -.-> T4
     end
 
     subgraph S5[" "]
         direction TB
-        T5d_in["<b>DIFF in</b><br/>judge on image_01<br/>C=0.56 A=0.76 NO<br/>text still deficient<br/>fixes: post-process overlay"]
-        T5d_forced["<b>DIFF forced</b><br/>new findings"]
-        T5d_decode["<b>DIFF decode</b><br/>Watermark 'Artisan Roast'"]
+        T5d_in["<b>DIFF in vs T3</b><br/>judge target: image_01 (was image_00)<br/>C=0.56 (was 0.76) A=0.76 NO<br/>findings: text severely deficient<br/>(was: layout OK, footer degraded)<br/>fixes: post-process text overlay<br/>(was: legible serif typography)"]
+        T5d_forced["<b>DIFF agentic_forced_reflection vs T3</b><br/>same skeleton; quotes image_01 judge (was image_00)"]
+        T5d_decode["<b>DIFF decode vs T3</b><br/>rewrite #2 = rewrite #1<br/>+ Watermark 'Artisan Roast'"]
         T5["<b>T5 · agent_rewrite_after_forced_reflection</b><br/>in: same shape as T3<br/>forced/response: same shape as T3 Reflection<br/>tool/decode: rewrite #2 = rewrite #1"]
         T5d_in -.-> T5
         T5d_forced -.-> T5
@@ -126,7 +126,7 @@ flowchart LR
 
     subgraph S6[" "]
         direction TB
-        T6d["<b>DIFF in</b><br/>path=image_02"]
+        T6d["<b>DIFF in vs T2</b><br/>path=image_02"]
         T6["<b>T6 · call_judge_image</b><br/>in: same shape as T2<br/>tool/decode: same as T2"]
         T6d -.-> T6
     end
