@@ -621,9 +621,9 @@ JUDGE_TOOL_SCHEMA = {
                 "image_prompt": {
                     "type": "string",
                     "description": (
-                        "Prefer exactly 'last', or a short echo of the diffusion prompt. "
-                        "Do NOT re-paste long prompts; the server resolves the latest "
-                        "generated image and full prompt for this rollout."
+                        "Use exactly 'last'. The server resolves the latest generated "
+                        "image, then judges it against the original user request rather "
+                        "than a rewritten diffusion prompt."
                     ),
                 },
             },
@@ -659,11 +659,23 @@ _JUDGE_PROMPT_PLACEHOLDERS = {
     "image_prompt",
 }
 
+_AGENTIC_BREVITY_SUFFIX_RE = re.compile(
+    r"\s*Keep any private thinking to (?:AT MOST\s+)?one short paragraph"
+    r"\s*\(≤4 sentences\)\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _original_judge_request() -> str:
+    """Original business request, without the dataset's control suffix."""
+    bound = (get_active_user_prompt() or "").strip()
+    return _AGENTIC_BREVITY_SUFFIX_RE.sub("", bound).strip()
+
 
 def _expand_judge_user_request(user_request: str) -> str:
     """Expand compact / truncated judge args to the bound live user task."""
     raw = (user_request or "").strip()
-    bound = (get_active_user_prompt() or "").strip()
+    bound = _original_judge_request()
     if not bound:
         return raw
     low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
@@ -678,8 +690,20 @@ def _expand_judge_user_request(user_request: str) -> str:
 
 
 def _expand_judge_image_prompt(image_prompt: str) -> str:
-    """Expand compact / truncated image_prompt to the latest live generate prompt."""
+    """Use the original request as the judge target for every live rollout.
+
+    ``image_prompt`` used to expand to the latest rewritten diffusion prompt.
+    That let the agent move the evaluation target during self-correction and
+    receive a high correctness score for an image that had drifted from the
+    user's intent. Image lookup is independently rollout-scoped to the latest
+    PNG, so the judge does not need the rewritten prompt to find the pixels.
+    """
     raw = (image_prompt or "").strip()
+    original = _original_judge_request()
+    if original:
+        return original
+
+    # Unbound unit tests / direct tool calls retain the legacy lookup context.
     latest = (get_latest_generate_prompt_for_active_rollout() or "").strip()
     low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
     if low in _JUDGE_PROMPT_PLACEHOLDERS:

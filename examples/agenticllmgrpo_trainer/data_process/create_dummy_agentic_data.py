@@ -50,8 +50,8 @@ Protocol (one logical turn = generate → judge → reflect & decide):
 2. After the image returns, call judge_image with SHORT args only:
    user_request="same as user message"
    image_prompt="last"
-   Do NOT paste the full user task or re-paste long diffusion prompts into
-   judge_image — the tool expands those from the live task and latest image.
+   The tool judges the latest image against the ORIGINAL user request. Rewritten
+   diffusion prompts may improve pixels but never replace the evaluation target.
 3. Read the VL feedback (correctness, aesthetics, good_enough, findings,
    suggested_fixes). Then write your reflection and decide:
    - If good_enough=YES → "Reflection: <summary> Done."

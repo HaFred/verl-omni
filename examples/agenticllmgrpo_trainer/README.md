@@ -1,10 +1,10 @@
 # Agentic LLM GRPO trainer
 
-Last updated: 08/12/2026
+Last updated: 08/17/2026
 
 Training recipes for **Agentic LLM RL** with GRPO ([#302](https://github.com/verl-project/verl-omni/issues/302)).
-This folder covers the agent-LLM + frozen-tool loop (gen → judge → reflect / Done), not the full
-Reflection–Plan Co-Optimization (RPCO) design from the RFC.
+This folder covers the agent-LLM + frozen-tool loop (gen → judge → reflect / Done), plus the
+PR 2 RPCO stage-3 recipe (multi-task RL co-optimization with the multi-dimensional reward set).
 In this example, we conduct LoRA overfitting on this, where the Agent LLM, image
 gen tool, and image judge can be **changed** as you need; this example uses:
 
@@ -43,14 +43,23 @@ Typical force-on trajectory (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
 
 `compute_score` returns a scalar `score` plus per-component fields. WandB
 `agentic_reward/*` logs **only the scalar mix terms** (via
-`agentic_metrics_manager.REWARD_COMPONENTS`):
+`agentic_metrics_manager.REWARD_COMPONENTS`); absent keys are skipped:
+
+**PR 1** (`agentic_reward`):
 
 - `agentic_reward/tool_call/{mean,min,max}`
 - `agentic_reward/correctness/{mean,min,max}`
 - `agentic_reward/aesthetics/{mean,min,max}`
 - `agentic_reward/done/{mean,min,max}`
 
-`reward_correctness` / `reward_aesthetics` prefer the last successful
+**PR 2 / RPCO** (`agentic_multidim_reward`):
+
+- `agentic_reward/{reflect,plan,format,tool,result,done,tool_call}/{mean,min,max}`
+
+RPCO does **not** emit `reward_correctness` / `reward_aesthetics` (VL C/A feed
+`reward_reflect` instead), so those series are not logged on RPCO runs.
+
+`reward_correctness` / `reward_aesthetics` (PR 1) prefer the last successful
 `agentic_judge ok=1` observation already in the trajectory (same C/A the actor
 saw). If absent, reward falls back to `AGENTIC_VLLM_URL` (OpenAI chat).
 Per-dimension facet fields may still appear in
@@ -241,3 +250,71 @@ Overfit pool is `USER_PROMPTS[0::2]` (soldier + cafe poster). With `--with_fewsh
 | --- | --- |
 | soldier (idx=0) | Class-1 two-pass same-task demo (ends on YES judge, **no** terminal `Done.`) |
 | cafe poster (idx=2) | system + user only (no baked demo; avoids copying soldier content) |
+
+## RPCO Stage 3 — multi-task RL on UniCoT (PR 2)
+
+`agent_llm/run_agentic_rpco.sh` runs the RFC §6.5 stage-3 multi-task RL
+co-optimization (VisionCreator-R1, [arXiv:2603.08812](https://arxiv.org/abs/2603.08812))
+on the public UniCoT snapshots. **Full dataset by default**: every parsed row
+lands in train or val (hash-based split at `UNICOT_VAL_RATIO`, default 0.05);
+`UNICOT_TRAIN_SIZE`/`UNICOT_VAL_SIZE`/`UNICOT_MIX_RATIO` cap and rebalance the
+pools only for smoke runs. Task pools:
+
+- **UniCoT-Self-Reflection-6K** → `reflect` rows (single-image, reference
+  states carry `eval_summary` + continue/stop transitions).
+- **UniCoT-Breakdown-3K** → `plan` rows (reference subtasks, 1–3 images) and
+  `reflect` rows ("No breakdown needed." → single image).
+
+`verl_omni/utils/dataset/visual_reflection/build_unicot_agentic_rl.py` parses both `metadata.json` files
+fail-closed ([`visual_reflection/`](../../verl_omni/utils/dataset/visual_reflection/))
+and emits train/val parquet in the PR 1 row schema. UniCoT fields are **reward
+ground truth only** — prompts are system + user, no fewshot. Images
+(`images.zip`) are not required: parsing is structural/text-only.
+
+### Multi-dimensional reward (`agentic_multidim_reward`)
+
+`reward.custom_reward_function.path=pkg://verl_omni.utils.reward_score.agentic_multidim_reward`
+computes the stage-3 set {reflection, plan, format, tool, result}:
+
+| Dim | Range | Computed by | What it measures |
+| --- | --- | --- | --- |
+| `R_reflect` | [0,1] | live judge C/A (checkpoint quality) + lexical coverage vs. reference `eval_summary` / judge findings | reflection quality on the final image |
+| `R_plan` | [0,1] | per-subtask best token coverage of the agent's plan lines vs. reference subtasks | plan completeness (plan rows only) |
+| `R_format` | [0,1] | rule-based check ratio | well-formed tool calls, judge-after-final-gen, tags, terminal `Done.` |
+| `R_tool` | {0,1} | rule-based | tool-call presence, mapped to PR 1's `f_tool_call`: 1.0 iff any tool call was parsed (the discrete self-correction ladder is dropped) |
+| `R_result` | {0,1} | rule-based | plan rows: exact image-count match; reflect rows: lenient stop-validity (terminal `Done.` + count ≤ reference, or final judge YES) |
+| `R_done` (logged only) | {0,1} | rule-based | PR 1's `f_done` closed-loop indicator, emitted as `reward_done` for the `agentic_reward/done` WandB series — not part of the score's W |
+
+Total: `score = (1/|W|) * sum(w_i * R_i)` over the active set W per row, all
+weights 1.0 by default (paper default); override with `RPCO_W_*` env vars at
+data-build time. Gating kept from PR 1: no successful `generate_image` ⇒
+`score=0`, `rollout_valid=0` (rollout discarded from the update). WandB logs
+`agentic_reward/{reflect,plan,format,tool,result,done,tool_call}/{mean,min,max}`
+(not `correctness`/`aesthetics` — those are PR 1-only).
+
+### Run
+
+```bash
+# panes A/B: frozen gen + judge sidecars (unchanged from the overfit recipe)
+TOTAL_STEPS=200 N_GPUS=2 \
+  bash examples/agenticllmgrpo_trainer/agent_llm/run_agentic_rpco.sh
+```
+
+Stage-1 init hook: `RPCO_INIT_CKPT=/path/to/stage1` replaces the cold-start
+model path (stages 1–2 themselves are not shipped). The mixed pool, sizes, and
+split seed are `UNICOT_BREAKDOWN_DIR`, `UNICOT_REFLECTION_DIR`,
+`UNICOT_TRAIN_SIZE`, `UNICOT_VAL_SIZE`, `UNICOT_VAL_RATIO`, `UNICOT_MIX_RATIO`,
+`UNICOT_SPLIT_SEED`.
+
+Validation runs every `TEST_FREQ` steps (default 10) with `val_before_train`
+on (default), greedy `val_kwargs` (n=`VAL_ROLLOUT_N`=1, temperature 0) so the
+val reward curve is cheap to track in WandB (`val-core/...`). The agentic
+reward dimensions on validation records are logged as
+`val_agentic_reward/*` (mirror of `agentic_reward/*`), and each validation pass
+also rolls out the fixed cafe-poster holdout task under both the UniCoT reflect
+and plan system prompts, appending one accumulating
+WandB table row under `val/generations` (FlowGRPO-style: `input_k` = rewritten
+`generate_image` prompt, `output_k` = PNG per tool turn; reflect protocol) and
+`val/generations_plan` (same schema for the plan protocol). Gate:
+`AGENTIC_VAL_VIZ=1`, set by default.
+Disable periodic validation with `TEST_FREQ=-1`.

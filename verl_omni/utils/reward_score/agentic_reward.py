@@ -518,7 +518,9 @@ def compute_score(
     last_c, last_a, correctness_scores, aesthetics_scores = _vl_judge_correctness_aesthetics(
         blob,
         user_request=user_request,
-        image_prompt=prompts[-1] if prompts else "",
+        # Keep the reward target anchored to the business request. A rewritten
+        # diffusion prompt is an action, not permission to redefine success.
+        image_prompt=user_request,
     )
     n_judge_ok, n_judge_fail, judge_parse_rate = _judge_parse_stats(blob)
     # No successful parse anywhere → keep C/A at 0 (do not invent scores).

@@ -92,7 +92,6 @@ fields). Parquet only stores system + optional fewshot + the live user task
 (with brevity tail). Turn-1 `turn_obs` is backfilled from that last user
 message when there is no prior tool response.
 
-May refer to https://mermaid.ai/open-source/syntax/examples.html#larger-flowchart-with-some-styling for styling reference.
 
 ```mermaid
 flowchart LR

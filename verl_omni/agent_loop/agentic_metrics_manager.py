@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -46,11 +47,20 @@ from verl_omni.agent_loop.agentic_trajectory_context import (
 logger = logging.getLogger(__name__)
 
 # WandB ``agentic_reward/*`` — only the scalar mix terms used in compute_score.
+# Absent keys are skipped, so PR 1 (C/A) and PR 2 (RPCO dims) share this list
+# without forcing zeros for the inactive scorer.
 REWARD_COMPONENTS = (
+    # PR 1 ``agentic_reward`` gated mix (not emitted by ``agentic_multidim_reward``).
     "reward_tool_call",
     "reward_correctness",
     "reward_aesthetics",
     "reward_done",
+    # PR 2 RPCO multi-dimensional set.
+    "reward_reflect",
+    "reward_plan",
+    "reward_format",
+    "reward_tool",
+    "reward_result",
 )
 REWARD_ARTIFACT_FIELDS = (
     *REWARD_COMPONENTS,
@@ -159,6 +169,28 @@ def _extract_generate_image_prompts(decoded_response: str) -> list[str]:
         if prompt:
             found.append((match.start(), prompt))
     return [prompt for _, prompt in sorted(found)]
+
+
+def _pair_generate_image_turns(
+    decoded_response: str, image_paths: list[str]
+) -> list[tuple[str, str | None]]:
+    """Zip rewritten ``generate_image`` prompts with on-disk PNGs (call order)."""
+    prompts = _extract_generate_image_prompts(decoded_response)
+    n = max(len(prompts), len(image_paths))
+    pairs: list[tuple[str, str | None]] = []
+    for i in range(n):
+        prompt = prompts[i] if i < len(prompts) else ""
+        path = image_paths[i] if i < len(image_paths) else None
+        pairs.append((prompt, path))
+    return pairs
+
+
+def _val_generations_max_turns() -> int:
+    """Cap table columns to the live generate_image pass budget."""
+    try:
+        return max(1, int(os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")))
+    except ValueError:
+        return 3
 
 
 def aggregate_agentic_reward_metrics(non_tensor_batch: dict[str, Any]) -> dict[str, float]:
@@ -529,6 +561,8 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
         self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
+        # Accumulating WandB tables for FlowGRPO-style ``val/generations``.
+        self._val_generations_tables: dict[str, Any] = {}
 
     def _dump_raw_rollouts(self, prompts, output, step) -> None:
         """Write user prompt + raw assistant turns only."""
@@ -730,7 +764,15 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
 
     def generate_sequences(self, prompts):
         step = prompts.meta_info.get("global_steps")
+        is_val = bool(prompts.meta_info.get("validate", False))
         output = super().generate_sequences(prompts)
+        if is_val:
+            # Validation batches: metrics under val_agentic_reward/* plus the
+            # fixed viz set. No train dump (step-tagged filenames would collide
+            # with train samples) and no response_mask discard.
+            self._log_val_reward_metrics(output, step)
+            self._generate_val_viz(step)
+            return output
         # Dump before discard so hermes_actions shows real policy decodes
         # (discard zeros response_mask, which would hide tool-less prose as env text).
         self._dump_raw_rollouts(prompts, output, step)
@@ -747,6 +789,148 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 # Logging must never fail or alter rollout generation.
                 logger.warning("Failed to log agentic reward metrics to W&B: %s", exc)
         return output
+
+    @staticmethod
+    def _log_val_reward_metrics(output: Any, step) -> None:
+        """Mirror ``agentic_reward/*`` for validation records as ``val_agentic_reward/*``."""
+        try:
+            metrics = aggregate_agentic_reward_metrics(output.non_tensor_batch)
+            if not metrics:
+                return
+            import wandb
+
+            if wandb.run is not None:
+                val_metrics = {f"val_{key}": value for key, value in metrics.items()}
+                wandb.log(val_metrics, step=int(step) if step is not None else None, commit=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log val agentic reward metrics to W&B: %s", exc)
+
+    def _log_val_generations_table(
+        self,
+        step,
+        *,
+        table_key: str,
+        turn_pairs: list[tuple[str, str | None]],
+    ) -> None:
+        """Append one FlowGRPO-style generations row for this val step.
+
+        Columns: ``step``, then ``input_k`` / ``output_k`` for each generate_image
+        turn (rewritten tool prompt + PNG), padded to
+        ``AGENTIC_MAX_GENERATE_IMAGE_PASSES``.
+        """
+        import wandb
+
+        if wandb.run is None:
+            return
+        max_turns = _val_generations_max_turns()
+        columns = ["step"] + sum([[f"input_{i + 1}", f"output_{i + 1}"] for i in range(max_turns)], [])
+        prior = self._val_generations_tables.get(table_key)
+        if prior is None:
+            prior = wandb.Table(columns=columns)
+            self._val_generations_tables[table_key] = prior
+        # Workaround for https://github.com/wandb/wandb/issues/2981 — copy prior rows.
+        new_table = wandb.Table(columns=columns, data=prior.data)
+
+        row: list[Any] = [int(step) if step is not None else -1]
+        for i in range(max_turns):
+            if i < len(turn_pairs):
+                prompt, path = turn_pairs[i]
+                row.append(prompt)
+                if path and Path(path).is_file():
+                    row.append(wandb.Image(path))
+                else:
+                    row.append("")
+            else:
+                row.extend(["", ""])
+        new_table.add_data(*row)
+        wandb.log({table_key: new_table}, step=int(step) if step is not None else None, commit=False)
+        self._val_generations_tables[table_key] = new_table
+
+    def _generate_val_viz(self, step) -> None:
+        """Generate fixed cafe-poster viz rollouts and log ``val/generations``.
+
+        Two prompts share the cafe-poster task: UniCoT reflect + plan system
+        prompts. Each validation step appends one WandB table row per protocol
+        (FlowGRPO-style ``val/generations``) whose columns are rewritten
+        ``generate_image`` prompts + PNGs per tool turn. Reflect →
+        ``val/generations``; plan → ``val/generations_plan``.
+        Gate: ``AGENTIC_VAL_VIZ=1``.
+        """
+        if os.getenv("AGENTIC_VAL_VIZ", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        try:
+            from verl import DataProto
+
+            from verl_omni.utils.dataset.visual_reflection import build_unicot_agentic_rl
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("val viz disabled (import failed): %s", exc)
+            return
+        try:
+            # Fixed holdout task for WandB Media (not part of the UniCoT train pool).
+            task = (
+                'A vertical artistic cafe poster. The headline at the top reads "ARTISAN ROAST". '
+                "The center features a detailed, warm-toned illustration of a ceramic coffee cup sitting "
+                "on a rustic wooden table with soft steam rising and gentle morning sunlight coming through "
+                'a nearby window. Surrounding text at the bottom reads "Freshly Brewed Daily — Open at 7 AM". '
+                "Cozy, warm amber and brown color grading, shallow depth of field, cozy aesthetic."
+            )
+            user_text = build_unicot_agentic_rl._with_brevity(task)
+            viz_rows = (
+                ("reflect_prompt", build_unicot_agentic_rl.REFLECT_SYSTEM_PROMPT, "reflect", "val/generations"),
+                ("plan_prompt", build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT, "plan", "val/generations_plan"),
+            )
+            non_tensor = {key: [] for key in ("raw_prompt", "index", "data_source", "reward_model", "extra_info")}
+            for offset, (viz_id, system_prompt, task_type, _) in enumerate(viz_rows):
+                ground_truth = {"user_request": task, "task_type": task_type, "expected_num_images": 1}
+                if task_type == "plan":
+                    ground_truth["reference_subtasks"] = [task]
+                non_tensor["raw_prompt"].append(
+                    [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
+                )
+                # Out-of-band indices so viz trajectories never collide with
+                # val (0..n) or train sample files.
+                non_tensor["index"].append(9001 + offset)
+                non_tensor["data_source"].append("agentic_val_viz")
+                non_tensor["reward_model"].append({"style": "rule", "ground_truth": ground_truth})
+                non_tensor["extra_info"].append(
+                    {
+                        "viz_id": viz_id,
+                        "task_type": task_type,
+                        "expected_num_images": 1,
+                        "raw_prompt": task,
+                    }
+                )
+            batch = DataProto.from_single_dict(
+                {key: np.array(value, dtype=object) for key, value in non_tensor.items()}
+            )
+            batch.meta_info = {
+                "global_steps": step,
+                "validate": True,
+                "eos_token_id": getattr(self._monitor_tokenizer, "eos_token_id", None),
+                "pad_token_id": getattr(self._monitor_tokenizer, "pad_token_id", None),
+                "recompute_log_prob": False,
+                "do_sample": False,
+            }
+            output = super().generate_sequences(batch)
+            relpaths = output.non_tensor_batch.get("trajectory_relpath")
+            run_dir = _run_dir()
+            responses = output.batch["responses"]
+            for i, (_, _, _, table_key) in enumerate(viz_rows):
+                relpath = str(relpaths[i]) if relpaths is not None else ""
+                decoded = self._monitor_tokenizer.decode(responses[i].tolist(), skip_special_tokens=False)
+                image_paths = _materialize_rollout_images(
+                    decoded_response=decoded,
+                    run_dir=run_dir,
+                    relpath=relpath,
+                    user_prompt=task,
+                )
+                self._log_val_generations_table(
+                    step,
+                    table_key=table_key,
+                    turn_pairs=_pair_generate_image_turns(decoded, image_paths),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to generate/log val viz rollouts: %s", exc)
 
     @staticmethod
     def _discard_invalid_rollouts(output: Any) -> None:
