@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Build UniCoT agentic RL train/validation parquet (RFC #302 PR 2).
+"""Build UniCoT agentic RL train/validation parquet.
 
 This is the GRPO application of the UniCoT parsers, not a generic dataset
 loader. Invoke as::
