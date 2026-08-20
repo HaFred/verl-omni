@@ -102,8 +102,8 @@ def test_closed_reflect_trajectory_scores_near_full():
 
     assert out["rollout_valid"] == 1
     assert out["reward_format"] == 1.0
-    assert out["reward_tool"] == 1.0
     assert out["reward_tool_call"] == 1.0
+    assert "reward_tool" not in out
     assert out["reward_result"] == 1.0
     assert out["reward_done"] == 1.0
     assert 0.5 < out["reward_reflect"] <= 1.0
@@ -145,7 +145,7 @@ def test_plan_trajectory_exact_count_and_coverage():
     assert out["reward_plan"] > 0.5
     assert out["reward_result"] == 1.0
     assert out["reward_format"] == 1.0
-    assert out["reward_tool"] == 1.0
+    assert out["reward_tool_call"] == 1.0
     assert out["score"] > 0.8
 
 
@@ -226,7 +226,6 @@ def test_tool_reward_is_presence_based():
         ]
     )
     out = compute_score(solution_str=blob, ground_truth=_gt())
-    assert out["reward_tool"] == 1.0
     assert out["reward_tool_call"] == 1.0
     assert out["reward_done"] == 0.0
 
@@ -249,7 +248,7 @@ def test_rewrite_after_yes_downgrades_done():
     out = compute_score(solution_str=blob, ground_truth=_gt())
 
     assert out["rewrite_after_yes"] == 1
-    assert out["reward_tool"] == 1.0  # calls exist — presence, not the old ladder
+    assert out["reward_tool_call"] == 1.0  # calls exist — presence, not the old ladder
     assert out["reward_done"] == 0.0  # rewrite-after-YES breaks the closed loop
 
 
@@ -270,7 +269,7 @@ def test_injected_forced_reflection_never_earns_credit():
     assert out["terminal_done"] == 1
     assert out["forced_reflection_context"] == 1
     assert out["terminal_policy_reflection"] == 0
-    assert out["reward_tool"] == 1.0
+    assert out["reward_tool_call"] == 1.0
     assert out["reward_done"] == 1.0  # forced stop context still closes the loop
 
 
@@ -288,16 +287,22 @@ def test_weighted_total_respects_active_set():
     base = compute_score(solution_str=blob, ground_truth=gt)
 
     # w_plan is ignored on reflect rows (not in the active set W).
-    gt_plan_heavy = {**gt, **{f"w_{dim}": 1.0 for dim in ("reflect", "plan", "format", "tool", "result")}}
+    gt_plan_heavy = {**gt, **{f"w_{dim}": 1.0 for dim in ("reflect", "plan", "format", "tool_call", "result")}}
     gt_plan_heavy["w_plan"] = 99.0
     out = compute_score(solution_str=blob, ground_truth=gt_plan_heavy)
     assert out["score"] == pytest.approx(base["score"])
 
     # All dimensions weighted zero → score 0 despite valid rollout.
-    gt_zero = dict(gt, **{f"w_{dim}": 0.0 for dim in ("reflect", "format", "tool", "result")})
+    gt_zero = dict(gt, **{f"w_{dim}": 0.0 for dim in ("reflect", "format", "tool_call", "result")})
     out = compute_score(solution_str=blob, ground_truth=gt_zero)
     assert out["score"] == 0.0
     assert out["rollout_valid"] == 1
+
+    # Legacy parquet ``w_tool`` still drives the mix (same as ``w_tool_call``).
+    gt_legacy = dict(gt, **{f"w_{dim}": 0.0 for dim in ("reflect", "format", "result")})
+    gt_legacy["w_tool"] = 1.0
+    out = compute_score(solution_str=blob, ground_truth=gt_legacy)
+    assert out["score"] == pytest.approx(out["reward_tool_call"])
 
 
 def test_empty_and_invalid_rollouts_zero():
@@ -312,11 +317,11 @@ def test_empty_and_invalid_rollouts_zero():
 
 
 def _assert_full_schema(out: dict) -> None:
-    for dim in ("reflect", "plan", "format", "tool", "result"):
+    for dim in ("reflect", "plan", "format", "tool_call", "result"):
         assert f"reward_{dim}" in out
+    assert "reward_tool" not in out
     for key in (
         "reward_done",
-        "reward_tool_call",
         "num_hermes_tool_calls",
         "num_generate_image_prompts",
         "num_judge_image_calls",

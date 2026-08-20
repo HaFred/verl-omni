@@ -32,7 +32,6 @@ def test_aggregate_includes_rpco_dimensions_and_pr1_fields():
         "reward_reflect": np.array([0.8, 0.9]),
         "reward_plan": np.array([0.5, 0.6]),
         "reward_format": np.array([1.0, 1.0]),
-        "reward_tool": np.array([1.0, 1.0]),
         "reward_result": np.array([1.0, 0.0]),
         "reward_done": np.array([1.0, 0.0]),
         "reward_tool_call": np.array([1.0, 1.0]),
@@ -69,13 +68,13 @@ def test_val_prefix_transform():
     metrics = aggregate_agentic_reward_metrics(
         {
             "reward_reflect": np.array([0.8, 0.9]),
-            "reward_tool": np.array([1.0, 1.0]),
+            "reward_tool_call": np.array([1.0, 1.0]),
         }
     )
     val_metrics = _val_prefixed(metrics)
 
     assert val_metrics["val_agentic_reward/reflect/mean"] == pytest.approx(0.85)
-    assert val_metrics["val_agentic_reward/tool/mean"] == pytest.approx(1.0)
+    assert val_metrics["val_agentic_reward/tool_call/mean"] == pytest.approx(1.0)
     assert "val_agentic_reward/correctness/mean" not in val_metrics
 
 

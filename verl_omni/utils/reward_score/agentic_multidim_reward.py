@@ -27,9 +27,9 @@ Reward set (VisionCreator-R1, arXiv:2603.08812, §4.1/§4.3):
   R_format  — rule-based ratio over structural checks: well-formed tool calls,
       judge after the last generate, terminal policy-sampled Done, and the
       task-type tags (Plan + Reflection on plan rows; Reflection on reflect rows).
-  R_tool    — tool-call presence, mapped to PR 1's ``f_tool_call``
+  R_tool_call — tool-call presence, the same ``f_tool_call`` as PR 1
       (``agentic_reward.py``): 1.0 iff any tool call was parsed, else 0.
-      The discrete self-correction ladder is dropped.
+      Emitted as ``reward_tool_call`` so PR 1 and RPCO share one WandB series.
   R_result  — output count/type match against ``expected_num_images``.
       Plan rows: exact count match. Reflect rows (lenient stop-validity):
       terminal Done + ≥1 image + (count ≤ expected OR last judge YES).
@@ -38,6 +38,8 @@ Reward set (VisionCreator-R1, arXiv:2603.08812, §4.1/§4.3):
       emitted as ``reward_done`` for the ``agentic_reward/done`` WandB series.
 
 Total: ``score = (1/|W|) * sum(w_i * R_i)`` over the active set W (dims with
+``w_* > 0`` that apply to the row's task type). Default weights are 1.0 (paper
+default); the UniCoT builder bakes per-row weights into ``ground_truth``.
 ``w_* > 0`` that apply to the row's task type). Default weights are 1.0 (paper
 default); the UniCoT builder bakes per-row weights into ``ground_truth``.
 
@@ -72,13 +74,12 @@ from verl_omni.utils.reward_score.agentic_reward import (
     _zero_result as _pr1_zero_result,
 )
 
-DIMS = ("reflect", "plan", "format", "tool", "result")
+DIMS = ("reflect", "plan", "format", "tool_call", "result")
 # Always emit these so Ray `_postprocess` (keys taken from sample 0) cannot
 # KeyError when one rollout is valid and another hits an early-zero path.
 _SCHEMA_EXTRAS: dict[str, float | str | int | None] = {
     **{f"reward_{dim}": 0.0 for dim in DIMS},
     "reward_done": 0.0,
-    "reward_tool_call": 0.0,
     "terminal_done": 0,
     "terminal_policy_reflection": 0,
     "forced_reflection_context": 0,
@@ -231,14 +232,24 @@ def _result_reward(
     return 1.0 if (n_successful_gens <= expected or last_yes) else 0.0
 
 
+def _weight_raw(gt: dict[str, Any], extra_info: dict[str, Any], dim: str) -> Any:
+    raw = extra_info.get(f"w_{dim}")
+    if raw is None:
+        raw = gt.get(f"w_{dim}")
+    # Existing UniCoT parquet baked ``w_tool`` before the dim was renamed.
+    if dim == "tool_call" and raw is None:
+        raw = extra_info.get("w_tool")
+        if raw is None:
+            raw = gt.get("w_tool")
+    return raw
+
+
 def _active_weights(gt: dict[str, Any], extra_info: dict[str, Any], *, task_type: str) -> dict[str, float]:
     weights = {}
     for dim in DIMS:
         if dim == "plan" and task_type != "plan":
             continue
-        raw = extra_info.get(f"w_{dim}")
-        if raw is None:
-            raw = gt.get(f"w_{dim}")
+        raw = _weight_raw(gt, extra_info, dim)
         try:
             weight = float(raw if raw is not None else 1.0)
         except (TypeError, ValueError):
@@ -316,7 +327,7 @@ def compute_score(
         "reflect": _reflection_reward(blob, gt=gt)[0],
         "plan": _plan_reward(blob, gt=gt),
         "format": _format_reward(blob, task_type=task_type, n_successful_gens=n_successful_gens),
-        "tool": f_tool_call,
+        "tool_call": f_tool_call,
         "result": _result_reward(
             blob,
             task_type=task_type,
@@ -335,7 +346,6 @@ def compute_score(
             "score": float(min(1.0, score)),
             **{f"reward_{dim}": float(rewards[dim]) for dim in DIMS},
             "reward_done": float(f_done),
-            "reward_tool_call": float(f_tool_call),
             "protocol_ok": int(rewards["format"] == 1.0),
             "rewrite_after_yes": int(n_rewrite_after_yes),
             "rollout_valid": 1,

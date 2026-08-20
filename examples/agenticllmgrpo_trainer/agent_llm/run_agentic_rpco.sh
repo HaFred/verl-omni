@@ -99,7 +99,10 @@ export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 export UNICOT_BREAKDOWN_DIR UNICOT_REFLECTION_DIR UNICOT_MIX_RATIO UNICOT_VAL_RATIO UNICOT_SPLIT_SEED
 # Per-dimension weights (VisionCreator-R1 default: all 1.0). Forward any
 # RPCO_W_* overrides to the data builder so they land in gt/extra_info.
-for _dim in REFLECT PLAN FORMAT TOOL RESULT; do
+if [[ -z "${RPCO_W_TOOL_CALL:-}" && -n "${RPCO_W_TOOL:-}" ]]; then
+  export RPCO_W_TOOL_CALL="${RPCO_W_TOOL}"
+fi
+for _dim in REFLECT PLAN FORMAT TOOL_CALL RESULT; do
   _key="RPCO_W_${_dim}"
   if [[ -z "${!_key:-}" ]]; then
     export "${_key}=1.0"
@@ -108,7 +111,7 @@ done
 
 echo "[INFO] wandb online experiment_name=${EXPERIMENT_NAME} (WANDB_SERVICE_TRANSPORT=${WANDB_SERVICE_TRANSPORT})"
 echo "[INFO] ckpt dir=${CKPT_DIR}"
-echo "[INFO] rpco stage-3: full dataset (val_ratio=${UNICOT_VAL_RATIO}; sizes only for smoke: train=${UNICOT_TRAIN_SIZE:-<unset>} val=${UNICOT_VAL_SIZE:-<unset>} mix=${UNICOT_MIX_RATIO}) seed=${UNICOT_SPLIT_SEED} weights=${RPCO_W_REFLECT}/${RPCO_W_PLAN}/${RPCO_W_FORMAT}/${RPCO_W_TOOL}/${RPCO_W_RESULT}"
+echo "[INFO] rpco stage-3: full dataset (val_ratio=${UNICOT_VAL_RATIO}; sizes only for smoke: train=${UNICOT_TRAIN_SIZE:-<unset>} val=${UNICOT_VAL_SIZE:-<unset>} mix=${UNICOT_MIX_RATIO}) seed=${UNICOT_SPLIT_SEED} weights=${RPCO_W_REFLECT}/${RPCO_W_PLAN}/${RPCO_W_FORMAT}/${RPCO_W_TOOL_CALL}/${RPCO_W_RESULT}"
 echo "[INFO] init ckpt=${RPCO_INIT_CKPT:-<cold start>} resume_mode=${RESUME_MODE:-disable}"
 echo "[INFO] agent loop=agentic_tool_agent (AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-<unset>}; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-<unset>})"
 echo "[INFO] force-first generate=${AGENTIC_FORCE_FIRST_GENERATE:-<unset>} warmup=${AGENTIC_FORCE_FIRST_WARMUP_STEPS:-<unset>} end=${AGENTIC_FORCE_FIRST_END_STEP:-<unset>}"

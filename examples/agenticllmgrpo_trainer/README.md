@@ -54,7 +54,7 @@ Typical force-on trajectory (`AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=1`):
 
 **PR 2 / RPCO** (`agentic_multidim_reward`):
 
-- `agentic_reward/{reflect,plan,format,tool,result,done,tool_call}/{mean,min,max}`
+- `agentic_reward/{reflect,plan,format,tool_call,result,done}/{mean,min,max}`
 
 RPCO does **not** emit `reward_correctness` / `reward_aesthetics` (VL C/A feed
 `reward_reflect` instead), so those series are not logged on RPCO runs.
@@ -274,14 +274,14 @@ ground truth only** — prompts are system + user, no fewshot. Images
 ### Multi-dimensional reward (`agentic_multidim_reward`)
 
 `reward.custom_reward_function.path=pkg://verl_omni.utils.reward_score.agentic_multidim_reward`
-computes the stage-3 set {reflection, plan, format, tool, result}:
+computes the stage-3 set {reflection, plan, format, tool_call, result}:
 
 | Dim | Range | Computed by | What it measures |
 | --- | --- | --- | --- |
 | `R_reflect` | [0,1] | live judge C/A (checkpoint quality) + lexical coverage vs. reference `eval_summary` / judge findings | reflection quality on the final image |
 | `R_plan` | [0,1] | per-subtask best token coverage of the agent's plan lines vs. reference subtasks | plan completeness (plan rows only) |
 | `R_format` | [0,1] | rule-based check ratio | well-formed tool calls, judge-after-final-gen, tags, terminal `Done.` |
-| `R_tool` | {0,1} | rule-based | tool-call presence, mapped to PR 1's `f_tool_call`: 1.0 iff any tool call was parsed (the discrete self-correction ladder is dropped) |
+| `R_tool_call` | {0,1} | rule-based | tool-call presence (`f_tool_call`): 1.0 iff any tool call was parsed; same `reward_tool_call` key as PR 1 |
 | `R_result` | {0,1} | rule-based | plan rows: exact image-count match; reflect rows: lenient stop-validity (terminal `Done.` + count ≤ reference, or final judge YES) |
 | `R_done` (logged only) | {0,1} | rule-based | PR 1's `f_done` closed-loop indicator, emitted as `reward_done` for the `agentic_reward/done` WandB series — not part of the score's W |
 
@@ -289,7 +289,7 @@ Total: `score = (1/|W|) * sum(w_i * R_i)` over the active set W per row, all
 weights 1.0 by default (paper default); override with `RPCO_W_*` env vars at
 data-build time. Gating kept from PR 1: no successful `generate_image` ⇒
 `score=0`, `rollout_valid=0` (rollout discarded from the update). WandB logs
-`agentic_reward/{reflect,plan,format,tool,result,done,tool_call}/{mean,min,max}`
+`agentic_reward/{reflect,plan,format,tool_call,result,done}/{mean,min,max}`
 (not `correctness`/`aesthetics` — those are PR 1-only).
 
 ### Run

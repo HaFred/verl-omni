@@ -55,11 +55,10 @@ REWARD_COMPONENTS = (
     "reward_correctness",
     "reward_aesthetics",
     "reward_done",
-    # PR 2 RPCO multi-dimensional set.
+    # PR 2 RPCO multi-dimensional set (``reward_tool_call`` is shared with PR 1).
     "reward_reflect",
     "reward_plan",
     "reward_format",
-    "reward_tool",
     "reward_result",
 )
 REWARD_ARTIFACT_FIELDS = (

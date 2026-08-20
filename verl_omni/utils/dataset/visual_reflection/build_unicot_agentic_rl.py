@@ -68,7 +68,7 @@ REFLECT_ABILITY = "agentic_generate_self_reflect"
 PLAN_ABILITY = "agentic_plan_generate"
 REFLECT_DATA_SOURCE = "unicot_reflection"
 BREAKDOWN_DATA_SOURCE = "unicot_breakdown"
-DIMS = ("reflect", "plan", "format", "tool", "result")
+DIMS = ("reflect", "plan", "format", "tool_call", "result")
 MANIFEST_ID = "agentic_rpco_stage3"
 
 # Reflect protocol (self-contained; no dependency on ``examples/``).
@@ -179,11 +179,18 @@ class _TextOnlyImageResolver:
 
 def _env_weight(dim: str) -> float:
     """Read RPCO_W_<DIM> (default 1.0 — VisionCreator-R1 sets all weights to 1)."""
-    raw = os.environ.get(f"RPCO_W_{dim.upper()}", "1.0").strip()
+    env_key = f"RPCO_W_{dim.upper()}"
+    raw = os.environ.get(env_key)
+    # Alias kept so existing launchers that export RPCO_W_TOOL still apply.
+    if raw is None and dim == "tool_call":
+        raw = os.environ.get("RPCO_W_TOOL")
+    if raw is None:
+        raw = "1.0"
+    raw = raw.strip()
     try:
         return max(0.0, float(raw))
     except ValueError:
-        raise ValueError(f"RPCO_W_{dim.upper()} must be a float, got {raw!r}") from None
+        raise ValueError(f"{env_key} must be a float, got {raw!r}") from None
 
 
 def _weights() -> dict[str, float]:
