@@ -23,6 +23,11 @@ active only for plan rows. ``done`` and ``tool_call`` reproduce the PR1
 closed-loop indicators for metrics, but are not additional score dimensions.
 Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
 receive score zero and ``rollout_valid=0``.
+
+Judge C/A is trusted only after a parsed ``judge_image`` ``<tool_call>`` and the
+tool observation header. Coverage is token F1 (not recall-only), so dumping
+reference words into a long blob does not max ``R_reflect`` / ``R_plan``.
+Rewrite-after-YES zeros ``R_result`` as well as the Done indicator.
 """
 
 from __future__ import annotations
@@ -59,6 +64,7 @@ _TOOL_OBS_LINE_RE = re.compile(
     r")\b.*$"
 )
 _REFLECTION_RE = re.compile(r"\bReflection\s*:", re.IGNORECASE)
+_JUDGE_OBS_HEADER = "VL judge on the last generated image"
 _PLAN_HEADER_RE = re.compile(r"\bPlan\s*:", re.IGNORECASE)
 _PLAN_ITEM_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+(.+)$")
 _FINDINGS_RE = re.compile(r"(?im)^\s*(?:findings|suggested_fixes)\s*:\s*(.*)$")
@@ -157,6 +163,11 @@ def _tool_name(call: dict[str, Any]) -> str:
     return str(call.get("name") or "").strip().lower()
 
 
+def _follows_judge_image_call(pos: int, calls: list[tuple[int, int, dict[str, Any]]]) -> bool:
+    """True when ``pos`` is after at least one parsed ``judge_image`` ``<tool_call>``."""
+    return any(end <= pos for _, end, call in calls if _tool_name(call) == "judge_image")
+
+
 def _generate_prompts(calls: list[tuple[int, int, dict[str, Any]]]) -> list[str]:
     prompts = []
     for _, _, call in calls:
@@ -194,10 +205,21 @@ def _tokens(text: str) -> set[str]:
 
 
 def _coverage(candidate: str, reference: str) -> float:
+    """Token F1 of candidate vs reference (recall-only bag-of-words is not enough).
+
+    Precision penalizes dumping the reference tokens into a long unrelated blob;
+    recall still rewards covering the reference. Exact copy scores 1.0.
+    """
     reference_tokens = _tokens(reference)
-    if not reference_tokens:
+    candidate_tokens = _tokens(candidate)
+    if not reference_tokens or not candidate_tokens:
         return 0.0
-    return len(_tokens(candidate) & reference_tokens) / len(reference_tokens)
+    overlap = len(reference_tokens & candidate_tokens)
+    if overlap == 0:
+        return 0.0
+    recall = overlap / len(reference_tokens)
+    precision = overlap / len(candidate_tokens)
+    return 2.0 * precision * recall / (precision + recall)
 
 
 def _count_successful_generates(text: str) -> int:
@@ -208,11 +230,21 @@ def _count_successful_generates(text: str) -> int:
     )
 
 
-def _judge_parse_stats(text: str) -> tuple[int, int, float]:
-    ok = len(_JUDGE_OK_RE.findall(text or ""))
-    failed = len(re.findall(r"\bagentic_judge\s+ok=0\b", text or "", flags=re.IGNORECASE))
+def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] | None = None) -> tuple[int, int, float]:
+    blob = text or ""
+    parsed_calls = calls if calls is not None else _extract_tool_calls(blob)
+    ok = 0
+    for marker in _JUDGE_OK_RE.finditer(blob):
+        if _follows_judge_image_call(marker.start(), parsed_calls):
+            ok += 1
+    failed = 0
+    for marker in re.finditer(r"\bagentic_judge\s+ok=0\b", blob, flags=re.IGNORECASE):
+        if _follows_judge_image_call(marker.start(), parsed_calls):
+            failed += 1
     if failed == 0:
-        failed = len(_JUDGE_FAIL_RE.findall(text or ""))
+        for marker in _JUDGE_FAIL_RE.finditer(blob):
+            if _follows_judge_image_call(marker.start(), parsed_calls):
+                failed += 1
     total = ok + failed
     return ok, failed, ok / total if total else 1.0
 
@@ -226,11 +258,20 @@ def _good_enough(window: str) -> bool | None:
 
 
 def _successful_judges(text: str) -> list[tuple[float, float, bool | None, int]]:
-    """Return trusted ``(correctness, aesthetics, good_enough, end)`` values."""
+    """Return trusted ``(correctness, aesthetics, good_enough, end)`` values.
+
+    Hits must follow a parsed ``judge_image`` ``<tool_call>`` and the tool's
+    ``VL judge on the last generated image`` header.
+    """
     blob = text or ""
+    calls = _extract_tool_calls(blob)
     hits = []
     for marker in _JUDGE_OK_RE.finditer(blob):
+        if not _follows_judge_image_call(marker.start(), calls):
+            continue
         window = blob[max(0, marker.start() - 1400) : marker.end()]
+        if _JUDGE_OBS_HEADER not in window:
+            continue
         if re.search(r"\bparse_ok\s*=\s*0\b", window, re.IGNORECASE):
             continue
         correctness = list(_CORRECTNESS_RE.finditer(window))
@@ -300,8 +341,11 @@ def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
 
     steps = ground_truth.get("reference_steps") or []
     reference = " ".join(str(step.get("reflection") or "") for step in steps if isinstance(step, dict)).strip()
-    if not reference:
-        feedback = [match.group(1).strip() for match in _FINDINGS_RE.finditer(text or "")]
+    if not reference and judges:
+        feedback = []
+        for _, _, _, end in judges:
+            window = text[max(0, end - 1400) : end]
+            feedback.extend(match.group(1).strip() for match in _FINDINGS_RE.finditer(window))
         reference = " ".join(item for item in feedback if item.lower() not in {"", "none", "n/a"}).strip()
     if not reference:
         return quality
@@ -346,8 +390,9 @@ def _result_reward(
     successful_generates: int,
     terminal_done: bool,
     blocked: bool,
+    rewrite_after_yes: int,
 ) -> float:
-    if blocked or not terminal_done or successful_generates < 1:
+    if blocked or not terminal_done or successful_generates < 1 or rewrite_after_yes > 0:
         return 0.0
     if task_type == "plan":
         return 1.0 if successful_generates == expected else 0.0
@@ -401,7 +446,7 @@ def compute_score(
     calls = _extract_tool_calls(text)
     prompts = _generate_prompts(calls)
     names = [_tool_name(call) for _, _, call in calls]
-    judge_ok, judge_failed, judge_rate = _judge_parse_stats(text)
+    judge_ok, judge_failed, judge_rate = _judge_parse_stats(text, calls)
     successful_generates = _count_successful_generates(text)
     terminal_done, policy_reflection, forced_context = _terminal_decision(text)
     blocked = bool(_BLOCKED_GENERATE_RE.search(text))
@@ -441,6 +486,7 @@ def compute_score(
             successful_generates=successful_generates,
             terminal_done=terminal_done,
             blocked=blocked,
+            rewrite_after_yes=rewrites_after_yes,
         ),
     }
     weights = _active_weights(gt, metadata, task_type=task_type)
