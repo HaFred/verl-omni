@@ -21,6 +21,7 @@ import pytest
 from verl_omni.agent_loop.agentic_tool_agent_loop import (
     _count_successful_generates,
     _count_successful_judges,
+    _fits_response_budget,
     _force_enabled,
     _force_first_generate_probability,
     _hermes_tool_call,
@@ -210,3 +211,10 @@ def test_build_forced_reflection_max_passes_stop_cue():
 
 def test_build_forced_reflection_requires_judge_ok():
     assert build_forced_reflection("no judge marker here") is None
+
+
+def test_fits_response_budget_rejects_overflow():
+    assert _fits_response_budget(mask_len=10, n_new_ids=5, response_length=16) is True
+    assert _fits_response_budget(mask_len=10, n_new_ids=6, response_length=16) is False
+    assert _fits_response_budget(mask_len=10, n_new_ids=0, response_length=16) is False
+    assert _fits_response_budget(mask_len=0, n_new_ids=1, response_length=1) is False

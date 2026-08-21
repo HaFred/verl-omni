@@ -96,6 +96,15 @@ def _max_generate_passes() -> int:
         return 3
 
 
+def _fits_response_budget(mask_len: int, n_new_ids: int, response_length: int) -> bool:
+    """True when appending ``n_new_ids`` stays strictly under ``response_length``.
+
+    Forced Reflection must not mutate ``messages`` unless the encoded tokens
+    also fit; otherwise dumps show a stop cue the policy never saw.
+    """
+    return n_new_ids > 0 and mask_len + n_new_ids < response_length
+
+
 def _force_first_generate_probability(step: Any, *, validate: bool = False) -> float:
     """Bootstrap missing tool calls for weak VL, then anneal fully off.
 
@@ -583,17 +592,21 @@ class AgenticToolAgentLoop(ToolAgentLoop):
         # Marker keeps dumps / metrics grep-able even if the model also continues.
         reflection_text = f"{reflection_text} agentic_forced_reflection=1"
         assistant_msg = {"role": "assistant", "content": reflection_text}
-        agent_data.messages.append(assistant_msg)
-
+        # Encode first: do not append to messages unless tokens also fit.
         # Same encoding path as tool responses (strip system prompt; keep gen prompt
         # so the policy can continue with rewritten generate_image when not done).
         response_ids = await self.apply_chat_template(
             [assistant_msg],
             remove_system_prompt=True,
         )
-        if len(agent_data.response_mask) + len(response_ids) >= self.response_length:
+        if not _fits_response_budget(
+            len(agent_data.response_mask),
+            len(response_ids),
+            self.response_length,
+        ):
             return AgentState.TERMINATED
 
+        agent_data.messages.append(assistant_msg)
         agent_data.prompt_ids += response_ids
         # Mask 0: keep Reflection in context/dumps, but do not train on injected tokens
         # (logprobs were not sampled from the policy).
