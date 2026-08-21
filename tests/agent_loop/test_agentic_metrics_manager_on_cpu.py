@@ -17,6 +17,7 @@ import numpy as np
 import pytest
 
 from verl_omni.agent_loop.agentic_metrics_manager import (
+    AgenticMetricsAgentLoopManager,
     _pair_generate_image_turns,
     aggregate_agentic_reward_metrics,
 )
@@ -107,3 +108,67 @@ def test_pair_generate_image_turns_pads_missing_side():
     decoded = '<tool_call>{"name": "generate_image", "arguments": {"prompt": "only"}}</tool_call>'
     assert _pair_generate_image_turns(decoded, []) == [("only", None)]
     assert _pair_generate_image_turns("", ["/tmp/a.png"]) == [("", "/tmp/a.png")]
+
+
+def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
+    """FlowGRPO-style: each val step appends a row; summary table has all rows."""
+    import types
+
+    logged: list[dict] = []
+
+    class _FakeImage:
+        def __init__(self, path):
+            self.path = str(path)
+
+    class _FakeTable:
+        def __init__(self, columns, data=None):
+            self.columns = columns
+            self.data = list(data or [])
+
+        def add_data(self, *row):
+            self.data.append(list(row))
+
+    class _FakeRun:
+        pass
+
+    fake_wandb = types.SimpleNamespace(
+        run=_FakeRun(),
+        Image=_FakeImage,
+        Table=_FakeTable,
+        log=lambda payload, step=None, commit=True: logged.append(
+            {"payload": payload, "step": step, "commit": commit}
+        ),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "2")
+
+    png_a = tmp_path / "a.png"
+    png_b = tmp_path / "b.png"
+    png_a.write_bytes(b"fake")
+    png_b.write_bytes(b"fake")
+
+    manager = types.SimpleNamespace(
+        _val_generations_history={},
+        _log_val_generations_table=AgenticMetricsAgentLoopManager._log_val_generations_table,
+    )
+
+    AgenticMetricsAgentLoopManager._log_val_generations_table(
+        manager, 0, table_key="val/generations", turn_pairs=[("p0", str(png_a))]
+    )
+    AgenticMetricsAgentLoopManager._log_val_generations_table(
+        manager, 10, table_key="val/generations", turn_pairs=[("p10", str(png_b))]
+    )
+    AgenticMetricsAgentLoopManager._log_val_generations_table(
+        manager, 20, table_key="val/generations", turn_pairs=[("p20", None)]
+    )
+
+    assert len(logged) == 3
+    assert all(entry["commit"] is True for entry in logged)
+    # Latest summary payload must contain all prior val steps as rows.
+    latest = logged[-1]["payload"]["val/generations"]
+    assert [row[0] for row in latest.data] == [0, 10, 20]
+    assert latest.data[0][1] == "p0"
+    assert isinstance(latest.data[0][2], _FakeImage)
+    assert latest.data[1][1] == "p10"
+    assert latest.data[2][2] == ""
+    assert len(manager._val_generations_history["val/generations"]) == 3

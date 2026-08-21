@@ -560,8 +560,12 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
         self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
-        # Accumulating WandB tables for FlowGRPO-style ``val/generations``.
-        self._val_generations_tables: dict[str, Any] = {}
+        # FlowGRPO-style ``val/generations``: keep plain history (step + prompt/path
+        # pairs), rebuild ``wandb.Table`` + fresh ``wandb.Image``s each val step.
+        # Storing Image cells in a copied table leaves ``runs.summary`` stuck on
+        # the first row (wandb/2981 + media reuse).
+        self._val_generations_history: dict[str, list[list[Any]]] = {}
+        self._val_viz_logged_steps: set[int] = set()
 
     def _dump_raw_rollouts(self, prompts, output, step) -> None:
         """Write user prompt + raw assistant turns only."""
@@ -811,11 +815,15 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         table_key: str,
         turn_pairs: list[tuple[str, str | None]],
     ) -> None:
-        """Append one FlowGRPO-style generations row for this val step.
+        """Append one FlowGRPO-style generations row and commit the full table.
 
-        Columns: ``step``, then ``input_k`` / ``output_k`` for each generate_image
-        turn (rewritten tool prompt + PNG), padded to
-        ``AGENTIC_MAX_GENERATE_IMAGE_PASSES``.
+        Matches ``ValidationGenerationsLogger._log_generations_to_wandb`` (used by
+        ``run_qwen_image_ocr_lora.sh``): accumulate every val step as a new row so
+        ``runs.summary["val/generations"]`` lists idx 1/2/3… for steps 0/10/20….
+
+        History stores paths (not ``wandb.Image``). Each log rebuilds Images so
+        prior media is not reused across table copies (wandb/2981).
+        Commit is intentional (FlowGRPO does the same) so summary updates.
         """
         import wandb
 
@@ -823,27 +831,34 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             return
         max_turns = _val_generations_max_turns()
         columns = ["step"] + sum([[f"input_{i + 1}", f"output_{i + 1}"] for i in range(max_turns)], [])
-        prior = self._val_generations_tables.get(table_key)
-        if prior is None:
-            prior = wandb.Table(columns=columns)
-            self._val_generations_tables[table_key] = prior
-        # Workaround for https://github.com/wandb/wandb/issues/2981 — copy prior rows.
-        new_table = wandb.Table(columns=columns, data=prior.data)
 
-        row: list[Any] = [int(step) if step is not None else -1]
+        history_row: list[Any] = [int(step) if step is not None else -1]
         for i in range(max_turns):
             if i < len(turn_pairs):
                 prompt, path = turn_pairs[i]
+                history_row.append(prompt or "")
+                history_row.append(str(path) if path else "")
+            else:
+                history_row.extend(["", ""])
+        history = self._val_generations_history.setdefault(table_key, [])
+        history.append(history_row)
+
+        # Rebuild the full table from plain history (fresh Images every time).
+        new_table = wandb.Table(columns=columns)
+        for stored in history:
+            row: list[Any] = [stored[0]]
+            for i in range(max_turns):
+                prompt = stored[1 + 2 * i]
+                path = stored[2 + 2 * i]
                 row.append(prompt)
                 if path and Path(path).is_file():
                     row.append(wandb.Image(path))
                 else:
                     row.append("")
-            else:
-                row.extend(["", ""])
-        new_table.add_data(*row)
-        wandb.log({table_key: new_table}, step=int(step) if step is not None else None, commit=False)
-        self._val_generations_tables[table_key] = new_table
+            new_table.add_data(*row)
+
+        # Commit like FlowGRPO — ``commit=False`` left summary stuck on row 1.
+        wandb.log({table_key: new_table}, step=int(step) if step is not None else None)
 
     def _generate_val_viz(self, step) -> None:
         """Generate fixed cafe-poster viz rollouts and log ``val/generations``.
@@ -853,9 +868,16 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         (FlowGRPO-style ``val/generations``) whose columns are rewritten
         ``generate_image`` prompts + PNGs per tool turn. Reflect →
         ``val/generations``; plan → ``val/generations_plan``.
-        Gate: ``AGENTIC_VAL_VIZ=1``.
+        Gate: ``AGENTIC_VAL_VIZ=1``. Once per ``global_steps`` (val may emit
+        multiple ``generate_sequences`` batches).
         """
         if os.getenv("AGENTIC_VAL_VIZ", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        try:
+            step_i = int(step) if step is not None else -1
+        except (TypeError, ValueError):
+            step_i = -1
+        if step_i in self._val_viz_logged_steps:
             return
         try:
             from verl import DataProto
@@ -928,6 +950,7 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                     table_key=table_key,
                     turn_pairs=_pair_generate_image_turns(decoded, image_paths),
                 )
+            self._val_viz_logged_steps.add(step_i)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to generate/log val viz rollouts: %s", exc)
 

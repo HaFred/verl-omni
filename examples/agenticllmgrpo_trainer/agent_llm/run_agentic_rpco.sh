@@ -93,8 +93,8 @@ export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
 export AGENTIC_E2E_RUN_NAME="${EXPERIMENT_NAME}"
 # Val viz: each validation pass also rolls out the cafe-poster task under the
 # reflect SYSTEM_PROMPT and the plan PLAN_SYSTEM_PROMPT, appending one WandB
-# ``val/generations`` table row (rewritten generate_image prompts + PNGs per
-# turn; see agentic_metrics_manager).
+# ``val/generations`` table row per val step (FlowGRPO-style accumulating
+# summary: idx 1/2/3… for steps 0/10/20…; see agentic_metrics_manager).
 export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 export UNICOT_BREAKDOWN_DIR UNICOT_REFLECTION_DIR UNICOT_MIX_RATIO UNICOT_VAL_RATIO UNICOT_SPLIT_SEED
 # Per-dimension weights (VisionCreator-R1 default: all 1.0). Forward any
@@ -151,6 +151,7 @@ python3 -m verl.trainer.main_ppo \
     data.filter_overlong_prompts=true \
     data.truncation=left \
     data.return_raw_chat=true \
+    data.seed=$UNICOT_SPLIT_SEED \
     actor_rollout_ref.model.path=$MODEL_PATH \
     actor_rollout_ref.model.lora_rank=32 \
     actor_rollout_ref.model.lora_alpha=16 \
