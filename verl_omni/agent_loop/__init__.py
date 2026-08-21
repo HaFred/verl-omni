@@ -14,6 +14,11 @@
 
 # Register agentic_tool_agent (forces Reflection after successful judge_image).
 from . import agentic_tool_agent_loop as _agentic_tool_agent_loop  # noqa: F401
+# The MiniMax H3 agent loop lives in its pipeline package; import it here so the
+# @register decorator fires when the agent_loop package is imported. Do not
+# re-export the class from the pipeline package __init__ (import cycle).
+from verl_omni.pipelines.minimax_h3_diffusion_nft.agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
+
 from .composite_agent_loop import CompositeAgentLoopWorker
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
 from .diffusion_agent_loop_tq import (
@@ -29,4 +34,5 @@ __all__ = [
     "DiffusionAgentLoopWorkerTQ",
     "create_diffusion_agent_loop_manager",
     "DiffusionSingleTurnAgentLoop",
+    "MiniMaxH3DiffusionSingleTurnAgentLoop",
 ]
