@@ -143,15 +143,32 @@ def test_judge_image_stub_without_vllm(monkeypatch):
 
 
 def test_expand_judge_user_request_placeholders():
-    bound = "A vertical artistic cafe poster."
+    original = "A vertical artistic cafe poster."
+    bound = f"{original} Keep any private thinking to AT MOST one short paragraph (≤4 sentences)."
     token = set_active_user_prompt(bound)
     try:
-        assert tools._expand_judge_user_request("same as user message") == bound
-        assert tools._expand_judge_user_request("last") == bound
+        assert tools._expand_judge_user_request("same as user message") == original
+        assert tools._expand_judge_user_request("last") == original
         assert tools._expand_judge_user_request("some other task text") == "some other task text"
     finally:
         reset_active_user_prompt(token)
     assert tools._expand_judge_user_request("raw without binding") == "raw without binding"
+
+
+def test_bound_judge_image_prompt_uses_original_user_request(tmp_path):
+    original = "A vertical artistic cafe poster."
+    dataset_prompt = f"{original} Keep any private thinking to AT MOST one short paragraph (≤4 sentences)."
+    png = tmp_path / "image.png"
+    Image.new("RGB", (1, 1), (4, 5, 6)).save(png)
+    path_token = set_active_trajectory_relpath("step_000001/sample_0.00")
+    prompt_token = set_active_user_prompt(dataset_prompt)
+    try:
+        register_tool_artifact(prompt="latest rewritten prompt", paths=[str(png)], backend="qwen_image")
+        assert tools._expand_judge_image_prompt("last") == original
+        assert tools._expand_judge_image_prompt("latest rewritten prompt") == original
+    finally:
+        reset_active_user_prompt(prompt_token)
+        reset_active_trajectory_relpath(path_token)
 
 
 def test_expand_judge_image_prompt_to_latest_live_prompt(tmp_path):

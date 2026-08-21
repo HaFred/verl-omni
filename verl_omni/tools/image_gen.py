@@ -621,9 +621,9 @@ JUDGE_TOOL_SCHEMA = {
                 "image_prompt": {
                     "type": "string",
                     "description": (
-                        "Prefer exactly 'last', or a short echo of the diffusion prompt. "
-                        "Do NOT re-paste long prompts; the server resolves the latest "
-                        "generated image and full prompt for this rollout."
+                        "Use exactly 'last'. The server resolves the latest generated "
+                        "image, then judges it against the original user request rather "
+                        "than a rewritten diffusion prompt."
                     ),
                 },
             },
@@ -660,10 +660,23 @@ _JUDGE_PROMPT_PLACEHOLDERS = {
 }
 
 
+_AGENTIC_BREVITY_SUFFIX_RE = re.compile(
+    r"\s*Keep any private thinking to (?:AT MOST\s+)?one short paragraph"
+    r"\s*\(≤4 sentences\)\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _original_judge_request() -> str:
+    """Return the bound business request without the dataset control suffix."""
+    bound = (get_active_user_prompt() or "").strip()
+    return _AGENTIC_BREVITY_SUFFIX_RE.sub("", bound).strip()
+
+
 def _expand_judge_user_request(user_request: str) -> str:
     """Expand compact / truncated judge args to the bound live user task."""
     raw = (user_request or "").strip()
-    bound = (get_active_user_prompt() or "").strip()
+    bound = _original_judge_request()
     if not bound:
         return raw
     low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
@@ -678,8 +691,18 @@ def _expand_judge_user_request(user_request: str) -> str:
 
 
 def _expand_judge_image_prompt(image_prompt: str) -> str:
-    """Expand compact / truncated image_prompt to the latest live generate prompt."""
+    """Use the original request as the judge target for a bound rollout.
+
+    Image lookup is independently scoped to the latest rollout PNG. Judging
+    against a rewritten diffusion prompt would let the agent move the target
+    away from the user's request during self-correction.
+    """
     raw = (image_prompt or "").strip()
+    original = _original_judge_request()
+    if original:
+        return original
+
+    # Direct calls without a bound user request retain the legacy behavior.
     latest = (get_latest_generate_prompt_for_active_rollout() or "").strip()
     low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
     if low in _JUDGE_PROMPT_PLACEHOLDERS:

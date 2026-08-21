@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -45,12 +46,17 @@ from verl_omni.agent_loop.agentic_trajectory_context import (
 
 logger = logging.getLogger(__name__)
 
-# WandB ``agentic_reward/*`` — only the scalar mix terms used in compute_score.
+# WandB ``agentic_reward/*`` — scorer fields that are present in the batch.
+# PR1 and RPCO share this list; absent fields are skipped.
 REWARD_COMPONENTS = (
     "reward_tool_call",
     "reward_correctness",
     "reward_aesthetics",
     "reward_done",
+    "reward_reflect",
+    "reward_plan",
+    "reward_format",
+    "reward_result",
 )
 REWARD_ARTIFACT_FIELDS = (
     *REWARD_COMPONENTS,
@@ -159,6 +165,26 @@ def _extract_generate_image_prompts(decoded_response: str) -> list[str]:
         if prompt:
             found.append((match.start(), prompt))
     return [prompt for _, prompt in sorted(found)]
+
+
+def _pair_generate_image_turns(decoded_response: str, image_paths: list[str]) -> list[tuple[str, str | None]]:
+    """Zip rewritten ``generate_image`` prompts with on-disk images."""
+    prompts = _extract_generate_image_prompts(decoded_response)
+    return [
+        (
+            prompts[index] if index < len(prompts) else "",
+            image_paths[index] if index < len(image_paths) else None,
+        )
+        for index in range(max(len(prompts), len(image_paths)))
+    ]
+
+
+def _val_generations_max_turns() -> int:
+    """Cap table columns to the live generate-image pass budget."""
+    try:
+        return max(1, int(os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")))
+    except ValueError:
+        return 3
 
 
 def aggregate_agentic_reward_metrics(non_tensor_batch: dict[str, Any]) -> dict[str, float]:
@@ -526,6 +552,10 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
         self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
+        # Store plain rows and rebuild media objects on each log. Reusing
+        # wandb.Image objects across copied tables can leave run summaries stale.
+        self._val_generations_history: dict[str, list[list[Any]]] = {}
+        self._val_viz_logged_steps: set[int] = set()
 
     def _dump_raw_rollouts(self, prompts, output, step) -> None:
         """Write user prompt + raw assistant turns only."""
@@ -727,7 +757,12 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
 
     def generate_sequences(self, prompts):
         step = prompts.meta_info.get("global_steps")
+        is_val = bool(prompts.meta_info.get("validate", False))
         output = super().generate_sequences(prompts)
+        if is_val:
+            self._log_val_reward_metrics(output, step)
+            self._generate_val_viz(step)
+            return output
         # Dump before discard so hermes_actions shows real policy decodes
         # (discard zeros response_mask, which would hide tool-less prose as env text).
         self._dump_raw_rollouts(prompts, output, step)
@@ -744,6 +779,145 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 # Logging must never fail or alter rollout generation.
                 logger.warning("Failed to log agentic reward metrics to W&B: %s", exc)
         return output
+
+    @staticmethod
+    def _log_val_reward_metrics(output: Any, step) -> None:
+        """Mirror training reward dimensions under ``val_agentic_reward/*``."""
+        try:
+            metrics = aggregate_agentic_reward_metrics(output.non_tensor_batch)
+            if not metrics:
+                return
+            import wandb
+
+            if wandb.run is not None:
+                wandb.log(
+                    {f"val_{key}": value for key, value in metrics.items()},
+                    step=int(step) if step is not None else None,
+                    commit=False,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to log val agentic reward metrics to W&B: %s", exc)
+
+    def _log_val_generations_table(
+        self,
+        step,
+        *,
+        table_key: str,
+        turn_pairs: list[tuple[str, str | None]],
+    ) -> None:
+        """Append one validation row and log the accumulated W&B table."""
+        import wandb
+
+        if wandb.run is None:
+            return
+        max_turns = _val_generations_max_turns()
+        columns = ["step"] + sum(
+            [[f"input_{index + 1}", f"output_{index + 1}"] for index in range(max_turns)],
+            [],
+        )
+        history_row: list[Any] = [int(step) if step is not None else -1]
+        for index in range(max_turns):
+            if index < len(turn_pairs):
+                prompt, path = turn_pairs[index]
+                history_row.extend([prompt or "", str(path) if path else ""])
+            else:
+                history_row.extend(["", ""])
+        history = self._val_generations_history.setdefault(table_key, [])
+        history.append(history_row)
+
+        table = wandb.Table(columns=columns)
+        for stored in history:
+            row: list[Any] = [stored[0]]
+            for index in range(max_turns):
+                row.append(stored[1 + 2 * index])
+                path = stored[2 + 2 * index]
+                row.append(wandb.Image(path) if path and Path(path).is_file() else "")
+            table.add_data(*row)
+        # Commit so W&B run summaries advance to the newly accumulated table.
+        wandb.log({table_key: table}, step=int(step) if step is not None else None)
+
+    def _generate_val_viz(self, step) -> None:
+        """Roll out a fixed cafe-poster task under reflect and plan prompts."""
+        if os.getenv("AGENTIC_VAL_VIZ", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+            return
+        try:
+            step_i = int(step) if step is not None else -1
+        except (TypeError, ValueError):
+            step_i = -1
+        if step_i in self._val_viz_logged_steps:
+            return
+        try:
+            from verl import DataProto
+
+            from verl_omni.utils.dataset.visual_reflection import build_unicot_agentic_rl
+
+            task = (
+                'A vertical artistic cafe poster. The headline at the top reads "ARTISAN ROAST". '
+                "The center features a warm-toned ceramic coffee cup on a rustic wooden table, "
+                "with soft steam and gentle morning sunlight through a nearby window. "
+                'The bottom text reads "Freshly Brewed Daily — Open at 7 AM". '
+                "Use cozy amber and brown grading and shallow depth of field."
+            )
+            user_text = build_unicot_agentic_rl._with_brevity(task)
+            viz_rows = (
+                (build_unicot_agentic_rl.REFLECT_SYSTEM_PROMPT, "reflect", "val/generations"),
+                (build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT, "plan", "val/generations_plan"),
+            )
+            non_tensor = {key: [] for key in ("raw_prompt", "index", "data_source", "reward_model", "extra_info")}
+            for offset, (system_prompt, task_type, _) in enumerate(viz_rows):
+                ground_truth = {
+                    "user_request": task,
+                    "task_type": task_type,
+                    "expected_num_images": 1,
+                }
+                if task_type == "plan":
+                    ground_truth["reference_subtasks"] = [task]
+                non_tensor["raw_prompt"].append(
+                    [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
+                )
+                non_tensor["index"].append(9001 + offset)
+                non_tensor["data_source"].append("agentic_val_viz")
+                non_tensor["reward_model"].append({"style": "rule", "ground_truth": ground_truth})
+                non_tensor["extra_info"].append(
+                    {
+                        "viz_id": f"{task_type}_prompt",
+                        "task_type": task_type,
+                        "expected_num_images": 1,
+                        "raw_prompt": task,
+                    }
+                )
+            batch = DataProto.from_single_dict(
+                {key: np.array(value, dtype=object) for key, value in non_tensor.items()}
+            )
+            batch.meta_info = {
+                "global_steps": step,
+                "validate": True,
+                "eos_token_id": getattr(self._monitor_tokenizer, "eos_token_id", None),
+                "pad_token_id": getattr(self._monitor_tokenizer, "pad_token_id", None),
+                "recompute_log_prob": False,
+                "do_sample": False,
+            }
+            output = super().generate_sequences(batch)
+            relpaths = output.non_tensor_batch.get("trajectory_relpath")
+            run_dir = _run_dir()
+            responses = output.batch["responses"]
+            for index, (_, _, table_key) in enumerate(viz_rows):
+                relpath = str(relpaths[index]) if relpaths is not None else ""
+                decoded = self._monitor_tokenizer.decode(responses[index].tolist(), skip_special_tokens=False)
+                image_paths = _materialize_rollout_images(
+                    decoded_response=decoded,
+                    run_dir=run_dir,
+                    relpath=relpath,
+                    user_prompt=task,
+                )
+                self._log_val_generations_table(
+                    step,
+                    table_key=table_key,
+                    turn_pairs=_pair_generate_image_turns(decoded, image_paths),
+                )
+            self._val_viz_logged_steps.add(step_i)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to generate/log val viz rollouts: %s", exc)
 
     @staticmethod
     def _discard_invalid_rollouts(output: Any) -> None:
