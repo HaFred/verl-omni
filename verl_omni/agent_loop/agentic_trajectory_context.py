@@ -223,6 +223,39 @@ def register_tool_artifact(
             _latest_image_by_rollout[rid] = png
 
 
+def _entry_belongs_to_active_rollout(entry: dict, rid: str | None, relpath: str | None) -> bool:
+    if rid and entry.get("rollout_id") == rid:
+        return True
+    if not rid and relpath and entry.get("trajectory_relpath") == relpath:
+        return True
+    return False
+
+
+def clear_tool_artifacts_for_active_rollout() -> None:
+    """Drop registry rows and indexes for the active rollout (not other in-flight samples)."""
+    rid = get_active_rollout_id()
+    relpath = get_active_trajectory_relpath()
+    if not rid and not relpath:
+        set_latest_tool_image_path(None)
+        return
+    with _artifact_registry_lock:
+        kept: list[dict] = []
+        drop_ids: list[str] = []
+        for entry in _artifact_registry:
+            if _entry_belongs_to_active_rollout(entry, rid, relpath):
+                aid = entry.get("artifact_id")
+                if aid:
+                    drop_ids.append(str(aid))
+            else:
+                kept.append(entry)
+        _artifact_registry[:] = kept
+        for aid in drop_ids:
+            _artifact_by_id.pop(aid, None)
+        if rid:
+            _latest_image_by_rollout.pop(rid, None)
+    set_latest_tool_image_path(None)
+
+
 def count_live_generate_artifacts_for_active_rollout() -> int:
     """Count successful live ``generate_image`` PNGs for the active rollout.
 
@@ -324,8 +357,8 @@ def get_latest_tool_image_path() -> str | None:
 
 
 def clear_latest_tool_image_for_active_rollout() -> None:
-    """Drop the latest-image pointer for the active rollout_id."""
-    set_latest_tool_image_path(None)
+    """Drop this rollout's latest-image pointer, artifact registry rows, and id index."""
+    clear_tool_artifacts_for_active_rollout()
 
 
 def set_good_enough_yes_reached(reached: bool) -> contextvars.Token:

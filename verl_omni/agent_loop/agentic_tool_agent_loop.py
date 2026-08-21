@@ -55,6 +55,7 @@ from verl_omni.agent_loop.agentic_trajectory_context import (
     clear_good_enough_yes_reached,
     clear_latest_tool_image_for_active_rollout,
     get_active_trajectory_relpath,
+    reset_active_trajectory_relpath,
     set_active_trajectory_relpath,
 )
 
@@ -313,8 +314,9 @@ class AgenticToolAgentLoop(ToolAgentLoop):
         self._agentic_trajectory_relpath = (
             kwargs.pop("_agentic_trajectory_relpath", None) or get_active_trajectory_relpath()
         )
+        path_tokens = None
         if self._agentic_trajectory_relpath:
-            set_active_trajectory_relpath(self._agentic_trajectory_relpath)
+            path_tokens = set_active_trajectory_relpath(self._agentic_trajectory_relpath)
         clear_good_enough_yes_reached()
         clear_latest_tool_image_for_active_rollout()
         try:
@@ -335,18 +337,27 @@ class AgenticToolAgentLoop(ToolAgentLoop):
             output.extra_fields["trajectory_relpath"] = self._agentic_trajectory_relpath or ""
             return output
         finally:
+            # Prune while this rollout's ContextVar is still bound, then restore
+            # the worker's outer token (nested set/reset must stay LIFO).
             clear_good_enough_yes_reached()
             clear_latest_tool_image_for_active_rollout()
+            if path_tokens is not None:
+                reset_active_trajectory_relpath(path_tokens)
 
     async def _call_tool(self, tool_call, tools_kwargs, agent_data):
         # ``FunctionTool.call`` uses ``asyncio.to_thread`` (context copied at schedule
         # time). Re-bind the active relpath immediately before each tool so concurrent
         # sibling rollouts cannot leave a stale ContextVar on this task.
         relpath = getattr(self, "_agentic_trajectory_relpath", None) or get_active_trajectory_relpath()
+        path_tokens = None
         if relpath:
-            set_active_trajectory_relpath(relpath)
+            path_tokens = set_active_trajectory_relpath(relpath)
             agent_data.extra_fields["trajectory_relpath"] = relpath
-        return await super()._call_tool(tool_call, tools_kwargs, agent_data)
+        try:
+            return await super()._call_tool(tool_call, tools_kwargs, agent_data)
+        finally:
+            if path_tokens is not None:
+                reset_active_trajectory_relpath(path_tokens)
 
     async def _rewrite_premature_judge_to_generate(self, agent_data: AgentData) -> AgentState | None:
         """Replace a first-turn ``judge_image`` call with ``generate_image`` (mask=1)."""

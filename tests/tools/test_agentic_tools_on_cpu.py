@@ -21,10 +21,14 @@ import base64
 import importlib.util
 import io
 
+import pytest
 from PIL import Image
 
+from verl_omni.agent_loop import agentic_trajectory_context as _traj_ctx
 from verl_omni.agent_loop.agentic_metrics_manager import AgenticAgentLoopWorker
 from verl_omni.agent_loop.agentic_trajectory_context import (
+    clear_latest_tool_image_for_active_rollout,
+    count_live_generate_artifacts_for_active_rollout,
     register_tool_artifact,
     reset_active_trajectory_relpath,
     reset_active_user_prompt,
@@ -47,6 +51,23 @@ def _load_tools_module():
 
 
 tools = _load_tools_module()
+
+
+def _clear_all_tool_artifacts() -> None:
+    """Test-only: wipe the process-global generate_image registry between cases."""
+    with _traj_ctx._artifact_registry_lock:
+        _traj_ctx._artifact_registry.clear()
+        _traj_ctx._artifact_by_id.clear()
+        _traj_ctx._latest_image_by_rollout.clear()
+    _traj_ctx.set_latest_tool_image_path(None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tool_artifact_registry():
+    """Prior tests share ``step_*/sample_*`` keys; wipe leftover registry rows."""
+    _clear_all_tool_artifacts()
+    yield
+    _clear_all_tool_artifacts()
 
 
 def _png_b64(color=(12, 34, 56)) -> str:
@@ -143,6 +164,38 @@ def test_expand_judge_image_prompt_to_latest_live_prompt(tmp_path):
         assert tools._expand_judge_image_prompt("") == "latest diffusion prompt"
     finally:
         reset_active_trajectory_relpath(tokens)
+
+
+def test_clear_latest_image_prunes_only_active_rollout_registry(tmp_path):
+    png_a = tmp_path / "a.png"
+    png_b = tmp_path / "b.png"
+    Image.new("RGB", (1, 1), (1, 2, 3)).save(png_a)
+    Image.new("RGB", (1, 1), (4, 5, 6)).save(png_b)
+
+    tokens_a = set_active_trajectory_relpath("step_000001/sample_0.00")
+    register_tool_artifact(prompt="prompt a", paths=[str(png_a)], backend="qwen_image")
+    assert count_live_generate_artifacts_for_active_rollout() == 1
+    reset_active_trajectory_relpath(tokens_a)
+
+    tokens_b = set_active_trajectory_relpath("step_000001/sample_1.00")
+    register_tool_artifact(prompt="prompt b", paths=[str(png_b)], backend="qwen_image")
+    assert count_live_generate_artifacts_for_active_rollout() == 1
+    reset_active_trajectory_relpath(tokens_b)
+
+    tokens_a = set_active_trajectory_relpath("step_000001/sample_0.00")
+    try:
+        clear_latest_tool_image_for_active_rollout()
+        assert count_live_generate_artifacts_for_active_rollout() == 0
+    finally:
+        reset_active_trajectory_relpath(tokens_a)
+
+    tokens_b = set_active_trajectory_relpath("step_000001/sample_1.00")
+    try:
+        assert count_live_generate_artifacts_for_active_rollout() == 1
+        clear_latest_tool_image_for_active_rollout()
+        assert count_live_generate_artifacts_for_active_rollout() == 0
+    finally:
+        reset_active_trajectory_relpath(tokens_b)
 
 
 def test_decode_images_base64():
