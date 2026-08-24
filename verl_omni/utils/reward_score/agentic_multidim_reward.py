@@ -15,12 +15,13 @@
 
 Reward set (VisionCreator-R1, arXiv:2603.08812, §4.1/§4.3):
 
-  R_reflect — satisfied-checkpoint ratio on the final accepted image. The live
-      ``judge_image`` facets are the checkpoints; quality is the mean of the
-      last successful judge's correctness/aesthetics. When a UniCoT reference
-      summary exists (``gt.reference_steps``), lexical coverage of the agent's
-      ``Reflection:`` against that reference is blended in (0.5 quality +
-      0.5 coverage), grounding the signal in the dataset's eval summaries.
+  R_reflect — continuous last-image quality from live ``judge_image`` C/A
+      (mean of the **final** successful judge, not the first ``good_enough=YES``).
+      Optionally mixed with a light lexical regularizer and a rewrite-delta
+      term: ``0.70 * last_CA + 0.20 * coverage + 0.10 * max(0, last_CA - first_CA)``.
+      ``good_enough`` is not used as a binary gate on this dim. Also emitted as
+      ``reward_correctness`` / ``reward_aesthetics`` (last image) and
+      ``first_correctness`` / ``first_aesthetics``.
   R_plan    — requirement coverage of the agent's plan lines against the
       reference subtasks (per-subtask best token overlap, then mean). Applied
       only on plan rows (``gt.reference_subtasks``). Zero when no plan text.
@@ -38,10 +39,9 @@ Reward set (VisionCreator-R1, arXiv:2603.08812, §4.1/§4.3):
       emitted as ``reward_done`` for the ``agentic_reward/done`` WandB series.
 
 Total: ``score = (1/|W|) * sum(w_i * R_i)`` over the active set W (dims with
-``w_* > 0`` that apply to the row's task type). Default weights are 1.0 (paper
-default); the UniCoT builder bakes per-row weights into ``ground_truth``.
-``w_* > 0`` that apply to the row's task type). Default weights are 1.0 (paper
-default); the UniCoT builder bakes per-row weights into ``ground_truth``.
+``w_* > 0`` that apply to the row's task type). Default weights are 1.0 except
+``w_reflect=1.5`` so last-image C/A outranks format/tool presence. ``RPCO_W_*``
+env vars override parquet-baked ``w_*`` without a rebuild.
 
 Gating kept from PR 1: no ``generate_image`` / no successful PNG → score 0 and
 ``rollout_valid=0`` (rollout is discarded from the GRPO update). Env-injected
@@ -50,6 +50,7 @@ Gating kept from PR 1: no ``generate_image`` / no successful PNG → score 0 and
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any
 
@@ -75,11 +76,27 @@ from verl_omni.utils.reward_score.agentic_reward import (
 )
 
 DIMS = ("reflect", "plan", "format", "tool_call", "result")
+# Slightly overweight last-image C/A so GRPO prefers better generate_image
+# prompts / useful rewrites over protocol-only dims.
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "reflect": 1.5,
+    "plan": 1.0,
+    "format": 1.0,
+    "tool_call": 1.0,
+    "result": 1.0,
+}
 # Always emit these so Ray `_postprocess` (keys taken from sample 0) cannot
 # KeyError when one rollout is valid and another hits an early-zero path.
 _SCHEMA_EXTRAS: dict[str, float | str | int | None] = {
     **{f"reward_{dim}": 0.0 for dim in DIMS},
     "reward_done": 0.0,
+    "reward_correctness": 0.0,
+    "reward_aesthetics": 0.0,
+    "first_correctness": 0.0,
+    "first_aesthetics": 0.0,
+    "reward_reflect_delta": 0.0,
+    "rewrite_improve_frac": 0.0,
+    "n_images_to_best": 0,
     "terminal_done": 0,
     "terminal_policy_reflection": 0,
     "forced_reflection_context": 0,
@@ -92,15 +109,14 @@ _SCHEMA_EXTRAS: dict[str, float | str | int | None] = {
 def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
     out = _pr1_zero_result(method=method)
     out.update(_SCHEMA_EXTRAS)
-    # PR 1 C/A mix terms are not part of the RPCO score; drop the inherited
-    # stub zeros so WandB ``agentic_reward/{correctness,aesthetics}`` is not
-    # logged as a perpetual all-zero series under this scorer.
+    # Keep last-image C/A (and first-image / delta) so WandB can plot continuous
+    # quality. Facet breakdowns from PR 1 remain unused here.
     for key in list(out):
-        if key == "reward_correctness" or key == "reward_aesthetics" or key.startswith(
-            ("reward_correctness_", "reward_aesthetics_")
-        ):
+        if key.startswith("reward_correctness_") or key.startswith("reward_aesthetics_"):
             out.pop(key, None)
     return out
+
+
 _PLAN_HEADER_RE = re.compile(r"\bPlan\s*:", re.IGNORECASE)
 _PLAN_ITEM_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+(.+)$")
 _FINDINGS_RE = re.compile(r"(?im)^\s*(?:findings|suggested_fixes)\s*:\s*(.*)$")
@@ -160,26 +176,62 @@ def _reference_reflection_text(gt: dict[str, Any]) -> str:
     return " ".join(str(step.get("reflection") or "") for step in steps if isinstance(step, dict)).strip()
 
 
-def _reflection_reward(blob: str, *, gt: dict[str, Any]) -> tuple[float, float]:
-    """``(R_reflect, quality)`` — satisfied-checkpoint ratio (+ reference coverage)."""
-    hits = _iter_successful_judge_scores(blob)
-    quality = 0.0
-    if hits:
-        for c, a, good_enough, _ in hits:
-            if good_enough is True:
-                quality = 0.5 * (c + a)
-                break
-        else:
-            c, a, _, _ = hits[-1]
-            quality = 0.5 * (c + a)
+def _judge_ca_series(blob: str) -> list[tuple[float, float]]:
+    """Successful ``judge_image`` C/A pairs in order. ``good_enough`` is ignored."""
+    return [(float(c), float(a)) for c, a, _, _ in _iter_successful_judge_scores(blob)]
+
+
+def _first_last_judge_ca(blob: str) -> tuple[float, float, float, float]:
+    """Continuous first/last-image C/A. Zeros when no successful judge."""
+    series = _judge_ca_series(blob)
+    if not series:
+        return 0.0, 0.0, 0.0, 0.0
+    first_c, first_a = series[0]
+    last_c, last_a = series[-1]
+    return first_c, first_a, last_c, last_a
+
+
+def _rewrite_improve_stats(blob: str) -> tuple[float, int]:
+    """``(frac of judge-to-judge C/A lifts, 1-indexed judge of max C/A)``."""
+    series = _judge_ca_series(blob)
+    if not series:
+        return 0.0, 0
+    cas = [0.5 * (c + a) for c, a in series]
+    if len(cas) >= 2:
+        n_up = sum(1 for i in range(1, len(cas)) if cas[i] > cas[i - 1])
+        frac = n_up / float(len(cas) - 1)
+    else:
+        frac = 0.0
+    best_i = max(range(len(cas)), key=lambda i: (cas[i], -i))
+    return float(frac), int(best_i + 1)
+
+
+def _reflection_reward(blob: str, *, gt: dict[str, Any]) -> tuple[float, float, float, float, float]:
+    """``(R_reflect, last_c, last_a, first_c, first_a)``.
+
+    Last-image quality is the mean of the **final** successful judge's C/A
+    (continuous in [0, 1]). Lexical coverage of GT / judge feedback is a light
+    regularizer, not a 50/50 mix. Rewrite delta ``max(0, last_CA - first_CA)``
+    credits improvements without punishing a strong first image.
+    """
+    first_c, first_a, last_c, last_a = _first_last_judge_ca(blob)
+    last_ca = 0.5 * (last_c + last_a)
+    first_ca = 0.5 * (first_c + first_a)
+    delta = max(0.0, last_ca - first_ca)
+
+    coverage = 0.0
     reference = _reference_reflection_text(gt)
     if reference:
         coverage = _coverage(_reflection_text(blob), reference)
-        return 0.5 * quality + 0.5 * coverage, quality
-    feedback = _judge_feedback_text(blob)
-    if feedback:
-        return 0.5 * quality + 0.5 * _coverage(_reflection_text(blob), feedback), quality
-    return quality, quality
+    else:
+        feedback = _judge_feedback_text(blob)
+        if feedback:
+            coverage = _coverage(_reflection_text(blob), feedback)
+
+    if last_ca <= 0.0 and coverage <= 0.0:
+        return 0.0, last_c, last_a, first_c, first_a
+    r_reflect = 0.70 * last_ca + 0.20 * coverage + 0.10 * delta
+    return float(r_reflect), last_c, last_a, first_c, first_a
 
 
 def _plan_reward(blob: str, *, gt: dict[str, Any]) -> float:
@@ -232,7 +284,21 @@ def _result_reward(
     return 1.0 if (n_successful_gens <= expected or last_yes) else 0.0
 
 
+def _env_weight_override(dim: str) -> float | None:
+    """``RPCO_W_REFLECT`` / ``RPCO_W_PLAN`` / … beat parquet-baked ``w_*``."""
+    raw = os.environ.get(f"RPCO_W_{dim.upper()}")
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def _weight_raw(gt: dict[str, Any], extra_info: dict[str, Any], dim: str) -> Any:
+    env_w = _env_weight_override(dim)
+    if env_w is not None:
+        return env_w
     raw = extra_info.get(f"w_{dim}")
     if raw is None:
         raw = gt.get(f"w_{dim}")
@@ -250,10 +316,11 @@ def _active_weights(gt: dict[str, Any], extra_info: dict[str, Any], *, task_type
         if dim == "plan" and task_type != "plan":
             continue
         raw = _weight_raw(gt, extra_info, dim)
+        default = DEFAULT_WEIGHTS.get(dim, 1.0)
         try:
-            weight = float(raw if raw is not None else 1.0)
+            weight = float(raw if raw is not None else default)
         except (TypeError, ValueError):
-            weight = 1.0
+            weight = default
         if weight > 0.0:
             weights[dim] = weight
     return weights
@@ -323,8 +390,10 @@ def compute_score(
     f_tool_call = 1.0 if calls else 0.0
     f_done = 1.0 if closed else 0.0
 
+    r_reflect, last_c, last_a, first_c, first_a = _reflection_reward(blob, gt=gt)
+    rewrite_improve_frac, n_images_to_best = _rewrite_improve_stats(blob)
     rewards = {
-        "reflect": _reflection_reward(blob, gt=gt)[0],
+        "reflect": r_reflect,
         "plan": _plan_reward(blob, gt=gt),
         "format": _format_reward(blob, task_type=task_type, n_successful_gens=n_successful_gens),
         "tool_call": f_tool_call,
@@ -346,6 +415,13 @@ def compute_score(
             "score": float(min(1.0, score)),
             **{f"reward_{dim}": float(rewards[dim]) for dim in DIMS},
             "reward_done": float(f_done),
+            "reward_correctness": float(last_c),
+            "reward_aesthetics": float(last_a),
+            "first_correctness": float(first_c),
+            "first_aesthetics": float(first_a),
+            "reward_reflect_delta": float(max(0.0, 0.5 * (last_c + last_a) - 0.5 * (first_c + first_a))),
+            "rewrite_improve_frac": float(rewrite_improve_frac),
+            "n_images_to_best": int(n_images_to_best),
             "protocol_ok": int(rewards["format"] == 1.0),
             "rewrite_after_yes": int(n_rewrite_after_yes),
             "rollout_valid": 1,

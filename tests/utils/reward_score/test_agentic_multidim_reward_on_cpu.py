@@ -20,6 +20,12 @@ import pytest
 from verl_omni.utils.reward_score.agentic_multidim_reward import compute_score
 
 
+@pytest.fixture(autouse=True)
+def _clear_rpco_weight_env(monkeypatch):
+    for dim in ("REFLECT", "PLAN", "FORMAT", "TOOL_CALL", "RESULT", "TOOL"):
+        monkeypatch.delenv(f"RPCO_W_{dim}", raising=False)
+
+
 def _gen_call(prompt: str) -> str:
     payload = json.dumps({"name": "generate_image", "arguments": {"prompt": prompt}})
     return f"<tool_call>\n{payload}\n</tool_call>"
@@ -107,6 +113,11 @@ def test_closed_reflect_trajectory_scores_near_full():
     assert out["reward_result"] == 1.0
     assert out["reward_done"] == 1.0
     assert 0.5 < out["reward_reflect"] <= 1.0
+    assert out["reward_correctness"] == pytest.approx(0.80)
+    assert out["reward_aesthetics"] == pytest.approx(0.76)
+    assert out["first_correctness"] == pytest.approx(0.80)
+    assert out["first_aesthetics"] == pytest.approx(0.76)
+    assert out["reward_reflect_delta"] == pytest.approx(0.0)
     assert out["reward_plan"] == 0.0
     assert out["score"] > 0.9
     assert out["n_successful_generates"] == 1
@@ -284,7 +295,8 @@ def test_weighted_total_respects_active_set():
             },
         ]
     )
-    base = compute_score(solution_str=blob, ground_truth=gt)
+    equal = {f"w_{dim}": 1.0 for dim in ("reflect", "format", "tool_call", "result")}
+    base = compute_score(solution_str=blob, ground_truth={**gt, **equal})
 
     # w_plan is ignored on reflect rows (not in the active set W).
     gt_plan_heavy = {**gt, **{f"w_{dim}": 1.0 for dim in ("reflect", "plan", "format", "tool_call", "result")}}
@@ -322,6 +334,11 @@ def _assert_full_schema(out: dict) -> None:
     assert "reward_tool" not in out
     for key in (
         "reward_done",
+        "reward_correctness",
+        "reward_aesthetics",
+        "first_correctness",
+        "first_aesthetics",
+        "reward_reflect_delta",
         "num_hermes_tool_calls",
         "num_generate_image_prompts",
         "num_judge_image_calls",
@@ -342,10 +359,66 @@ def test_full_schema_is_emitted():
     _assert_full_schema(compute_score(solution_str="Reflection: Done.", ground_truth=_gt()))
 
 
-def test_multidim_does_not_emit_pr1_correctness_aesthetics():
+def test_multidim_emits_continuous_first_and_last_ca():
     out = compute_score(solution_str=_closed_reflect_trajectory(), ground_truth=_gt())
-    assert "reward_correctness" not in out
-    assert "reward_aesthetics" not in out
+    assert out["reward_correctness"] == pytest.approx(0.80)
+    assert out["reward_aesthetics"] == pytest.approx(0.76)
     empty = compute_score(solution_str="", ground_truth=_gt())
-    assert "reward_correctness" not in empty
-    assert "reward_aesthetics" not in empty
+    assert empty["reward_correctness"] == 0.0
+    assert empty["reward_aesthetics"] == 0.0
+
+
+def test_reflect_uses_last_image_ca_not_first_yes():
+    prompt = "A poster."
+    blob = "\n".join(
+        [
+            _gen_call(prompt),
+            _gen_obs("/tmp/x/image_00.png", prompt),
+            _judge_call(),
+            _judge_obs("/tmp/x/image_00.png", correctness=0.90, aesthetics=0.90, good_enough=True, findings="ok"),
+            _gen_call("rewrite"),
+            _gen_obs("/tmp/x/image_01.png", "rewrite"),
+            _judge_call(),
+            _judge_obs("/tmp/x/image_01.png", correctness=0.40, aesthetics=0.40, good_enough=False, findings="worse"),
+            "Reflection: The rewrite made it worse. Done.",
+        ]
+    )
+    out = compute_score(solution_str=blob, ground_truth=_gt())
+    assert out["first_correctness"] == pytest.approx(0.90)
+    assert out["reward_correctness"] == pytest.approx(0.40)
+    assert out["reward_aesthetics"] == pytest.approx(0.40)
+    assert out["reward_reflect_delta"] == pytest.approx(0.0)
+    assert out["rewrite_improve_frac"] == pytest.approx(0.0)
+    assert out["n_images_to_best"] == 1
+
+    blob_up = "\n".join(
+        [
+            _gen_call(prompt),
+            _gen_obs("/tmp/x/image_00.png", prompt),
+            _judge_call(),
+            _judge_obs("/tmp/x/image_00.png", correctness=0.40, aesthetics=0.40, good_enough=False, findings="weak"),
+            _gen_call("better rewrite"),
+            _gen_obs("/tmp/x/image_01.png", "better rewrite"),
+            _judge_call(),
+            _judge_obs("/tmp/x/image_01.png", correctness=0.85, aesthetics=0.85, good_enough=False, findings="better"),
+            "Reflection: The rewrite improved the poster. Done.",
+        ]
+    )
+    up = compute_score(solution_str=blob_up, ground_truth=_gt())
+    assert up["reward_correctness"] == pytest.approx(0.85)
+    assert up["first_correctness"] == pytest.approx(0.40)
+    assert up["reward_reflect_delta"] == pytest.approx(0.45)
+    assert up["rewrite_improve_frac"] == pytest.approx(1.0)
+    assert up["n_images_to_best"] == 2
+    assert up["reward_reflect"] > out["reward_reflect"]
+
+
+def test_env_reflect_weight_overrides_parquet(monkeypatch):
+    blob = _closed_reflect_trajectory()
+    gt = _gt(w_reflect=1.0, w_format=1.0, w_tool_call=1.0, w_result=1.0)
+    base = compute_score(solution_str=blob, ground_truth=gt)
+    monkeypatch.setenv("RPCO_W_REFLECT", "9.0")
+    heavy = compute_score(solution_str=blob, ground_truth=gt)
+    # Heavier last-image C/A pull moves the mix toward reward_reflect.
+    assert heavy["reward_reflect"] == pytest.approx(base["reward_reflect"])
+    assert abs(heavy["score"] - heavy["reward_reflect"]) < abs(base["score"] - base["reward_reflect"])

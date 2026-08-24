@@ -278,19 +278,20 @@ computes the stage-3 set {reflection, plan, format, tool_call, result}:
 
 | Dim | Range | Computed by | What it measures |
 | --- | --- | --- | --- |
-| `R_reflect` | [0,1] | live judge C/A (checkpoint quality) + lexical coverage vs. reference `eval_summary` / judge findings | reflection quality on the final image |
+| `R_reflect` | [0,1] | **last** successful judge C/A (continuous; not `good_enough` YES/NO), plus light lexical coverage and `max(0, last_CA − first_CA)` | last-image quality and rewrite lift |
 | `R_plan` | [0,1] | per-subtask best token coverage of the agent's plan lines vs. reference subtasks | plan completeness (plan rows only) |
 | `R_format` | [0,1] | rule-based check ratio | well-formed tool calls, judge-after-final-gen, tags, terminal `Done.` |
 | `R_tool_call` | {0,1} | rule-based | tool-call presence (`f_tool_call`): 1.0 iff any tool call was parsed; same `reward_tool_call` key as PR 1 |
 | `R_result` | {0,1} | rule-based | plan rows: exact image-count match; reflect rows: lenient stop-validity (terminal `Done.` + count ≤ reference, or final judge YES) |
 | `R_done` (logged only) | {0,1} | rule-based | PR 1's `f_done` closed-loop indicator, emitted as `reward_done` for the `agentic_reward/done` WandB series — not part of the score's W |
 
-Total: `score = (1/|W|) * sum(w_i * R_i)` over the active set W per row, all
-weights 1.0 by default (paper default); override with `RPCO_W_*` env vars at
-data-build time. Gating kept from PR 1: no successful `generate_image` ⇒
+Total: `score = (1/|W|) * sum(w_i * R_i)` over the active set W per row.
+Default `w_reflect=1.5` (other dims 1.0) so last-image C/A outranks protocol-only
+dims. `RPCO_W_*` env vars override parquet-baked `w_*` at **score time** (not
+only at data-build). Gating kept from PR 1: no successful `generate_image` ⇒
 `score=0`, `rollout_valid=0` (rollout discarded from the update). WandB logs
-`agentic_reward/{reflect,plan,format,tool_call,result,done}/{mean,min,max}`
-(not `correctness`/`aesthetics` — those are PR 1-only).
+`agentic_reward/{reflect,plan,format,tool_call,result,done,correctness,aesthetics,reflect_delta}/{mean,min,max}`
+plus first-image C/A on artifacts.
 
 ### Run
 

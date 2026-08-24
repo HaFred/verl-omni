@@ -50,7 +50,6 @@ logger = logging.getLogger(__name__)
 # Absent keys are skipped, so PR 1 (C/A) and PR 2 (RPCO dims) share this list
 # without forcing zeros for the inactive scorer.
 REWARD_COMPONENTS = (
-    # PR 1 ``agentic_reward`` gated mix (not emitted by ``agentic_multidim_reward``).
     "reward_tool_call",
     "reward_correctness",
     "reward_aesthetics",
@@ -60,6 +59,7 @@ REWARD_COMPONENTS = (
     "reward_plan",
     "reward_format",
     "reward_result",
+    "reward_reflect_delta",
 )
 REWARD_ARTIFACT_FIELDS = (
     *REWARD_COMPONENTS,
@@ -74,7 +74,10 @@ REWARD_ARTIFACT_FIELDS = (
     "reward_delta_c",
     "reward_rewrite_yes",
     "first_correctness",
+    "first_aesthetics",
     "first_judge_no",
+    "rewrite_improve_frac",
+    "n_images_to_best",
     "rollout_valid",
 )
 _TOOL_CALL_RE = re.compile(

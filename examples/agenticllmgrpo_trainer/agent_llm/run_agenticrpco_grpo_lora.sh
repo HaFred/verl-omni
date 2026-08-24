@@ -12,11 +12,11 @@
 #   # pane B — image judge server (GPU 0):
 #   CUDA_VISIBLE_DEVICES=0 \
 #     bash examples/agenticllmgrpo_trainer/agent_llm/run_judge_image_tool_server.sh
-#   # pane C — training on GPUs that are NOT serving gen/judge (this box: 0,1):
-#   CUDA_VISIBLE_DEVICES=2,3 N_GPUS=2 TOTAL_STEPS=200 \
-#     bash examples/agenticllmgrpo_trainer/agent_llm/run_agentic_rpco.sh
+#   # pane C — training on GPUs that are NOT serving gen/judge (this box: 4,5):
+#   CUDA_VISIBLE_DEVICES=4,5 N_GPUS=2 TOTAL_STEPS=200 \
+#     bash examples/agenticllmgrpo_trainer/agent_llm/run_agenticrpco_grpo_lora.sh
 #   CUDA_VISIBLE_DEVICES=2,3,4,5 N_GPUS=4 TOTAL_STEPS=200 \
-#     bash examples/agenticllmgrpo_trainer/agent_llm/run_agentic_rpco.sh
+#     bash examples/agenticllmgrpo_trainer/agent_llm/run_agenticrpco_grpo_lora.sh
 #
 # Optional stage-1 init (strong-reflection checkpoint from a prior run):
 #   RPCO_INIT_CKPT=/path/to/stage1_ckpt \
@@ -97,15 +97,19 @@ export AGENTIC_E2E_RUN_NAME="${EXPERIMENT_NAME}"
 # summary: idx 1/2/3… for steps 0/10/20…; see agentic_metrics_manager).
 export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 export UNICOT_BREAKDOWN_DIR UNICOT_REFLECTION_DIR UNICOT_MIX_RATIO UNICOT_VAL_RATIO UNICOT_SPLIT_SEED
-# Per-dimension weights (VisionCreator-R1 default: all 1.0). Forward any
-# RPCO_W_* overrides to the data builder so they land in gt/extra_info.
+# Per-dimension weights. Default ``w_reflect=1.5`` so last-image C/A outranks
+# format/tool presence. RPCO_W_* env vars override parquet-baked ``w_*``.
 if [[ -z "${RPCO_W_TOOL_CALL:-}" && -n "${RPCO_W_TOOL:-}" ]]; then
   export RPCO_W_TOOL_CALL="${RPCO_W_TOOL}"
 fi
 for _dim in REFLECT PLAN FORMAT TOOL_CALL RESULT; do
   _key="RPCO_W_${_dim}"
   if [[ -z "${!_key:-}" ]]; then
-    export "${_key}=1.0"
+    if [[ "${_dim}" == "REFLECT" ]]; then
+      export "${_key}=1.5"
+    else
+      export "${_key}=1.0"
+    fi
   fi
 done
 
@@ -150,7 +154,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     data.train_files=$TRAIN_FILE \
     data.val_files=$VAL_FILE \
-    data.train_batch_size=${TRAIN_BATCH_SIZE:-16} \
+    data.train_batch_size=$TRAIN_BATCH_SIZE \
     data.max_prompt_length=$MAX_PROMPT_LEN \
     data.max_response_length=$MAX_RESP_LEN \
     data.filter_overlong_prompts=true \
