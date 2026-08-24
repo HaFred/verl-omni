@@ -74,7 +74,9 @@ The reason that we log all the inputs here only (no output) except for the force
 }
 ```
 
-# Larger flowchart with some styling
+# Demo: fewshot overfit + val prompt
+
+The fewshots in prompt do NOT include the cafe poster prompt illustrated as below.
 
 Multiturn tool calling + prompt rewriting for the cafe poster trajectory above
 (JSON example). Each dump turn is an **agent LLM sample step**; diffusion /
