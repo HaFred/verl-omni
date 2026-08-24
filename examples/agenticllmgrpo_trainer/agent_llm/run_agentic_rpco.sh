@@ -130,16 +130,21 @@ if [[ -z "${AGENTIC_VLLM_URL:-}" ]]; then
 fi
 
 # Build the mixed UniCoT train/val parquet (system + user only; UniCoT fields
-# are reward ground truth, never fewshot).
-python3 -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl \
-    --breakdown_dir "$UNICOT_BREAKDOWN_DIR" \
-    --reflection_dir "$UNICOT_REFLECTION_DIR" \
-    --local_save_dir "$(dirname "$TRAIN_FILE")" \
-    --mix_ratio "$UNICOT_MIX_RATIO" \
-    --val_ratio "$UNICOT_VAL_RATIO" \
-    --seed "$UNICOT_SPLIT_SEED" \
-    ${UNICOT_TRAIN_SIZE:+--train_size "$UNICOT_TRAIN_SIZE"} \
-    ${UNICOT_VAL_SIZE:+--val_size "$UNICOT_VAL_SIZE"}
+# are reward ground truth, never fewshot). Skip when both files already exist
+# unless REBUILD_UNICOT=1 (avoids import-heavy rebuild on resume).
+if [[ "${REBUILD_UNICOT:-0}" == "1" || ! -f "$TRAIN_FILE" || ! -f "$VAL_FILE" ]]; then
+  python3 -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl \
+      --breakdown_dir "$UNICOT_BREAKDOWN_DIR" \
+      --reflection_dir "$UNICOT_REFLECTION_DIR" \
+      --local_save_dir "$(dirname "$TRAIN_FILE")" \
+      --mix_ratio "$UNICOT_MIX_RATIO" \
+      --val_ratio "$UNICOT_VAL_RATIO" \
+      --seed "$UNICOT_SPLIT_SEED" \
+      ${UNICOT_TRAIN_SIZE:+--train_size "$UNICOT_TRAIN_SIZE"} \
+      ${UNICOT_VAL_SIZE:+--val_size "$UNICOT_VAL_SIZE"}
+else
+  echo "[INFO] reusing existing UniCoT parquet: $TRAIN_FILE / $VAL_FILE (set REBUILD_UNICOT=1 to rebuild)"
+fi
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \

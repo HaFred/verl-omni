@@ -16,6 +16,7 @@
 import numpy as np
 import pytest
 
+import verl_omni.agent_loop.agentic_metrics_manager as metrics_module
 from verl_omni.agent_loop.agentic_metrics_manager import (
     AgenticMetricsAgentLoopManager,
     _pair_generate_image_turns,
@@ -121,9 +122,10 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
             self.path = str(path)
 
     class _FakeTable:
-        def __init__(self, columns, data=None):
+        def __init__(self, columns, data=None, log_mode="IMMUTABLE"):
             self.columns = columns
             self.data = list(data or [])
+            self.log_mode = log_mode
 
         def add_data(self, *row):
             self.data.append(list(row))
@@ -135,9 +137,7 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
         run=_FakeRun(),
         Image=_FakeImage,
         Table=_FakeTable,
-        log=lambda payload, step=None, commit=True: logged.append(
-            {"payload": payload, "step": step, "commit": commit}
-        ),
+        log=lambda payload, step=None, commit=True: logged.append({"payload": payload, "step": step, "commit": commit}),
     )
     monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
     monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "2")
@@ -149,6 +149,7 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
 
     manager = types.SimpleNamespace(
         _val_generations_history={},
+        _val_generations_tables={},
         _log_val_generations_table=AgenticMetricsAgentLoopManager._log_val_generations_table,
     )
 
@@ -172,3 +173,115 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     assert latest.data[1][1] == "p10"
     assert latest.data[2][2] == ""
     assert len(manager._val_generations_history["val/generations"]) == 3
+    assert latest.log_mode == "MUTABLE"
+    # All logs reuse one mutable object instead of creating immutable
+    # one-row artifacts that leave runs.summary stuck at step 0.
+    assert all(entry["payload"]["val/generations"] is latest for entry in logged)
+
+
+def test_val_generations_reflect_and_plan_accumulate_independently(tmp_path, monkeypatch):
+    """The 9001 reflect and 9002 plan protocols retain every validation step."""
+    import types
+
+    class _FakeTable:
+        def __init__(self, columns, log_mode="IMMUTABLE"):
+            self.columns = columns
+            self.data = []
+            self.log_mode = log_mode
+
+        def add_data(self, *row):
+            self.data.append(list(row))
+
+    fake_wandb = types.SimpleNamespace(
+        run=object(),
+        Image=lambda path: str(path),
+        Table=_FakeTable,
+        log=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "1")
+
+    png = tmp_path / "cafe.png"
+    png.write_bytes(b"fake")
+    manager = types.SimpleNamespace(_val_generations_history={}, _val_generations_tables={})
+
+    for step in (0, 10, 20):
+        AgenticMetricsAgentLoopManager._log_val_generations_table(
+            manager, step, table_key="val/generations", turn_pairs=[(f"reflect-{step}", str(png))]
+        )
+        AgenticMetricsAgentLoopManager._log_val_generations_table(
+            manager, step, table_key="val/generations_plan", turn_pairs=[(f"plan-{step}", str(png))]
+        )
+
+    reflect = manager._val_generations_tables["val/generations"]
+    plan = manager._val_generations_tables["val/generations_plan"]
+    assert [row[0] for row in reflect.data] == [0, 10, 20]
+    assert [row[0] for row in plan.data] == [0, 10, 20]
+    assert [row[1] for row in reflect.data] == ["reflect-0", "reflect-10", "reflect-20"]
+    assert [row[1] for row in plan.data] == ["plan-0", "plan-10", "plan-20"]
+    assert reflect.log_mode == plan.log_mode == "MUTABLE"
+
+
+def test_cafe_trajectory_dump_writes_samples_without_overwriting_monitor(tmp_path, monkeypatch):
+    """9001/9002 get trajectory files without replacing regular hermes_actions."""
+    import types
+
+    class _Ids:
+        def tolist(self):
+            return [1, 2, 3]
+
+    class _Tokenizer:
+        pad_token_id = 0
+
+        @staticmethod
+        def decode(ids, skip_special_tokens=False):
+            del ids, skip_special_tokens
+            return "decoded cafe rollout"
+
+    output = types.SimpleNamespace(
+        batch={
+            "responses": [_Ids(), _Ids()],
+            "response_mask": [object(), object()],
+        },
+        non_tensor_batch={
+            "raw_prompt": np.array(
+                [
+                    [{"role": "user", "content": "reflect cafe"}],
+                    [{"role": "user", "content": "plan cafe"}],
+                ],
+                dtype=object,
+            ),
+            "index": np.array([9001, 9002]),
+            "trajectory_relpath": np.array(
+                ["step_000010/sample_9001.00", "step_000010/sample_9002.00"],
+                dtype=object,
+            ),
+        },
+    )
+    manager = types.SimpleNamespace(_monitor_tokenizer=_Tokenizer())
+    monkeypatch.setattr(metrics_module, "_run_dir", lambda: tmp_path)
+    monkeypatch.setattr(metrics_module, "_materialize_rollout_images", lambda **kwargs: [])
+    monkeypatch.setattr(metrics_module, "_artifact_reward_metrics", lambda output, i: {})
+    monkeypatch.setattr(
+        metrics_module,
+        "split_rollout_turns",
+        lambda *args, **kwargs: [
+            {
+                "turn": 1,
+                "turn_prompt": "cafe prompt",
+                "turn_input": "full cafe input",
+                "decode": "assistant decode",
+                "response": "assistant response",
+                "decode_has_tool_call": True,
+            }
+        ],
+    )
+
+    AgenticMetricsAgentLoopManager._dump_raw_rollouts(manager, None, output, 10, write_monitor=False)
+
+    trajectory_dir = tmp_path / "rollout_trajectories" / "step_000010"
+    assert (trajectory_dir / "sample_9001.00.json").is_file()
+    assert (trajectory_dir / "sample_9001.00.txt").is_file()
+    assert (trajectory_dir / "sample_9002.00.json").is_file()
+    assert (trajectory_dir / "sample_9002.00.txt").is_file()
+    assert not (tmp_path / "hermes_actions").exists()

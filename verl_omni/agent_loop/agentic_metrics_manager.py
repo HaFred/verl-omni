@@ -560,15 +560,15 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
         self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
-        # FlowGRPO-style ``val/generations``: keep plain history (step + prompt/path
-        # pairs), rebuild ``wandb.Table`` + fresh ``wandb.Image``s each val step.
-        # Storing Image cells in a copied table leaves ``runs.summary`` stuck on
-        # the first row (wandb/2981 + media reuse).
+        # Keep one MUTABLE W&B table per cafe protocol. The default
+        # IMMUTABLE mode only publishes the first log for a table key, which
+        # leaves ``runs.summary`` stuck at validation step 0.
         self._val_generations_history: dict[str, list[list[Any]]] = {}
+        self._val_generations_tables: dict[str, Any] = {}
         self._val_viz_logged_steps: set[int] = set()
 
-    def _dump_raw_rollouts(self, prompts, output, step) -> None:
-        """Write user prompt + raw assistant turns only."""
+    def _dump_raw_rollouts(self, prompts, output, step, *, write_monitor: bool = True) -> None:
+        """Write per-sample trajectories and optionally the step monitor files."""
         try:
             responses = output.batch["responses"]
             response_masks = output.batch["response_mask"]
@@ -579,7 +579,8 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             run_dir = _run_dir()
             monitor_dir = run_dir / "hermes_actions"
             trajectory_dir = run_dir / "rollout_trajectories" / step_tag
-            monitor_dir.mkdir(parents=True, exist_ok=True)
+            if write_monitor:
+                monitor_dir.mkdir(parents=True, exist_ok=True)
             trajectory_dir.mkdir(parents=True, exist_ok=True)
 
             rollout_counts: dict[str, int] = {}
@@ -759,8 +760,9 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 }
                 jsonl_rows.append(json.dumps(monitor_payload, ensure_ascii=False))
 
-            (monitor_dir / f"{step_tag}.txt").write_text("\n".join(step_text) + "\n")
-            (monitor_dir / f"{step_tag}.jsonl").write_text("\n".join(jsonl_rows) + "\n")
+            if write_monitor:
+                (monitor_dir / f"{step_tag}.txt").write_text("\n".join(step_text) + "\n")
+                (monitor_dir / f"{step_tag}.jsonl").write_text("\n".join(jsonl_rows) + "\n")
         except Exception as exc:  # noqa: BLE001
             # Monitoring must never fail or alter rollout generation.
             logger.warning("Failed to dump raw agent rollouts: %s", exc)
@@ -814,16 +816,13 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         *,
         table_key: str,
         turn_pairs: list[tuple[str, str | None]],
-    ) -> None:
-        """Append one FlowGRPO-style generations row and commit the full table.
+        log: bool = True,
+    ) -> Any:
+        """Append one cafe rollout row to a mutable W&B table.
 
-        Matches ``ValidationGenerationsLogger._log_generations_to_wandb`` (used by
-        ``run_qwen_image_ocr_lora.sh``): accumulate every val step as a new row so
-        ``runs.summary["val/generations"]`` lists idx 1/2/3… for steps 0/10/20….
-
-        History stores paths (not ``wandb.Image``). Each log rebuilds Images so
-        prior media is not reused across table copies (wandb/2981).
-        Commit is intentional (FlowGRPO does the same) so summary updates.
+        Reusing the same ``log_mode="MUTABLE"`` table publishes a new artifact
+        version containing the full row history. This is required for
+        ``runs.summary[table_key]`` to expose every validation step.
         """
         import wandb
 
@@ -840,25 +839,29 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                 history_row.append(str(path) if path else "")
             else:
                 history_row.extend(["", ""])
-        history = self._val_generations_history.setdefault(table_key, [])
-        history.append(history_row)
+        self._val_generations_history.setdefault(table_key, []).append(history_row)
 
-        # Rebuild the full table from plain history (fresh Images every time).
-        new_table = wandb.Table(columns=columns)
-        for stored in history:
-            row: list[Any] = [stored[0]]
-            for i in range(max_turns):
-                prompt = stored[1 + 2 * i]
-                path = stored[2 + 2 * i]
-                row.append(prompt)
-                if path and Path(path).is_file():
-                    row.append(wandb.Image(path))
-                else:
-                    row.append("")
-            new_table.add_data(*row)
+        tables = getattr(self, "_val_generations_tables", None)
+        if tables is None:
+            # Compatibility with managers restored from older checkpoints.
+            tables = {}
+            self._val_generations_tables = tables
+        table = tables.get(table_key)
+        if table is None:
+            table = wandb.Table(columns=columns, log_mode="MUTABLE")
+            tables[table_key] = table
 
-        # Commit like FlowGRPO — ``commit=False`` left summary stuck on row 1.
-        wandb.log({table_key: new_table}, step=int(step) if step is not None else None)
+        row: list[Any] = [history_row[0]]
+        for i in range(max_turns):
+            prompt = history_row[1 + 2 * i]
+            path = history_row[2 + 2 * i]
+            row.append(prompt)
+            row.append(wandb.Image(path) if path and Path(path).is_file() else "")
+        table.add_data(*row)
+
+        if log:
+            wandb.log({table_key: table}, step=int(step) if step is not None else None)
+        return table
 
     def _generate_val_viz(self, step) -> None:
         """Generate fixed cafe-poster viz rollouts and log ``val/generations``.
@@ -936,6 +939,7 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             relpaths = output.non_tensor_batch.get("trajectory_relpath")
             run_dir = _run_dir()
             responses = output.batch["responses"]
+            table_payload: dict[str, Any] = {}
             for i, (_, _, _, table_key) in enumerate(viz_rows):
                 relpath = str(relpaths[i]) if relpaths is not None else ""
                 decoded = self._monitor_tokenizer.decode(responses[i].tolist(), skip_special_tokens=False)
@@ -945,11 +949,21 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                     relpath=relpath,
                     user_prompt=task,
                 )
-                self._log_val_generations_table(
+                table_payload[table_key] = self._log_val_generations_table(
                     step,
                     table_key=table_key,
                     turn_pairs=_pair_generate_image_turns(decoded, image_paths),
+                    log=False,
                 )
+            # The fixed cafe rollouts bypass this manager's generate_sequences
+            # override, so explicitly persist their complete multi-turn decodes.
+            # Do not overwrite the regular step-level hermes_actions monitor.
+            self._dump_raw_rollouts(batch, output, step, write_monitor=False)
+            # One commit per validation step keeps the 9001 reflect and 9002
+            # plan tables on the same W&B history row.
+            import wandb
+
+            wandb.log(table_payload, step=step)
             self._val_viz_logged_steps.add(step_i)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to generate/log val viz rollouts: %s", exc)
