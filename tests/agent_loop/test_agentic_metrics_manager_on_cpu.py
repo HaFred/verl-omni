@@ -22,6 +22,7 @@ from verl_omni.agent_loop.agentic_metrics_manager import (
     _pair_generate_image_turns,
     aggregate_agentic_reward_metrics,
 )
+from verl_omni.agent_loop.agentic_trajectory_context import build_trajectory_relpath
 
 
 def _val_prefixed(metrics: dict[str, float]) -> dict[str, float]:
@@ -253,7 +254,7 @@ def test_cafe_trajectory_dump_writes_samples_without_overwriting_monitor(tmp_pat
             ),
             "index": np.array([9001, 9002]),
             "trajectory_relpath": np.array(
-                ["step_000010/sample_9001.00", "step_000010/sample_9002.00"],
+                ["step_000010/sample_9001", "step_000010/sample_9002"],
                 dtype=object,
             ),
         },
@@ -277,11 +278,22 @@ def test_cafe_trajectory_dump_writes_samples_without_overwriting_monitor(tmp_pat
         ],
     )
 
-    AgenticMetricsAgentLoopManager._dump_raw_rollouts(manager, None, output, 10, write_monitor=False)
+    AgenticMetricsAgentLoopManager._dump_raw_rollouts(
+        manager, None, output, 10, write_monitor=False, validate=True
+    )
 
     trajectory_dir = tmp_path / "rollout_trajectories" / "step_000010"
-    assert (trajectory_dir / "sample_9001.00.json").is_file()
-    assert (trajectory_dir / "sample_9001.00.txt").is_file()
-    assert (trajectory_dir / "sample_9002.00.json").is_file()
-    assert (trajectory_dir / "sample_9002.00.txt").is_file()
+    assert (trajectory_dir / "sample_9001.json").is_file()
+    assert (trajectory_dir / "sample_9001.txt").is_file()
+    assert (trajectory_dir / "sample_9002.json").is_file()
+    assert (trajectory_dir / "sample_9002.txt").is_file()
     assert not (tmp_path / "hermes_actions").exists()
+
+
+def test_build_trajectory_relpath_val_omits_rollout_n_suffix():
+    """Train group member ``.00`` must not share a folder with val ``n=1``."""
+    train = build_trajectory_relpath(step=140, sample_index=145, rollout_n=0, validate=False)
+    val = build_trajectory_relpath(step=140, sample_index=145, rollout_n=0, validate=True)
+    assert train == "step_000140/sample_145.00"
+    assert val == "step_000140/sample_145"
+    assert train != val

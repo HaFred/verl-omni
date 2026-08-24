@@ -520,6 +520,7 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
             step=trajectory["step"],
             sample_index=trajectory["sample_index"],
             rollout_n=trajectory["rollout_n"],
+            validate=bool(trajectory.get("validate")),
         )
         raw_prompt = kwargs.get("raw_prompt")
         user_prompt = _last_user_prompt(raw_prompt) if raw_prompt is not None else ""
@@ -567,7 +568,7 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         self._val_generations_tables: dict[str, Any] = {}
         self._val_viz_logged_steps: set[int] = set()
 
-    def _dump_raw_rollouts(self, prompts, output, step, *, write_monitor: bool = True) -> None:
+    def _dump_raw_rollouts(self, prompts, output, step, *, write_monitor: bool = True, validate: bool = False) -> None:
         """Write per-sample trajectories and optionally the step monitor files."""
         try:
             responses = output.batch["responses"]
@@ -604,20 +605,24 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
                         live_relpath = None
                 if live_relpath:
                     relpath = live_relpath
-                    # Parse sample_index.rollout_n from ``…/sample_6.03`` when present.
+                    # Parse train ``sample_6.03`` or val ``sample_145`` (no group suffix).
                     name = Path(relpath).name
                     m = re.fullmatch(r"sample_(.+)\.(\d+)$", name)
                     if m:
                         sample_key = m.group(1)
                         rollout_n = int(m.group(2))
                     else:
-                        rollout_n = rollout_counts.get(sample_key, 0)
+                        m_val = re.fullmatch(r"sample_(.+)$", name)
+                        if m_val:
+                            sample_key = m_val.group(1)
+                        rollout_n = 0
                 else:
-                    rollout_n = rollout_counts.get(sample_key, 0)
+                    rollout_n = 0 if validate else rollout_counts.get(sample_key, 0)
                     relpath = build_trajectory_relpath(
                         step=step_i,
                         sample_index=sample_index,
                         rollout_n=rollout_n,
+                        validate=validate,
                     )
                 rollout_counts[sample_key] = max(rollout_counts.get(sample_key, 0), int(rollout_n) + 1)
                 user_prompt = _last_user_prompt(raw_prompts[i]) if raw_prompts is not None else ""
@@ -773,9 +778,10 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         output = super().generate_sequences(prompts)
         if is_val:
             # Validation batches: metrics under val_agentic_reward/* plus the
-            # fixed viz set. No train dump (step-tagged filenames would collide
-            # with train samples) and no response_mask discard.
+            # fixed viz set. Dumps use ``sample_{idx}.json`` (no ``.00``) so they
+            # cannot collide with train ``sample_{idx}.00`` on the same step.
             self._log_val_reward_metrics(output, step)
+            self._dump_raw_rollouts(prompts, output, step, write_monitor=False, validate=True)
             self._generate_val_viz(step)
             return output
         # Dump before discard so hermes_actions shows real policy decodes
@@ -958,7 +964,7 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             # The fixed cafe rollouts bypass this manager's generate_sequences
             # override, so explicitly persist their complete multi-turn decodes.
             # Do not overwrite the regular step-level hermes_actions monitor.
-            self._dump_raw_rollouts(batch, output, step, write_monitor=False)
+            self._dump_raw_rollouts(batch, output, step, write_monitor=False, validate=True)
             # One commit per validation step keeps the 9001 reflect and 9002
             # plan tables on the same W&B history row.
             import wandb

@@ -19,8 +19,17 @@ can be shared by the stock-loop manager and diffusion tool safely.
 
 Artifact layout (under the e2e run dir)::
 
-    rollout_trajectories/step_{S:06d}/sample_{index}.{rollout_n:02d}.json
-    rollout_images/step_{S:06d}/sample_{index}.{rollout_n:02d}/
+    Train (GRPO group member ``rollout_n``)::
+
+        rollout_trajectories/step_{S:06d}/sample_{index}.{rollout_n:02d}.json
+        rollout_images/step_{S:06d}/sample_{index}.{rollout_n:02d}/
+
+    Val (``n=1``, no group suffix — avoids colliding with train
+    ``sample_{index}.00`` when ``extra_info.index`` overlaps 0..val_size)::
+
+        rollout_trajectories/step_{S:06d}/sample_{index}.json
+        rollout_images/step_{S:06d}/sample_{index}/
+
         image_00_<artifact_id>.png ...
         meta.json
 
@@ -452,12 +461,24 @@ def _sanitize_sample_index(sample_index: object | None) -> str:
         return re.sub(r"[^\w.\-]+", "_", raw)[:64] or "unknown"
 
 
-def build_trajectory_relpath(*, step: int | None, sample_index: object | None, rollout_n: int) -> str:
-    """Build ``step_XXXXXX/sample_{index}.{rollout_n:02d}``."""
+def build_trajectory_relpath(
+    *,
+    step: int | None,
+    sample_index: object | None,
+    rollout_n: int,
+    validate: bool = False,
+) -> str:
+    """Build train ``step_XXXXXX/sample_{index}.{rollout_n:02d}`` or val ``…/sample_{index}``."""
     try:
         step_i = int(step) if step is not None else -1
     except (TypeError, ValueError):
         step_i = -1
     step_part = f"step_{step_i:06d}" if step_i >= 0 else "step_unknown"
-    sample_part = f"sample_{_sanitize_sample_index(sample_index)}.{int(rollout_n):02d}"
+    sample_id = _sanitize_sample_index(sample_index)
+    if validate:
+        # Val always uses ``n=1``. Omit ``.00`` so the folder cannot collide with
+        # a train group member that shares the same ``extra_info.index``.
+        sample_part = f"sample_{sample_id}"
+    else:
+        sample_part = f"sample_{sample_id}.{int(rollout_n):02d}"
     return f"{step_part}/{sample_part}"
