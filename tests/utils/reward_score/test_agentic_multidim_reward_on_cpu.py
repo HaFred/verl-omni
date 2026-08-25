@@ -210,6 +210,40 @@ def test_reflect_result_is_lenient_stop_validity():
     assert out["reward_result"] == 1.0
 
 
+def test_terminal_no_is_negative_candidate_despite_positive_components():
+    """Final NO cannot retain positive scalar reward from C/A or protocol dims."""
+    failed = compute_score(
+        solution_str=_closed_reflect_trajectory(
+            correctness=0.80,
+            aesthetics=0.80,
+            good_enough=False,
+        ),
+        ground_truth=_gt(expected=3),
+    )
+    passed = compute_score(
+        solution_str=_closed_reflect_trajectory(
+            correctness=0.80,
+            aesthetics=0.80,
+            good_enough=True,
+        ),
+        ground_truth=_gt(expected=3),
+    )
+
+    # Preserve diagnostics/shaping, then apply an unweighted terminal penalty.
+    assert failed["reward_reflect"] > 0.0
+    assert failed["reward_format"] == 1.0
+    assert failed["reward_result"] == 1.0
+    assert failed["score_before_terminal_penalty"] > 0.0
+    assert failed["reward_terminal_no_penalty"] == -1.0
+    assert failed["final_good_enough"] == 0
+    assert -1.0 <= failed["score"] <= 0.0
+
+    assert passed["reward_terminal_no_penalty"] == 0.0
+    assert passed["final_good_enough"] == 1
+    assert passed["score"] == pytest.approx(passed["score_before_terminal_penalty"])
+    assert passed["score"] > failed["score"]
+
+
 def test_tool_reward_is_presence_based():
     prompt = "A poster."
     # No successful image → rollout invalid, score 0.
@@ -334,6 +368,9 @@ def _assert_full_schema(out: dict) -> None:
     assert "reward_tool" not in out
     for key in (
         "reward_done",
+        "reward_terminal_no_penalty",
+        "score_before_terminal_penalty",
+        "final_good_enough",
         "reward_correctness",
         "reward_aesthetics",
         "first_correctness",

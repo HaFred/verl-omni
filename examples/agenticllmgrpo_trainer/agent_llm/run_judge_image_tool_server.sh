@@ -18,9 +18,14 @@ MAX_MODEL_LEN="${AGENTIC_REFLECT_MAX_MODEL_LEN:-4096}"
 GDN_BACKEND="${GDN_PREFILL_BACKEND:-triton}"
 
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+# Same client-side stamp guard as the trainer recipe. Middleware re-parses VL
+# JSON in *this* process for stdout lines; without the export it defaults ON
+# and keeps printing rubber_stamp=1 / forced NO even when training has guard=0.
+export AGENTIC_JUDGE_RUBBER_STAMP_GUARD="${AGENTIC_JUDGE_RUBBER_STAMP_GUARD:-0}"
 
 echo "[INFO] image judge MODEL=${MODEL}"
 echo "[INFO] gdn-prefill-backend=${GDN_BACKEND} GPU_MEM_UTIL=${GPU_MEM_UTIL}"
+echo "[INFO] AGENTIC_JUDGE_RUBBER_STAMP_GUARD=${AGENTIC_JUDGE_RUBBER_STAMP_GUARD}"
 
 exec vllm serve "${MODEL}" \
   --host "${HOST}" \

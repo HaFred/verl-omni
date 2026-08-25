@@ -77,6 +77,22 @@ def good_enough_threshold() -> float:
         return 0.80
 
 
+def rubber_stamp_guard_enabled() -> bool:
+    """Whether flat-high facets may cap scores and force ``good_enough=NO``.
+
+    Keep the parser-level default on for backward compatibility. Individual
+    recipes can disable it when their judge is sufficiently calibrated:
+    ``AGENTIC_JUDGE_RUBBER_STAMP_GUARD=0``.
+    """
+    return os.getenv("AGENTIC_JUDGE_RUBBER_STAMP_GUARD", "1").strip().lower() not in {
+        "0",
+        "false",
+        "off",
+        "no",
+        "",
+    }
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return max(0.0, min(1.0, float(value)))
@@ -147,9 +163,10 @@ def _annotate_rubber_stamp_findings(findings: str) -> str:
 def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     """Normalize a parsed judge dict into the canonical scored shape.
 
-    Facet scores are snapped onto ``_SCORE_GRID``. Rubber-stamps (flat identical
-    near-max facets on the *raw* pre-snap values, default ≥0.9) are handled
-    model-agnostically:
+    Facet scores are snapped onto ``_SCORE_GRID``. When
+    ``AGENTIC_JUDGE_RUBBER_STAMP_GUARD`` is enabled, rubber-stamps (flat
+    identical near-max facets on the *raw* pre-snap values, default ≥0.9) are
+    handled model-agnostically:
 
     - ``good_enough`` is forced ``False`` (blocks Done on undifferentiated maxing),
     - C and A facets share a soft symmetric cap at 0.8 (keeps reward signal),
@@ -183,9 +200,10 @@ def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
                 a_scores[str(key)] = snap_score(value)
 
     rubber_stamp = False
+    rubber_stamp_guard = rubber_stamp_guard_enabled()
     if c_scores and a_scores:
         # Detect on raw continuous facets (before snap) to avoid double penalty.
-        rubber_stamp = _is_flat_high_facets(c_raw) or _is_flat_high_facets(a_raw)
+        rubber_stamp = rubber_stamp_guard and (_is_flat_high_facets(c_raw) or _is_flat_high_facets(a_raw))
         if rubber_stamp:
             c_scores = _cap_facets(c_scores, ceiling=_RUBBER_STAMP_SCORE_CEILING)
             a_scores = _cap_facets(a_scores, ceiling=_RUBBER_STAMP_SCORE_CEILING)
@@ -195,7 +213,7 @@ def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
         correctness = snap_score(data.get("correctness", 0.0))
         aesthetics = snap_score(data.get("aesthetics", 0.0))
         # Scalar-only: treat both axes ≥ 0.9 as an undifferentiated stamp.
-        rubber_stamp = (
+        rubber_stamp = rubber_stamp_guard and (
             _safe_float(data.get("correctness", 0.0)) >= 0.9 and _safe_float(data.get("aesthetics", 0.0)) >= 0.9
         )
         if rubber_stamp:
@@ -365,6 +383,7 @@ def format_judge_observation(
     correctness = float(parsed["correctness"])
     aesthetics = float(parsed["aesthetics"])
     good = bool(parsed.get("good_enough", False))
+    rubber_stamp = bool(parsed.get("rubber_stamp", False))
     findings_short = re.sub(r"\s+", " ", str(parsed.get("findings") or "no specific findings")).strip()[:220]
     fixes_short = re.sub(r"\s+", " ", str(parsed.get("suggested_fixes") or "none")).strip()[:160]
     text = (
@@ -373,6 +392,7 @@ def format_judge_observation(
         f"  correctness={correctness:.2f}\n"
         f"  aesthetics ={aesthetics:.2f}\n"
         f"  good_enough ={'YES' if good else 'NO'}\n"
+        f"  rubber_stamp ={'True' if rubber_stamp else 'False'}\n"
         f"  findings: {findings_short}\n"
         f"  suggested_fixes: {fixes_short}\n"
         f"  agentic_judge ok=1 parse_ok=1 stub=0 backend={backend} parse_retries={parse_retries}"
@@ -381,6 +401,7 @@ def format_judge_observation(
         "correctness": correctness,
         "aesthetics": aesthetics,
         "good_enough": good,
+        "rubber_stamp": rubber_stamp,
         "findings": str(parsed.get("findings") or ""),
         "suggested_fixes": str(parsed.get("suggested_fixes") or "none"),
         "image_path": image_path,
@@ -388,8 +409,6 @@ def format_judge_observation(
         "parse_ok": 1,
         "parse_retries": int(parse_retries),
     }
-    if "rubber_stamp" in parsed:
-        meta["rubber_stamp"] = bool(parsed.get("rubber_stamp"))
     for key, value in (parsed.get("correctness_scores") or {}).items():
         if isinstance(value, int | float):
             meta[f"correctness_{key}"] = float(value)

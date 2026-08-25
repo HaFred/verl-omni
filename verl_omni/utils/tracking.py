@@ -14,7 +14,10 @@
 
 """Experiment-tracking helpers layered on verl.utils.tracking."""
 
+import json
+import logging
 import os
+import re
 import subprocess
 import tempfile
 import wave
@@ -26,6 +29,179 @@ import numpy as np
 import torch
 
 from verl_omni.utils.reward_score.reward_utils import video_tensor_to_pil_frames
+
+logger = logging.getLogger(__name__)
+
+
+class AgenticValidationGenerationsLogger:
+    """Log cumulative agentic validation images using verl's copy-table pattern.
+
+    The agent loop supplies prompts and materialized image paths. This class
+    owns all tracking-specific state: restoring prior rows after resume,
+    constructing W&B media/tables, and avoiding out-of-order W&B steps.
+    """
+
+    DEFAULT_SAMPLE_TABLE_KEYS = {
+        "sample_9001": "val/generations",
+        "sample_9002": "val/generations_plan",
+    }
+
+    def __init__(
+        self,
+        run_dir: str | Path,
+        max_turns: int | None = None,
+        sample_table_keys: dict[str, str] | None = None,
+    ):
+        self.run_dir = Path(run_dir)
+        self.max_turns = max_turns if max_turns is not None else self._max_turns_from_env()
+        self.sample_table_keys = dict(sample_table_keys or self.DEFAULT_SAMPLE_TABLE_KEYS)
+        self.history = self._restore_history()
+        self.tables: dict[str, Any] = {}
+
+    @staticmethod
+    def _max_turns_from_env() -> int:
+        try:
+            return max(1, int(os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")))
+        except ValueError:
+            return 3
+
+    @staticmethod
+    def pair_turns(prompts: Sequence[str], image_paths: Sequence[str]) -> list[tuple[str, str | None]]:
+        """Zip generated-image prompts and paths in call order."""
+        n = max(len(prompts), len(image_paths))
+        return [
+            (
+                prompts[index] if index < len(prompts) else "",
+                image_paths[index] if index < len(image_paths) else None,
+            )
+            for index in range(n)
+        ]
+
+    @staticmethod
+    def effective_wandb_step(step) -> int | None:
+        """Return a W&B step that will not be dropped after resume."""
+        if step is None:
+            return None
+        try:
+            requested = int(step)
+        except (TypeError, ValueError):
+            return None
+        try:
+            import wandb
+        except Exception:  # noqa: BLE001
+            return requested
+        if wandb.run is None:
+            return requested
+        current = getattr(wandb.run, "step", None)
+        try:
+            current_i = int(current) if current is not None else None
+        except (TypeError, ValueError):
+            current_i = None
+        # Resume restores ``run.step`` to the last *committed* remote step. Logging
+        # at that same integer is still dropped/ignored for new media, so bump to
+        # strictly greater than the current tip. Table row[0] still stores
+        # ``requested`` (the trainer global step).
+        if current_i is not None and requested <= current_i:
+            bumped = current_i + 1
+            logger.warning(
+                "W&B step %s is behind-or-equal run.step=%s; logging validation tables at "
+                "step %s so the cumulative summary is not dropped (table rows still store %s)",
+                requested,
+                current_i,
+                bumped,
+                requested,
+            )
+            return bumped
+        return requested
+
+    def _restore_history(self) -> dict[str, list[list[Any]]]:
+        """Recover cumulative validation rows from on-disk image metadata."""
+        history: dict[str, list[list[Any]]] = {}
+        images_root = self.run_dir / "rollout_images"
+        for sample_name, table_key in self.sample_table_keys.items():
+            rows: list[list[Any]] = []
+            for meta_path in images_root.glob(f"step_*/{sample_name}/meta.json"):
+                match = re.fullmatch(r"step_(\d+)", meta_path.parent.parent.name)
+                if match is None:
+                    continue
+                try:
+                    meta = json.loads(meta_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                prompts = list(meta.get("tool_prompts") or [])
+                paths = list(meta.get("image_paths") or [])
+                row: list[Any] = [int(match.group(1))]
+                for index in range(self.max_turns):
+                    row.append(str(prompts[index]) if index < len(prompts) else "")
+                    row.append(str(paths[index]) if index < len(paths) else "")
+                rows.append(row)
+            if rows:
+                by_step = {int(row[0]): row for row in rows}
+                history[table_key] = [by_step[step] for step in sorted(by_step)]
+        return history
+
+    def _build_table(self, step, table_key: str, turn_pairs: Sequence[tuple[str, str | None]]) -> Any:
+        """Append one row and return a fresh cumulative W&B table."""
+        import wandb
+
+        if wandb.run is None:
+            return None
+        columns = ["step"] + sum(
+            [[f"input_{index + 1}", f"output_{index + 1}"] for index in range(self.max_turns)], []
+        )
+        try:
+            step_i = int(step) if step is not None else -1
+        except (TypeError, ValueError):
+            step_i = -1
+
+        history_row: list[Any] = [step_i]
+        for index in range(self.max_turns):
+            if index < len(turn_pairs):
+                prompt, path = turn_pairs[index]
+                history_row.extend([prompt or "", str(path) if path else ""])
+            else:
+                history_row.extend(["", ""])
+        history = self.history.setdefault(table_key, [])
+        history[:] = [row for row in history if row[0] != step_i]
+        history.append(history_row)
+        history.sort(key=lambda row: row[0])
+
+        previous = self.tables.get(table_key)
+        if previous is None or len(getattr(previous, "data", [])) < len(history) - 1:
+            table = wandb.Table(columns=columns)
+            for saved_row in history[:-1]:
+                row: list[Any] = [saved_row[0]]
+                for index in range(self.max_turns):
+                    prompt = saved_row[1 + 2 * index]
+                    path = saved_row[2 + 2 * index]
+                    row.extend([prompt, wandb.Image(path) if path and Path(path).is_file() else ""])
+                table.add_data(*row)
+        else:
+            prior = [list(row) for row in previous.data if not row or row[0] != step_i]
+            table = wandb.Table(columns=columns, data=prior)
+
+        new_row: list[Any] = [history_row[0]]
+        for index in range(self.max_turns):
+            prompt = history_row[1 + 2 * index]
+            path = history_row[2 + 2 * index]
+            new_row.extend([prompt, wandb.Image(path) if path and Path(path).is_file() else ""])
+        table.add_data(*new_row)
+        self.tables[table_key] = table
+        return table
+
+    def log(self, step, table_rows: dict[str, Sequence[tuple[str, str | None]]]) -> None:
+        """Publish all validation protocols in one W&B history commit."""
+        import wandb
+
+        if wandb.run is None:
+            return
+        payload = {
+            table_key: table
+            for table_key, turn_pairs in table_rows.items()
+            if (table := self._build_table(step, table_key, turn_pairs)) is not None
+        }
+        if payload:
+            wandb.log(payload, step=self.effective_wandb_step(step))
 
 
 def batch_items(values: Any, batch_size: int, name: str) -> list[Any]:

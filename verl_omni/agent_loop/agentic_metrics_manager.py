@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -39,10 +38,14 @@ from verl_omni.agent_loop.agentic_trajectory_context import (
     clear_good_enough_yes_reached,
     reset_active_trajectory_relpath,
     reset_active_user_prompt,
+    resolve_rollout_images_root,
     resolve_run_dir,
     set_active_trajectory_relpath,
     set_active_user_prompt,
 )
+from verl_omni.agent_loop.rl_insight_profiler import init_rl_insight
+from verl_omni.utils.agentic_val_viz import resolve_agentic_val_viz_provider
+from verl_omni.utils.tracking import AgenticValidationGenerationsLogger
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +63,12 @@ REWARD_COMPONENTS = (
     "reward_format",
     "reward_result",
     "reward_reflect_delta",
+    "reward_terminal_no_penalty",
 )
 REWARD_ARTIFACT_FIELDS = (
     *REWARD_COMPONENTS,
+    "score_before_terminal_penalty",
+    "final_good_enough",
     "num_hermes_tool_calls",
     "num_generate_image_prompts",
     "num_judge_image_calls",
@@ -103,41 +109,68 @@ _VL_JUDGE_OBS_RE = re.compile(r"\b(?:VL judge|agentic_judge)\b", re.IGNORECASE)
 _FORCED_REFLECTION_RE = re.compile(r"\bagentic_forced_reflection=1\b", re.IGNORECASE)
 _STOP_DECISION_RE = re.compile(r"\bagentic_stop_decision_required=1\b", re.IGNORECASE)
 _TERMINAL_DONE_RE = re.compile(r"(?is)^\s*(?:Reflection\s*:.*?)?Done\.\s*(?:<\|im_end\|>)?\s*$")
+_GOOD_ENOUGH_OBS_RE = re.compile(r"\bgood_enough\s*=\s*(YES|NO)", re.IGNORECASE)
+_MAX_PASSES_RE = re.compile(r"\bagentic_force_stop_max_passes=1\b", re.IGNORECASE)
+
+
+def _obs_good_enough(turn_prompt: str) -> bool | None:
+    """YES/NO from the current VL-judge obs. ``None`` if this turn has no verdict."""
+    match = _GOOD_ENOUGH_OBS_RE.search(turn_prompt or "")
+    if not match:
+        return None
+    return match.group(1).upper() == "YES"
+
+
+def _policy_said_done(decode: str) -> bool:
+    text = decode or ""
+    if _GEN_CALL_RE.search(text) or _JUDGE_CALL_RE.search(text):
+        return False
+    if _TERMINAL_DONE_RE.search(text):
+        return True
+    return bool(_AGENT_REFLECTION_RE.search(text))
 
 
 def _turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
-    """Label turns so trajectory dumps make protocol stages grep-able."""
+    """Label a dump turn from the current image verdict and the policy decode.
+
+    Injected ``Reflection:`` (``response``, mask=0) is not the turn kind. Cue
+    labels (``forced_reflection_continue`` / ``*_stop_cue``) are only used when
+    there is no policy sample (trailing env flush).
+    """
     resp = response or ""
-    forced_context = f"{turn_prompt or ''}\n{resp}"
-    if _JUDGE_CALL_RE.search(decode or ""):
+    prompt = turn_prompt or ""
+    text = decode or ""
+    forced_context = f"{prompt}\n{resp}"
+    good = _obs_good_enough(prompt)
+
+    if _JUDGE_CALL_RE.search(text):
         return "call_judge_image"
-    if _GEN_CALL_RE.search(decode or ""):
-        if _FORCED_REFLECTION_RE.search(resp) or _FORCED_REFLECTION_RE.search(turn_prompt or ""):
+    if _GEN_CALL_RE.search(text):
+        if _FORCED_REFLECTION_RE.search(resp) or _FORCED_REFLECTION_RE.search(prompt):
             return "agent_rewrite_after_forced_reflection"
-        return "call_generate_image"
-    if _TERMINAL_DONE_RE.search(decode or "") and _STOP_DECISION_RE.search(forced_context):
-        if re.search(r"\bagentic_force_stop_max_passes=1\b", forced_context):
-            return "agent_done_after_max_passes"
-        return "agent_done_after_forced_reflection"
-    if re.search(r"\bagentic_force_stop_max_passes=1\b", resp) or (
-        not (decode or "").strip() and re.search(r"\bagentic_force_stop_max_passes=1\b", turn_prompt or "")
-    ):
-        return "forced_reflection_max_passes_stop_cue"
-    if _FORCED_REFLECTION_RE.search(resp):
-        if _STOP_DECISION_RE.search(resp):
-            return "forced_reflection_stop_cue"
-        return "forced_reflection_continue"
-    if not (decode or "").strip() and _FORCED_REFLECTION_RE.search(turn_prompt or ""):
-        if _STOP_DECISION_RE.search(turn_prompt or ""):
-            return "forced_reflection_stop_cue"
-        return "forced_reflection_continue"
-    if _AGENT_REFLECTION_RE.search(decode or ""):
-        if _GEN_CALL_RE.search(decode or ""):
+        if _AGENT_REFLECTION_RE.search(text):
             return "agent_reflection_rewrite"
+        return "call_generate_image"
+
+    if text.strip() and _policy_said_done(text):
+        if _MAX_PASSES_RE.search(forced_context):
+            return "agent_done_after_max_passes"
+        if good is True:
+            return "agent_done_after_forced_reflection"
         return "agent_reflection_done"
-    if _VL_JUDGE_OBS_RE.search(turn_prompt or ""):
+
+    # No policy tokens: classify the injected cue only (empty ``decode`` flush).
+    cue_src = resp if _FORCED_REFLECTION_RE.search(resp) else prompt
+    if not text.strip() and _FORCED_REFLECTION_RE.search(cue_src):
+        if _MAX_PASSES_RE.search(cue_src):
+            return "forced_reflection_max_passes_stop_cue"
+        if _STOP_DECISION_RE.search(cue_src) or good is True:
+            return "forced_reflection_stop_cue"
+        return "forced_reflection_continue"
+
+    if _VL_JUDGE_OBS_RE.search(prompt):
         return "after_judge_feedback"
-    if "path=" in (turn_prompt or "") and "agentic_tool" in (turn_prompt or ""):
+    if "path=" in prompt and "agentic_tool" in prompt:
         return "after_generate_image"
     return "other"
 
@@ -173,28 +206,6 @@ def _extract_generate_image_prompts(decoded_response: str) -> list[str]:
     return [prompt for _, prompt in sorted(found)]
 
 
-def _pair_generate_image_turns(
-    decoded_response: str, image_paths: list[str]
-) -> list[tuple[str, str | None]]:
-    """Zip rewritten ``generate_image`` prompts with on-disk PNGs (call order)."""
-    prompts = _extract_generate_image_prompts(decoded_response)
-    n = max(len(prompts), len(image_paths))
-    pairs: list[tuple[str, str | None]] = []
-    for i in range(n):
-        prompt = prompts[i] if i < len(prompts) else ""
-        path = image_paths[i] if i < len(image_paths) else None
-        pairs.append((prompt, path))
-    return pairs
-
-
-def _val_generations_max_turns() -> int:
-    """Cap table columns to the live generate_image pass budget."""
-    try:
-        return max(1, int(os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")))
-    except ValueError:
-        return 3
-
-
 def aggregate_agentic_reward_metrics(non_tensor_batch: dict[str, Any]) -> dict[str, float]:
     """Aggregate numeric reward extras already returned by verl's reward manager."""
     metrics: dict[str, float] = {}
@@ -227,6 +238,7 @@ def _artifact_reward_metrics(output: Any, index: int) -> dict[str, float | int]:
         "num_judge_image_calls",
         "protocol_ok",
         "rollout_valid",
+        "final_good_enough",
     }
     for key in REWARD_ARTIFACT_FIELDS:
         values = output.non_tensor_batch.get(key)
@@ -475,6 +487,24 @@ def _materialize_rollout_images(
     return image_paths
 
 
+def _init_rl_insight_from_config(config) -> None:
+    """Enable rl-insight online observability for this process (idempotent).
+
+    Called from the trainer driver (``AgenticMetricsAgentLoopManager``) and every
+    agent-loop worker (``AgenticAgentLoopWorker``) so each emitting process
+    connects to the shared Ray monitor hub. A no-op when ``rl-insight`` is not
+    installed or ``RL_INSIGHT_SERVER_URL`` is unset.
+    """
+    experiment_name = None
+    try:
+        trainer = config.get("trainer", {}) if config is not None else {}
+        experiment_name = trainer.get("experiment_name")
+    except Exception:  # noqa: BLE001 - config shape may vary across trainers
+        experiment_name = None
+    init_rl_insight(project="verl_omni_agentic", experiment_name=experiment_name)
+
+
+
 class AgenticAgentLoopWorker(AgentLoopWorker):
     """Worker-side hooks: trajectory bind + step kwargs for force-first curriculum.
 
@@ -499,6 +529,7 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
         # decorators, then load_function_tools_from_path would re-exec the file and
         # raise "already registered".
         _bind_run_artifact_env(config)
+        _init_rl_insight_from_config(config)
         tool_path = self._AGENTIC_FUNCTION_TOOLS
         if not tool_path.is_file():
             raise FileNotFoundError(
@@ -560,15 +591,19 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             config = args[0]
         if config is not None:
             _bind_run_artifact_env(config)
+            _init_rl_insight_from_config(config)
         super().__init__(*args, **kwargs)
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
         self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
-        # Keep one MUTABLE W&B table per cafe protocol. The default
-        # IMMUTABLE mode only publishes the first log for a table key, which
-        # leaves ``runs.summary`` stuck at validation step 0.
-        self._val_generations_history: dict[str, list[list[Any]]] = {}
-        self._val_generations_tables: dict[str, Any] = {}
+        # Holdout viz prompts live outside the agent loop; the manager only
+        # generates, dumps, and hands prompt/image rows to the tracker.
+        self._val_viz_provider = resolve_agentic_val_viz_provider()
+        sample_table_keys = self._val_viz_provider.sample_table_keys if self._val_viz_provider else None
+        self._val_generations_logger = AgenticValidationGenerationsLogger(
+            _run_dir(),
+            sample_table_keys=sample_table_keys,
+        )
         self._val_viz_logged_steps: set[int] = set()
 
     def _dump_raw_rollouts(self, prompts, output, step, *, write_monitor: bool = True, validate: bool = False) -> None:
@@ -775,21 +810,96 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             # Monitoring must never fail or alter rollout generation.
             logger.warning("Failed to dump raw agent rollouts: %s", exc)
 
+
+    def _log_tool_latency_metrics(self, output: Any, step, *, val_prefix: str = "") -> None:
+        """Aggregate per-rollout ``timing.jsonl`` samples into WandB latency metrics.
+
+        Reads the wall-clock samples written by ``tools.generate_image`` /
+        ``tools.judge_image`` during rollout and logs mean / p50 / p95 / max /
+        count under ``agentic_tool/<tool>_latency_s`` (or ``val_agentic_tool/...``
+        when ``val_prefix`` is set). Best-effort: never alters rollout generation.
+        """
+        try:
+            relpaths = output.non_tensor_batch.get("trajectory_relpath")
+            if relpaths is None:
+                return
+            samples: dict[str, list[float]] = {"generate_image": [], "judge_image": []}
+            seen: set[str] = set()
+            images_root = resolve_rollout_images_root()
+            for raw in relpaths:
+                if raw is None:
+                    continue
+                relpath = str(raw)
+                if not relpath or relpath in seen:
+                    continue
+                seen.add(relpath)
+                timing_path = images_root / relpath / "timing.jsonl"
+                if not timing_path.is_file():
+                    continue
+                try:
+                    lines = timing_path.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    continue
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    tool = str(row.get("tool", ""))
+                    latency = row.get("latency_s")
+                    if tool not in samples or not isinstance(latency, (int, float)):
+                        continue
+                    samples[tool].append(float(latency))
+
+            import wandb
+
+            if wandb.run is None:
+                return
+            prefix = f"{val_prefix}agentic_tool/" if val_prefix else "agentic_tool/"
+            for tool, values in samples.items():
+                if not values:
+                    continue
+                values.sort()
+                n = len(values)
+                mean = sum(values) / n
+                p50 = (values[n // 2] + values[(n - 1) // 2]) / 2.0
+                p95 = values[min(n - 1, int(round(n * 0.95)) - 1)]
+                wandb.log(
+                    {
+                        f"{prefix}{tool}_latency_s/mean": float(mean),
+                        f"{prefix}{tool}_latency_s/p50": float(p50),
+                        f"{prefix}{tool}_latency_s/p95": float(p95),
+                        f"{prefix}{tool}_latency_s/max": float(values[-1]),
+                        f"{prefix}{tool}_latency_s/count": int(n),
+                    },
+                    step=int(step) if step is not None else None,
+                    commit=False,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to aggregate tool-latency metrics: %s", exc)
+
     def generate_sequences(self, prompts):
         step = prompts.meta_info.get("global_steps")
         is_val = bool(prompts.meta_info.get("validate", False))
+        if is_val:
+            # Holdout 9001/9002 first: generate → dump → commit W&B
+            # ``val/generations(_plan)`` to remote summary *before* the long
+            # UniCoT val set (~250 prompts). Once-per-step via
+            # ``_val_viz_logged_steps`` so later val batches skip the holdout.
+            self._maybe_run_val_viz(step)
         output = super().generate_sequences(prompts)
         if is_val:
-            # Validation batches: metrics under val_agentic_reward/* plus the
-            # fixed viz set. Dumps use ``sample_{idx}.json`` (no ``.00``) so they
-            # cannot collide with train ``sample_{idx}.00`` on the same step.
+            # Main val-set batch metrics only (no train dump / mask discard).
             self._log_val_reward_metrics(output, step)
-            self._dump_raw_rollouts(prompts, output, step, write_monitor=False, validate=True)
-            self._generate_val_viz(step)
+            self._log_tool_latency_metrics(output, step, val_prefix="val_")
             return output
         # Dump before discard so hermes_actions shows real policy decodes
         # (discard zeros response_mask, which would hide tool-less prose as env text).
         self._dump_raw_rollouts(prompts, output, step)
+        self._log_tool_latency_metrics(output, step)
         self._discard_invalid_rollouts(output)
         metrics = aggregate_agentic_reward_metrics(output.non_tensor_batch)
         if metrics:
@@ -815,75 +925,25 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
 
             if wandb.run is not None:
                 val_metrics = {f"val_{key}": value for key, value in metrics.items()}
-                wandb.log(val_metrics, step=int(step) if step is not None else None, commit=False)
+                wandb.log(
+                    val_metrics,
+                    step=AgenticValidationGenerationsLogger.effective_wandb_step(step),
+                    commit=False,
+                )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log val agentic reward metrics to W&B: %s", exc)
 
-    def _log_val_generations_table(
-        self,
-        step,
-        *,
-        table_key: str,
-        turn_pairs: list[tuple[str, str | None]],
-        log: bool = True,
-    ) -> Any:
-        """Append one cafe rollout row to a mutable W&B table.
+    def _maybe_run_val_viz(self, step) -> None:
+        """Holdout cafe-poster (9001/9002) generate → dump → W&B table commit.
 
-        Reusing the same ``log_mode="MUTABLE"`` table publishes a new artifact
-        version containing the full row history. This is required for
-        ``runs.summary[table_key]`` to expose every validation step.
+        Invoked at the *start* of the first validate ``generate_sequences`` for
+        ``global_steps`` so remote ``val/generations(_plan)`` updates before the
+        UniCoT val set. Prompt content comes from ``AgenticValVizProvider``;
+        this method only: generate → dump → track. Subsequent val batches in
+        the same step are no-ops via ``_val_viz_logged_steps``.
         """
-        import wandb
-
-        if wandb.run is None:
-            return
-        max_turns = _val_generations_max_turns()
-        columns = ["step"] + sum([[f"input_{i + 1}", f"output_{i + 1}"] for i in range(max_turns)], [])
-
-        history_row: list[Any] = [int(step) if step is not None else -1]
-        for i in range(max_turns):
-            if i < len(turn_pairs):
-                prompt, path = turn_pairs[i]
-                history_row.append(prompt or "")
-                history_row.append(str(path) if path else "")
-            else:
-                history_row.extend(["", ""])
-        self._val_generations_history.setdefault(table_key, []).append(history_row)
-
-        tables = getattr(self, "_val_generations_tables", None)
-        if tables is None:
-            # Compatibility with managers restored from older checkpoints.
-            tables = {}
-            self._val_generations_tables = tables
-        table = tables.get(table_key)
-        if table is None:
-            table = wandb.Table(columns=columns, log_mode="MUTABLE")
-            tables[table_key] = table
-
-        row: list[Any] = [history_row[0]]
-        for i in range(max_turns):
-            prompt = history_row[1 + 2 * i]
-            path = history_row[2 + 2 * i]
-            row.append(prompt)
-            row.append(wandb.Image(path) if path and Path(path).is_file() else "")
-        table.add_data(*row)
-
-        if log:
-            wandb.log({table_key: table}, step=int(step) if step is not None else None)
-        return table
-
-    def _generate_val_viz(self, step) -> None:
-        """Generate fixed cafe-poster viz rollouts and log ``val/generations``.
-
-        Two prompts share the cafe-poster task: UniCoT reflect + plan system
-        prompts. Each validation step appends one WandB table row per protocol
-        (FlowGRPO-style ``val/generations``) whose columns are rewritten
-        ``generate_image`` prompts + PNGs per tool turn. Reflect →
-        ``val/generations``; plan → ``val/generations_plan``.
-        Gate: ``AGENTIC_VAL_VIZ=1``. Once per ``global_steps`` (val may emit
-        multiple ``generate_sequences`` batches).
-        """
-        if os.getenv("AGENTIC_VAL_VIZ", "0").strip().lower() not in {"1", "true", "yes", "on"}:
+        provider = self._val_viz_provider
+        if provider is None:
             return
         try:
             step_i = int(step) if step is not None else -1
@@ -892,88 +952,41 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         if step_i in self._val_viz_logged_steps:
             return
         try:
-            from verl import DataProto
-
-            from verl_omni.utils.dataset.visual_reflection import build_unicot_agentic_rl
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("val viz disabled (import failed): %s", exc)
-            return
-        try:
-            # Fixed holdout task for WandB Media (not part of the UniCoT train pool).
-            task = (
-                'A vertical artistic cafe poster. The headline at the top reads "ARTISAN ROAST". '
-                "The center features a detailed, warm-toned illustration of a ceramic coffee cup sitting "
-                "on a rustic wooden table with soft steam rising and gentle morning sunlight coming through "
-                'a nearby window. Surrounding text at the bottom reads "Freshly Brewed Daily — Open at 7 AM". '
-                "Cozy, warm amber and brown color grading, shallow depth of field, cozy aesthetic."
+            batch = provider.build_batch(
+                step,
+                eos_token_id=getattr(self._monitor_tokenizer, "eos_token_id", None),
+                pad_token_id=getattr(self._monitor_tokenizer, "pad_token_id", None),
             )
-            user_text = build_unicot_agentic_rl._with_brevity(task)
-            viz_rows = (
-                ("reflect_prompt", build_unicot_agentic_rl.REFLECT_SYSTEM_PROMPT, "reflect", "val/generations"),
-                ("plan_prompt", build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT, "plan", "val/generations_plan"),
-            )
-            non_tensor = {key: [] for key in ("raw_prompt", "index", "data_source", "reward_model", "extra_info")}
-            for offset, (viz_id, system_prompt, task_type, _) in enumerate(viz_rows):
-                ground_truth = {"user_request": task, "task_type": task_type, "expected_num_images": 1}
-                if task_type == "plan":
-                    ground_truth["reference_subtasks"] = [task]
-                non_tensor["raw_prompt"].append(
-                    [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}]
-                )
-                # Out-of-band indices so viz trajectories never collide with
-                # val (0..n) or train sample files.
-                non_tensor["index"].append(9001 + offset)
-                non_tensor["data_source"].append("agentic_val_viz")
-                non_tensor["reward_model"].append({"style": "rule", "ground_truth": ground_truth})
-                non_tensor["extra_info"].append(
-                    {
-                        "viz_id": viz_id,
-                        "task_type": task_type,
-                        "expected_num_images": 1,
-                        "raw_prompt": task,
-                    }
-                )
-            batch = DataProto.from_single_dict(
-                {key: np.array(value, dtype=object) for key, value in non_tensor.items()}
-            )
-            batch.meta_info = {
-                "global_steps": step,
-                "validate": True,
-                "eos_token_id": getattr(self._monitor_tokenizer, "eos_token_id", None),
-                "pad_token_id": getattr(self._monitor_tokenizer, "pad_token_id", None),
-                "recompute_log_prob": False,
-                "do_sample": False,
-            }
+            # Parent generate only — never re-enter this override (no recursion).
             output = super().generate_sequences(batch)
             relpaths = output.non_tensor_batch.get("trajectory_relpath")
             run_dir = _run_dir()
             responses = output.batch["responses"]
-            table_payload: dict[str, Any] = {}
-            for i, (_, _, _, table_key) in enumerate(viz_rows):
+            table_rows: dict[str, list[tuple[str, str | None]]] = {}
+            for i, case in enumerate(provider.cases):
                 relpath = str(relpaths[i]) if relpaths is not None else ""
                 decoded = self._monitor_tokenizer.decode(responses[i].tolist(), skip_special_tokens=False)
                 image_paths = _materialize_rollout_images(
                     decoded_response=decoded,
                     run_dir=run_dir,
                     relpath=relpath,
-                    user_prompt=task,
+                    user_prompt=case.user_request,
                 )
-                table_payload[table_key] = self._log_val_generations_table(
-                    step,
-                    table_key=table_key,
-                    turn_pairs=_pair_generate_image_turns(decoded, image_paths),
-                    log=False,
+                table_rows[case.table_key] = self._val_generations_logger.pair_turns(
+                    _extract_generate_image_prompts(decoded), image_paths
                 )
-            # The fixed cafe rollouts bypass this manager's generate_sequences
-            # override, so explicitly persist their complete multi-turn decodes.
-            # Do not overwrite the regular step-level hermes_actions monitor.
+            # Holdout rollouts bypass this manager's generate_sequences override,
+            # so dump them explicitly before fallible W&B table construction.
             self._dump_raw_rollouts(batch, output, step, write_monitor=False, validate=True)
-            # One commit per validation step keeps the 9001 reflect and 9002
-            # plan tables on the same W&B history row.
-            import wandb
-
-            wandb.log(table_payload, step=step)
+            # Default commit=True: push cumulative tables to remote summary now,
+            # before the remaining ~250-prompt val set burns wall-clock.
+            self._val_generations_logger.log(step, table_rows)
             self._val_viz_logged_steps.add(step_i)
+            logger.info(
+                "Val holdout viz logged for step=%s tables=%s (before main val set)",
+                step_i,
+                sorted(table_rows),
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to generate/log val viz rollouts: %s", exc)
 

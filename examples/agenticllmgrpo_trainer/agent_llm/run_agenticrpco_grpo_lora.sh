@@ -42,6 +42,11 @@ PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.30}"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export VERLOMNI_ROOT="${REPO_ROOT}"
+# Qwen3.5-9B's detailed findings are useful, but it frequently emits identical
+# high facet scores. In this RPCO run the old flat-high guard turned many
+# "fully satisfies / no fixes" cases into NO and corrupted the terminal signal.
+# Set to 1 to restore score capping + forced-NO rubber-stamp protection.
+export AGENTIC_JUDGE_RUBBER_STAMP_GUARD="${AGENTIC_JUDGE_RUBBER_STAMP_GUARD:-0}"
 HF_HOME_DIR="${HF_HOME_DIR:-/home/fq9hpsac/fq9hpsacuser11/fred/hf_home/hub}"
 UNICOT_BREAKDOWN_DIR="${UNICOT_BREAKDOWN_DIR:-${HF_HOME_DIR}/datasets--Fr0zencr4nE--UniCoT-Breakdown-3K}"
 UNICOT_REFLECTION_DIR="${UNICOT_REFLECTION_DIR:-${HF_HOME_DIR}/datasets--Fr0zencr4nE--UniCoT-Self-Reflection-6K}"
@@ -91,10 +96,12 @@ MAX_USER_TURNS="${MAX_USER_TURNS:-16}"
 # Co-locate images with traj/hermes under outputs/e2e/<experiment>/ (not /tmp).
 export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
 export AGENTIC_E2E_RUN_NAME="${EXPERIMENT_NAME}"
-# Val viz: each validation pass also rolls out the cafe-poster task under the
-# reflect SYSTEM_PROMPT and the plan PLAN_SYSTEM_PROMPT, appending one WandB
-# ``val/generations`` table row per val step (FlowGRPO-style accumulating
-# summary: idx 1/2/3… for steps 0/10/20…; see agentic_metrics_manager).
+# Val viz order (per validate step): cafe-poster holdout 9001/9002 first →
+# commit W&B ``val/generations`` / ``val/generations_plan`` to remote summary →
+# then the UniCoT val set (~250). Provider prompts in
+# ``verl_omni.utils.agentic_val_viz``; tables in
+# ``AgenticValidationGenerationsLogger``. On W&B resume, table logs bump past
+# ``wandb.run.step`` when needed so summary is not silently dropped.
 export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 export UNICOT_BREAKDOWN_DIR UNICOT_REFLECTION_DIR UNICOT_MIX_RATIO UNICOT_VAL_RATIO UNICOT_SPLIT_SEED
 # Per-dimension weights. Default ``w_reflect=1.5`` so last-image C/A outranks

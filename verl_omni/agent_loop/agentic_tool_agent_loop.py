@@ -70,10 +70,18 @@ _GEN_LIVE_BACKEND_RE = re.compile(
 _CORRECTNESS_RE = re.compile(r"\bcorrectness\s*=\s*([0-9.]+)", re.IGNORECASE)
 _AESTHETICS_RE = re.compile(r"\baesthetics\s*=\s*([0-9.]+)", re.IGNORECASE)
 _GOOD_ENOUGH_RE = re.compile(r"\bgood_enough\s*=\s*(YES|NO)", re.IGNORECASE)
+_RUBBER_STAMP_RE = re.compile(r"\brubber_stamp\s*=\s*(True|False|1|0|YES|NO)", re.IGNORECASE)
 _FINDINGS_RE = re.compile(
     r"\bfindings:\s*(.+?)(?:\n\s*suggested_fixes:|\n\s*agentic_judge\b)", re.IGNORECASE | re.DOTALL
 )
 _FIXES_RE = re.compile(r"\bsuggested_fixes:\s*(.+?)(?:\n\s*agentic_judge\b|\n\n|\Z)", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_rubber_stamp(tool_text: str) -> bool:
+    match = _RUBBER_STAMP_RE.search(tool_text or "")
+    if not match:
+        return False
+    return match.group(1).strip().lower() in {"true", "1", "yes"}
 
 
 def _force_enabled() -> bool:
@@ -270,22 +278,24 @@ def build_forced_reflection(
     correctness = c_m.group(1) if c_m else "?"
     aesthetics = a_m.group(1) if a_m else "?"
     good_enough = (g_m.group(1).upper() == "YES") if g_m else False
+    rubber_stamp = _parse_rubber_stamp(tool_text)
     findings = re.sub(r"\s+", " ", (f_m.group(1) if f_m else "").strip())[:220]
     fixes = re.sub(r"\s+", " ", (x_m.group(1) if x_m else "").strip())[:160]
     if not findings:
         findings = "see VL facet scores above"
+    stamp = f"rubber_stamp={rubber_stamp}"
 
     if good_enough:
         text = (
             f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
-            f"good_enough=YES. {findings} Stop now; do not call another tool. "
+            f"good_enough=YES. {stamp}. {findings} Stop now; do not call another tool. "
             f"Your next and only action must be exactly Done. agentic_stop_decision_required=1"
         )
         return text, True
     if force_done:
         text = (
             f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
-            f"good_enough=NO after generate_image pass {generate_pass}/{max_passes}. "
+            f"good_enough=NO after generate_image pass {generate_pass}/{max_passes}. {stamp}. "
             f"{findings} {max_passes}-pass max reached; stop now and do not call another tool. "
             f"Your next and only action must be exactly Done. "
             f"agentic_force_stop_max_passes=1 agentic_stop_decision_required=1"
@@ -294,7 +304,7 @@ def build_forced_reflection(
     fix_note = f" Suggested fixes: {fixes}." if fixes and fixes.lower() != "none" else ""
     text = (
         f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
-        f"good_enough=NO. {findings}.{fix_note} Rewriting the diffusion prompt next."
+        f"good_enough=NO. {stamp}. {findings}.{fix_note} Rewriting the diffusion prompt next."
     )
     return text, False
 

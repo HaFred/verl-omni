@@ -37,11 +37,18 @@ Reward set (VisionCreator-R1, arXiv:2603.08812, §4.1/§4.3):
   R_done    — logged-only (not in W): PR 1's ``f_done`` closed-loop indicator
       (valid terminal context + policy-sampled ``Done.`` or forced stop cue),
       emitted as ``reward_done`` for the ``agentic_reward/done`` WandB series.
+  R_terminal_no_penalty — an additive -1.0 scalar penalty when the final
+      successful judge verdict is ``good_enough=NO``. Component rewards remain
+      visible for diagnosis, but a failed terminal verdict cannot have positive
+      total reward. The penalty is placed on the final response token by verl's
+      reward manager, so it trains the sampled terminal decision.
 
-Total: ``score = (1/|W|) * sum(w_i * R_i)`` over the active set W (dims with
-``w_* > 0`` that apply to the row's task type). Default weights are 1.0 except
-``w_reflect=1.5`` so last-image C/A outranks format/tool presence. ``RPCO_W_*``
-env vars override parquet-baked ``w_*`` without a rebuild.
+Base: ``base_score = (1/|W|) * sum(w_i * R_i)`` over the active set W (dims
+with ``w_* > 0`` that apply to the row's task type). Final:
+``score = base_score + R_terminal_no_penalty``, clipped to [-1, 1]. Default
+weights are 1.0 except ``w_reflect=1.5`` so last-image C/A outranks
+format/tool presence. ``RPCO_W_*`` env vars override parquet-baked ``w_*``
+without a rebuild.
 
 Gating kept from PR 1: no ``generate_image`` / no successful PNG → score 0 and
 ``rollout_valid=0`` (rollout is discarded from the GRPO update). Env-injected
@@ -72,7 +79,7 @@ from verl_omni.utils.reward_score.agentic_reward import (
     _policy_terminal_decision,
 )
 from verl_omni.utils.reward_score.agentic_reward import (
-    _zero_result as _pr1_zero_result,
+    _zero_result as _ca_zero_result,
 )
 
 DIMS = ("reflect", "plan", "format", "tool_call", "result")
@@ -90,6 +97,9 @@ DEFAULT_WEIGHTS: dict[str, float] = {
 _SCHEMA_EXTRAS: dict[str, float | str | int | None] = {
     **{f"reward_{dim}": 0.0 for dim in DIMS},
     "reward_done": 0.0,
+    "reward_terminal_no_penalty": 0.0,
+    "score_before_terminal_penalty": 0.0,
+    "final_good_enough": -1,
     "reward_correctness": 0.0,
     "reward_aesthetics": 0.0,
     "first_correctness": 0.0,
@@ -107,7 +117,7 @@ _SCHEMA_EXTRAS: dict[str, float | str | int | None] = {
 
 
 def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
-    out = _pr1_zero_result(method=method)
+    out = _ca_zero_result(method=method)
     out.update(_SCHEMA_EXTRAS)
     # Keep last-image C/A (and first-image / delta) so WandB can plot continuous
     # quality. Facet breakdowns from PR 1 remain unused here.
@@ -408,11 +418,24 @@ def compute_score(
     }
     weights = _active_weights(gt, extra_info, task_type=task_type)
     w_sum = sum(weights.values())
-    score = sum(weights[dim] * rewards[dim] for dim in weights) / w_sum if w_sum > 0 else 0.0
+    base_score = sum(weights[dim] * rewards[dim] for dim in weights) / w_sum if w_sum > 0 else 0.0
+    judge_hits = _iter_successful_judge_scores(blob)
+    final_good_enough = judge_hits[-1][2] if judge_hits else None
+    # This is deliberately outside the weighted average. A terminal NO is task
+    # failure regardless of high C/A or protocol-component rewards. Subtracting
+    # one keeps continuous ordering among failed samples while ensuring every
+    # failed sample scores <= 0 and every successful sample remains unchanged.
+    terminal_no_penalty = -1.0 if final_good_enough is False else 0.0
+    score = max(-1.0, min(1.0, base_score + terminal_no_penalty))
 
     out.update(
         {
-            "score": float(min(1.0, score)),
+            "score": float(score),
+            "score_before_terminal_penalty": float(base_score),
+            "reward_terminal_no_penalty": float(terminal_no_penalty),
+            "final_good_enough": (
+                1 if final_good_enough is True else 0 if final_good_enough is False else -1
+            ),
             **{f"reward_{dim}": float(rewards[dim]) for dim in DIMS},
             "reward_done": float(f_done),
             "reward_correctness": float(last_c),

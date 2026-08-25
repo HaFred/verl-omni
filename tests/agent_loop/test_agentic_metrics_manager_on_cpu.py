@@ -13,16 +13,19 @@
 # limitations under the License.
 """CPU tests for agentic reward metric aggregation (train + val prefixes)."""
 
+import json
+
 import numpy as np
 import pytest
 
 import verl_omni.agent_loop.agentic_metrics_manager as metrics_module
 from verl_omni.agent_loop.agentic_metrics_manager import (
     AgenticMetricsAgentLoopManager,
-    _pair_generate_image_turns,
+    _turn_kind,
     aggregate_agentic_reward_metrics,
 )
 from verl_omni.agent_loop.agentic_trajectory_context import build_trajectory_relpath
+from verl_omni.utils.tracking import AgenticValidationGenerationsLogger
 
 
 def _val_prefixed(metrics: dict[str, float]) -> dict[str, float]:
@@ -98,18 +101,15 @@ def test_empty_arrays_are_skipped():
 
 
 def test_pair_generate_image_turns_zips_prompts_and_paths():
-    decoded = (
-        '<tool_call>{"name": "generate_image", "arguments": {"prompt": "first rewrite"}}</tool_call>\n'
-        '<tool_call>{"name": "generate_image", "arguments": {"prompt": "second rewrite"}}</tool_call>'
+    pairs = AgenticValidationGenerationsLogger.pair_turns(
+        ["first rewrite", "second rewrite"], ["/tmp/a.png", "/tmp/b.png"]
     )
-    pairs = _pair_generate_image_turns(decoded, ["/tmp/a.png", "/tmp/b.png"])
     assert pairs == [("first rewrite", "/tmp/a.png"), ("second rewrite", "/tmp/b.png")]
 
 
 def test_pair_generate_image_turns_pads_missing_side():
-    decoded = '<tool_call>{"name": "generate_image", "arguments": {"prompt": "only"}}</tool_call>'
-    assert _pair_generate_image_turns(decoded, []) == [("only", None)]
-    assert _pair_generate_image_turns("", ["/tmp/a.png"]) == [("", "/tmp/a.png")]
+    assert AgenticValidationGenerationsLogger.pair_turns(["only"], []) == [("only", None)]
+    assert AgenticValidationGenerationsLogger.pair_turns([], ["/tmp/a.png"]) == [("", "/tmp/a.png")]
 
 
 def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
@@ -125,20 +125,28 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     class _FakeTable:
         def __init__(self, columns, data=None, log_mode="IMMUTABLE"):
             self.columns = columns
-            self.data = list(data or [])
+            self.data = [list(row) for row in (data or [])]
             self.log_mode = log_mode
+            self.logged = False
 
         def add_data(self, *row):
+            if self.logged:
+                raise RuntimeError("cannot mutate an uploaded W&B table")
             self.data.append(list(row))
 
     class _FakeRun:
-        pass
+        step = 0
+
+    def _log(payload, step=None, commit=True):
+        for table in payload.values():
+            table.logged = True
+        logged.append({"payload": payload, "step": step, "commit": commit})
 
     fake_wandb = types.SimpleNamespace(
         run=_FakeRun(),
         Image=_FakeImage,
         Table=_FakeTable,
-        log=lambda payload, step=None, commit=True: logged.append({"payload": payload, "step": step, "commit": commit}),
+        log=_log,
     )
     monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
     monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "2")
@@ -148,21 +156,10 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     png_a.write_bytes(b"fake")
     png_b.write_bytes(b"fake")
 
-    manager = types.SimpleNamespace(
-        _val_generations_history={},
-        _val_generations_tables={},
-        _log_val_generations_table=AgenticMetricsAgentLoopManager._log_val_generations_table,
-    )
-
-    AgenticMetricsAgentLoopManager._log_val_generations_table(
-        manager, 0, table_key="val/generations", turn_pairs=[("p0", str(png_a))]
-    )
-    AgenticMetricsAgentLoopManager._log_val_generations_table(
-        manager, 10, table_key="val/generations", turn_pairs=[("p10", str(png_b))]
-    )
-    AgenticMetricsAgentLoopManager._log_val_generations_table(
-        manager, 20, table_key="val/generations", turn_pairs=[("p20", None)]
-    )
+    tracker = AgenticValidationGenerationsLogger(tmp_path, max_turns=2)
+    tracker.log(0, {"val/generations": [("p0", str(png_a))]})
+    tracker.log(10, {"val/generations": [("p10", str(png_b))]})
+    tracker.log(20, {"val/generations": [("p20", None)]})
 
     assert len(logged) == 3
     assert all(entry["commit"] is True for entry in logged)
@@ -173,11 +170,55 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     assert isinstance(latest.data[0][2], _FakeImage)
     assert latest.data[1][1] == "p10"
     assert latest.data[2][2] == ""
-    assert len(manager._val_generations_history["val/generations"]) == 3
-    assert latest.log_mode == "MUTABLE"
-    # All logs reuse one mutable object instead of creating immutable
-    # one-row artifacts that leave runs.summary stuck at step 0.
-    assert all(entry["payload"]["val/generations"] is latest for entry in logged)
+    assert len(tracker.history["val/generations"]) == 3
+    # Default (IMMUTABLE) table objects; never mutate after log — FlowGRPO copy.
+    assert latest.log_mode == "IMMUTABLE"
+    tables = [entry["payload"]["val/generations"] for entry in logged]
+    assert len({id(table) for table in tables}) == 3
+    assert [len(table.data) for table in tables] == [1, 2, 3]
+    # Later steps reuse Image objects from prior ``table.data`` (FlowGRPO).
+    assert tables[1].data[0][2] is tables[0].data[0][2]
+    assert tables[2].data[0][2] is tables[1].data[0][2]
+    assert tables[2].data[1][2] is tables[1].data[1][2]
+
+
+def test_wandb_effective_log_step_bumps_behind_run_step(monkeypatch):
+    """Resume must not log cafe tables at a step W&B will silently drop."""
+    import types
+
+    fake_wandb = types.SimpleNamespace(run=types.SimpleNamespace(step=33))
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    # Behind or equal to the resumed tip must bump strictly forward.
+    assert AgenticValidationGenerationsLogger.effective_wandb_step(30) == 34
+    assert AgenticValidationGenerationsLogger.effective_wandb_step(33) == 34
+    assert AgenticValidationGenerationsLogger.effective_wandb_step(40) == 40
+    fake_wandb.run = None
+    assert AgenticValidationGenerationsLogger.effective_wandb_step(30) == 30
+
+
+def test_val_generations_history_restores_from_image_metadata(tmp_path, monkeypatch):
+    """A resumed run republishes all cafe validation steps, not only new ones."""
+    monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "2")
+    for step in (0, 10, 20):
+        for sample in (9001, 9002):
+            image_dir = tmp_path / "rollout_images" / f"step_{step:06d}" / f"sample_{sample}"
+            image_dir.mkdir(parents=True)
+            paths = [str(image_dir / f"image_{i:02d}.png") for i in range(2)]
+            (image_dir / "meta.json").write_text(
+                json.dumps(
+                    {
+                        "tool_prompts": [f"prompt-{sample}-{step}-0", f"prompt-{sample}-{step}-1"],
+                        "image_paths": paths,
+                    }
+                )
+            )
+
+    history = AgenticValidationGenerationsLogger(tmp_path, max_turns=2).history
+
+    assert [row[0] for row in history["val/generations"]] == [0, 10, 20]
+    assert [row[0] for row in history["val/generations_plan"]] == [0, 10, 20]
+    assert history["val/generations"][1][1] == "prompt-9001-10-0"
+    assert history["val/generations_plan"][2][3] == "prompt-9002-20-1"
 
 
 def test_val_generations_reflect_and_plan_accumulate_independently(tmp_path, monkeypatch):
@@ -185,16 +226,16 @@ def test_val_generations_reflect_and_plan_accumulate_independently(tmp_path, mon
     import types
 
     class _FakeTable:
-        def __init__(self, columns, log_mode="IMMUTABLE"):
+        def __init__(self, columns, data=None, log_mode="IMMUTABLE"):
             self.columns = columns
-            self.data = []
+            self.data = [list(row) for row in (data or [])]
             self.log_mode = log_mode
 
         def add_data(self, *row):
             self.data.append(list(row))
 
     fake_wandb = types.SimpleNamespace(
-        run=object(),
+        run=types.SimpleNamespace(step=0),
         Image=lambda path: str(path),
         Table=_FakeTable,
         log=lambda *args, **kwargs: None,
@@ -204,23 +245,24 @@ def test_val_generations_reflect_and_plan_accumulate_independently(tmp_path, mon
 
     png = tmp_path / "cafe.png"
     png.write_bytes(b"fake")
-    manager = types.SimpleNamespace(_val_generations_history={}, _val_generations_tables={})
+    tracker = AgenticValidationGenerationsLogger(tmp_path, max_turns=1)
 
     for step in (0, 10, 20):
-        AgenticMetricsAgentLoopManager._log_val_generations_table(
-            manager, step, table_key="val/generations", turn_pairs=[(f"reflect-{step}", str(png))]
-        )
-        AgenticMetricsAgentLoopManager._log_val_generations_table(
-            manager, step, table_key="val/generations_plan", turn_pairs=[(f"plan-{step}", str(png))]
+        tracker.log(
+            step,
+            {
+                "val/generations": [(f"reflect-{step}", str(png))],
+                "val/generations_plan": [(f"plan-{step}", str(png))],
+            },
         )
 
-    reflect = manager._val_generations_tables["val/generations"]
-    plan = manager._val_generations_tables["val/generations_plan"]
+    reflect = tracker.tables["val/generations"]
+    plan = tracker.tables["val/generations_plan"]
     assert [row[0] for row in reflect.data] == [0, 10, 20]
     assert [row[0] for row in plan.data] == [0, 10, 20]
     assert [row[1] for row in reflect.data] == ["reflect-0", "reflect-10", "reflect-20"]
     assert [row[1] for row in plan.data] == ["plan-0", "plan-10", "plan-20"]
-    assert reflect.log_mode == plan.log_mode == "MUTABLE"
+    assert reflect.log_mode == plan.log_mode == "IMMUTABLE"
 
 
 def test_cafe_trajectory_dump_writes_samples_without_overwriting_monitor(tmp_path, monkeypatch):
@@ -288,6 +330,58 @@ def test_cafe_trajectory_dump_writes_samples_without_overwriting_monitor(tmp_pat
     assert (trajectory_dir / "sample_9002.json").is_file()
     assert (trajectory_dir / "sample_9002.txt").is_file()
     assert not (tmp_path / "hermes_actions").exists()
+
+
+_JUDGE_NO = (
+    "VL judge on the last generated image:\n"
+    "  correctness=0.80\n"
+    "  aesthetics =0.80\n"
+    "  good_enough =NO\n"
+    "  findings: fully rendered\n"
+    "  suggested_fixes: No fixes needed\n"
+    "  agentic_judge ok=1 parse_ok=1"
+)
+_JUDGE_YES = _JUDGE_NO.replace("good_enough =NO", "good_enough =YES")
+_CONTINUE_CUE = (
+    "Reflection: VL judge reports correctness=0.80, aesthetics=0.80, "
+    "good_enough=NO. Rewriting the diffusion prompt next. agentic_forced_reflection=1"
+)
+_STOP_CUE = (
+    "Reflection: VL judge reports good_enough=YES. Stop now. "
+    "Your next and only action must be exactly Done. "
+    "agentic_stop_decision_required=1 agentic_forced_reflection=1"
+)
+_REWRITE_DECODE = (
+    '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "lion"}}\n</tool_call>'
+)
+
+
+def test_turn_kind_uses_good_enough_and_policy_decode_not_injected_cue():
+    """Injected continue-cue must not hide a sampled Done / rewrite."""
+    done = "Reflection: The image meets the original request. Done.<|im_end|>"
+    assert _turn_kind(done, _JUDGE_NO, _CONTINUE_CUE) == "agent_reflection_done"
+    assert _turn_kind(done, _JUDGE_YES, _STOP_CUE) == "agent_done_after_forced_reflection"
+    assert _turn_kind(_REWRITE_DECODE, _JUDGE_NO, _CONTINUE_CUE) == (
+        "agent_rewrite_after_forced_reflection"
+    )
+
+
+def test_turn_kind_forced_reflection_continue_only_when_decode_empty():
+    assert _turn_kind("", _JUDGE_NO, _CONTINUE_CUE) == "forced_reflection_continue"
+    assert _turn_kind("", _JUDGE_YES, _STOP_CUE) == "forced_reflection_stop_cue"
+
+
+def test_val_holdout_runs_before_main_validate_generate():
+    """Cafe 9001/9002 + W&B table commit must precede the UniCoT val set."""
+    import inspect
+
+    src = inspect.getsource(AgenticMetricsAgentLoopManager.generate_sequences)
+    # Strip the holdout body call inside ``_maybe_run_val_viz`` by looking only
+    # at the outer method: viz gate, then parent generate for the val batch.
+    viz_gate = src.index("self._maybe_run_val_viz(step)")
+    main_generate = src.index("output = super().generate_sequences(prompts)")
+    assert viz_gate < main_generate
+    assert "if is_val:" in src[:viz_gate]
 
 
 def test_build_trajectory_relpath_val_omits_rollout_n_suffix():
