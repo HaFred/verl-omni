@@ -44,6 +44,8 @@ class AgenticValidationGenerationsLogger:
     DEFAULT_SAMPLE_TABLE_KEYS = {
         "sample_9001": "val/generations",
         "sample_9002": "val/generations_plan",
+        "sample_9003": "val/generations_cn",
+        "sample_9004": "val/generations_plan_cn",
     }
 
     def __init__(
@@ -82,11 +84,13 @@ class AgenticValidationGenerationsLogger:
         """Return the trainer global step for mid-validate soft W&B logs.
 
         Always the exact ``global_steps`` (no tip bump). Holdout tables and
-        ``val_agentic_reward/*`` are logged with ``commit=False`` *before* the
-        trainer's ``Tracking.log`` of ``val-core`` at the same step. Bumping to
-        ``run.step + 1`` here used to finalize tip ``N+1`` first, so the later
-        ``val-core`` commit at ``N`` was dropped (``Tried to log to step N <
-        current step N+1``). Table ``row[0]`` also stores this same integer.
+        mid-val scalars soft-log with ``commit=False`` before the trainer's
+        ``Tracking.log`` of ``val-core`` at the same step; the cumulative table
+        is also dual-written into ``run.summary`` so Media prev/next works
+        without committing tip early. Bumping to ``run.step + 1`` used to
+        finalize tip ``N+1`` first, so the later ``val-core`` commit at ``N`` was
+        dropped (``Tried to log to step N < current step N+1``). Table ``row[0]``
+        also stores this same integer.
         """
         if step is None:
             return None
@@ -171,10 +175,14 @@ class AgenticValidationGenerationsLogger:
         return table
 
     def log(self, step, table_rows: dict[str, Sequence[tuple[str, str | None]]]) -> None:
-        """Soft-log cumulative validation tables at the trainer global step.
+        """Soft-log cumulative tables and dual-write them into ``run.summary``.
 
-        Uses ``commit=False`` so the tip stays available for the trainer's later
-        ``Tracking.log`` of ``val-core`` / step metrics at the same ``step``.
+        ``wandb.log(..., commit=False)`` at exact ``global_steps`` keeps the tip
+        free for the trainer's later ``val-core`` commit (same step). Soft-log
+        alone left ``runs.summary["val/generations"]`` stuck on the first
+        one-row table, so also assign the rebuilt cumulative table onto
+        ``wandb.run.summary[key]`` — that is what the Media prev/next pager
+        reads. Never tip+1.
         """
         import wandb
 
@@ -185,8 +193,17 @@ class AgenticValidationGenerationsLogger:
             for table_key, turn_pairs in table_rows.items()
             if (table := self._build_table(step, table_key, turn_pairs)) is not None
         }
-        if payload:
-            wandb.log(payload, step=self.effective_wandb_step(step), commit=False)
+        if not payload:
+            return
+        wandb.log(payload, step=self.effective_wandb_step(step), commit=False)
+        summary = getattr(wandb.run, "summary", None)
+        if summary is None:
+            return
+        for table_key, table in payload.items():
+            try:
+                summary[table_key] = table
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Failed to dual-write %s into wandb.run.summary: %s", table_key, exc)
 
 
 def batch_items(values: Any, batch_size: int, name: str) -> list[Any]:

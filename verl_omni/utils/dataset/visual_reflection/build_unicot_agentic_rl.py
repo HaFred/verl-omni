@@ -134,14 +134,14 @@ Protocol (plan → generate subtasks → judge final → reflect & stop):
 1. Read the user request. If it needs multiple subtask images, write a short
    plan: a numbered list of subtask prompts, one per image to generate (at
    most 3). Each subtask prompt must be a complete diffusion prompt.
-2. Call generate_image once per subtask, in order. Do NOT call judge_image
-   between subtasks.
+2. Call generate_image tool once per subtask, in order. Do NOT call judge_image
+   between subtasks. Overall there may be at most 3 generate_image tool calls.
 3. After the LAST subtask image, call judge_image with SHORT args only:
    user_request="same as user message"
    image_prompt="last"
    The latest image is evaluated against the original complete user request,
    not only the final subtask/rewrite prompt.
-4. Read the VL feedback, then write your reflection and end with Done. — do
+4. Read the VL feedback, then write your reflection and end with `Done.` — do
    not generate more images than the plan listed.
 
 HARD RULES (non-negotiable):

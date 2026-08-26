@@ -16,11 +16,12 @@
 
 These are experiment-tracking fixtures, not part of the agent-loop protocol.
 On each validate step the metrics manager runs this holdout *first* (samples
-9001/9002 by default), soft-logs ``val/generations(_plan)`` to W&B
-(``commit=False`` at exact ``global_steps``), then evaluates the UniCoT val
-set. The trainer later commits ``val-core`` at the same step. The agent loop
-only generates whatever batch a provider builds and forwards prompt/image
-rows to ``AgenticValidationGenerationsLogger``.
+9001/9002 cafe + 9003/9004 CN poster by default), soft-logs
+``val/generations(_plan)`` and ``val/generations(_plan)_cn`` to W&B
+(``commit=False`` at exact ``global_steps``) and dual-writes ``run.summary``,
+then evaluates the UniCoT val set. The trainer later commits ``val-core`` at
+the same step. The agent loop only generates whatever batch a provider builds
+and forwards prompt/image rows to ``AgenticValidationGenerationsLogger``.
 """
 
 from __future__ import annotations
@@ -141,18 +142,71 @@ def _cafe_poster_cases() -> list[ValVizCase]:
     ]
 
 
+_CN_POSTER_TASK = (
+    "一张垂直构图的平面设计海报，背景是纯粹而鲜艳的宝蓝色。"
+    "顶部的巨大无衬线字体主标题，上半部分为浅灰色的“Sofa Montain Slummerfest”，"
+    "下半部分为白色的“Annual Napping Festival 2025”。"
+    "其下方是巨大的黑色书法字体中文标题“沙发山打呼节”。"
+    "海报的下半部分由一幅巨大的、插画风格的老虎插画占据，它正趴着面向观众，眼睛是黄色的。"
+    "其皮毛由橙、黑、白三色构成。一个包含红色爱心的思想泡泡漂浮在它的头顶。"
+    "海报上布满了详尽的活动文字。左栏用白色字体列出了以猫为主题的乐队名，"
+    "如“The Fluffy Paws Grumbers (毛爪咕噜)”、“DJ Meow Mix”、“九命怪猫 (Nine Lives)”、"
+    "“激光笔追逐者 (The Laser Dots)”、“纸箱爱好者 (Cardbock Box Lovers)”、"
+    "“呼噜神教 (The Purr-fectionists)”、“猫草成瘾者 (The Catnip Junkies)”、"
+    "“DJ Chairman Meow (猫主席)”以及像“Varh Radator Fesidenl Paw-Five”这样的无意义短语。"
+    "右栏列出了活动细节，其中许多都带有滑稽的拼写错误或无意义内容，"
+    "包括日期“4/1 MONDAY SUNL SUNSET”、地点“上海市浦东新区猫抓板路1号顶楼阳台”"
+    "以及票务信息如“ADV. 1 CAN OF TUNA, DOOR 2 CANS, KITTENS FREE!”。"
+    "在最底部是一排虚构的赞助商标志，名称包括“Catberd”、"
+    "“好主人罐罐有限公司 (Good Oinar Canned Food Ltd)”和“iNONEPAWS”。"
+)
+
+
+def _cn_poster_cases() -> list[ValVizCase]:
+    """UniCoT reflect/plan Chinese napping-festival poster holdout (9003/9004)."""
+    from verl_omni.utils.dataset.visual_reflection import build_unicot_agentic_rl
+
+    user_text = build_unicot_agentic_rl._with_brevity(_CN_POSTER_TASK)
+    return [
+        ValVizCase(
+            sample_index=9003,
+            table_key="val/generations_cn",
+            viz_id="reflect_prompt_cn",
+            task_type="reflect",
+            system_prompt=build_unicot_agentic_rl.REFLECT_SYSTEM_PROMPT,
+            user_request=user_text,
+            expected_num_images=1,
+        ),
+        ValVizCase(
+            sample_index=9004,
+            table_key="val/generations_plan_cn",
+            viz_id="plan_prompt_cn",
+            task_type="plan",
+            system_prompt=build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT,
+            user_request=user_text,
+            expected_num_images=1,
+            reference_subtasks=(_CN_POSTER_TASK,),
+        ),
+    ]
+
+
+def _default_holdout_cases() -> list[ValVizCase]:
+    """Cafe 9001/9002 + CN poster 9003/9004."""
+    return _cafe_poster_cases() + _cn_poster_cases()
+
+
 def resolve_agentic_val_viz_provider() -> AgenticValVizProvider | None:
     """Return the enabled holdout viz provider, or ``None`` when gated off.
 
-    Gate: ``AGENTIC_VAL_VIZ=1``. Recipe selection defaults to the cafe-poster
-    holdout; override with ``AGENTIC_VAL_VIZ_PROVIDER=cafe_poster``.
+    Gate: ``AGENTIC_VAL_VIZ=1``. Recipe selection defaults to cafe + CN poster
+    holdouts; override with ``AGENTIC_VAL_VIZ_PROVIDER=cafe_poster``.
     """
     if os.getenv("AGENTIC_VAL_VIZ", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
     provider_name = os.getenv("AGENTIC_VAL_VIZ_PROVIDER", "cafe_poster").strip().lower() or "cafe_poster"
     try:
         if provider_name in {"cafe_poster", "cafe", "default"}:
-            return AgenticValVizProvider(_cafe_poster_cases())
+            return AgenticValVizProvider(_default_holdout_cases())
     except Exception as exc:  # noqa: BLE001
         logger.warning("val viz disabled (provider %s failed): %s", provider_name, exc)
         return None

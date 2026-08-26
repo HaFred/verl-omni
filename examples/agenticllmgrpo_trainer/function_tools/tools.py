@@ -102,6 +102,36 @@ DIFFUSION_TOOL_SCHEMA = {
 }
 
 
+def _record_tool_latency(name: str, latency_s: float, *, ok: bool, backend: str = "") -> None:
+    """Append one wall-clock tool-latency sample to the active rollout's timeline.
+
+    Written to ``<rollout_images_root>/<relpath>/timing.jsonl`` — the same
+    per-rollout directory that already holds ``image_*.png`` and ``meta.json``.
+    The metrics manager aggregates these into ``agentic_tool/<name>_latency_s``
+    for the profiling baseline. Failures must never break the tool path.
+    """
+    relpath = get_active_trajectory_relpath()
+    if not relpath or latency_s < 0:
+        return
+    try:
+        traj_dir = _e2e_run_root() / relpath
+        traj_dir.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(
+            {
+                "tool": name,
+                "latency_s": round(float(latency_s), 4),
+                "ok": bool(ok),
+                "backend": backend,
+                "wall": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            },
+            ensure_ascii=False,
+        )
+        with (traj_dir / "timing.jsonl").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
 def _decode_images(payload: dict) -> list[Image.Image]:
     """Decode the endpoint's optional base64 image fields."""
     encoded = payload.get("images_base64")
@@ -377,10 +407,13 @@ def _call_generic_http(
     # Offloaded Qwen-Image requests may queue behind other rollout workers on
     # the single frozen-tool GPU.
     timeout = float(os.getenv("AGENTIC_DIFFUSION_TOOL_TIMEOUT", "900"))
+    t0 = time.perf_counter()
     try:
         with urlopen(request, timeout=timeout) as result:  # noqa: S310 - endpoint is operator-configured
             payload = json.loads(result.read())
+        _record_tool_latency("generate_image", time.perf_counter() - t0, ok=True, backend=backend)
     except Exception as exc:  # noqa: BLE001 - return failure as an observable tool result
+        _record_tool_latency("generate_image", time.perf_counter() - t0, ok=False, backend=f"{backend}_error")
         err = f"{backend} request failed: {exc}"
         logger.error(err)
         return _pack_response(

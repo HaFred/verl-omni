@@ -96,12 +96,14 @@ MAX_USER_TURNS="${MAX_USER_TURNS:-16}"
 # Co-locate images with traj/hermes under outputs/e2e/<experiment>/ (not /tmp).
 export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
 export AGENTIC_E2E_RUN_NAME="${EXPERIMENT_NAME}"
-# Val viz order (per validate step): cafe-poster holdout 9001/9002 first →
-# soft-log W&B ``val/generations`` / ``val/generations_plan`` (commit=False at
-# exact global_steps) → UniCoT val set (~250) → trainer Tracking.log commits
-# ``val-core`` at the same step. Provider: ``verl_omni.utils.agentic_val_viz``;
-# tables: ``AgenticValidationGenerationsLogger``. Do not bump past tip mid-val
-# or ``val-core`` at N is dropped when tip is already N+1.
+# Val viz order (per validate step): cafe 9001/9002 + CN poster 9003/9004 first →
+# soft-log W&B ``val/generations(_plan)`` and ``val/generations(_plan)_cn``
+# (commit=False at exact global_steps) + dual-write ``run.summary`` (Media
+# prev/next) → UniCoT val set (~250) → trainer Tracking.log commits
+# ``val-core`` at the same step.
+# Provider: ``verl_omni.utils.agentic_val_viz``; tables:
+# ``AgenticValidationGenerationsLogger``. Do not bump past tip mid-val or
+# ``val-core`` at N is dropped when tip is already N+1.
 export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 export UNICOT_BREAKDOWN_DIR UNICOT_REFLECTION_DIR UNICOT_MIX_RATIO UNICOT_VAL_RATIO UNICOT_SPLIT_SEED
 # Per-dimension weights. Default ``w_reflect=1.5`` so last-image C/A outranks
@@ -143,7 +145,7 @@ fi
 # Build the mixed UniCoT train/val parquet (system + user only; UniCoT fields
 # are reward ground truth, never fewshot). Skip when both files already exist
 # unless REBUILD_UNICOT=1 (avoids import-heavy rebuild on resume).
-if [[ "${REBUILD_UNICOT:-0}" == "1" || ! -f "$TRAIN_FILE" || ! -f "$VAL_FILE" ]]; then
+if [[ "${REBUILD_UNICOT:-1}" == "1" || ! -f "$TRAIN_FILE" || ! -f "$VAL_FILE" ]]; then
   python3 -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl \
       --breakdown_dir "$UNICOT_BREAKDOWN_DIR" \
       --reflection_dir "$UNICOT_REFLECTION_DIR" \

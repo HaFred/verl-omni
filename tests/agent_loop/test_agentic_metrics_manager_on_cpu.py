@@ -113,7 +113,7 @@ def test_pair_generate_image_turns_pads_missing_side():
 
 
 def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
-    """FlowGRPO-style: each val step appends a row; summary table has all rows."""
+    """Each val step appends a row; soft-log + summary dual-write has all rows."""
     import types
 
     logged: list[dict] = []
@@ -137,13 +137,17 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     class _FakeRun:
         step = 0
 
+        def __init__(self):
+            self.summary = {}
+
     def _log(payload, step=None, commit=True):
         for table in payload.values():
             table.logged = True
         logged.append({"payload": payload, "step": step, "commit": commit})
 
+    fake_run = _FakeRun()
     fake_wandb = types.SimpleNamespace(
-        run=_FakeRun(),
+        run=fake_run,
         Image=_FakeImage,
         Table=_FakeTable,
         log=_log,
@@ -164,8 +168,9 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     assert len(logged) == 3
     assert all(entry["commit"] is False for entry in logged)
     assert [entry["step"] for entry in logged] == [0, 10, 20]
-    # Latest summary payload must contain all prior val steps as rows.
+    # Soft-log payload and summary dual-write must carry all prior val steps.
     latest = logged[-1]["payload"]["val/generations"]
+    assert fake_run.summary["val/generations"] is latest
     assert [row[0] for row in latest.data] == [0, 10, 20]
     assert latest.data[0][1] == "p0"
     assert isinstance(latest.data[0][2], _FakeImage)
@@ -202,8 +207,8 @@ def test_wandb_effective_log_step_keeps_trainer_global_steps(monkeypatch):
     assert AgenticValidationGenerationsLogger.effective_wandb_step("bad") is None
 
 
-def test_val_generations_log_does_not_advance_tip_past_trainer_step(tmp_path, monkeypatch):
-    """Holdout soft-log stays at N with commit=False even when tip is already N."""
+def test_val_generations_soft_logs_and_dual_writes_summary(tmp_path, monkeypatch):
+    """Holdout soft-logs at exact N and dual-writes run.summary; never tip+1."""
     import types
 
     logged: list[dict] = []
@@ -217,8 +222,15 @@ def test_val_generations_log_does_not_advance_tip_past_trainer_step(tmp_path, mo
         def add_data(self, *row):
             self.data.append(list(row))
 
+    class _FakeRun:
+        step = 10
+
+        def __init__(self):
+            self.summary = {}
+
+    fake_run = _FakeRun()
     fake_wandb = types.SimpleNamespace(
-        run=types.SimpleNamespace(step=10),
+        run=fake_run,
         Image=lambda path: str(path),
         Table=_FakeTable,
         log=lambda payload, step=None, commit=True: logged.append(
@@ -234,6 +246,8 @@ def test_val_generations_log_does_not_advance_tip_past_trainer_step(tmp_path, mo
     assert len(logged) == 1
     assert logged[0]["step"] == 10
     assert logged[0]["commit"] is False
+    assert fake_run.summary["val/generations"] is logged[0]["payload"]["val/generations"]
+    assert [row[0] for row in fake_run.summary["val/generations"].data] == [10]
 
 
 def test_val_generations_history_restores_from_image_metadata(tmp_path, monkeypatch):
