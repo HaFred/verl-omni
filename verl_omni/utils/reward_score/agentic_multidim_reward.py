@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-dimensional reward for RPCO stage-3 multi-task RL (PR 2 of RFC #302).
+"""Multi-dimensional reward for RPCO agentic RL.
 
 Reward set (VisionCreator-R1, arXiv:2603.08812, §4.1/§4.3):
 
@@ -245,6 +245,7 @@ def _reflection_reward(blob: str, *, gt: dict[str, Any]) -> tuple[float, float, 
 
 
 def _plan_reward(blob: str, *, gt: dict[str, Any]) -> float:
+    """R_plan"""
     subtasks = [str(s).strip() for s in (gt.get("reference_subtasks") or []) if str(s).strip()]
     if not subtasks:
         return 0.0
