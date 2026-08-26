@@ -57,6 +57,7 @@ from verl_omni.agent_loop.agentic_trajectory_context import (
     get_active_trajectory_relpath,
     set_active_trajectory_relpath,
 )
+from verl_omni.agent_loop.rl_insight_profiler import trace_state
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +359,11 @@ class AgenticToolAgentLoop(ToolAgentLoop):
             agent_data.extra_fields["trajectory_relpath"] = relpath
         return await super()._call_tool(tool_call, tools_kwargs, agent_data)
 
+    def _rl_insight_lane(self) -> str:
+        """Swim-lane id for this rollout (one lane per trajectory in trace UIs)."""
+        relpath = getattr(self, "_agentic_trajectory_relpath", None) or get_active_trajectory_relpath()
+        return relpath or f"rollout_{id(self)}"
+
     async def _rewrite_premature_judge_to_generate(self, agent_data: AgentData) -> AgentState | None:
         """Replace a first-turn ``judge_image`` call with ``generate_image`` (mask=1)."""
         active_tools = getattr(agent_data, "_active_tools", self.tools)
@@ -447,7 +453,16 @@ class AgenticToolAgentLoop(ToolAgentLoop):
         ignore_termination: bool = False,
     ) -> AgentState:
         """Teacher-force missing generate/judge tool calls during early curriculum."""
-        state = await super()._handle_generating_state(agent_data, sampling_params, ignore_termination)
+                # rl-insight swim-lane: paint the policy decode on this rollout's lane so
+        # the sidecar tool calls appear as gaps between ``decode`` spans.
+        lane = self._rl_insight_lane()
+        with trace_state(
+            "decode",
+            state_lane_id=lane,
+            step=int(getattr(self, "_agentic_step", 0)),
+            assistant_turn=int(getattr(agent_data, "assistant_turns", 0)) + 1,
+        ):
+            state = await super()._handle_generating_state(agent_data, sampling_params, ignore_termination)
         probability = _force_first_generate_probability(
             getattr(self, "_agentic_step", 0),
             validate=getattr(self, "_agentic_validate", False),

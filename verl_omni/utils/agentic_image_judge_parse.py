@@ -384,8 +384,8 @@ def format_judge_observation(
     aesthetics = float(parsed["aesthetics"])
     good = bool(parsed.get("good_enough", False))
     rubber_stamp = bool(parsed.get("rubber_stamp", False))
-    findings_short = re.sub(r"\s+", " ", str(parsed.get("findings") or "no specific findings")).strip()[:220]
-    fixes_short = re.sub(r"\s+", " ", str(parsed.get("suggested_fixes") or "none")).strip()[:160]
+    findings_short = re.sub(r"\s+", " ", str(parsed.get("findings") or "no specific findings")).strip()
+    fixes_short = re.sub(r"\s+", " ", str(parsed.get("suggested_fixes") or "none")).strip()
     text = (
         f"VL judge on the last generated image:\n"
         f"  path={image_path}\n"
@@ -434,7 +434,7 @@ def format_judge_parse_error(
     )
     meta = {
         "error": "unparseable",
-        "raw": (raw_text or "")[:300],
+        "raw": (raw_text or ""),
         "image_path": image_path,
         "backend": backend,
         "parse_ok": 0,

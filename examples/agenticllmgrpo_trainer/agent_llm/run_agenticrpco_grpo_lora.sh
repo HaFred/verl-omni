@@ -97,11 +97,11 @@ MAX_USER_TURNS="${MAX_USER_TURNS:-16}"
 export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
 export AGENTIC_E2E_RUN_NAME="${EXPERIMENT_NAME}"
 # Val viz order (per validate step): cafe-poster holdout 9001/9002 first →
-# commit W&B ``val/generations`` / ``val/generations_plan`` to remote summary →
-# then the UniCoT val set (~250). Provider prompts in
-# ``verl_omni.utils.agentic_val_viz``; tables in
-# ``AgenticValidationGenerationsLogger``. On W&B resume, table logs bump past
-# ``wandb.run.step`` when needed so summary is not silently dropped.
+# soft-log W&B ``val/generations`` / ``val/generations_plan`` (commit=False at
+# exact global_steps) → UniCoT val set (~250) → trainer Tracking.log commits
+# ``val-core`` at the same step. Provider: ``verl_omni.utils.agentic_val_viz``;
+# tables: ``AgenticValidationGenerationsLogger``. Do not bump past tip mid-val
+# or ``val-core`` at N is dropped when tip is already N+1.
 export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 export UNICOT_BREAKDOWN_DIR UNICOT_REFLECTION_DIR UNICOT_MIX_RATIO UNICOT_VAL_RATIO UNICOT_SPLIT_SEED
 # Per-dimension weights. Default ``w_reflect=1.5`` so last-image C/A outranks

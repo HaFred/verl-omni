@@ -885,10 +885,11 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         step = prompts.meta_info.get("global_steps")
         is_val = bool(prompts.meta_info.get("validate", False))
         if is_val:
-            # Holdout 9001/9002 first: generate → dump → commit W&B
-            # ``val/generations(_plan)`` to remote summary *before* the long
-            # UniCoT val set (~250 prompts). Once-per-step via
-            # ``_val_viz_logged_steps`` so later val batches skip the holdout.
+            # Holdout 9001/9002 first: generate → dump → soft-log W&B
+            # ``val/generations(_plan)`` (commit=False) *before* the long UniCoT
+            # val set (~250 prompts). Once-per-step via ``_val_viz_logged_steps``
+            # so later val batches skip the holdout. Soft-log keeps tip at
+            # ``global_steps`` for the trainer's later ``val-core`` commit.
             self._maybe_run_val_viz(step)
         output = super().generate_sequences(prompts)
         if is_val:
@@ -934,13 +935,15 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             logger.warning("Failed to log val agentic reward metrics to W&B: %s", exc)
 
     def _maybe_run_val_viz(self, step) -> None:
-        """Holdout cafe-poster (9001/9002) generate → dump → W&B table commit.
+        """Holdout cafe-poster (9001/9002) generate → dump → soft W&B table log.
 
         Invoked at the *start* of the first validate ``generate_sequences`` for
-        ``global_steps`` so remote ``val/generations(_plan)`` updates before the
-        UniCoT val set. Prompt content comes from ``AgenticValVizProvider``;
-        this method only: generate → dump → track. Subsequent val batches in
-        the same step are no-ops via ``_val_viz_logged_steps``.
+        ``global_steps`` so ``val/generations(_plan)`` is queued at that step
+        (``commit=False``) before the UniCoT val set. The trainer's later
+        ``Tracking.log`` commits ``val-core`` at the same step. Prompt content
+        comes from ``AgenticValVizProvider``; this method only: generate → dump
+        → track. Subsequent val batches in the same step are no-ops via
+        ``_val_viz_logged_steps``.
         """
         provider = self._val_viz_provider
         if provider is None:
@@ -978,12 +981,12 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             # Holdout rollouts bypass this manager's generate_sequences override,
             # so dump them explicitly before fallible W&B table construction.
             self._dump_raw_rollouts(batch, output, step, write_monitor=False, validate=True)
-            # Default commit=True: push cumulative tables to remote summary now,
-            # before the remaining ~250-prompt val set burns wall-clock.
+            # Soft-log (commit=False) at exact global_steps: do not advance the
+            # W&B tip past N before the trainer commits val-core at N.
             self._val_generations_logger.log(step, table_rows)
             self._val_viz_logged_steps.add(step_i)
             logger.info(
-                "Val holdout viz logged for step=%s tables=%s (before main val set)",
+                "Val holdout viz soft-logged for step=%s tables=%s (before main val set)",
                 step_i,
                 sorted(table_rows),
             )

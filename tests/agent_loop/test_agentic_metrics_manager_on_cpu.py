@@ -162,7 +162,8 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     tracker.log(20, {"val/generations": [("p20", None)]})
 
     assert len(logged) == 3
-    assert all(entry["commit"] is True for entry in logged)
+    assert all(entry["commit"] is False for entry in logged)
+    assert [entry["step"] for entry in logged] == [0, 10, 20]
     # Latest summary payload must contain all prior val steps as rows.
     latest = logged[-1]["payload"]["val/generations"]
     assert [row[0] for row in latest.data] == [0, 10, 20]
@@ -182,18 +183,57 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     assert tables[2].data[1][2] is tables[1].data[1][2]
 
 
-def test_wandb_effective_log_step_bumps_behind_run_step(monkeypatch):
-    """Resume must not log cafe tables at a step W&B will silently drop."""
+def test_wandb_effective_log_step_keeps_trainer_global_steps(monkeypatch):
+    """Mid-validate soft logs must use exact global_steps (never tip+1).
+
+    Bumping past ``run.step`` before the trainer's ``Tracking.log`` made
+    ``val-core`` at step N drop with ``Tried to log to step N < current N+1``.
+    """
     import types
 
     fake_wandb = types.SimpleNamespace(run=types.SimpleNamespace(step=33))
     monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
-    # Behind or equal to the resumed tip must bump strictly forward.
-    assert AgenticValidationGenerationsLogger.effective_wandb_step(30) == 34
-    assert AgenticValidationGenerationsLogger.effective_wandb_step(33) == 34
+    assert AgenticValidationGenerationsLogger.effective_wandb_step(30) == 30
+    assert AgenticValidationGenerationsLogger.effective_wandb_step(33) == 33
     assert AgenticValidationGenerationsLogger.effective_wandb_step(40) == 40
     fake_wandb.run = None
     assert AgenticValidationGenerationsLogger.effective_wandb_step(30) == 30
+    assert AgenticValidationGenerationsLogger.effective_wandb_step(None) is None
+    assert AgenticValidationGenerationsLogger.effective_wandb_step("bad") is None
+
+
+def test_val_generations_log_does_not_advance_tip_past_trainer_step(tmp_path, monkeypatch):
+    """Holdout soft-log stays at N with commit=False even when tip is already N."""
+    import types
+
+    logged: list[dict] = []
+
+    class _FakeTable:
+        def __init__(self, columns, data=None, log_mode="IMMUTABLE"):
+            self.columns = columns
+            self.data = [list(row) for row in (data or [])]
+            self.log_mode = log_mode
+
+        def add_data(self, *row):
+            self.data.append(list(row))
+
+    fake_wandb = types.SimpleNamespace(
+        run=types.SimpleNamespace(step=10),
+        Image=lambda path: str(path),
+        Table=_FakeTable,
+        log=lambda payload, step=None, commit=True: logged.append(
+            {"payload": payload, "step": step, "commit": commit}
+        ),
+    )
+    monkeypatch.setitem(__import__("sys").modules, "wandb", fake_wandb)
+    png = tmp_path / "cafe.png"
+    png.write_bytes(b"fake")
+    tracker = AgenticValidationGenerationsLogger(tmp_path, max_turns=1)
+    tracker.log(10, {"val/generations": [("p10", str(png))]})
+
+    assert len(logged) == 1
+    assert logged[0]["step"] == 10
+    assert logged[0]["commit"] is False
 
 
 def test_val_generations_history_restores_from_image_metadata(tmp_path, monkeypatch):

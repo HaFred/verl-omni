@@ -16,10 +16,11 @@
 
 These are experiment-tracking fixtures, not part of the agent-loop protocol.
 On each validate step the metrics manager runs this holdout *first* (samples
-9001/9002 by default), commits ``val/generations(_plan)`` to W&B, then
-evaluates the UniCoT val set. The agent loop only generates whatever batch a
-provider builds and forwards prompt/image rows to
-``AgenticValidationGenerationsLogger``.
+9001/9002 by default), soft-logs ``val/generations(_plan)`` to W&B
+(``commit=False`` at exact ``global_steps``), then evaluates the UniCoT val
+set. The trainer later commits ``val-core`` at the same step. The agent loop
+only generates whatever batch a provider builds and forwards prompt/image
+rows to ``AgenticValidationGenerationsLogger``.
 """
 
 from __future__ import annotations

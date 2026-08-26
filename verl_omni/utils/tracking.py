@@ -79,40 +79,21 @@ class AgenticValidationGenerationsLogger:
 
     @staticmethod
     def effective_wandb_step(step) -> int | None:
-        """Return a W&B step that will not be dropped after resume."""
+        """Return the trainer global step for mid-validate soft W&B logs.
+
+        Always the exact ``global_steps`` (no tip bump). Holdout tables and
+        ``val_agentic_reward/*`` are logged with ``commit=False`` *before* the
+        trainer's ``Tracking.log`` of ``val-core`` at the same step. Bumping to
+        ``run.step + 1`` here used to finalize tip ``N+1`` first, so the later
+        ``val-core`` commit at ``N`` was dropped (``Tried to log to step N <
+        current step N+1``). Table ``row[0]`` also stores this same integer.
+        """
         if step is None:
             return None
         try:
-            requested = int(step)
+            return int(step)
         except (TypeError, ValueError):
             return None
-        try:
-            import wandb
-        except Exception:  # noqa: BLE001
-            return requested
-        if wandb.run is None:
-            return requested
-        current = getattr(wandb.run, "step", None)
-        try:
-            current_i = int(current) if current is not None else None
-        except (TypeError, ValueError):
-            current_i = None
-        # Resume restores ``run.step`` to the last *committed* remote step. Logging
-        # at that same integer is still dropped/ignored for new media, so bump to
-        # strictly greater than the current tip. Table row[0] still stores
-        # ``requested`` (the trainer global step).
-        if current_i is not None and requested <= current_i:
-            bumped = current_i + 1
-            logger.warning(
-                "W&B step %s is behind-or-equal run.step=%s; logging validation tables at "
-                "step %s so the cumulative summary is not dropped (table rows still store %s)",
-                requested,
-                current_i,
-                bumped,
-                requested,
-            )
-            return bumped
-        return requested
 
     def _restore_history(self) -> dict[str, list[list[Any]]]:
         """Recover cumulative validation rows from on-disk image metadata."""
@@ -190,7 +171,11 @@ class AgenticValidationGenerationsLogger:
         return table
 
     def log(self, step, table_rows: dict[str, Sequence[tuple[str, str | None]]]) -> None:
-        """Publish all validation protocols in one W&B history commit."""
+        """Soft-log cumulative validation tables at the trainer global step.
+
+        Uses ``commit=False`` so the tip stays available for the trainer's later
+        ``Tracking.log`` of ``val-core`` / step metrics at the same ``step``.
+        """
         import wandb
 
         if wandb.run is None:
@@ -201,7 +186,7 @@ class AgenticValidationGenerationsLogger:
             if (table := self._build_table(step, table_key, turn_pairs)) is not None
         }
         if payload:
-            wandb.log(payload, step=self.effective_wandb_step(step))
+            wandb.log(payload, step=self.effective_wandb_step(step), commit=False)
 
 
 def batch_items(values: Any, batch_size: int, name: str) -> list[Any]:
