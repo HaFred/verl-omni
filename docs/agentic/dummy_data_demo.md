@@ -146,7 +146,7 @@ flowchart LR
     class T3d,T4d,T5d_in,T5d_forced,T5d_decode,T6d delta
 ```
 
-
-| <img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/b89396b5-0410-4dc5-99e7-881166d75d56" />| <img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/3a61b571-804b-4589-9ee3-6549ca8d629d" /> | <img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/e60b5d68-1a4e-4dcf-bea7-fa0fd4ab251a" /> |
-| :-: | :-:| :-:|
-| image_00 |  image_01 | image_02 | 
+| Turn | #00 |  #01 | #02 | 
+| :-: | :-: | :-:| :-:|
+| **Prompt** | `A vertical cafe poster, headline 'ARTISAN ROAST', ceramic cup on wooden table, footer 'Freshly Brewed Daily — Open at 7 AM', cozy amber grading + brevity` | #00 + `warm amber headline, serif footer, centered cup` | #01 + `Watermark 'Artisan Roast'` |
+| **Image** | <img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/b89396b5-0410-4dc5-99e7-881166d75d56" />| <img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/3a61b571-804b-4589-9ee3-6549ca8d629d" /> | <img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/e60b5d68-1a4e-4dcf-bea7-fa0fd4ab251a" /> |
