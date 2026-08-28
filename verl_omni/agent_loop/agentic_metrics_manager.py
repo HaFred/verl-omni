@@ -100,7 +100,16 @@ _TERMINAL_DONE_RE = re.compile(r"(?is)^\s*(?:Reflection\s*:.*?)?Done\.\s*(?:<\|i
 
 
 def _turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
-    """Label turns so trajectory dumps make protocol stages grep-able."""
+    """Label a rollout turn with one of 13 ``turn_kind`` strings (grep-able dumps).
+
+    - Tool calls: `call_generate_image`, `call_judge_image`, `agent_rewrite_after_forced_reflection`
+    - Injected Reflection cues: `forced_reflection_continue`, `forced_reflection_stop_cue`,
+    `forced_reflection_max_passes_stop_cue`
+    - Policy stop / self-reflection: `agent_done_after_forced_reflection`, `agent_done_after_max_passes`,
+    `agent_reflection_done`, `agent_reflection_rewrite`
+    - Obs-only (no matching call): `after_generate_image`, `after_judge_feedback`
+    - Fallback: `other`
+    """
     resp = response or ""
     forced_context = f"{turn_prompt or ''}\n{resp}"
     if _JUDGE_CALL_RE.search(decode or ""):
