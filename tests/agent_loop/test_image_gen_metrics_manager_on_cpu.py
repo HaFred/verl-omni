@@ -16,13 +16,13 @@
 import numpy as np
 import pytest
 
-import verl_omni.agent_loop.agentic_metrics_manager as metrics_module
-from verl_omni.agent_loop.agentic_metrics_manager import (
-    AgenticMetricsAgentLoopManager,
+import verl_omni.agent_loop.image_gen_metrics_manager as metrics_module
+from verl_omni.agent_loop.image_gen_metrics_manager import (
+    ImageGenMetricsAgentLoopManager,
     _turn_kind,
     aggregate_agentic_reward_metrics,
 )
-from verl_omni.agent_loop.agentic_trajectory_context import build_trajectory_relpath
+from verl_omni.agent_loop.image_gen_trajectory_context import build_trajectory_relpath
 
 
 def _val_prefixed(metrics: dict[str, float]) -> dict[str, float]:
@@ -152,7 +152,7 @@ def test_cafe_trajectory_dump_writes_samples_without_overwriting_monitor(tmp_pat
         ],
     )
 
-    AgenticMetricsAgentLoopManager._dump_raw_rollouts(
+    ImageGenMetricsAgentLoopManager._dump_raw_rollouts(
         manager, None, output, 10, write_monitor=False, validate=True
     )
 
@@ -207,7 +207,7 @@ def test_val_holdout_runs_before_main_validate_generate():
     """Cafe 9001/9002 + W&B table commit must precede the UniCoT val set."""
     import inspect
 
-    src = inspect.getsource(AgenticMetricsAgentLoopManager.generate_sequences)
+    src = inspect.getsource(ImageGenMetricsAgentLoopManager.generate_sequences)
     # Strip the holdout body call inside ``_maybe_run_val_viz`` by looking only
     # at the outer method: viz gate, then parent generate for the val batch.
     viz_gate = src.index("self._maybe_run_val_viz(step)")

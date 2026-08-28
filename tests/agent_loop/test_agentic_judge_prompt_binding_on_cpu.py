@@ -53,8 +53,8 @@ def _load_tools_without_gpu_pipelines(monkeypatch):
 
     context = _load_source_module(
         monkeypatch,
-        "verl_omni.agent_loop.agentic_trajectory_context",
-        _ROOT / "verl_omni/agent_loop/agentic_trajectory_context.py",
+        "verl_omni.agent_loop.image_gen_trajectory_context",
+        _ROOT / "verl_omni/agent_loop/image_gen_trajectory_context.py",
     )
     _load_source_module(
         monkeypatch,

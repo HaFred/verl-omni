@@ -32,7 +32,7 @@ from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.utils import hf_tokenizer
 
-from verl_omni.agent_loop.agentic_trajectory_context import (
+from verl_omni.agent_loop.image_gen_trajectory_context import (
     bind_run_artifact_env,
     build_trajectory_relpath,
     clear_good_enough_yes_reached,
@@ -491,8 +491,8 @@ def _materialize_rollout_images(
 def _init_rl_insight_from_config(config) -> None:
     """Enable rl-insight online observability for this process (idempotent).
 
-    Called from the trainer driver (``AgenticMetricsAgentLoopManager``) and every
-    agent-loop worker (``AgenticAgentLoopWorker``) so each emitting process
+    Called from the trainer driver (``ImageGenMetricsAgentLoopManager``) and every
+    agent-loop worker (``ImageGenAgentLoopWorker``) so each emitting process
     connects to the shared Ray monitor hub. A no-op when ``rl-insight`` is not
     installed or ``RL_INSIGHT_SERVER_URL`` is unset.
     """
@@ -506,7 +506,7 @@ def _init_rl_insight_from_config(config) -> None:
 
 
 
-class AgenticAgentLoopWorker(AgentLoopWorker):
+class ImageGenAgentLoopWorker(AgentLoopWorker):
     """Worker-side hooks: trajectory bind + step kwargs for force-first curriculum.
 
     ``AgentLoopManager.generate_sequences`` dispatches to Ray ``AgentLoopWorker``s.
@@ -563,7 +563,7 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
         prompt_token = set_active_user_prompt(user_prompt)
         # Fresh trajectory: allow generate_image until the first good_enough=YES.
         clear_good_enough_yes_reached()
-        # Force-first curriculum reads these inside AgenticToolAgentLoop.run().
+        # Force-first curriculum reads these inside ImageGenToolAgentLoop.run().
         kwargs["_agentic_step"] = trajectory["step"]
         kwargs["_agentic_validate"] = trajectory["validate"]
         # Same id used by agentic_tool saves and post-hoc trajectory dumps.
@@ -581,12 +581,12 @@ class AgenticAgentLoopWorker(AgentLoopWorker):
             reset_active_trajectory_relpath(path_token)
 
 
-class AgenticMetricsAgentLoopManager(AgentLoopManager):
+class ImageGenMetricsAgentLoopManager(AgentLoopManager):
     """Use stock rollout management; observe outputs without changing them."""
 
     def __init__(self, *args, **kwargs):
         # Must set before AgentLoopManager.__init__ creates Ray workers.
-        self.agent_loop_workers_class = ray.remote(AgenticAgentLoopWorker)
+        self.agent_loop_workers_class = ray.remote(ImageGenAgentLoopWorker)
         config = kwargs.get("config")
         if config is None and args:
             config = args[0]
@@ -623,7 +623,7 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             for i in range(len(responses)):
                 sample_index = indices[i]
                 sample_key = str(int(sample_index)) if str(sample_index).lstrip("-").isdigit() else str(sample_index)
-                # Prefer the live artifact id stamped by AgenticToolAgentLoop so
+                # Prefer the live artifact id stamped by ImageGenToolAgentLoop so
                 # trajectory JSON / image folders match path= markers in tool obs.
                 # Fallback: renumber by batch order (legacy; can diverge if workers
                 # reorder outputs relative to dispatch).

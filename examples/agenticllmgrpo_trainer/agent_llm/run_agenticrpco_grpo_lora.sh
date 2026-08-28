@@ -119,7 +119,7 @@ echo "[INFO] wandb online experiment_name=${EXPERIMENT_NAME} (WANDB_SERVICE_TRAN
 echo "[INFO] ckpt dir=${CKPT_DIR}"
 echo "[INFO] rpco stage-3: full dataset (val_ratio=${UNICOT_VAL_RATIO}; sizes only for smoke: train=${UNICOT_TRAIN_SIZE:-<unset>} val=${UNICOT_VAL_SIZE:-<unset>} mix=${UNICOT_MIX_RATIO}) seed=${UNICOT_SPLIT_SEED} weights=${RPCO_W_REFLECT}/${RPCO_W_PLAN}/${RPCO_W_FORMAT}/${RPCO_W_TOOL_CALL}/${RPCO_W_RESULT}"
 echo "[INFO] init ckpt=${RPCO_INIT_CKPT:-<cold start>} resume_mode=${RESUME_MODE:-disable}"
-echo "[INFO] agent loop=agentic_tool_agent (AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-<unset>}; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-<unset>})"
+echo "[INFO] agent loop=image_gen_tool_agent (AGENTIC_FORCE_REFLECTION_AFTER_JUDGE=${AGENTIC_FORCE_REFLECTION_AFTER_JUDGE:-<unset>}; max generate_image passes=${AGENTIC_MAX_GENERATE_IMAGE_PASSES:-<unset>})"
 echo "[INFO] force-first generate=${AGENTIC_FORCE_FIRST_GENERATE:-<unset>} warmup=${AGENTIC_FORCE_FIRST_WARMUP_STEPS:-<unset>} end=${AGENTIC_FORCE_FIRST_END_STEP:-<unset>}"
 echo "[INFO] n_gpus=${N_GPUS} cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-<unset>} rollout_tp=${ROLLOUT_TP} agent_num_workers=${AGENT_NUM_WORKERS} train_batch=${TRAIN_BATCH_SIZE} ppo_mini_batch=${PPO_MINI_BATCH_SIZE} gpu_mem_util=${GPU_MEM_UTIL}"
 echo "[INFO] agent MODEL_PATH=${MODEL_PATH}"
@@ -203,8 +203,8 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_assistant_turns=$MAX_ASSISTANT_TURNS \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=$MAX_USER_TURNS \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2048 \
-    actor_rollout_ref.rollout.agent.default_agent_loop=agentic_tool_agent \
-    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.agentic_metrics_manager.AgenticMetricsAgentLoopManager \
+    actor_rollout_ref.rollout.agent.default_agent_loop=image_gen_tool_agent \
+    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.image_gen_metrics_manager.ImageGenMetricsAgentLoopManager \
     actor_rollout_ref.rollout.agent.num_workers=$AGENT_NUM_WORKERS \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \

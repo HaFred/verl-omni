@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Agentic ToolAgentLoop with optional rollout-exploration scaffolding.
+"""Image-gen ToolAgentLoop with optional rollout-exploration scaffolding.
 
 During early training, missing ``generate_image`` / ``judge_image`` calls can be
 teacher-forced as Hermes ``<tool_call>`` completion tokens (``response_mask=1``),
@@ -51,7 +51,7 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.tool_parser import FunctionCall
 
-from verl_omni.agent_loop.agentic_trajectory_context import (
+from verl_omni.agent_loop.image_gen_trajectory_context import (
     clear_good_enough_yes_reached,
     clear_latest_tool_image_for_active_rollout,
     get_active_trajectory_relpath,
@@ -310,8 +310,8 @@ def build_forced_reflection(
     return text, False
 
 
-@register("agentic_tool_agent")
-class AgenticToolAgentLoop(ToolAgentLoop):
+@register("image_gen_tool_agent")
+class ImageGenToolAgentLoop(ToolAgentLoop):
     """Stock tool agent + forced Reflection after successful ``judge_image``."""
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
