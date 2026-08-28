@@ -16,9 +16,10 @@
 
 These are experiment-tracking fixtures, not part of the agent-loop protocol.
 On each validate step the metrics manager runs this holdout *first* (samples
-9001/9002 cafe + 9003/9004 CN poster by default), soft-logs
+9001/9002 cafe + 9003/9004 CN poster by default), commits
 ``val/generations(_plan)`` and ``val/generations(_plan)_cn`` to W&B
-(``commit=False`` at exact ``global_steps``) and dual-writes ``run.summary``,
+(FlowGRPO-style ``commit=True`` at exact ``global_steps``) and dual-writes
+``run.summary``,
 then evaluates the UniCoT val set. The trainer later commits ``val-core`` at
 the same step. The agent loop only generates whatever batch a provider builds
 and forwards prompt/image rows to ``AgenticValidationGenerationsLogger``.

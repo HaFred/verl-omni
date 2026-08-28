@@ -912,8 +912,10 @@ def judge_image(user_request: str, image_prompt: str) -> tuple[ToolResponse, flo
         image_prompt: The diffusion prompt used to generate the image being judged.
     """
     text, meta = _call_judge_vlm(user_request, image_prompt)
+    judge_succeeded = bool(meta.get("parse_ok", 1) != 0 and not meta.get("error") and not meta.get("stub"))
+    good_enough = bool(meta.get("good_enough")) if judge_succeeded else False
     # Env hard-stop latch: after YES, later generate_image calls are refused.
-    if meta.get("good_enough") and meta.get("parse_ok", 1) != 0 and not meta.get("error"):
+    if good_enough:
         set_good_enough_yes_reached(True)
     metrics = {
         "tool": "judge_image",
@@ -929,4 +931,8 @@ def judge_image(user_request: str, image_prompt: str) -> tuple[ToolResponse, flo
     ):
         if key in meta:
             metrics[f"judge_{key}"] = meta[key]
-    return ToolResponse(text=text), 0.0, metrics
+    # Per-tool diagnostic reward shown in AgentLoop/Weave traces. The actual
+    # GRPO objective remains the trajectory-level custom reward_score; this
+    # value makes the sparse successful judge event visible instead of
+    # reporting every live tool call as zero.
+    return ToolResponse(text=text), (1.0 if good_enough else 0.0), metrics

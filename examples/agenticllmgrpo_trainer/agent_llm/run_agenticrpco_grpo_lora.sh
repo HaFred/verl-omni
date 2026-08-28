@@ -97,10 +97,10 @@ MAX_USER_TURNS="${MAX_USER_TURNS:-16}"
 export AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
 export AGENTIC_E2E_RUN_NAME="${EXPERIMENT_NAME}"
 # Val viz order (per validate step): cafe 9001/9002 + CN poster 9003/9004 first →
-# soft-log W&B ``val/generations(_plan)`` and ``val/generations(_plan)_cn``
-# (commit=False at exact global_steps) + dual-write ``run.summary`` (Media
-# prev/next) → UniCoT val set (~250) → trainer Tracking.log commits
-# ``val-core`` at the same step.
+# commit W&B ``val/generations(_plan)`` and ``val/generations(_plan)_cn``
+# (FlowGRPO-style commit=True at exact global_steps; Ray worker must flush) +
+# dual-write ``run.summary`` (Media prev/next) → UniCoT val set (~250) →
+# trainer Tracking.log ``val-core`` at the same step.
 # Provider: ``verl_omni.utils.agentic_val_viz``; tables:
 # ``AgenticValidationGenerationsLogger``. Do not bump past tip mid-val or
 # ``val-core`` at N is dropped when tip is already N+1.

@@ -453,7 +453,7 @@ class AgenticToolAgentLoop(ToolAgentLoop):
         ignore_termination: bool = False,
     ) -> AgentState:
         """Teacher-force missing generate/judge tool calls during early curriculum."""
-                # rl-insight swim-lane: paint the policy decode on this rollout's lane so
+        # rl-insight swim-lane: paint the policy decode on this rollout's lane so
         # the sidecar tool calls appear as gaps between ``decode`` spans.
         lane = self._rl_insight_lane()
         with trace_state(

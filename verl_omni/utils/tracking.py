@@ -175,14 +175,16 @@ class AgenticValidationGenerationsLogger:
         return table
 
     def log(self, step, table_rows: dict[str, Sequence[tuple[str, str | None]]]) -> None:
-        """Soft-log cumulative tables and dual-write them into ``run.summary``.
+        """Commit cumulative tables at exact ``global_steps`` (FlowGRPO-style).
 
-        ``wandb.log(..., commit=False)`` at exact ``global_steps`` keeps the tip
-        free for the trainer's later ``val-core`` commit (same step). Soft-log
-        alone left ``runs.summary["val/generations"]`` stuck on the first
-        one-row table, so also assign the rebuilt cumulative table onto
-        ``wandb.run.summary[key]`` — that is what the Media prev/next pager
-        reads. Never tip+1.
+        Holdout viz runs inside the Ray agent-loop worker. Soft-logging with
+        ``commit=False`` left media artifacts stuck on the first one-row table
+        (``runs.summary["val/generations(_plan)"]`` had no prev/next) because the
+        driver's later ``val-core`` commit does not flush the worker's pending
+        table payload. Match ``ValidationGenerationsLogger``: ``wandb.log`` with
+        default ``commit=True`` at the exact trainer step (never tip+1), and
+        dual-write the rebuilt cumulative table into ``run.summary`` so the
+        Media pager always sees every val step (0/10/20/…).
         """
         import wandb
 
@@ -195,7 +197,10 @@ class AgenticValidationGenerationsLogger:
         }
         if not payload:
             return
-        wandb.log(payload, step=self.effective_wandb_step(step), commit=False)
+        log_step = self.effective_wandb_step(step)
+        # commit=True is required on the Ray worker so each val step uploads a
+        # fresh cumulative table artifact (soft-log never flushed remotely).
+        wandb.log(payload, step=log_step, commit=True)
         summary = getattr(wandb.run, "summary", None)
         if summary is None:
             return

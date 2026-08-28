@@ -113,7 +113,7 @@ def test_pair_generate_image_turns_pads_missing_side():
 
 
 def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
-    """Each val step appends a row; soft-log + summary dual-write has all rows."""
+    """Each val step appends a row; commit=True + summary dual-write has all rows."""
     import types
 
     logged: list[dict] = []
@@ -166,9 +166,10 @@ def test_val_generations_table_accumulates_all_steps(tmp_path, monkeypatch):
     tracker.log(20, {"val/generations": [("p20", None)]})
 
     assert len(logged) == 3
-    assert all(entry["commit"] is False for entry in logged)
+    # Ray-worker flush: must commit so Media is not stuck on the first row.
+    assert all(entry["commit"] is True for entry in logged)
     assert [entry["step"] for entry in logged] == [0, 10, 20]
-    # Soft-log payload and summary dual-write must carry all prior val steps.
+    # Committed payload and summary dual-write must carry all prior val steps.
     latest = logged[-1]["payload"]["val/generations"]
     assert fake_run.summary["val/generations"] is latest
     assert [row[0] for row in latest.data] == [0, 10, 20]
@@ -207,8 +208,8 @@ def test_wandb_effective_log_step_keeps_trainer_global_steps(monkeypatch):
     assert AgenticValidationGenerationsLogger.effective_wandb_step("bad") is None
 
 
-def test_val_generations_soft_logs_and_dual_writes_summary(tmp_path, monkeypatch):
-    """Holdout soft-logs at exact N and dual-writes run.summary; never tip+1."""
+def test_val_generations_commits_and_dual_writes_summary(tmp_path, monkeypatch):
+    """Holdout commits at exact N and dual-writes run.summary; never tip+1."""
     import types
 
     logged: list[dict] = []
@@ -245,7 +246,7 @@ def test_val_generations_soft_logs_and_dual_writes_summary(tmp_path, monkeypatch
 
     assert len(logged) == 1
     assert logged[0]["step"] == 10
-    assert logged[0]["commit"] is False
+    assert logged[0]["commit"] is True
     assert fake_run.summary["val/generations"] is logged[0]["payload"]["val/generations"]
     assert [row[0] for row in fake_run.summary["val/generations"].data] == [10]
 

@@ -108,3 +108,34 @@ def test_unbound_judge_retains_explicit_prompt(monkeypatch):
 
     assert tools._expand_judge_user_request("explicit user request") == "explicit user request"
     assert tools._expand_judge_image_prompt(rewritten) == rewritten
+
+
+def test_judge_tool_reward_marks_only_live_good_enough(monkeypatch):
+    tools, _ = _load_tools_without_gpu_pipelines(monkeypatch)
+
+    monkeypatch.setattr(
+        tools,
+        "_call_judge_vlm",
+        lambda *_args: (
+            "good",
+            {"parse_ok": 1, "good_enough": True, "correctness": 0.82, "aesthetics": 0.80},
+        ),
+    )
+    _, yes_reward, _ = tools.judge_image("request", "prompt")
+    assert yes_reward == 1.0
+
+    monkeypatch.setattr(
+        tools,
+        "_call_judge_vlm",
+        lambda *_args: ("bad", {"parse_ok": 1, "good_enough": False}),
+    )
+    _, no_reward, _ = tools.judge_image("request", "prompt")
+    assert no_reward == 0.0
+
+    monkeypatch.setattr(
+        tools,
+        "_call_judge_vlm",
+        lambda *_args: ("stub", {"stub": True, "good_enough": True}),
+    )
+    _, stub_reward, _ = tools.judge_image("request", "prompt")
+    assert stub_reward == 0.0

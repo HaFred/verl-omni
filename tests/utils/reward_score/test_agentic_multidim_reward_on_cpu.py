@@ -239,9 +239,67 @@ def test_terminal_no_is_negative_candidate_despite_positive_components():
     assert -1.0 <= failed["score"] <= 0.0
 
     assert passed["reward_terminal_no_penalty"] == 0.0
+    assert passed["reward_missing_tools_penalty"] == 0.0
+    assert passed["reward_good_enough_floor_lift"] == 0.0
     assert passed["final_good_enough"] == 1
     assert passed["score"] == pytest.approx(passed["score_before_terminal_penalty"])
     assert passed["score"] > failed["score"]
+
+
+def test_skip_judge_cannot_beat_judge_terminal_no():
+    """Generate-only must not outscore an honest judge+NO (reward-hack floor)."""
+    prompt = "A vertical cafe poster with bold headline text."
+    skip_judge = "\n".join(
+        [
+            _gen_call(prompt),
+            _gen_obs("/tmp/x/image_00_a.png", prompt),
+            "Reflection: Looks fine, stopping without judge. Done.",
+        ]
+    )
+    skip = compute_score(solution_str=skip_judge, ground_truth=_gt(expected=3))
+    failed = compute_score(
+        solution_str=_closed_reflect_trajectory(
+            correctness=0.80,
+            aesthetics=0.80,
+            good_enough=False,
+        ),
+        ground_truth=_gt(expected=3),
+    )
+
+    assert skip["rollout_valid"] == 1
+    assert skip["num_judge_image_calls"] == 0
+    assert skip["reward_missing_tools_penalty"] == -1.0
+    assert skip["score_before_terminal_penalty"] > 0.0
+    assert -1.0 <= skip["score"] <= 0.0
+    # Skip-judge must not be the higher-reward escape hatch vs terminal NO.
+    assert skip["score"] <= failed["score"]
+
+
+def test_good_enough_at_turn_cap_keeps_high_success_reward():
+    """A live YES remains a strong signal even without budget for Done."""
+    prompt = "A vertical cafe poster with bold headline text."
+    reached_yes_at_cap = "\n".join(
+        [
+            _gen_call(prompt),
+            _gen_obs("/tmp/x/image_00_a.png", prompt),
+            _judge_call(),
+            _judge_obs(
+                "/tmp/x/image_00_a.png",
+                correctness=0.82,
+                aesthetics=0.80,
+                good_enough=True,
+                findings="all requested elements are clear",
+            ),
+        ]
+    )
+    out = compute_score(solution_str=reached_yes_at_cap, ground_truth=_gt(expected=3))
+
+    assert out["rollout_valid"] == 1
+    assert out["final_good_enough"] == 1
+    assert out["terminal_done"] == 0
+    assert out["score_before_terminal_penalty"] < 0.8
+    assert out["reward_good_enough_floor_lift"] > 0.0
+    assert out["score"] == pytest.approx(0.8)
 
 
 def test_tool_reward_is_presence_based():
@@ -369,6 +427,8 @@ def _assert_full_schema(out: dict) -> None:
     for key in (
         "reward_done",
         "reward_terminal_no_penalty",
+        "reward_missing_tools_penalty",
+        "reward_good_enough_floor_lift",
         "score_before_terminal_penalty",
         "final_good_enough",
         "reward_correctness",

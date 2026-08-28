@@ -42,13 +42,24 @@ Reward set (VisionCreator-R1, arXiv:2603.08812, §4.1/§4.3):
       visible for diagnosis, but a failed terminal verdict cannot have positive
       total reward. The penalty is placed on the final response token by verl's
       reward manager, so it trains the sampled terminal decision.
+  R_missing_tools_penalty — an additive -1.0 scalar penalty when the trajectory
+      omits a ``generate_image`` call or a ``judge_image`` call. Without this,
+      generate-only rollouts still earn ~0.3–0.4 from format/tool_call/result
+      while judge+NO is floored at ≤0, so the policy learns to skip the judge.
+      Same magnitude as ``R_terminal_no_penalty`` so skip-judge cannot beat
+      an honest failed verdict.
+  R_good_enough_floor_lift — raises a valid trajectory whose final successful
+      sidecar verdict is ``good_enough=YES`` to at least 0.80. This protects the
+      sparse success signal when the rollout reaches a good image near the
+      generate/turn cap but lacks budget for a perfect Reflection/Done suffix.
+      Cleanly closed YES trajectories retain their naturally higher score.
 
 Base: ``base_score = (1/|W|) * sum(w_i * R_i)`` over the active set W (dims
 with ``w_* > 0`` that apply to the row's task type). Final:
-``score = base_score + R_terminal_no_penalty``, clipped to [-1, 1]. Default
-weights are 1.0 except ``w_reflect=1.5`` so last-image C/A outranks
-format/tool presence. ``RPCO_W_*`` env vars override parquet-baked ``w_*``
-without a rebuild.
+``score = base_score + R_terminal_no_penalty + R_missing_tools_penalty``,
+clipped to [-1, 1]. Default weights are 1.0 except ``w_reflect=1.5`` so
+last-image C/A outranks format/tool presence. ``RPCO_W_*`` env vars override
+parquet-baked ``w_*`` without a rebuild.
 
 Gating kept from PR 1: no ``generate_image`` / no successful PNG → score 0 and
 ``rollout_valid=0`` (rollout is discarded from the GRPO update). Env-injected
@@ -83,6 +94,7 @@ from verl_omni.utils.reward_score.agentic_reward import (
 )
 
 DIMS = ("reflect", "plan", "format", "tool_call", "result")
+GOOD_ENOUGH_SCORE_FLOOR = 0.80
 # Slightly overweight last-image C/A so GRPO prefers better generate_image
 # prompts / useful rewrites over protocol-only dims.
 DEFAULT_WEIGHTS: dict[str, float] = {
@@ -98,6 +110,8 @@ _SCHEMA_EXTRAS: dict[str, float | str | int | None] = {
     **{f"reward_{dim}": 0.0 for dim in DIMS},
     "reward_done": 0.0,
     "reward_terminal_no_penalty": 0.0,
+    "reward_missing_tools_penalty": 0.0,
+    "reward_good_enough_floor_lift": 0.0,
     "score_before_terminal_penalty": 0.0,
     "final_good_enough": -1,
     "reward_correctness": 0.0,
@@ -427,13 +441,34 @@ def compute_score(
     # one keeps continuous ordering among failed samples while ensuring every
     # failed sample scores <= 0 and every successful sample remains unchanged.
     terminal_no_penalty = -1.0 if final_good_enough is False else 0.0
-    score = max(-1.0, min(1.0, base_score + terminal_no_penalty))
+    # Hard protocol gate: both tools must appear as parsed Hermes calls.
+    # Format/result soft-miss alone left generate-only trajectories at ~+0.35,
+    # which beat judge+NO (~-0.4) and collapsed the closed loop after force-first.
+    called_generate = any(name == "generate_image" for name in names)
+    called_judge = any(name == "judge_image" for name in names)
+    missing_tools_penalty = 0.0 if (called_generate and called_judge) else -1.0
+    penalized_score = base_score + terminal_no_penalty + missing_tools_penalty
+    # A parsed live YES is the scarce task-success event. Preserve that signal
+    # even when it arrives at the turn cap before a perfect terminal suffix.
+    # Require both parsed calls and a successful image so prose cannot fake it.
+    valid_good_enough = bool(
+        final_good_enough is True
+        and called_generate
+        and called_judge
+        and n_successful_gens >= 1
+        and n_judge_ok > 0
+        and not blocked
+    )
+    good_enough_floor_lift = max(0.0, GOOD_ENOUGH_SCORE_FLOOR - penalized_score) if valid_good_enough else 0.0
+    score = max(-1.0, min(1.0, penalized_score + good_enough_floor_lift))
 
     out.update(
         {
             "score": float(score),
             "score_before_terminal_penalty": float(base_score),
             "reward_terminal_no_penalty": float(terminal_no_penalty),
+            "reward_missing_tools_penalty": float(missing_tools_penalty),
+            "reward_good_enough_floor_lift": float(good_enough_floor_lift),
             "final_good_enough": (
                 1 if final_good_enough is True else 0 if final_good_enough is False else -1
             ),
