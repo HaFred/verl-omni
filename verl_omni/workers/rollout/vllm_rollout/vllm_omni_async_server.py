@@ -34,7 +34,7 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.net_utils import get_free_port
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.config import RolloutConfig
-from verl.workers.rollout.replica import TokenOutput
+from verl.workers.rollout.replica import RolloutMode, TokenOutput
 from verl.workers.rollout.utils import run_uvicorn
 from verl.workers.rollout.vllm_rollout.utils import (
     VLLM_LORA_INT_ID,
@@ -113,19 +113,25 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     # Initialisation hooks
     # -----------------------------------------------------------------------
 
+    def _init_config(self, config):
+        engine_kwargs = getattr(config, "engine_kwargs", None) or {}
+        omni_kwargs = engine_kwargs.get("vllm_omni", {}) or {}
+        self._ar_mode = omni_kwargs.get("output_mode", "diffusion") == "ar"
+        self._rollout_flags: dict[int, dict] = {}
+        if self._ar_mode:
+            dc = omega_conf_to_dataclass(config, dataclass_type=RolloutConfig)
+        else:
+            dc = omega_conf_to_dataclass(config, dataclass_type=DiffusionRolloutConfig)
+        if getattr(dc, "seed", None) is None:
+            dc.seed = 42
+        return dc
+
     def _init_model_config(self, model_config):
         """AR mode uses OmniModelConfig; diffusion uses DiffusionModelConfig.
 
         Mode is selected by ``engine_kwargs.vllm_omni.output_mode`` ("ar" vs the
         default "diffusion").
         """
-        engine_kwargs = getattr(self.config, "engine_kwargs", None) or {}
-        omni_kwargs = engine_kwargs.get("vllm_omni", {}) or {}
-        # TODO (mike): drop this once the legacy omni training script is removed.
-        # It should be automatically inferred from the model config
-        self._ar_mode = omni_kwargs.get("output_mode", "diffusion") == "ar"
-        self._rollout_flags: dict[int, dict] = {}
-
         if self._ar_mode:
             return omega_conf_to_dataclass(model_config, dataclass_type=OmniModelConfig)
         return omega_conf_to_dataclass(model_config, dataclass_type=DiffusionModelConfig)
@@ -147,6 +153,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     # -----------------------------------------------------------------------
     # launch_server hooks
     # -----------------------------------------------------------------------
+
+    def _apply_quantization(self) -> tuple[str | None, dict]:
+        if not self._ar_mode:
+            return None, {}
+        return super()._apply_quantization()
 
     def _get_override_generation_config(self) -> dict:
         """AR mode uses the parent's LLM sampling config; diffusion has none."""
@@ -245,6 +256,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                     "stage_id": sid,
                     "devices": devices,
                     "tensor_parallel_size": tp_size,
+                    "text_encoder_tp_size": getattr(self.config, "text_encoder_tp_size", 1),
                     "engine_extras": adapter_cls.get_stage_engine_extras(sid, pipeline_mode=pipeline_mode),
                 }
                 for sid in stage_ids
@@ -328,8 +340,14 @@ class vLLMOmniHttpServer(vLLMHttpServer):
                     )
                     engine_args["max_num_seqs"] = 1
 
+            engine_args["enable_prompt_embed_cache"] = self.config.enable_prompt_embed_cache
+            engine_args["prompt_embed_cache_size"] = self.config.prompt_embed_cache_size
+
         if getattr(self.config, "step_execution", False):
             engine_args["step_execution"] = True
+
+        if engine_args.get("seed") is None:
+            engine_args.pop("seed", None)
 
         diffusion_master_port, diffusion_master_sock = get_free_port("127.0.0.1", with_alive_sock=True)
         diffusion_master_sock.close()
@@ -372,6 +390,13 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     def _get_wake_up_tags(self) -> list[str]:
         return ["weights"]
 
+    def _resolve_sleep_level(self) -> int:
+        """
+        # TODO (andy): use sleep_level=2 when vllm-omni implements wake_up
+        after level-2 sleep AND the trainer syncs the full pipeline.
+        """
+        return 1
+
     async def wake_up(self, tags: list[str] | None = None):
         """Override parent to use collective_rpc instead of engine.wake_up().
 
@@ -404,11 +429,27 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         weight syncs. Use level-1 sleep so those weights are offloaded and can
         be restored on wake-up instead of discarded by level-2 sleep.
         """
-        # TODO (andy): use `sleep_level=2` in the future when the
-        #  trainer side incorporates the whole components of the model.
         self._invalidate_lora_request_cache()
-        await self.engine.collective_rpc("sleep", kwargs={"level": 1})
+        await self.engine.collective_rpc("sleep", kwargs={"level": self._resolve_sleep_level()})
         await self.engine.reset_encoder_cache()
+
+    async def release_kv_cache(self):
+        """Free cache around a weight sync without discarding Omni weights."""
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+        if self.rollout_mode == RolloutMode.COLOCATED:
+            return
+        self._invalidate_lora_request_cache()
+        await self.engine.collective_rpc("sleep", kwargs={"level": self._resolve_sleep_level()})
+        await self.engine.collective_rpc("wake_up", kwargs={"tags": ["weights"]})
+
+    async def resume_kv_cache(self):
+        """Restore after a weight sync. Route through collective_rpc like wake_up."""
+        if self.node_rank != 0 or not self.config.free_cache_engine:
+            return
+        if self.rollout_mode == RolloutMode.COLOCATED:
+            return
+        await self.engine.collective_rpc("wake_up", kwargs={"tags": ["kv_cache"]})
 
     async def resume_generation(self):
         if self.node_rank == 0:
@@ -952,11 +993,6 @@ class vLLMOmniReplica(vLLMReplica):
     ):
         super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
         self.server_class = ray.remote(vLLMOmniHttpServer)
-
-    def _validate_launch_requirements(self) -> None:
-        """No-op: the parent check validates vllm.__version__ which is
-        irrelevant for vllm-omni (a separate package)."""
-        pass
 
     def _get_server_name_prefix(self) -> str:
         return "vllm_omni_"

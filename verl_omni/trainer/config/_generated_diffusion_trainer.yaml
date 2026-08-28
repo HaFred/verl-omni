@@ -189,6 +189,7 @@ actor_rollout_ref:
     cudagraph_capture_sizes: null
     free_cache_engine: true
     tensor_model_parallel_size: 2
+    text_encoder_tp_size: 1
     data_parallel_size: 1
     expert_parallel_size: 1
     pipeline_model_parallel_size: 1
@@ -205,12 +206,16 @@ actor_rollout_ref:
     log_prob_micro_batch_size_per_gpu: null
     disable_log_stats: true
     'n': 1
-    seed: null
+    seed: 42
+    full_determinism: false
     multi_turn:
       _target_: verl.workers.config.MultiTurnConfig
       enable: false
     engine_kwargs:
       vllm_omni: {}
+    enable_prompt_embed_cache: false
+    prompt_embed_cache_size: 32
+    enable_prompt_embed_cache_routing_affinity: false
     val_kwargs:
       _target_: verl_omni.workers.config.diffusion.DiffusionSamplingConfig
       'n': 1
@@ -225,6 +230,8 @@ actor_rollout_ref:
         num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
         frame_rate: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_rate,24.0}
         video_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.video_flow_shift,12.0}
+        task: ${oc.select:actor_rollout_ref.rollout.pipeline.task,null}
+        frame_indices: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_indices,null}
         aspect_ratio: ${oc.select:actor_rollout_ref.rollout.pipeline.aspect_ratio,null}
       algo:
         _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
@@ -254,6 +261,8 @@ actor_rollout_ref:
       num_frames: 1
       frame_rate: 24.0
       video_flow_shift: 12.0
+      task: null
+      frame_indices: null
       aspect_ratio: null
     calculate_log_probs: false
     llm_calculate_log_probs: false
@@ -323,6 +332,8 @@ actor_rollout_ref:
       guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
       num_frames: ${oc.select:actor_rollout_ref.rollout.pipeline.num_frames,1}
       frame_rate: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_rate,24.0}
+      task: ${oc.select:actor_rollout_ref.rollout.pipeline.task,null}
+      frame_indices: ${oc.select:actor_rollout_ref.rollout.pipeline.frame_indices,null}
       video_flow_shift: ${oc.select:actor_rollout_ref.rollout.pipeline.video_flow_shift,12.0}
     algo:
       _target_: verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig
@@ -332,6 +343,7 @@ actor_rollout_ref:
       sde_window_range: ${oc.select:actor_rollout_ref.rollout.algo.sde_window_range,null}
       sde_contiguous: ${oc.select:actor_rollout_ref.rollout.algo.sde_contiguous,true}
     model_type: diffusion_model
+  separate: false
   hybrid_engine: true
   nccl_timeout: 600
 data:
@@ -430,6 +442,8 @@ reward:
       top_p: 1
       do_sample: true
       'n': 1
+      seed: 42
+      full_determinism: false
       prompt_length: 2048
       response_length: 2048
       quantization: null
@@ -468,10 +482,15 @@ reward:
 distillation:
   _target_: verl_omni.workers.config.diffusion.DiffusionDistillationConfig
   enabled: false
+  n_gpus_per_node: 0
+  nnodes: 0
   teacher_models:
     teacher_model:
       _target_: verl_omni.workers.config.diffusion.DiffusionDistillationTeacherModelConfig
+      key: null
       model_path: null
+      world_size: 0
+  teacher_key: data_source
 algorithm:
   _target_: verl_omni.trainer.config.DiffusionAlgoConfig
   trainer_type: policy_gradient

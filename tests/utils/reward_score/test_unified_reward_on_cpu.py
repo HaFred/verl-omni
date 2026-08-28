@@ -11,7 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""CPU tests for the UnifiedReward parser."""
 
-# TODO: Remove this import / conftest after verl is upgraded to 0.9.0
-# (which removes the need for FusedMoE alias on test collection).
-import verl_omni  # noqa: F401
+from verl_omni.utils.reward_score.unified_reward import _parse_unified_reward_scores
+
+
+def test_unified_reward_requires_all_labeled_axes():
+    assert _parse_unified_reward_scores("Alignment Score: 4\nCoherence Score: 5") == {}
+    assert _parse_unified_reward_scores("Alignment Score: 4\nCoherence Score: 5\nStyle Score: 3") == {
+        "alignment": 4.0,
+        "coherence": 5.0,
+        "style": 3.0,
+    }
