@@ -311,11 +311,7 @@ Validation runs every `TEST_FREQ` steps (default 10) with `val_before_train`
 on (default), greedy `val_kwargs` (n=`VAL_ROLLOUT_N`=1, temperature 0) so the
 val reward curve is cheap to track in WandB (`val-core/...`). The agentic
 reward dimensions on validation records are logged as
-`val_agentic_reward/*` (mirror of `agentic_reward/*`), and each validation pass
-also rolls out the fixed cafe-poster holdout task under both the UniCoT reflect
-and plan system prompts, appending one accumulating
-WandB table row under `val/generations` (FlowGRPO-style: `input_k` = rewritten
-`generate_image` prompt, `output_k` = PNG per tool turn; reflect protocol) and
-`val/generations_plan` (same schema for the plan protocol). Gate:
-`AGENTIC_VAL_VIZ=1`, set by default.
+`val_agentic_reward/*` (mirror of `agentic_reward/*`). Each validation pass
+also rolls out fixed cafe-poster holdout tasks (reflect + plan); PNGs land under
+`outputs/e2e/<experiment>/rollout_images/` (`AGENTIC_VAL_VIZ=1`, default).
 Disable periodic validation with `TEST_FREQ=-1`.

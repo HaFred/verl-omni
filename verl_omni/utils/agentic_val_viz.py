@@ -16,33 +16,24 @@
 
 These are experiment-tracking fixtures, not part of the agent-loop protocol.
 On each validate step the metrics manager runs this holdout *first* (samples
-9001/9002 cafe + 9003/9004 CN poster by default), commits
-``val/generations(_plan)`` and ``val/generations(_plan)_cn`` to W&B
-(FlowGRPO-style ``commit=True`` at exact ``global_steps``) and dual-writes
-``run.summary``,
-then evaluates the UniCoT val set. The trainer later commits ``val-core`` at
-the same step. The agent loop only generates whatever batch a provider builds
-and forwards prompt/image rows to ``AgenticValidationGenerationsLogger``.
+9001/9002 cafe + 9003/9004 CN poster by default), writes PNGs and ``meta.json``
+under ``outputs/e2e/<run>/rollout_images/``, then evaluates the UniCoT val set.
+The trainer driver logs ``val-core`` at the same step.
 """
 
 from __future__ import annotations
 
-import logging
 import os
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 import numpy as np
 
-logger = logging.getLogger(__name__)
-
-
 @dataclass(frozen=True)
 class ValVizCase:
     """One fixed validation visualization sample."""
 
     sample_index: int
-    table_key: str
     viz_id: str
     task_type: str
     system_prompt: str
@@ -58,11 +49,6 @@ class AgenticValVizProvider:
         if not cases:
             raise ValueError("AgenticValVizProvider requires at least one ValVizCase")
         self.cases = list(cases)
-
-    @property
-    def sample_table_keys(self) -> dict[str, str]:
-        """Map on-disk ``sample_<id>`` folders to W&B table keys."""
-        return {f"sample_{case.sample_index}": case.table_key for case in self.cases}
 
     def build_batch(self, step, *, eos_token_id: int | None, pad_token_id: int | None) -> Any:
         """Construct a validation DataProto for the configured holdout cases."""
@@ -123,7 +109,6 @@ def _cafe_poster_cases() -> list[ValVizCase]:
     return [
         ValVizCase(
             sample_index=9001,
-            table_key="val/generations",
             viz_id="reflect_prompt",
             task_type="reflect",
             system_prompt=build_unicot_agentic_rl.REFLECT_SYSTEM_PROMPT,
@@ -132,7 +117,6 @@ def _cafe_poster_cases() -> list[ValVizCase]:
         ),
         ValVizCase(
             sample_index=9002,
-            table_key="val/generations_plan",
             viz_id="plan_prompt",
             task_type="plan",
             system_prompt=build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT,
@@ -171,7 +155,6 @@ def _cn_poster_cases() -> list[ValVizCase]:
     return [
         ValVizCase(
             sample_index=9003,
-            table_key="val/generations_cn",
             viz_id="reflect_prompt_cn",
             task_type="reflect",
             system_prompt=build_unicot_agentic_rl.REFLECT_SYSTEM_PROMPT,
@@ -180,7 +163,6 @@ def _cn_poster_cases() -> list[ValVizCase]:
         ),
         ValVizCase(
             sample_index=9004,
-            table_key="val/generations_plan_cn",
             viz_id="plan_prompt_cn",
             task_type="plan",
             system_prompt=build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT,
@@ -197,19 +179,7 @@ def _default_holdout_cases() -> list[ValVizCase]:
 
 
 def resolve_agentic_val_viz_provider() -> AgenticValVizProvider | None:
-    """Return the enabled holdout viz provider, or ``None`` when gated off.
-
-    Gate: ``AGENTIC_VAL_VIZ=1``. Recipe selection defaults to cafe + CN poster
-    holdouts; override with ``AGENTIC_VAL_VIZ_PROVIDER=cafe_poster``.
-    """
+    """Return the fixed holdout provider when ``AGENTIC_VAL_VIZ=1``."""
     if os.getenv("AGENTIC_VAL_VIZ", "0").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
-    provider_name = os.getenv("AGENTIC_VAL_VIZ_PROVIDER", "cafe_poster").strip().lower() or "cafe_poster"
-    try:
-        if provider_name in {"cafe_poster", "cafe", "default"}:
-            return AgenticValVizProvider(_default_holdout_cases())
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("val viz disabled (provider %s failed): %s", provider_name, exc)
-        return None
-    logger.warning("Unknown AGENTIC_VAL_VIZ_PROVIDER=%s; val viz disabled", provider_name)
-    return None
+    return AgenticValVizProvider(_default_holdout_cases())

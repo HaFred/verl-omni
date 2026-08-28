@@ -45,7 +45,6 @@ from verl_omni.agent_loop.agentic_trajectory_context import (
 )
 from verl_omni.agent_loop.rl_insight_profiler import init_rl_insight
 from verl_omni.utils.agentic_val_viz import resolve_agentic_val_viz_provider
-from verl_omni.utils.tracking import AgenticValidationGenerationsLogger
 
 logger = logging.getLogger(__name__)
 
@@ -598,14 +597,7 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))
         self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
-        # Holdout viz prompts live outside the agent loop; the manager only
-        # generates, dumps, and hands prompt/image rows to the tracker.
         self._val_viz_provider = resolve_agentic_val_viz_provider()
-        sample_table_keys = self._val_viz_provider.sample_table_keys if self._val_viz_provider else None
-        self._val_generations_logger = AgenticValidationGenerationsLogger(
-            _run_dir(),
-            sample_table_keys=sample_table_keys,
-        )
         self._val_viz_logged_steps: set[int] = set()
 
     def _dump_raw_rollouts(self, prompts, output, step, *, write_monitor: bool = True, validate: bool = False) -> None:
@@ -887,13 +879,6 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
         step = prompts.meta_info.get("global_steps")
         is_val = bool(prompts.meta_info.get("validate", False))
         if is_val:
-            # Holdout 9001–9004 first: generate → dump → commit W&B
-            # ``val/generations(_plan)`` / ``val/generations(_plan)_cn``
-            # (FlowGRPO-style commit=True at exact ``global_steps``) + dual-write
-            # ``run.summary`` *before* the long UniCoT val set (~250 prompts).
-            # Once-per-step via ``_val_viz_logged_steps``. Worker must commit so
-            # Media prev/next sees every val row; tip stays at ``global_steps``
-            # (never tip+1) for trainer ``val-core``.
             self._maybe_run_val_viz(step)
         output = super().generate_sequences(prompts)
         if is_val:
@@ -930,25 +915,12 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
 
             if wandb.run is not None:
                 val_metrics = {f"val_{key}": value for key, value in metrics.items()}
-                wandb.log(
-                    val_metrics,
-                    step=AgenticValidationGenerationsLogger.effective_wandb_step(step),
-                    commit=False,
-                )
+                wandb.log(val_metrics, step=int(step), commit=False)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to log val agentic reward metrics to W&B: %s", exc)
 
     def _maybe_run_val_viz(self, step) -> None:
-        """Holdout cafe + CN poster (9001–9004) generate → dump → soft W&B table log.
-
-        Invoked at the *start* of the first validate ``generate_sequences`` for
-        ``global_steps`` so ``val/generations(_plan)`` is committed + dual-written
-        into ``run.summary`` before the UniCoT val set. The trainer's later
-        ``Tracking.log`` also logs ``val-core`` at the same step. Prompt content
-        comes from ``AgenticValVizProvider``; this method only: generate → dump
-        → track. Subsequent val batches in the same step are no-ops via
-        ``_val_viz_logged_steps``.
-        """
+        """Generate and dump fixed holdout rollouts once per validation step."""
         provider = self._val_viz_provider
         if provider is None:
             return
@@ -966,34 +938,9 @@ class AgenticMetricsAgentLoopManager(AgentLoopManager):
             )
             # Parent generate only — never re-enter this override (no recursion).
             output = super().generate_sequences(batch)
-            relpaths = output.non_tensor_batch.get("trajectory_relpath")
-            run_dir = _run_dir()
-            responses = output.batch["responses"]
-            table_rows: dict[str, list[tuple[str, str | None]]] = {}
-            for i, case in enumerate(provider.cases):
-                relpath = str(relpaths[i]) if relpaths is not None else ""
-                decoded = self._monitor_tokenizer.decode(responses[i].tolist(), skip_special_tokens=False)
-                image_paths = _materialize_rollout_images(
-                    decoded_response=decoded,
-                    run_dir=run_dir,
-                    relpath=relpath,
-                    user_prompt=case.user_request,
-                )
-                table_rows[case.table_key] = self._val_generations_logger.pair_turns(
-                    _extract_generate_image_prompts(decoded), image_paths
-                )
-            # Holdout rollouts bypass this manager's generate_sequences override,
-            # so dump them explicitly before fallible W&B table construction.
             self._dump_raw_rollouts(batch, output, step, write_monitor=False, validate=True)
-            # Commit at exact global_steps + summary dual-write: tip stays at N
-            # for val-core; Media prev/next sees the cumulative table.
-            self._val_generations_logger.log(step, table_rows)
             self._val_viz_logged_steps.add(step_i)
-            logger.info(
-                "Val holdout viz committed+summary for step=%s tables=%s (before main val set)",
-                step_i,
-                sorted(table_rows),
-            )
+            logger.info("Val holdout viz dumped for step=%s", step_i)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Failed to generate/log val viz rollouts: %s", exc)
 

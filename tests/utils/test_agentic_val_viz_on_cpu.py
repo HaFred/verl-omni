@@ -17,8 +17,6 @@
 import pytest
 
 from verl_omni.utils.agentic_val_viz import (
-    AgenticValVizProvider,
-    ValVizCase,
     resolve_agentic_val_viz_provider,
 )
 
@@ -30,16 +28,9 @@ def test_resolve_disabled_without_env(monkeypatch):
 
 def test_resolve_cafe_poster_provider(monkeypatch):
     monkeypatch.setenv("AGENTIC_VAL_VIZ", "1")
-    monkeypatch.setenv("AGENTIC_VAL_VIZ_PROVIDER", "cafe_poster")
     provider = resolve_agentic_val_viz_provider()
     assert provider is not None
     assert [case.sample_index for case in provider.cases] == [9001, 9002, 9003, 9004]
-    assert provider.sample_table_keys == {
-        "sample_9001": "val/generations",
-        "sample_9002": "val/generations_plan",
-        "sample_9003": "val/generations_cn",
-        "sample_9004": "val/generations_plan_cn",
-    }
     assert provider.cases[0].task_type == "reflect"
     assert provider.cases[1].task_type == "plan"
     assert provider.cases[2].task_type == "reflect"
@@ -60,19 +51,3 @@ def test_provider_build_batch_shapes(monkeypatch):
     assert batch.meta_info["validate"] is True
     assert batch.meta_info["global_steps"] == 40
     assert batch.non_tensor_batch["reward_model"][1]["ground_truth"]["task_type"] == "plan"
-
-
-def test_custom_provider_cases_do_not_require_cafe():
-    provider = AgenticValVizProvider(
-        [
-            ValVizCase(
-                sample_index=42,
-                table_key="val/generations_custom",
-                viz_id="custom",
-                task_type="reflect",
-                system_prompt="sys",
-                user_request="draw a cat",
-            )
-        ]
-    )
-    assert provider.sample_table_keys == {"sample_42": "val/generations_custom"}
