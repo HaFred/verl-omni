@@ -11,14 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the agentic multi-turn agent loop helpers."""
+"""CPU tests for the image-gen multi-turn agent loop helpers."""
 
 import json
 from types import SimpleNamespace
 
 import pytest
 
-from verl_omni.agent_loop.agentic_tool_agent_loop import (
+from verl_omni.agent_loop.image_gen_tool_agent_loop import (
     _count_successful_generates,
     _count_successful_judges,
     _fits_response_budget,

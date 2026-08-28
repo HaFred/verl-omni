@@ -24,9 +24,9 @@ import io
 import pytest
 from PIL import Image
 
-from verl_omni.agent_loop import agentic_trajectory_context as _traj_ctx
-from verl_omni.agent_loop.agentic_metrics_manager import AgenticAgentLoopWorker
-from verl_omni.agent_loop.agentic_trajectory_context import (
+from verl_omni.agent_loop import image_gen_trajectory_context as _traj_ctx
+from verl_omni.agent_loop.image_gen_metrics_manager import ImageGenAgentLoopWorker
+from verl_omni.agent_loop.image_gen_trajectory_context import (
     clear_latest_tool_image_for_active_rollout,
     count_live_generate_artifacts_for_active_rollout,
     register_tool_artifact,
@@ -36,7 +36,7 @@ from verl_omni.agent_loop.agentic_trajectory_context import (
     set_active_user_prompt,
 )
 
-_TOOL_PATH = AgenticAgentLoopWorker._AGENTIC_FUNCTION_TOOLS
+_TOOL_PATH = ImageGenAgentLoopWorker._AGENTIC_FUNCTION_TOOLS
 if not _TOOL_PATH.is_file():
     raise FileNotFoundError(f"agentic function tools not found at {_TOOL_PATH}")
 

@@ -250,7 +250,7 @@ def _rollout_image_roots(extra_info: dict[str, Any]) -> list[Path]:
         if relpath:
             roots.append(base / relpath)
     try:
-        from verl_omni.agent_loop.agentic_trajectory_context import resolve_rollout_images_root
+        from verl_omni.agent_loop.image_gen_trajectory_context import resolve_rollout_images_root
 
         env_root = resolve_rollout_images_root()
         roots.append(env_root)
