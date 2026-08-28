@@ -42,16 +42,28 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import random
-import re
 from typing import Any
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.tool_parser import FunctionCall
 
-from verl_omni.agent_loop.image_gen_trajectory_context import (
+from verl_omni.agent_loop.utils import (
+    build_forced_reflection,
+    count_successful_generates,
+    count_successful_judges,
+    fits_response_budget,
+    force_enabled,
+    force_first_generate_probability,
+    hermes_tool_call,
+    last_user_text,
+    max_generate_passes,
+    rewrite_judge_before_generate,
+    tool_calls_are_premature_judge,
+    tool_message_text,
+)
+from verl_omni.tools.image_gen_trajectory_context import (
     clear_good_enough_yes_reached,
     clear_latest_tool_image_for_active_rollout,
     get_active_trajectory_relpath,
@@ -60,253 +72,6 @@ from verl_omni.agent_loop.image_gen_trajectory_context import (
 )
 
 logger = logging.getLogger(__name__)
-
-_JUDGE_OK_RE = re.compile(r"\bagentic_judge\s+ok=1\b", re.IGNORECASE)
-_GEN_OK_RE = re.compile(r"\bagentic_tool\s+ok=1\b", re.IGNORECASE)
-_GEN_FEWSHOT_RE = re.compile(r"\bbackend\s*=\s*fewshot\b", re.IGNORECASE)
-_GEN_LIVE_BACKEND_RE = re.compile(
-    r"\bbackend\s*=\s*(?!fewshot\b)[A-Za-z0-9_]+\b",
-    re.IGNORECASE,
-)
-_CORRECTNESS_RE = re.compile(r"\bcorrectness\s*=\s*([0-9.]+)", re.IGNORECASE)
-_AESTHETICS_RE = re.compile(r"\baesthetics\s*=\s*([0-9.]+)", re.IGNORECASE)
-_GOOD_ENOUGH_RE = re.compile(r"\bgood_enough\s*=\s*(YES|NO)", re.IGNORECASE)
-_FINDINGS_RE = re.compile(
-    r"\bfindings:\s*(.+?)(?:\n\s*suggested_fixes:|\n\s*agentic_judge\b)", re.IGNORECASE | re.DOTALL
-)
-_FIXES_RE = re.compile(r"\bsuggested_fixes:\s*(.+?)(?:\n\s*agentic_judge\b|\n\n|\Z)", re.IGNORECASE | re.DOTALL)
-
-
-def _force_enabled() -> bool:
-    # Default ON for overfit: every successful judge is followed by Reflection
-    # carrying the stop/continue verdict (mask=0; reward strips force markers).
-    return os.getenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE", "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-        "",
-    }
-
-
-def _max_generate_passes() -> int:
-    try:
-        return max(1, int(os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")))
-    except ValueError:
-        return 3
-
-
-def _fits_response_budget(mask_len: int, n_new_ids: int, response_length: int) -> bool:
-    """True when appending ``n_new_ids`` stays strictly under ``response_length``.
-
-    Forced Reflection must not mutate ``messages`` unless the encoded tokens
-    also fit; otherwise dumps show a stop cue the policy never saw.
-    """
-    return n_new_ids > 0 and mask_len + n_new_ids < response_length
-
-
-def _force_first_generate_probability(step: Any, *, validate: bool = False) -> float:
-    """Bootstrap missing tool calls for weak VL, then anneal fully off.
-
-    Through ``AGENTIC_FORCE_FIRST_WARMUP_STEPS`` force prob is 1.0, then linear
-    decay to 0 at ``AGENTIC_FORCE_FIRST_END_STEP``. Teacher-forces Hermes
-    ``<tool_call>`` tokens (mask=1) so reward/GRPO can see and learn the format;
-    execution-only injection left ``rollout_valid=0`` / ``score=0``.
-    """
-    enabled = os.getenv("AGENTIC_FORCE_FIRST_GENERATE", "0").strip().lower()
-    if validate or enabled not in {"1", "true", "yes", "on"}:
-        return 0.0
-    try:
-        step_i = max(0, int(step))
-    except (TypeError, ValueError):
-        step_i = 0
-    try:
-        warmup = max(0, int(os.getenv("AGENTIC_FORCE_FIRST_WARMUP_STEPS", "10")))
-    except ValueError:
-        warmup = 10
-    try:
-        end = max(warmup + 1, int(os.getenv("AGENTIC_FORCE_FIRST_END_STEP", "20")))
-    except ValueError:
-        end = 20
-    if step_i <= warmup:
-        return 1.0
-    if step_i >= end:
-        return 0.0
-    return float(end - step_i) / float(end - warmup)
-
-
-def _rewrite_judge_before_generate() -> bool:
-    """Hard protocol guard: rewrite premature ``judge_image`` → ``generate_image``.
-
-    Force-first only fires when the policy emits *no* tool call. After anneal,
-    weak VL often samples ``judge_image`` first (``image_prompt=last``) → missing
-    path aborts and log spam. Default on; set ``AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE=0``
-    to disable.
-    """
-    return os.getenv("AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE", "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
-
-
-def _tool_calls_are_premature_judge(tool_calls: list[Any] | None) -> bool:
-    if not tool_calls:
-        return False
-    names = [getattr(tc, "name", None) for tc in tool_calls]
-    return bool(names) and all(n == "judge_image" for n in names)
-
-
-def _last_user_text(messages: list[dict[str, Any]]) -> str:
-    for message in reversed(messages):
-        if message.get("role") != "user":
-            continue
-        content = message.get("content", "")
-        if isinstance(content, list):
-            return " ".join(
-                str(item.get("text") or "") for item in content if isinstance(item, dict) and item.get("type") == "text"
-            ).strip()
-        return str(content or "").strip()
-    return ""
-
-
-def _hermes_tool_call(name: str, **arguments: str) -> str:
-    """Qwen3-VL Hermes wire format (must match multi_turn.format=hermes)."""
-    payload = {"name": name, "arguments": dict(arguments)}
-    return f"<tool_call>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_call>"
-
-
-def _messages_after_last_user(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Live rollout suffix after the last user turn (excludes fewshot demo tools)."""
-    last_user = -1
-    for i, message in enumerate(messages):
-        if message.get("role") == "user":
-            last_user = i
-    if last_user < 0:
-        return list(messages)
-    return list(messages[last_user + 1 :])
-
-
-def _count_successful_judges(messages: list[dict[str, Any]]) -> int:
-    """Count live ``agentic_judge ok=1`` tool obs after the live user turn.
-
-    Fewshot demos also contain ``agentic_judge ok=1`` with ``backend=fewshot``,
-    so counting the full transcript falsely skips teacher-forced ``judge_image``.
-    """
-    n = 0
-    for message in _messages_after_last_user(messages):
-        if message.get("role") != "tool":
-            continue
-        text = _tool_message_text(message)
-        if not _JUDGE_OK_RE.search(text):
-            continue
-        if _GEN_FEWSHOT_RE.search(text):
-            continue
-        n += 1
-    return n
-
-
-def _last_live_generate_prompt(messages: list[dict[str, Any]]) -> str:
-    """Best-effort diffusion prompt from the last live generate_image obs."""
-    for message in reversed(_messages_after_last_user(messages)):
-        if message.get("role") != "tool":
-            continue
-        text = _tool_message_text(message)
-        if not _GEN_OK_RE.search(text) or _GEN_FEWSHOT_RE.search(text):
-            continue
-        if not _GEN_LIVE_BACKEND_RE.search(text):
-            continue
-        m = re.search(r"prompt='([^']*)'", text)
-        if m:
-            return m.group(1).strip()
-        m = re.search(r'prompt="([^"]*)"', text)
-        if m:
-            return m.group(1).strip()
-    return ""
-
-
-def _tool_message_text(message: dict[str, Any]) -> str:
-    content = message.get("content", "")
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                parts.append(str(item.get("text") or ""))
-        return "\n".join(parts)
-    return str(content or "")
-
-
-def _count_successful_generates(messages: list[dict[str, Any]]) -> int:
-    """Count live generate_image tool obs after the live user turn."""
-    n = 0
-    for message in _messages_after_last_user(messages):
-        if message.get("role") != "tool":
-            continue
-        text = _tool_message_text(message)
-        if not _GEN_OK_RE.search(text):
-            continue
-        # Fewshot rows use ``backend=fewshot``; live Qwen-Image uses ``backend=qwen_image``.
-        if _GEN_FEWSHOT_RE.search(text):
-            continue
-        if not _GEN_LIVE_BACKEND_RE.search(text):
-            continue
-        n += 1
-    return n
-
-
-def build_forced_reflection(
-    tool_text: str,
-    *,
-    force_done: bool = False,
-    generate_pass: int = 0,
-    max_passes: int = 3,
-) -> tuple[str, bool] | None:
-    """Build ``(assistant_text, stop_required)`` from a successful judge observation.
-
-    Forced text is context-only (response_mask=0).  Even when the judge says YES
-    or the pass cap is reached, leave ``Done.`` to one subsequent policy decode
-    so GRPO has a sampled terminal action to reinforce.
-    """
-    if not _JUDGE_OK_RE.search(tool_text or ""):
-        return None
-    c_m = _CORRECTNESS_RE.search(tool_text)
-    a_m = _AESTHETICS_RE.search(tool_text)
-    g_m = _GOOD_ENOUGH_RE.search(tool_text)
-    f_m = _FINDINGS_RE.search(tool_text)
-    x_m = _FIXES_RE.search(tool_text)
-    correctness = c_m.group(1) if c_m else "?"
-    aesthetics = a_m.group(1) if a_m else "?"
-    good_enough = (g_m.group(1).upper() == "YES") if g_m else False
-    findings = re.sub(r"\s+", " ", (f_m.group(1) if f_m else "").strip())[:220]
-    fixes = re.sub(r"\s+", " ", (x_m.group(1) if x_m else "").strip())[:160]
-    if not findings:
-        findings = "see VL facet scores above"
-
-    if good_enough:
-        text = (
-            f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
-            f"good_enough=YES. {findings} Stop now; do not call another tool. "
-            f"Your next and only action must be exactly Done. agentic_stop_decision_required=1"
-        )
-        return text, True
-    if force_done:
-        text = (
-            f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
-            f"good_enough=NO after generate_image pass {generate_pass}/{max_passes}. "
-            f"{findings} {max_passes}-pass max reached; stop now and do not call another tool. "
-            f"Your next and only action must be exactly Done. "
-            f"agentic_force_stop_max_passes=1 agentic_stop_decision_required=1"
-        )
-        return text, True
-    fix_note = f" Suggested fixes: {fixes}." if fixes and fixes.lower() != "none" else ""
-    text = (
-        f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
-        f"good_enough=NO. {findings}.{fix_note} Rewriting the diffusion prompt next."
-    )
-    return text, False
 
 
 @register("image_gen_tool_agent")
@@ -373,10 +138,10 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         active_tools = getattr(agent_data, "_active_tools", self.tools)
         if "generate_image" not in active_tools:
             return None
-        prompt = _last_user_text(agent_data.messages)
+        prompt = last_user_text(agent_data.messages)
         if not prompt:
             return None
-        hermes = _hermes_tool_call("generate_image", prompt=prompt)
+        hermes = hermes_tool_call("generate_image", prompt=prompt)
         tool_call = FunctionCall(
             name="generate_image",
             arguments=json.dumps({"prompt": prompt}, ensure_ascii=False),
@@ -458,7 +223,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
     ) -> AgentState:
         """Teacher-force missing generate/judge tool calls during early curriculum."""
         state = await super()._handle_generating_state(agent_data, sampling_params, ignore_termination)
-        probability = _force_first_generate_probability(
+        probability = force_first_generate_probability(
             getattr(self, "_agentic_step", 0),
             validate=getattr(self, "_agentic_validate", False),
         )
@@ -469,12 +234,12 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
 
         # Always-on ordering guard (independent of force-first anneal): policy
         # sampled judge_image with no live generate yet → rewrite to generate.
-        n_gen = _count_successful_generates(agent_data.messages)
+        n_gen = count_successful_generates(agent_data.messages)
         if (
-            _rewrite_judge_before_generate()
+            rewrite_judge_before_generate()
             and state == AgentState.PROCESSING_TOOLS
             and n_gen == 0
-            and _tool_calls_are_premature_judge(agent_data.tool_calls)
+            and tool_calls_are_premature_judge(agent_data.tool_calls)
             and len(agent_data.response_mask) < self.response_length
         ):
             rewritten = await self._rewrite_premature_judge_to_generate(agent_data)
@@ -491,14 +256,14 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         ):
             return state
 
-        n_judge = _count_successful_judges(agent_data.messages)
+        n_judge = count_successful_judges(agent_data.messages)
 
         # 1) First turn: no tools → teacher-force generate_image (replace Done prose).
         if agent_data.assistant_turns == 1 and n_gen == 0 and "generate_image" in active_tools:
-            prompt = _last_user_text(agent_data.messages)
+            prompt = last_user_text(agent_data.messages)
             if not prompt:
                 return state
-            hermes = _hermes_tool_call("generate_image", prompt=prompt)
+            hermes = hermes_tool_call("generate_image", prompt=prompt)
             tool_call = FunctionCall(
                 name="generate_image",
                 arguments=json.dumps({"prompt": prompt}, ensure_ascii=False),
@@ -521,7 +286,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         if n_gen >= 1 and n_judge < n_gen and "judge_image" in active_tools:
             user_request = "same as user message"
             image_prompt = "last"
-            hermes = _hermes_tool_call(
+            hermes = hermes_tool_call(
                 "judge_image",
                 user_request=user_request,
                 image_prompt=image_prompt,
@@ -559,19 +324,19 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         # Inspect tool messages just appended for a successful VL judge.
         forced: tuple[str, bool] | None = None
         gen_passes = 0
-        max_passes = _max_generate_passes()
+        max_passes = max_generate_passes()
         for message in reversed(agent_data.messages):
             if message.get("role") != "tool":
                 break
-            gen_passes = _count_successful_generates(agent_data.messages)
+            gen_passes = count_successful_generates(agent_data.messages)
             force_done = gen_passes >= max_passes
             # RL path (force off): only inject a stop cue at the generate-pass cap so
             # rollouts do not burn the response budget on a 4th rewrite loop.
             # Full YES/NO Reflection teacher remains opt-in via force=1.
-            if not _force_enabled() and not force_done:
+            if not force_enabled() and not force_done:
                 return state
             forced = build_forced_reflection(
-                _tool_message_text(message),
+                tool_message_text(message),
                 force_done=force_done,
                 generate_pass=gen_passes,
                 max_passes=max_passes,
@@ -583,7 +348,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
 
         reflection_text, stop_required = forced
         # When force is off, only keep the max-pass stop cue (not YES/NO rewrite coaching).
-        if not _force_enabled():
+        if not force_enabled():
             if not stop_required:
                 return state
             force_done = gen_passes >= max_passes
@@ -599,7 +364,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             [assistant_msg],
             remove_system_prompt=True,
         )
-        if not _fits_response_budget(
+        if not fits_response_budget(
             len(agent_data.response_mask),
             len(response_ids),
             self.response_length,
@@ -623,7 +388,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             "Forced Reflection after judge_image (stop_required=%s, chars=%d, force_full=%s)",
             stop_required,
             len(reflection_text),
-            _force_enabled(),
+            force_enabled(),
         )
 
         # YES/max-pass: sample the policy's terminal Done.  NO: sample a rewritten

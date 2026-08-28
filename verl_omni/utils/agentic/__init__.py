@@ -12,4 +12,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen ``generate_image`` / ``judge_image`` tools, loaded by file path."""
+"""Utilities for parsing and materializing agentic rollouts."""

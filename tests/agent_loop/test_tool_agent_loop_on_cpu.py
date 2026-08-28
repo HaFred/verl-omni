@@ -18,21 +18,21 @@ from types import SimpleNamespace
 
 import pytest
 
-from verl_omni.agent_loop.image_gen_tool_agent_loop import (
-    _count_successful_generates,
-    _count_successful_judges,
-    _fits_response_budget,
-    _force_enabled,
-    _force_first_generate_probability,
-    _hermes_tool_call,
-    _last_live_generate_prompt,
-    _last_user_text,
-    _max_generate_passes,
-    _messages_after_last_user,
-    _rewrite_judge_before_generate,
-    _tool_calls_are_premature_judge,
-    _tool_message_text,
+from verl_omni.agent_loop.utils import (
     build_forced_reflection,
+    count_successful_generates,
+    count_successful_judges,
+    fits_response_budget,
+    force_enabled,
+    force_first_generate_probability,
+    hermes_tool_call,
+    last_live_generate_prompt,
+    last_user_text,
+    max_generate_passes,
+    messages_after_last_user,
+    rewrite_judge_before_generate,
+    tool_calls_are_premature_judge,
+    tool_message_text,
 )
 
 
@@ -55,48 +55,48 @@ def _gen_obs(prompt="a poster", backend="qwen_image"):
 @pytest.mark.parametrize("value", ["0", "false", "off", "no"])
 def test_force_enabled_env_gate(monkeypatch, value):
     monkeypatch.setenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE", value)
-    assert _force_enabled() is False
+    assert force_enabled() is False
     monkeypatch.delenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE")
-    assert _force_enabled() is True  # default on
+    assert force_enabled() is True  # default on
 
 
 def test_max_generate_passes_env(monkeypatch):
     monkeypatch.delenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", raising=False)
-    assert _max_generate_passes() == 3
+    assert max_generate_passes() == 3
     monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "5")
-    assert _max_generate_passes() == 5
+    assert max_generate_passes() == 5
     monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "garbage")
-    assert _max_generate_passes() == 3
+    assert max_generate_passes() == 3
     monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "0")
-    assert _max_generate_passes() == 1  # floored at 1
+    assert max_generate_passes() == 1  # floored at 1
 
 
 def test_force_first_generate_probability_schedule(monkeypatch):
     monkeypatch.delenv("AGENTIC_FORCE_FIRST_GENERATE", raising=False)
-    assert _force_first_generate_probability(5) == 0.0  # off by default
-    assert _force_first_generate_probability(5, validate=True) == 0.0  # never on val
+    assert force_first_generate_probability(5) == 0.0  # off by default
+    assert force_first_generate_probability(5, validate=True) == 0.0  # never on val
     monkeypatch.setenv("AGENTIC_FORCE_FIRST_GENERATE", "1")
     monkeypatch.setenv("AGENTIC_FORCE_FIRST_WARMUP_STEPS", "10")
     monkeypatch.setenv("AGENTIC_FORCE_FIRST_END_STEP", "20")
-    assert _force_first_generate_probability(5) == 1.0  # warmup
-    assert _force_first_generate_probability(15) == pytest.approx(0.5)  # linear anneal
-    assert _force_first_generate_probability(20) == 0.0  # annealed off
-    assert _force_first_generate_probability("not-an-int") == 1.0  # step coerced to 0
+    assert force_first_generate_probability(5) == 1.0  # warmup
+    assert force_first_generate_probability(15) == pytest.approx(0.5)  # linear anneal
+    assert force_first_generate_probability(20) == 0.0  # annealed off
+    assert force_first_generate_probability("not-an-int") == 1.0  # step coerced to 0
 
 
 def test_rewrite_judge_before_generate_env(monkeypatch):
     monkeypatch.delenv("AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE", raising=False)
-    assert _rewrite_judge_before_generate() is True  # default on
+    assert rewrite_judge_before_generate() is True  # default on
     monkeypatch.setenv("AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE", "0")
-    assert _rewrite_judge_before_generate() is False
+    assert rewrite_judge_before_generate() is False
 
 
 def test_tool_calls_are_premature_judge():
-    assert _tool_calls_are_premature_judge([]) is False
-    assert _tool_calls_are_premature_judge(None) is False
-    assert _tool_calls_are_premature_judge([SimpleNamespace(name="judge_image")]) is True
+    assert tool_calls_are_premature_judge([]) is False
+    assert tool_calls_are_premature_judge(None) is False
+    assert tool_calls_are_premature_judge([SimpleNamespace(name="judge_image")]) is True
     assert (
-        _tool_calls_are_premature_judge([SimpleNamespace(name="generate_image"), SimpleNamespace(name="judge_image")])
+        tool_calls_are_premature_judge([SimpleNamespace(name="generate_image"), SimpleNamespace(name="judge_image")])
         is False
     )
 
@@ -106,14 +106,14 @@ def test_last_user_text_content_forms():
         {"role": "user", "content": [{"type": "text", "text": "part one"}, {"type": "text", "text": "part two"}]},
         {"role": "assistant", "content": "noise"},
     ]
-    assert _last_user_text(messages) == "part one part two"
+    assert last_user_text(messages) == "part one part two"
     messages[0]["content"] = "plain string task"
-    assert _last_user_text(messages) == "plain string task"
-    assert _last_user_text([{"role": "assistant", "content": "x"}]) == ""
+    assert last_user_text(messages) == "plain string task"
+    assert last_user_text([{"role": "assistant", "content": "x"}]) == ""
 
 
 def test_hermes_tool_call_wire_format():
-    text = _hermes_tool_call("generate_image", prompt="a cafe poster")
+    text = hermes_tool_call("generate_image", prompt="a cafe poster")
     assert text.startswith("<tool_call>\n") and text.endswith("\n</tool_call>")
     payload = json.loads(text[len("<tool_call>\n") : -len("\n</tool_call>")])
     assert payload == {"name": "generate_image", "arguments": {"prompt": "a cafe poster"}}
@@ -122,63 +122,63 @@ def test_hermes_tool_call_wire_format():
 def test_messages_after_last_user_excludes_fewshot_demos():
     demo = [
         {"role": "user", "content": "demo task"},
-        {"role": "assistant", "content": _hermes_tool_call("generate_image", prompt="demo")},
+        {"role": "assistant", "content": hermes_tool_call("generate_image", prompt="demo")},
         {"role": "tool", "content": _gen_obs(backend="fewshot")},
     ]
     live = [
         {"role": "user", "content": "live task"},
-        {"role": "assistant", "content": _hermes_tool_call("generate_image", prompt="live")},
+        {"role": "assistant", "content": hermes_tool_call("generate_image", prompt="live")},
         {"role": "tool", "content": _gen_obs(backend="qwen_image")},
     ]
-    assert _messages_after_last_user(demo + live) == live[1:]
-    assert _messages_after_last_user([{"role": "assistant", "content": "x"}]) == [{"role": "assistant", "content": "x"}]
+    assert messages_after_last_user(demo + live) == live[1:]
+    assert messages_after_last_user([{"role": "assistant", "content": "x"}]) == [{"role": "assistant", "content": "x"}]
 
 
 def test_count_successful_judges_ignores_fewshot():
     demo = [
         {"role": "user", "content": "demo"},
-        {"role": "assistant", "content": _hermes_tool_call("judge_image", user_request="same", image_prompt="last")},
+        {"role": "assistant", "content": hermes_tool_call("judge_image", user_request="same", image_prompt="last")},
         {"role": "tool", "content": _judge_obs().replace("backend=vllm", "backend=fewshot")},
     ]
     live = [
         {"role": "user", "content": "live"},
-        {"role": "assistant", "content": _hermes_tool_call("judge_image", user_request="same", image_prompt="last")},
+        {"role": "assistant", "content": hermes_tool_call("judge_image", user_request="same", image_prompt="last")},
         {"role": "tool", "content": _judge_obs()},
-        {"role": "assistant", "content": _hermes_tool_call("judge_image", user_request="same", image_prompt="last")},
+        {"role": "assistant", "content": hermes_tool_call("judge_image", user_request="same", image_prompt="last")},
         {"role": "tool", "content": _judge_obs(good_enough="NO")},
     ]
-    assert _count_successful_judges(demo + live) == 2
+    assert count_successful_judges(demo + live) == 2
 
 
 def test_count_successful_generates_requires_live_backend():
     live = [
         {"role": "user", "content": "live"},
-        {"role": "assistant", "content": _hermes_tool_call("generate_image", prompt="p1")},
+        {"role": "assistant", "content": hermes_tool_call("generate_image", prompt="p1")},
         {"role": "tool", "content": _gen_obs(backend="qwen_image")},
-        {"role": "assistant", "content": _hermes_tool_call("generate_image", prompt="p2")},
+        {"role": "assistant", "content": hermes_tool_call("generate_image", prompt="p2")},
         {"role": "tool", "content": _gen_obs(backend="fewshot")},  # demo marker, not live
-        {"role": "assistant", "content": _hermes_tool_call("generate_image", prompt="p3")},
+        {"role": "assistant", "content": hermes_tool_call("generate_image", prompt="p3")},
         {"role": "tool", "content": "agentic_tool ok=1 images=1 prompt='p3'"},  # no live backend token
     ]
-    assert _count_successful_generates(live) == 1
+    assert count_successful_generates(live) == 1
 
 
 def test_last_live_generate_prompt_extraction():
     live = [
         {"role": "user", "content": "live"},
-        {"role": "assistant", "content": _hermes_tool_call("generate_image", prompt="first")},
+        {"role": "assistant", "content": hermes_tool_call("generate_image", prompt="first")},
         {"role": "tool", "content": _gen_obs(prompt="first", backend="qwen_image")},
-        {"role": "assistant", "content": _hermes_tool_call("generate_image", prompt="rewritten")},
+        {"role": "assistant", "content": hermes_tool_call("generate_image", prompt="rewritten")},
         {"role": "tool", "content": _gen_obs(prompt="rewritten", backend="qwen_image")},
     ]
-    assert _last_live_generate_prompt(live) == "rewritten"
-    assert _last_live_generate_prompt([]) == ""
+    assert last_live_generate_prompt(live) == "rewritten"
+    assert last_live_generate_prompt([]) == ""
 
 
 def test_tool_message_text_forms():
-    assert _tool_message_text({"content": "plain"}) == "plain"
-    assert _tool_message_text({"content": [{"type": "text", "text": "a"}, {"type": "image", "image": "x"}]}) == "a"
-    assert _tool_message_text({"content": None}) == ""
+    assert tool_message_text({"content": "plain"}) == "plain"
+    assert tool_message_text({"content": [{"type": "text", "text": "a"}, {"type": "image", "image": "x"}]}) == "a"
+    assert tool_message_text({"content": None}) == ""
 
 
 def test_build_forced_reflection_yes_stop_cue():
@@ -214,7 +214,7 @@ def test_build_forced_reflection_requires_judge_ok():
 
 
 def test_fits_response_budget_rejects_overflow():
-    assert _fits_response_budget(mask_len=10, n_new_ids=5, response_length=16) is True
-    assert _fits_response_budget(mask_len=10, n_new_ids=6, response_length=16) is False
-    assert _fits_response_budget(mask_len=10, n_new_ids=0, response_length=16) is False
-    assert _fits_response_budget(mask_len=0, n_new_ids=1, response_length=1) is False
+    assert fits_response_budget(mask_len=10, n_new_ids=5, response_length=16) is True
+    assert fits_response_budget(mask_len=10, n_new_ids=6, response_length=16) is False
+    assert fits_response_budget(mask_len=10, n_new_ids=0, response_length=16) is False
+    assert fits_response_budget(mask_len=0, n_new_ids=1, response_length=1) is False

@@ -15,7 +15,7 @@
 """Frozen agentic function tools for verl's stock ``ToolAgentLoop``.
 
 Module path: ``verl_omni/tools/image_gen.py``.
-Bound automatically via ``ImageGenAgentLoopWorker`` (``function_tool_path``).
+Bound automatically via ``OmniAgentLoopWorker`` (``function_tool_path``).
 
 Provides ``generate_image`` + ``judge_image``. Agentic LLM RL keeps image
 generation **outside** the actor optimizer. GRPO trains the actor as the
@@ -57,7 +57,7 @@ from verl.tools.function_tool import function_tool
 from verl.tools.schemas import ToolResponse
 
 # Trajectory binding for artifact paths (no monkey-patch; agent loop sets ContextVars).
-from verl_omni.agent_loop.image_gen_trajectory_context import (
+from verl_omni.tools.image_gen_trajectory_context import (
     build_artifact_id,
     count_live_generate_artifacts_for_active_rollout,
     get_active_rollout_id,
@@ -66,6 +66,7 @@ from verl_omni.agent_loop.image_gen_trajectory_context import (
     get_good_enough_yes_reached,
     get_latest_generate_prompt_for_active_rollout,
     register_tool_artifact,
+    resolve_rollout_images_root,
     resolve_tool_image_path,
     set_good_enough_yes_reached,
     set_latest_tool_image_path,
@@ -122,13 +123,6 @@ def _decode_images(payload: dict) -> list[Image.Image]:
         except Exception as exc:  # noqa: BLE001 — soft-fail external tool payloads
             logger.warning("failed to decode diffusion image payload: %s", exc)
     return images
-
-
-def _e2e_run_root() -> Path:
-    """``<e2e_root>/<experiment>/rollout_images`` — same tree as traj/hermes."""
-    from verl_omni.agent_loop.image_gen_trajectory_context import resolve_rollout_images_root
-
-    return resolve_rollout_images_root()
 
 
 def _next_call_dir(root: Path) -> Path:
@@ -199,30 +193,40 @@ def _update_traj_meta(traj_dir: Path, entry: dict) -> None:
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
 
 
+def _image_call_entry(
+    idx: int,
+    path: Path,
+    *,
+    prompt: str,
+    backend: str,
+    stubbed: bool,
+    provenance: dict,
+) -> dict:
+    """One ``meta.json`` call row for a saved generate_image artifact."""
+    return {
+        "index": idx,
+        "file": path.name,
+        "path": str(path),
+        "prompt": prompt,
+        "backend": backend,
+        "tool_stubbed": stubbed,
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        **provenance,
+    }
+
+
 def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_stubbed: bool) -> list[str]:
     """Persist tool images under the active stock-loop request path.
 
     When no trajectory is bound (e.g. standalone smoke), falls back to
     ``rollout_images/call_<ts>_<uuid>/``.
     """
-    root = _e2e_run_root()
+    root = resolve_rollout_images_root()
     root.mkdir(parents=True, exist_ok=True)
     relpath = get_active_trajectory_relpath()
     user_prompt = get_active_user_prompt() or ""
     provenance = _call_meta_fields(prompt, user_prompt=user_prompt)
     paths: list[str] = []
-
-    def _entry(idx: int, path: Path, *, stubbed: bool) -> dict:
-        return {
-            "index": idx,
-            "file": path.name,
-            "path": str(path),
-            "prompt": prompt,
-            "backend": backend,
-            "tool_stubbed": stubbed,
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            **provenance,
-        }
 
     if relpath:
         traj_dir = root / relpath
@@ -237,7 +241,9 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
                 img.save(path)
                 paths.append(str(path))
                 artifact_ids.append(aid)
-                meta_entry = _entry(idx, path, stubbed=tool_stubbed)
+                meta_entry = _image_call_entry(
+                    idx, path, prompt=prompt, backend=backend, stubbed=tool_stubbed, provenance=provenance
+                )
                 meta_entry["artifact_id"] = aid
                 meta_entry["rollout_id"] = get_active_rollout_id()
                 _update_traj_meta(traj_dir, meta_entry)
@@ -256,7 +262,9 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
             )
             paths.append(str(stub_path))
             artifact_ids.append(aid)
-            meta_entry = _entry(start_idx, stub_path, stubbed=True)
+            meta_entry = _image_call_entry(
+                start_idx, stub_path, prompt=prompt, backend=backend, stubbed=True, provenance=provenance
+            )
             meta_entry["artifact_id"] = aid
             meta_entry["rollout_id"] = get_active_rollout_id()
             _update_traj_meta(traj_dir, meta_entry)
@@ -633,41 +641,28 @@ JUDGE_TOOL_SCHEMA = {
 }
 
 
-_JUDGE_USER_PLACEHOLDERS = {
-    "",
-    "same",
-    "same as user",
-    "same as user message",
-    "same as user task",
-    "same as the user message",
-    "same as the user task",
-    "user",
-    "user request",
-    "user_request",
-    "last",
-    "previous",
-}
-
-
-_JUDGE_PROMPT_PLACEHOLDERS = {
-    "",
-    "last",
-    "latest",
-    "same",
-    "previous",
-    "prior",
-    "image_prompt",
-}
-
-
 def _expand_judge_user_request(user_request: str) -> str:
     """Expand compact / truncated judge args to the bound live user task."""
+    potential_bound_holders = {
+        "",
+        "same",
+        "same as user",
+        "same as user message",
+        "same as user task",
+        "same as the user message",
+        "same as the user task",
+        "user",
+        "user request",
+        "user_request",
+        "last",
+        "previous",
+    }
     raw = (user_request or "").strip()
     bound = (get_active_user_prompt() or "").strip()
     if not bound:
         return raw
     low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
-    if low in _JUDGE_USER_PLACEHOLDERS:
+    if low in potential_bound_holders:
         return bound
     # Truncated paste of the full task (common when response budget runs out).
     if len(raw) < max(80, int(0.55 * len(bound))) and bound.lower().startswith(raw[:48].lower()):
@@ -679,10 +674,11 @@ def _expand_judge_user_request(user_request: str) -> str:
 
 def _expand_judge_image_prompt(image_prompt: str) -> str:
     """Expand compact / truncated image_prompt to the latest live generate prompt."""
+    potential_bound_holders = {"", "last", "latest", "same", "previous", "prior", "image_prompt"}
     raw = (image_prompt or "").strip()
     latest = (get_latest_generate_prompt_for_active_rollout() or "").strip()
     low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
-    if low in _JUDGE_PROMPT_PLACEHOLDERS:
+    if low in potential_bound_holders:
         return latest or raw
     if latest and len(raw) < max(40, int(0.55 * len(latest))) and latest.lower().startswith(raw[:40].lower()):
         return latest

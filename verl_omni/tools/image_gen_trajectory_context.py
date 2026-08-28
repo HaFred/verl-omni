@@ -14,8 +14,9 @@
 
 """Artifact path helpers and optional per-task diffusion-tool bindings.
 
-Kept in a tiny module with no ``@function_tool`` registration so path helpers
-can be shared by the stock-loop manager and diffusion tool safely.
+Kept next to ``image_gen.py`` with no ``@function_tool`` registration so path
+helpers can be imported by the agent loop, dumps, and the tools without
+re-executing the tool module.
 
 Artifact layout (under the e2e run dir)::
 
@@ -42,13 +43,37 @@ import re
 import threading
 from pathlib import Path
 
+__all__ = [
+    "bind_run_artifact_env",
+    "build_artifact_id",
+    "build_trajectory_relpath",
+    "clear_good_enough_yes_reached",
+    "clear_latest_tool_image_for_active_rollout",
+    "count_live_generate_artifacts_for_active_rollout",
+    "get_active_rollout_id",
+    "get_active_trajectory_relpath",
+    "get_active_user_prompt",
+    "get_good_enough_yes_reached",
+    "get_latest_generate_prompt_for_active_rollout",
+    "register_tool_artifact",
+    "reset_active_trajectory_relpath",
+    "reset_active_user_prompt",
+    "resolve_rollout_images_root",
+    "resolve_run_dir",
+    "resolve_tool_image_path",
+    "set_active_trajectory_relpath",
+    "set_active_user_prompt",
+    "set_good_enough_yes_reached",
+    "set_latest_tool_image_path",
+]
+
 
 def default_e2e_root() -> Path:
     """Repo ``outputs/e2e`` (absolute). Prefer ``VERLOMNI_ROOT`` when set."""
     verlomni = os.getenv("VERLOMNI_ROOT", "").strip()
     if verlomni:
         return Path(verlomni).expanduser().resolve() / "outputs" / "e2e"
-    # <repo>/verl_omni/agent_loop/this_file.py → parents[2] == repo root
+    # <repo>/verl_omni/tools/this_file.py → parents[2] == repo root
     return Path(__file__).resolve().parents[2] / "outputs" / "e2e"
 
 

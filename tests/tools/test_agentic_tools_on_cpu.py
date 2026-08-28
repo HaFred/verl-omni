@@ -20,13 +20,13 @@ against whichever checkout the worker binds (verl_omni/tools/image_gen.py).
 import base64
 import importlib.util
 import io
+from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from verl_omni.agent_loop import image_gen_trajectory_context as _traj_ctx
-from verl_omni.agent_loop.image_gen_metrics_manager import ImageGenAgentLoopWorker
-from verl_omni.agent_loop.image_gen_trajectory_context import (
+from verl_omni.tools import image_gen_trajectory_context as _traj_ctx
+from verl_omni.tools.image_gen_trajectory_context import (
     clear_latest_tool_image_for_active_rollout,
     count_live_generate_artifacts_for_active_rollout,
     register_tool_artifact,
@@ -36,7 +36,7 @@ from verl_omni.agent_loop.image_gen_trajectory_context import (
     set_active_user_prompt,
 )
 
-_TOOL_PATH = ImageGenAgentLoopWorker._AGENTIC_FUNCTION_TOOLS
+_TOOL_PATH = Path(__file__).resolve().parents[2] / "verl_omni" / "tools" / "image_gen.py"
 if not _TOOL_PATH.is_file():
     raise FileNotFoundError(f"agentic function tools not found at {_TOOL_PATH}")
 
