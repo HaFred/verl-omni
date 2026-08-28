@@ -61,7 +61,7 @@ from verl_omni.trainer.diffusion.diffusion_metric_utils import (
     compute_throughput_metrics_diffusion,
     compute_timing_metrics_diffusion,
 )
-from verl_omni.trainer.diffusion.ray_diffusion_trainer import compute_advantage
+from verl_omni.trainer.diffusion.ray_diffusion_trainer import _to_diffusion_worker_tensordict, compute_advantage
 from verl_omni.trainer.diffusion.rollout_correction import (
     apply_bypass_mode_to_diffusion_batch,
     apply_rollout_correction_to_diffusion_batch,
@@ -523,8 +523,8 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     self.config.actor_rollout_ref.actor.optim.total_training_steps = (
                         total_training_steps * self.parameter_sync_step
                     )
-        except Exception as e:
-            logger.warning(f"Could not set total_training_steps in config: {e}")
+        except (KeyError, TypeError, AttributeError, OmegaConf.errors.OmegaConfBaseException) as e:
+            raise RuntimeError("Failed to propagate trainer.total_training_steps to actor optimizer config.") from e
 
     def _init_dump_executor(self):
         self._dump_executor = ThreadPoolExecutor(max_workers=1)
@@ -715,11 +715,20 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         failure_metrics: Counter = Counter()
 
         while remaining_batch_size > 0:
-            batch, current_metrics = self.replay_buffer.sample(
-                global_steps=self.global_steps,
-                partition_id="train",
-                batch_size=remaining_batch_size,
-            )
+            try:
+                batch, current_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps,
+                    partition_id="train",
+                    batch_size=remaining_batch_size,
+                )
+            except RuntimeError as e:
+                if "Sync replay buffer selected terminal groups with no materializable trajectories" in str(
+                    e
+                ) and "sync_refill_failed_groups" in str(e):
+                    batch = KVBatchMeta(partition_id="train", keys=[], tags=[])
+                    current_metrics = {}
+                else:
+                    raise
             sampling_metrics.update(current_metrics)
 
             prompt_global_steps = self.replay_buffer.prompt_global_steps["train"]
@@ -819,7 +828,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _compute_old_log_prob(self, data: DataProto) -> DataProto:
         """Recompute old log-probs over diffusion latents with the actor engine."""
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         tu.assign_non_tensor(
             batch_td,
@@ -838,7 +847,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
 
     def _compute_ref_log_prob(self, data: DataProto) -> DataProto:
         """Compute reference log-probs over diffusion latents."""
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         metadata = {
             "compute_loss": False,
@@ -884,7 +893,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
         """Update the diffusion actor network."""
         rollout_config = self.config.actor_rollout_ref.rollout
         data.meta_info["multi_turn"] = rollout_config.multi_turn.enable
-        batch_td = data.to_tensordict()
+        batch_td = _to_diffusion_worker_tensordict(data)
         batch_td = embeds_padding_2_no_padding(batch_td)
         ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
         ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
@@ -1023,7 +1032,7 @@ class PolicyGradientDiffusionTrainerV1(ABC):
                     raise ValueError(f"Expected a uint8 image tensor, got {getattr(image, 'dtype', type(image))}.")
             import wandb
 
-            outputs = [wandb.Image(image, file_type="jpg", normalize=False) for image in outputs]
+            outputs = [wandb.Image(image, file_type="jpg") for image in outputs]
         samples = list(zip(inputs, outputs, scores, strict=True))
         samples.sort(key=lambda x: x[0])
         rng = np.random.RandomState(42)
@@ -1262,8 +1271,10 @@ class PolicyGradientDiffusionTrainerV1(ABC):
             if not os.path.isabs(global_step_folder):
                 global_step_folder = os.path.join(os.getcwd(), global_step_folder)
         else:
-            logger.exception(f"Unknown resume mode {self.config.trainer.resume_mode}")
-            return
+            raise ValueError(
+                f"Unknown trainer.resume_mode={self.config.trainer.resume_mode!r}. "
+                "Available options: ['disable', 'auto', 'resume_path']."
+            )
 
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
         logger.info(f"Resuming diffusion from {global_step_folder}, global_steps={self.global_steps}")
