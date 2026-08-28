@@ -17,6 +17,8 @@
 # re-export the class from the pipeline package __init__ (import cycle).
 from verl_omni.pipelines.minimax_h3_diffusion_nft.agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
 
+# Register image_gen_tool_agent (forces Reflection after successful judge_image).
+from . import image_gen_tool_agent_loop as _image_gen_tool_agent_loop  # noqa: F401
 from .composite_agent_loop import CompositeAgentLoopWorker
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
 from .diffusion_agent_loop_tq import (

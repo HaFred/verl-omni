@@ -14,6 +14,7 @@
 
 """Experiment-tracking helpers layered on verl.utils.tracking."""
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -24,6 +25,10 @@ from typing import Any
 
 import numpy as np
 import torch
+
+from verl_omni.utils.reward_score.reward_utils import video_tensor_to_pil_frames
+
+logger = logging.getLogger(__name__)
 
 
 def batch_items(values: Any, batch_size: int, name: str) -> list[Any]:

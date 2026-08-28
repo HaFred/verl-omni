@@ -134,3 +134,4 @@ tensorboard_log
 
 # locally downloaded reward weights (ImageBind / CLAP)
 .checkpoints
+.tools/trace_processor
