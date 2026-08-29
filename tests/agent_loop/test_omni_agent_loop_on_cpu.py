@@ -43,7 +43,7 @@ def _ensure_package(name: str, path: Path) -> types.ModuleType:
     return mod
 
 
-def _load(modname: str, path: Path):
+def _load(modname: str, path: Path, *, package_dir: Path | None = None):
     _ensure_package("verl_omni", _VERL_OMNI)
     _ensure_package("verl_omni.agent_loop", _AGENT_LOOP)
     _ensure_package("verl_omni.tools", _TOOLS)
@@ -51,9 +51,12 @@ def _load(modname: str, path: Path):
     _ensure_package("verl_omni.utils.agentic", _AGENTIC_UTILS)
     if modname in sys.modules and hasattr(sys.modules[modname], "__file__"):
         return sys.modules[modname]
-    spec = importlib.util.spec_from_file_location(modname, path)
+    search = [str(package_dir)] if package_dir is not None else None
+    spec = importlib.util.spec_from_file_location(modname, path, submodule_search_locations=search)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
+    if package_dir is not None:
+        mod.__path__ = [str(package_dir)]  # type: ignore[attr-defined]
     sys.modules[modname] = mod
     spec.loader.exec_module(mod)
     return mod
@@ -67,9 +70,11 @@ rollout_parse = _load(
     "verl_omni.utils.agentic.image_gen_rollout_parse",
     _AGENTIC_UTILS / "image_gen_rollout_parse.py",
 )
+_TRAJECTORY = _TOOLS / "trajectory"
 traj_ctx = _load(
-    "verl_omni.tools.image_gen_trajectory_context",
-    _TOOLS / "image_gen_trajectory_context.py",
+    "verl_omni.tools.trajectory",
+    _TRAJECTORY / "__init__.py",
+    package_dir=_TRAJECTORY,
 )
 rollout_dump = _load(
     "verl_omni.utils.agentic.image_gen_rollout_dump",
@@ -108,8 +113,16 @@ def _load_omni_agent_loop():
 
     agent_loop_pkg = types.ModuleType("verl.experimental.agent_loop")
     agent_loop_mod = types.ModuleType("verl.experimental.agent_loop.agent_loop")
+    tool_loop_mod = types.ModuleType("verl.experimental.agent_loop.tool_agent_loop")
+    parser_mod = types.ModuleType("verl.experimental.agent_loop.tool_parser")
     agent_loop_pkg.AgentLoopManager = _AgentLoopManager
     agent_loop_mod.AgentLoopWorker = _AgentLoopWorker
+    agent_loop_mod.AgentLoopOutput = type("AgentLoopOutput", (), {})
+    agent_loop_mod.register = lambda name: (lambda cls: cls)
+    tool_loop_mod.AgentData = type("AgentData", (), {})
+    tool_loop_mod.AgentState = type("AgentState", (), {})
+    tool_loop_mod.ToolAgentLoop = type("ToolAgentLoop", (), {})
+    parser_mod.FunctionCall = type("FunctionCall", (), {})
     utils_mod = types.ModuleType("verl.utils")
     utils_mod.hf_tokenizer = lambda *args, **kwargs: object()
 
@@ -118,11 +131,14 @@ def _load_omni_agent_loop():
         "verl.experimental": sys.modules.get("verl.experimental") or types.ModuleType("verl.experimental"),
         "verl.experimental.agent_loop": agent_loop_pkg,
         "verl.experimental.agent_loop.agent_loop": agent_loop_mod,
+        "verl.experimental.agent_loop.tool_agent_loop": tool_loop_mod,
+        "verl.experimental.agent_loop.tool_parser": parser_mod,
         "verl.utils": utils_mod,
     }
     saved = {name: sys.modules.get(name) for name in overlays}
     sys.modules.update(overlays)
     sys.modules.pop("verl_omni.agent_loop.omni_agent_loop", None)
+    sys.modules.pop("verl_omni.agent_loop.tool_agent_loop", None)
     try:
         omni = _load("verl_omni.agent_loop.omni_agent_loop", _AGENT_LOOP / "omni_agent_loop.py")
     finally:

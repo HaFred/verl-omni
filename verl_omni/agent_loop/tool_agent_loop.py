@@ -63,7 +63,7 @@ from verl_omni.agent_loop.utils import (
     tool_calls_are_premature_judge,
     tool_message_text,
 )
-from verl_omni.tools.image_gen_trajectory_context import (
+from verl_omni.tools.trajectory import (
     clear_good_enough_yes_reached,
     clear_latest_tool_image_for_active_rollout,
     get_active_trajectory_relpath,

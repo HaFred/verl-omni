@@ -24,7 +24,7 @@ from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.utils import hf_tokenizer
 
-from verl_omni.tools.image_gen_trajectory_context import (
+from verl_omni.tools.trajectory import (
     bind_run_artifact_env,
     build_trajectory_relpath,
     clear_good_enough_yes_reached,
@@ -40,6 +40,9 @@ from verl_omni.utils.agentic.image_gen_rollout_parse import (
     split_rollout_turns,
 )
 from verl_omni.utils.metrics_utils import AgenticRewardMetrics
+
+# Register ``image_gen_tool_agent`` when this manager/worker module is loaded.
+from . import tool_agent_loop as image_gen_tool_agent_loop  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

@@ -11,29 +11,62 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the image-gen multi-turn agent loop helpers."""
+"""CPU tests for the image-gen multi-turn agent loop helpers.
 
+Helpers are loaded from source so collection does not run ``verl_omni/__init__.py``.
+"""
+
+from __future__ import annotations
+
+import importlib.util
 import json
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from verl_omni.agent_loop.utils import (
-    build_forced_reflection,
-    count_successful_generates,
-    count_successful_judges,
-    fits_response_budget,
-    force_enabled,
-    force_first_generate_probability,
-    hermes_tool_call,
-    last_live_generate_prompt,
-    last_user_text,
-    max_generate_passes,
-    messages_after_last_user,
-    rewrite_judge_before_generate,
-    tool_calls_are_premature_judge,
-    tool_message_text,
-)
+_UTILS_PATH = Path(__file__).resolve().parents[2] / "verl_omni" / "agent_loop" / "utils.py"
+
+
+def _load_utils():
+    # Stub parent packages so we never execute verl_omni/__init__.py (CUDA).
+    root = _UTILS_PATH.parents[1]
+    for name, path in (
+        ("verl_omni", root),
+        ("verl_omni.agent_loop", root / "agent_loop"),
+    ):
+        if name not in sys.modules:
+            mod = types.ModuleType(name)
+            mod.__path__ = [str(path)]  # type: ignore[attr-defined]
+            sys.modules[name] = mod
+    if "verl_omni.agent_loop.utils" in sys.modules and hasattr(sys.modules["verl_omni.agent_loop.utils"], "__file__"):
+        return sys.modules["verl_omni.agent_loop.utils"]
+    spec = importlib.util.spec_from_file_location("verl_omni.agent_loop.utils", _UTILS_PATH)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load agent_loop utils from {_UTILS_PATH}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_utils = _load_utils()
+build_forced_reflection = _utils.build_forced_reflection
+count_successful_generates = _utils.count_successful_generates
+count_successful_judges = _utils.count_successful_judges
+fits_response_budget = _utils.fits_response_budget
+force_enabled = _utils.force_enabled
+force_first_generate_probability = _utils.force_first_generate_probability
+hermes_tool_call = _utils.hermes_tool_call
+last_live_generate_prompt = _utils.last_live_generate_prompt
+last_user_text = _utils.last_user_text
+max_generate_passes = _utils.max_generate_passes
+messages_after_last_user = _utils.messages_after_last_user
+rewrite_judge_before_generate = _utils.rewrite_judge_before_generate
+tool_calls_are_premature_judge = _utils.tool_calls_are_premature_judge
+tool_message_text = _utils.tool_message_text
 
 
 def _judge_obs(*, correctness=0.80, aesthetics=0.76, good_enough="YES", findings="text is legible", fixes="none"):

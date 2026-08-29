@@ -15,33 +15,75 @@
 
 The tool module is loaded from the worker-resolved path so the same test runs
 against whichever checkout the worker binds (verl_omni/tools/image_gen.py).
+
+Modules are loaded via importlib with lightweight package stubs so collection
+does not run ``verl_omni/__init__.py`` (pipelines → CUDA).
 """
+
+from __future__ import annotations
 
 import base64
 import importlib.util
 import io
+import sys
+import types
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from verl_omni.tools import image_gen_trajectory_context as _traj_ctx
-from verl_omni.tools.image_gen_trajectory_context import (
-    clear_latest_tool_image_for_active_rollout,
-    count_live_generate_artifacts_for_active_rollout,
-    register_tool_artifact,
-    reset_active_trajectory_relpath,
-    reset_active_user_prompt,
-    set_active_trajectory_relpath,
-    set_active_user_prompt,
-)
-
-_TOOL_PATH = Path(__file__).resolve().parents[2] / "verl_omni" / "tools" / "image_gen.py"
+_VERL_OMNI = Path(__file__).resolve().parents[2] / "verl_omni"
+_TOOL_PATH = _VERL_OMNI / "tools" / "image_gen.py"
+_TRAJECTORY = _VERL_OMNI / "tools" / "trajectory"
 if not _TOOL_PATH.is_file():
     raise FileNotFoundError(f"agentic function tools not found at {_TOOL_PATH}")
 
 
+def _ensure_package(name: str, path: Path) -> types.ModuleType:
+    mod = sys.modules.get(name)
+    if mod is not None:
+        return mod
+    mod = types.ModuleType(name)
+    mod.__path__ = [str(path)]  # type: ignore[attr-defined]
+    sys.modules[name] = mod
+    return mod
+
+
+def _load(modname: str, path: Path, *, package_dir: Path | None = None):
+    if modname in sys.modules and hasattr(sys.modules[modname], "__file__"):
+        return sys.modules[modname]
+    search = [str(package_dir)] if package_dir is not None else None
+    spec = importlib.util.spec_from_file_location(modname, path, submodule_search_locations=search)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {modname} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    if package_dir is not None:
+        mod.__path__ = [str(package_dir)]  # type: ignore[attr-defined]
+    sys.modules[modname] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ensure_package("verl_omni", _VERL_OMNI)
+_ensure_package("verl_omni.tools", _VERL_OMNI / "tools")
+_ensure_package("verl_omni.utils", _VERL_OMNI / "utils")
+
+traj = _load("verl_omni.tools.trajectory", _TRAJECTORY / "__init__.py", package_dir=_TRAJECTORY)
+_traj_ctx = _load("verl_omni.tools.trajectory.artifacts", _TRAJECTORY / "artifacts.py")
+_load("verl_omni.utils.agentic_image_judge_parse", _VERL_OMNI / "utils" / "agentic_image_judge_parse.py")
+
+clear_latest_tool_image_for_active_rollout = traj.clear_latest_tool_image_for_active_rollout
+count_live_generate_artifacts_for_active_rollout = traj.count_live_generate_artifacts_for_active_rollout
+register_tool_artifact = traj.register_tool_artifact
+reset_active_trajectory_relpath = traj.reset_active_trajectory_relpath
+reset_active_user_prompt = traj.reset_active_user_prompt
+set_active_trajectory_relpath = traj.set_active_trajectory_relpath
+set_active_user_prompt = traj.set_active_user_prompt
+
+
 def _load_tools_module():
+    # Anonymous module name: loading as ``verl_omni.tools.image_gen`` would
+    # re-register @function_tool names if something else already imported it.
     spec = importlib.util.spec_from_file_location("agentic_tools_under_test", _TOOL_PATH)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load tool module from {_TOOL_PATH}")

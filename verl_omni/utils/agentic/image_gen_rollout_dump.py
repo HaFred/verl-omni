@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from verl_omni.tools.image_gen_trajectory_context import (
+from verl_omni.tools.trajectory import (
     build_trajectory_relpath,
     resolve_run_dir,
 )

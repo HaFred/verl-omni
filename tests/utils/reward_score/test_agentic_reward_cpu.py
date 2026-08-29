@@ -18,16 +18,58 @@ score ∝ w_tool_call * f_tool_call
       + w_correctness * f_correctness_mix   # raw C × (1.0 if closed else 0.05)
       + w_aesthetics * f_aesthetics_mix     # raw A × (1.0 if closed else 0.05)
       + w_done * f_done                     # 1.0 iff closed protocol
+
+Loaded via importlib so collection skips ``verl_omni/__init__.py`` (CUDA).
 """
 
 from __future__ import annotations
 
+import importlib.util
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
-from verl_omni.utils.reward_score import agentic_reward
-from verl_omni.utils.reward_score.agentic_reward import compute_score
+_VERL_OMNI = Path(__file__).resolve().parents[3] / "verl_omni"
+_REWARD_SCORE = _VERL_OMNI / "utils" / "reward_score"
+
+
+def _ensure_package(name: str, path: Path) -> types.ModuleType:
+    mod = sys.modules.get(name)
+    if mod is not None:
+        return mod
+    mod = types.ModuleType(name)
+    mod.__path__ = [str(path)]  # type: ignore[attr-defined]
+    sys.modules[name] = mod
+    return mod
+
+
+def _load(modname: str, path: Path):
+    if modname in sys.modules and hasattr(sys.modules[modname], "__file__"):
+        return sys.modules[modname]
+    spec = importlib.util.spec_from_file_location(modname, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {modname} from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[modname] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_ensure_package("verl_omni", _VERL_OMNI)
+_ensure_package("verl_omni.utils", _VERL_OMNI / "utils")
+_ensure_package("verl_omni.utils.reward_score", _REWARD_SCORE)
+_load("verl_omni.utils.agentic_image_judge_parse", _VERL_OMNI / "utils" / "agentic_image_judge_parse.py")
+_load(
+    "verl_omni.utils.reward_score.agentic_image_judge_client",
+    _REWARD_SCORE / "agentic_image_judge_client.py",
+)
+agentic_reward = _load(
+    "verl_omni.utils.reward_score.agentic_reward",
+    _REWARD_SCORE / "agentic_reward.py",
+)
+compute_score = agentic_reward.compute_score
 
 
 def _gen(prompt: str = "a bright red apple", path: str = "/tmp/a.png") -> str:

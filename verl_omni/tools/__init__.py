@@ -12,4 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen ``generate_image`` / ``judge_image`` tools, loaded by file path."""
+"""Frozen ``generate_image`` / ``judge_image`` tools, loaded by file path.
+
+``OmniAgentLoopWorker`` binds ``image_gen.py`` as ``function_tool_path``.
+Rollout ContextVars and artifact registry live in ``verl_omni.tools.trajectory``.
+Importing this package does not register the tools.
+"""
