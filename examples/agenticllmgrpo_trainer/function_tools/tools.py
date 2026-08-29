@@ -59,6 +59,7 @@ from verl.tools.schemas import ToolResponse
 # Trajectory binding for artifact paths (no monkey-patch; agent loop sets ContextVars).
 from verl_omni.agent_loop.image_gen_trajectory_context import (  # noqa: F401
     build_artifact_id,
+    build_generate_call_meta,
     count_live_generate_artifacts_for_active_rollout,
     get_active_rollout_id,
     get_active_trajectory_relpath,
@@ -185,23 +186,8 @@ def _next_image_index(traj_dir: Path) -> int:
 
 
 def _call_meta_fields(prompt: str, *, user_prompt: str) -> dict:
-    """Default meta.json call-entry fields (reflection provenance is not bound)."""
-    return {
-        "call_role": "initial",
-        "controlled_by_reflection": False,
-        "reflection": "",
-        "prev_tool_prompt": "",
-        "source_image_for_reflection": "",
-        "rewritten_prompt": "",
-        "image_generated_from_reflected_prompt": False,
-        "tool_prompt_equals_rewritten_prompt": False,
-        "content_source": "initial",
-        "llm_reflection": "",
-        "llm_prompt": "",
-        "model_decode": "",
-        "user_prompt": user_prompt,
-        "tool_prompt": prompt,
-    }
+    """``meta.json`` call-entry provenance (initial vs reflection rewrite)."""
+    return build_generate_call_meta(prompt=prompt, user_prompt=user_prompt)
 
 
 def _update_traj_meta(traj_dir: Path, entry: dict) -> None:

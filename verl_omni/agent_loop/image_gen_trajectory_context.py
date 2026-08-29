@@ -116,6 +116,11 @@ _active_rollout_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
 _active_user_prompt: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentic_active_user_prompt", default=None
 )
+# Optional provenance for the *next* generate_image meta.json row (reflection / decode).
+# Set by the agent loop before the tool runs; consumed once when the PNG is saved.
+_pending_generate_provenance: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "agentic_pending_generate_provenance", default=None
+)
 
 # Live tool saves register here for judge lookup.
 _artifact_registry_lock = threading.Lock()
@@ -192,6 +197,94 @@ def reset_active_user_prompt(token: contextvars.Token) -> None:
 
 def get_active_user_prompt() -> str | None:
     return _active_user_prompt.get()
+
+
+def set_pending_generate_provenance(data: dict | None) -> contextvars.Token:
+    """Bind provenance for the next ``generate_image`` ``meta.json`` call row."""
+    return _pending_generate_provenance.set(dict(data) if data else None)
+
+
+def merge_pending_generate_provenance(updates: dict) -> contextvars.Token:
+    """Merge keys into the pending provenance dict (creates one if absent)."""
+    current = dict(_pending_generate_provenance.get() or {})
+    current.update({k: v for k, v in updates.items() if v is not None})
+    return _pending_generate_provenance.set(current)
+
+
+def get_pending_generate_provenance() -> dict | None:
+    pending = _pending_generate_provenance.get()
+    return dict(pending) if pending else None
+
+
+def consume_pending_generate_provenance() -> dict:
+    """Return and clear pending provenance for one generate_image save."""
+    pending = dict(_pending_generate_provenance.get() or {})
+    _pending_generate_provenance.set(None)
+    return pending
+
+
+def clear_pending_generate_provenance() -> None:
+    """Drop pending provenance for the active context (trajectory start/end)."""
+    _pending_generate_provenance.set(None)
+
+
+def build_generate_call_meta(*, prompt: str, user_prompt: str) -> dict:
+    """Build ``meta.json`` call-entry provenance for one ``generate_image`` save.
+
+    First live generate on the rollout → ``call_role=initial``.
+    Any later generate (after a prior artifact) → rewrite / reflection-controlled
+    fields filled from the previous prompt/image plus optional pending
+    reflection/decode bound by the agent loop.
+    """
+    prev_prompt = get_latest_generate_prompt_for_active_rollout() or ""
+    prev_image = get_latest_tool_image_path() or ""
+    pending = consume_pending_generate_provenance()
+    prompt_text = prompt or ""
+    user_text = user_prompt or ""
+
+    reflection = str(pending.get("reflection") or pending.get("llm_reflection") or "").strip()
+    model_decode = str(pending.get("model_decode") or "").strip()
+    llm_prompt = str(pending.get("llm_prompt") or "").strip() or prompt_text
+    forced_rewrite = bool(pending.get("controlled_by_reflection")) or (
+        str(pending.get("call_role") or "").strip().lower() == "rewrite"
+    )
+    is_rewrite = bool(prev_prompt) or forced_rewrite
+
+    if not is_rewrite:
+        return {
+            "call_role": "initial",
+            "controlled_by_reflection": False,
+            "reflection": "",
+            "prev_tool_prompt": "",
+            "source_image_for_reflection": "",
+            "rewritten_prompt": "",
+            "image_generated_from_reflected_prompt": False,
+            "tool_prompt_equals_rewritten_prompt": False,
+            "content_source": "initial",
+            "llm_reflection": "",
+            "llm_prompt": llm_prompt,
+            "model_decode": model_decode,
+            "user_prompt": user_text,
+            "tool_prompt": prompt_text,
+        }
+
+    rewritten = prompt_text
+    return {
+        "call_role": "rewrite",
+        "controlled_by_reflection": True,
+        "reflection": reflection,
+        "prev_tool_prompt": prev_prompt,
+        "source_image_for_reflection": prev_image,
+        "rewritten_prompt": rewritten,
+        "image_generated_from_reflected_prompt": True,
+        "tool_prompt_equals_rewritten_prompt": prompt_text.strip() == rewritten.strip(),
+        "content_source": "reflection",
+        "llm_reflection": reflection,
+        "llm_prompt": llm_prompt,
+        "model_decode": model_decode,
+        "user_prompt": user_text,
+        "tool_prompt": prompt_text,
+    }
 
 
 def register_tool_artifact(

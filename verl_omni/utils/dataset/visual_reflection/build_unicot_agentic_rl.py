@@ -97,6 +97,8 @@ HARD RULES (non-negotiable):
 - Never skip judge_image — you need the VL feedback to make an informed decision.
 - Never call tools other than generate_image and judge_image.
 - If you rewrite, the new prompt MUST differ from the previous one.
+- When calling generate_image, write the diffusion prompt in the SAME language
+  as the user request. Do not translate the user request into another language.
 - Keep judge_image arguments compact (placeholders above). Long pasted args
   waste the response budget and truncate the tool call.
 
@@ -148,6 +150,8 @@ HARD RULES (non-negotiable):
 - Call generate_image exactly once per planned subtask, in order.
 - ALWAYS call judge_image after the final image before deciding Done.
 - Never call tools other than generate_image and judge_image.
+- When calling generate_image, write the diffusion prompt in the SAME language
+  as the user request. Do not translate the user request into another language.
 - Keep judge_image arguments compact (placeholders above). Long pasted args
   waste the response budget and truncate the tool call.
 

@@ -54,8 +54,12 @@ from verl.experimental.agent_loop.tool_parser import FunctionCall
 from verl_omni.agent_loop.image_gen_trajectory_context import (
     clear_good_enough_yes_reached,
     clear_latest_tool_image_for_active_rollout,
+    clear_pending_generate_provenance,
     get_active_trajectory_relpath,
+    get_latest_generate_prompt_for_active_rollout,
+    merge_pending_generate_provenance,
     set_active_trajectory_relpath,
+    set_pending_generate_provenance,
 )
 from verl_omni.agent_loop.rl_insight_profiler import trace_state
 
@@ -238,6 +242,61 @@ def _tool_message_text(message: dict[str, Any]) -> str:
     return str(content or "")
 
 
+def _last_assistant_text(messages: list[dict[str, Any]] | None) -> str:
+    for message in reversed(messages or []):
+        if message.get("role") == "assistant":
+            return _tool_message_text(message).strip()
+    return ""
+
+
+def _last_reflection_text(messages: list[dict[str, Any]] | None) -> str:
+    """Most recent assistant ``Reflection:`` cue (forced or voluntary)."""
+    for message in reversed(messages or []):
+        if message.get("role") != "assistant":
+            continue
+        text = _tool_message_text(message).strip()
+        if re.search(r"\bReflection\s*:", text, re.IGNORECASE):
+            return text
+    return ""
+
+
+def _parse_generate_prompt_from_tool_call(tool_call: Any) -> str:
+    raw = getattr(tool_call, "arguments", None)
+    if raw is None and isinstance(tool_call, dict):
+        raw = tool_call.get("arguments")
+    if isinstance(raw, dict):
+        return str(raw.get("prompt") or "").strip()
+    if isinstance(raw, str) and raw.strip():
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return ""
+        if isinstance(payload, dict):
+            return str(payload.get("prompt") or "").strip()
+    return ""
+
+
+def _bind_generate_provenance_for_tool_call(tool_call: Any, agent_data: AgentData) -> None:
+    """Attach reflection/decode provenance before ``generate_image`` runs in a worker thread."""
+    name = getattr(tool_call, "name", None) or (tool_call.get("name") if isinstance(tool_call, dict) else None)
+    if name != "generate_image":
+        return
+    prompt = _parse_generate_prompt_from_tool_call(tool_call)
+    decode = _last_assistant_text(agent_data.messages)
+    reflection = _last_reflection_text(agent_data.messages)
+    updates: dict[str, Any] = {
+        "model_decode": decode,
+        "llm_prompt": prompt,
+    }
+    if reflection:
+        updates["reflection"] = reflection
+        updates["llm_reflection"] = reflection
+    if get_latest_generate_prompt_for_active_rollout() or reflection:
+        updates["controlled_by_reflection"] = True
+        updates["call_role"] = "rewrite"
+    merge_pending_generate_provenance(updates)
+
+
 def _count_successful_generates(messages: list[dict[str, Any]]) -> int:
     """Count live generate_image tool obs after the live user turn."""
     n = 0
@@ -328,6 +387,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             set_active_trajectory_relpath(self._agentic_trajectory_relpath)
         clear_good_enough_yes_reached()
         clear_latest_tool_image_for_active_rollout()
+        clear_pending_generate_provenance()
         try:
             # Always emit these keys so DataProto.concat across workers does not
             # drop/truncate sparse extra_fields (keys taken only from the first worker).
@@ -348,6 +408,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         finally:
             clear_good_enough_yes_reached()
             clear_latest_tool_image_for_active_rollout()
+            clear_pending_generate_provenance()
 
     async def _call_tool(self, tool_call, tools_kwargs, agent_data):
         # ``FunctionTool.call`` uses ``asyncio.to_thread`` (context copied at schedule
@@ -357,6 +418,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         if relpath:
             set_active_trajectory_relpath(relpath)
             agent_data.extra_fields["trajectory_relpath"] = relpath
+        _bind_generate_provenance_for_tool_call(tool_call, agent_data)
         return await super()._call_tool(tool_call, tools_kwargs, agent_data)
 
     def _rl_insight_lane(self) -> str:
@@ -598,6 +660,16 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         reflection_text = f"{reflection_text} agentic_forced_reflection=1"
         assistant_msg = {"role": "assistant", "content": reflection_text}
         agent_data.messages.append(assistant_msg)
+        if not stop_required:
+            # Next generate_image should record rewrite provenance in meta.json.
+            set_pending_generate_provenance(
+                {
+                    "reflection": reflection_text,
+                    "llm_reflection": reflection_text,
+                    "controlled_by_reflection": True,
+                    "call_role": "rewrite",
+                }
+            )
 
         # Same encoding path as tool responses (strip system prompt; keep gen prompt
         # so the policy can continue with rewritten generate_image when not done).
