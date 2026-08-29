@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Shared helpers for agent-loop rollout seeding and image-generation control."""
-
+from typing import Any, Optional
 from __future__ import annotations
 
 import json
@@ -39,6 +39,29 @@ __all__ = [
     "tool_calls_are_premature_judge",
     "tool_message_text",
 ]
+
+
+def messages_to_text(messages: Any) -> str:
+    """Extract message text without applying a chat template."""
+    if isinstance(messages, str):
+        return messages
+    if isinstance(messages, dict):
+        messages = [messages]
+
+    parts = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str):
+            parts.append(content)
+            continue
+        for item in content or []:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                parts.append(item.get("text", ""))
+    return "\n".join(part for part in parts if part).strip()
 
 
 def derive_rollout_seed(base_seed: int, rollout_index: int) -> int:
