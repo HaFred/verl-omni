@@ -41,7 +41,7 @@ from verl_omni.utils.agentic.image_gen_rollout_parse import (
 )
 from verl_omni.utils.metrics_utils import AgenticRewardMetrics
 
-# Register ``image_gen_tool_agent`` when this manager/worker module is loaded.
+# Register ``image_gen_tool_agent`` when this module is loaded.
 from . import tool_agent_loop as image_gen_tool_agent_loop  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -64,17 +64,13 @@ class OmniAgentLoopWorker(AgentLoopWorker):
     so launch recipes need not pass ``function_tool_path`` / ``format`` Hydra overrides.
     """
 
-    # Agentic Hermes wire format (teacher-force + parsers assume hermes).
     _AGENTIC_TOOL_FORMAT = "hermes"
-    # Frozen tools live under ``verl_omni/tools`` (parents[1] == verl_omni).
     _AGENTIC_FUNCTION_TOOLS = Path(__file__).resolve().parents[1] / "tools" / "image_gen.py"
 
     def __init__(self, config, *args, **kwargs):
         from omegaconf import open_dict
 
-        # Resolve path without importing — importing would register @function_tool
-        # decorators, then load_function_tools_from_path would re-exec the file and
-        # raise "already registered".
+        # Bind by path string only — importing image_gen.py would double-register tools.
         bind_run_artifact_env(config)
         tool_path = self._AGENTIC_FUNCTION_TOOLS
         if not tool_path.is_file():
@@ -104,12 +100,9 @@ class OmniAgentLoopWorker(AgentLoopWorker):
         user_prompt = last_user_prompt(raw_prompt) if raw_prompt is not None else ""
         path_token = set_active_trajectory_relpath(relpath)
         prompt_token = set_active_user_prompt(user_prompt)
-        # Fresh trajectory: allow generate_image until the first good_enough=YES.
         clear_good_enough_yes_reached()
-        # Force-first curriculum reads these inside ImageGenToolAgentLoop.run().
         kwargs["_agentic_step"] = trajectory["step"]
         kwargs["_agentic_validate"] = trajectory["validate"]
-        # Same id used by agentic_tool saves and post-hoc trajectory dumps.
         kwargs["_agentic_trajectory_relpath"] = relpath
         try:
             return await super()._run_agent_loop(
@@ -143,8 +136,7 @@ class OmniAgentLoopManager(AgentLoopManager):
     def generate_sequences(self, prompts):
         step = prompts.meta_info.get("global_steps")
         output = super().generate_sequences(prompts)
-        # Dump before discard so hermes_actions shows real policy decodes
-        # (discard zeros response_mask, which would hide tool-less prose as env text).
+        # Dump before discard: discard zeros response_mask and hides tool-less prose.
         dump_raw_rollouts(tokenizer=self._monitor_tokenizer, output=output, step=step)
         discard_invalid_rollouts(output)
         metrics = AgenticRewardMetrics.aggregate(output.non_tensor_batch)
@@ -153,9 +145,7 @@ class OmniAgentLoopManager(AgentLoopManager):
                 import wandb
 
                 if wandb.run is not None:
-                    # The trainer's Tracking.log call commits this same global step.
                     wandb.log(metrics, step=int(step) if step is not None else None, commit=False)
             except Exception as exc:  # noqa: BLE001
-                # Logging must never fail or alter rollout generation.
                 logger.warning("Failed to log agentic reward metrics to W&B: %s", exc)
         return output

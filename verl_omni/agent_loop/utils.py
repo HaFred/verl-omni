@@ -13,7 +13,7 @@
 # limitations under the License.
 
 """Shared helpers for agent-loop rollout seeding and image-generation control."""
-from typing import Any, Optional
+
 from __future__ import annotations
 
 import json

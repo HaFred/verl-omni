@@ -56,7 +56,6 @@ from PIL import Image
 from verl.tools.function_tool import function_tool
 from verl.tools.schemas import ToolResponse
 
-# Trajectory binding for artifact paths (no monkey-patch; agent loop sets ContextVars).
 from verl_omni.tools.trajectory import (
     build_artifact_id,
     count_live_generate_artifacts_for_active_rollout,
