@@ -35,8 +35,17 @@ def _load_source_module(monkeypatch, name: str, path: Path):
 
 def _load_tools_without_gpu_pipelines(monkeypatch):
     """Load the recipe tool directly without executing ``verl_omni.__init__``."""
-    for package in ("verl", "verl.tools", "verl_omni", "verl_omni.agent_loop", "verl_omni.utils"):
-        monkeypatch.setitem(sys.modules, package, types.ModuleType(package))
+    package_paths = {
+        "verl": _ROOT / "verl",
+        "verl.tools": _ROOT / "verl" / "tools",
+        "verl_omni": _ROOT / "verl_omni",
+        "verl_omni.tools": _ROOT / "verl_omni" / "tools",
+        "verl_omni.utils": _ROOT / "verl_omni" / "utils",
+    }
+    for package, path in package_paths.items():
+        module = types.ModuleType(package)
+        module.__path__ = [str(path)]
+        monkeypatch.setitem(sys.modules, package, module)
 
     function_tool_module = types.ModuleType("verl.tools.function_tool")
     function_tool_module.function_tool = lambda *_args, **_kwargs: lambda function: function
@@ -53,8 +62,8 @@ def _load_tools_without_gpu_pipelines(monkeypatch):
 
     context = _load_source_module(
         monkeypatch,
-        "verl_omni.agent_loop.image_gen_trajectory_context",
-        _ROOT / "verl_omni/agent_loop/image_gen_trajectory_context.py",
+        "verl_omni.tools.trajectory",
+        _ROOT / "verl_omni/tools/trajectory/__init__.py",
     )
     _load_source_module(
         monkeypatch,
@@ -64,7 +73,7 @@ def _load_tools_without_gpu_pipelines(monkeypatch):
     tools = _load_source_module(
         monkeypatch,
         "agentic_function_tools_under_test",
-        _ROOT / "examples/agenticllmgrpo_trainer/function_tools/tools.py",
+        _ROOT / "verl_omni/tools/image_gen.py",
     )
     return tools, context
 

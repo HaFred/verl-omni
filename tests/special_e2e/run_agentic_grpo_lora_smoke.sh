@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # System smoke for agentic GRPO LoRA.
 #
-# Mirrors examples/agenticllmgrpo_trainer/agent_llm/run_agentic_grpo_lora.sh with
+# Mirrors examples/agenticllmgrpo_trainer/agent_llm/run_agenticrpco_grpo_lora.sh with
 # smoke-scale knobs: mock overfit parquet, 1 train step, small rollout.n.
 set -euo pipefail
 
@@ -98,7 +98,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.multi_turn.max_user_turns="${MAX_USER_TURNS}" \
   actor_rollout_ref.rollout.multi_turn.max_tool_response_length=1024 \
   actor_rollout_ref.rollout.agent.default_agent_loop=image_gen_tool_agent \
-  +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.image_gen_metrics_manager.ImageGenMetricsAgentLoopManager \
+  +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.omni_agent_loop.OmniAgentLoopManager \
   actor_rollout_ref.rollout.agent.num_workers=1 \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.ref.fsdp_config.param_offload=true \

@@ -1,4 +1,4 @@
-# PR 2 Implementation Plan — Multi-Dimensional Reward System & RPCO Stage-3 Training
+# Implementation Plan — Multi-Dimensional Reward System & RPCO Stage-3 Training
 
 Last updated: 08/17/2026
 
@@ -14,13 +14,13 @@ The reason that we log all the inputs here only (no output) except for the force
 
 ---
 
-Plan for PR 2 of [RFC #302](https://github.com/verl-project/verl-omni/issues/302) (7.2).
+Plan for of [RFC #302](https://github.com/verl-project/verl-omni/issues/302) (7.2).
 Targets the `feat/rpco_and_rewards` branch, whose runner stub is
 [`examples/agenticllmgrpo_trainer/agent_llm/run_agentic_rpco.sh`](../../examples/agenticllmgrpo_trainer/agent_llm/run_agentic_rpco.sh).
 
 ## 1. Real targets (override the RFC where they differ)
 
-PR 2 implements an **e2e full-dataset GRPO training on the agentic LLM** so the agent learns:
+implements an **e2e full-dataset GRPO training on the agentic LLM** so the agent learns:
 
 1. **which tools to call** to carry out an image generation/editing task and meet the user request;
 2. **when to continue a new turn vs. stop** the multi-turn loop.
@@ -47,16 +47,16 @@ protocol (RFC D5), RPCO Stages 1–2 as shipped artifacts, trajectory analysis t
 
 PR 1 ([#329](https://github.com/verl-project/verl-omni/pull/329)) already provides:
 
-| Piece | File | Reuse for PR 2 |
+| Piece | File | Reuse for |
 | --- | --- | --- |
-| Live multi-turn agent loop (forced Reflection, YES/max-pass → policy `Done.`) | [image_gen_tool_agent_loop.py](../../verl_omni/agent_loop/image_gen_tool_agent_loop.py) | unchanged core; plan tasks ride the same loop (see §5) |
-| Frozen `generate_image` / `judge_image` tools + rollout-scoped artifact registry | [function_tools/tools.py](../../examples/agenticllmgrpo_trainer/function_tools/tools.py), [image_gen_trajectory_context.py](../../verl_omni/agent_loop/image_gen_trajectory_context.py) | unchanged; obs markers (`agentic_tool ok=…`, `agentic_judge ok=…`) are the reward inputs |
-| Scalar gated reward with trajectory parsing helpers | [agentic_reward.py](../../verl_omni/utils/reward_score/agentic_reward.py) | import its parsers (`_extract_tool_calls`, `_gen_image_prompts`, judge-window iterators); PR 2 scorer subsumes the mix |
-| Traj/hermes dumps + WandB metrics | [image_gen_metrics_manager.py](../../verl_omni/agent_loop/image_gen_metrics_manager.py) | extend `REWARD_COMPONENTS`; `rollout_valid` discard path reused as-is |
+| Live multi-turn agent loop (forced Reflection, YES/max-pass → policy `Done.`) | [tool_agent_loop.py](../../verl_omni/agent_loop/tool_agent_loop.py) | unchanged core; plan tasks ride the same loop (see §5) |
+| Frozen `generate_image` / `judge_image` tools + rollout-scoped artifact registry | [image_gen.py](../../verl_omni/tools/image_gen.py), [trajectory](../../verl_omni/tools/trajectory) | unchanged; obs markers (`agentic_tool ok=…`, `agentic_judge ok=…`) are the reward inputs |
+| Scalar gated reward with trajectory parsing helpers | [agentic_reward.py](../../verl_omni/utils/reward_score/agentic_reward.py) | import its parsers (`_extract_tool_calls`, `_gen_image_prompts`, judge-window iterators); scorer subsumes the mix |
+| Traj/hermes dumps + WandB metrics | [omni_agent_loop.py](../../verl_omni/agent_loop/omni_agent_loop.py), [agentic utils](../../verl_omni/utils/agentic) | extend `AgenticRewardMetrics.MIX_KEYS`; `rollout_valid` discard path reused as-is |
 | Dummy parquet builder (row schema) | [create_dummy_agentic_data.py](../../examples/agenticllmgrpo_trainer/data_process/create_dummy_agentic_data.py) | row schema + `_tc()` wire-format helpers reused by the UniCoT builder |
 | Generic visual-reflection data contracts + **UniCoT Self-Reflection adapter** | [visual_reflection/](../../verl_omni/utils/dataset/visual_reflection/) (`#313`) | `unicot.py` fail-closed parser + `partition.py` splits + `LocalImageResolver` reused; a **Breakdown adapter is new** |
 
-`run_agentic_rpco.sh` is currently byte-identical to `run_agentic_grpo_lora.sh` — PR 2 fills it in.
+`run_agentic_rpco.sh` is currently byte-identical to `run_agentic_grpo_lora.sh` — fills it in.
 
 ## 3. Dataset pipeline
 
@@ -162,7 +162,7 @@ score trajectory text against text references. Image materialization (unzip →
 
 One scorer, not five. The token path (`verl.trainer.main_ppo`) invokes a single
 `compute_score(data_source, solution_str, ground_truth, extra_info)` per rollout — the same
-contract PR 1 uses. PR 2 therefore ships **one** scorer that computes the five dimensions
+contract PR 1 uses. therefore ships **one** scorer that computes the five dimensions
 internally and returns `score` plus one `reward_<dim>` field each:
 
 ```
@@ -195,7 +195,7 @@ including tool obs) plus `gt` references:
 
 Gating kept from PR 1: no `generate_image` / no successful PNG ⇒ `score=0`,
 `rollout_valid=0` (rollout is dropped from the GRPO update by
-[`_discard_invalid_rollouts`](../../verl_omni/agent_loop/image_gen_metrics_manager.py)).
+[`discard_invalid_rollouts`](../../verl_omni/utils/agentic/image_gen_rollout_dump.py)).
 Env-injected `Reflection` (mask 0, `agentic_forced_reflection=1` markers) is stripped before
 `R_reflect` scoring so only policy-sampled text earns credit (same regex PR 1 uses).
 
@@ -214,7 +214,7 @@ are the structural regularizers.
 
 ### 4.4 Metrics
 
-Extend [`REWARD_COMPONENTS`](../../verl_omni/agent_loop/image_gen_metrics_manager.py) to
+Extend [`AgenticRewardMetrics.MIX_KEYS`](../../verl_omni/utils/metrics_utils.py) to
 `("reward_reflect", "reward_plan", "reward_format", "reward_tool", "reward_result")` so
 WandB logs `agentic_reward/<dim>/{mean,min,max}`; the counters already emitted
 (`num_generate_image_prompts`, `protocol_ok`, …) stay for dashboards.
@@ -230,7 +230,7 @@ The loop itself needs **no structural change** for `plan` rows:
 - `judge_image("…", "last")` judges the latest PNG — for plan rows that is the final
   subtask image, which is the semantically correct target.
 - Forced Reflection after a successful judge
-  ([`image_gen_tool_agent_loop.py`](../../verl_omni/agent_loop/image_gen_tool_agent_loop.py),
+  ([`tool_agent_loop.py`](../../verl_omni/agent_loop/tool_agent_loop.py),
   `_handle_processing_tools_state`) applies identically: plan rows judge only at the end,
   so the stop/continue cue arrives after the full plan execution.
 
@@ -302,7 +302,7 @@ E2E acceptance (pane A/B sidecars + pane C):
 | `verl_omni/utils/dataset/visual_reflection/build_unicot_agentic_rl.py` | UniCoT → agentic RL parquet builder |
 | `verl_omni/utils/dataset/visual_reflection/unicot_breakdown.py` | new: fail-closed Breakdown adapter |
 | `verl_omni/utils/reward_score/agentic_multidim_reward.py` | new: 5-dim scorer, imports PR 1 parsers |
-| `verl_omni/agent_loop/image_gen_metrics_manager.py` | `REWARD_COMPONENTS` → 5 dims (+ `agentic_multidim_reward` re-export if the manager references scorer keys) |
+| `verl_omni/utils/metrics_utils.py` | `AgenticRewardMetrics.MIX_KEYS` → RPCO dims (+ `agentic_multidim_reward` re-export if the manager references scorer keys) |
 | `examples/agenticllmgrpo_trainer/agent_llm/run_agentic_rpco.sh` | §7 |
 | `examples/agenticllmgrpo_trainer/README.md` | RPCO section + runner usage; `Last updated` bumped |
 | `tests/utils/dataset/test_unicot_breakdown_on_cpu.py`, `tests/utils/reward_score/test_agentic_multidim_reward_on_cpu.py`, `tests/utils/dataset/test_build_unicot_agentic_rl_on_cpu.py` | new CPU tests |

@@ -18,7 +18,6 @@ from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, register
 from verl.utils.profiler import simple_timer
-from verl.utils.tokenizer.chat_template import apply_chat_template as _apply_chat_template
 
 from verl_omni.agent_loop.diffusion_agent_loop import DiffusionAgentLoopOutput
 
@@ -51,8 +50,7 @@ class DiffusionSingleTurnAgentLoop(AgentLoopBase):
 
         def _tokenize() -> dict[str, list[int]]:
             processing_class = self.processor if self.processor is not None else self.tokenizer
-            text = _apply_chat_template(
-                processing_class,
+            text = processing_class.apply_chat_template(
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,

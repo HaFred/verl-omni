@@ -17,7 +17,7 @@
 # path (input.prompt_ids + TokenOutput.token_ids + llm_client.tokenizer). That
 # is patched into this env's site-packages verl — do **not** put a full newer
 # ``fred/verl`` checkout on PYTHONPATH (PPO v1 TensorDict breaks verl_omni's
-# ImageGenMetricsAgentLoopManager, which expects DataProto.meta_info).
+# OmniAgentLoopManager, which expects DataProto.meta_info).
 #
 # Env knobs (optional):
 #   TOTAL_STEPS                 training steps (default 1)
@@ -241,7 +241,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=$MAX_USER_TURNS \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2048 \
     actor_rollout_ref.rollout.agent.default_agent_loop=image_gen_tool_agent \
-    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.image_gen_metrics_manager.ImageGenMetricsAgentLoopManager \
+    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.omni_agent_loop.OmniAgentLoopManager \
     actor_rollout_ref.rollout.agent.num_workers=$AGENT_NUM_WORKERS \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \

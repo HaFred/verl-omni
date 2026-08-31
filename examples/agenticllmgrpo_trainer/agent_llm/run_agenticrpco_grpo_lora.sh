@@ -204,7 +204,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=$MAX_USER_TURNS \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2048 \
     actor_rollout_ref.rollout.agent.default_agent_loop=image_gen_tool_agent \
-    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.image_gen_metrics_manager.ImageGenMetricsAgentLoopManager \
+    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.omni_agent_loop.OmniAgentLoopManager \
     actor_rollout_ref.rollout.agent.num_workers=$AGENT_NUM_WORKERS \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \

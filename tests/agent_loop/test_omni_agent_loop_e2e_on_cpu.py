@@ -11,18 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for agentic reward metric aggregation (train + val prefixes)."""
+"""CPU tests for Omni agent-loop e2e metrics and validation behavior."""
 
 import numpy as np
 import pytest
 
-import verl_omni.agent_loop.image_gen_metrics_manager as metrics_module
-from verl_omni.agent_loop.image_gen_metrics_manager import (
-    ImageGenMetricsAgentLoopManager,
-    _turn_kind,
-    aggregate_agentic_reward_metrics,
-)
-from verl_omni.agent_loop.image_gen_trajectory_context import build_trajectory_relpath
+import verl_omni.utils.agentic.image_gen_rollout_dump as dump_module
+from verl_omni.agent_loop.omni_agent_loop import OmniAgentLoopManager
+from verl_omni.tools.trajectory import build_trajectory_relpath
+from verl_omni.utils.agentic.image_gen_rollout_dump import dump_raw_rollouts
+from verl_omni.utils.agentic.image_gen_rollout_parse import turn_kind
+from verl_omni.utils.metrics_utils import AgenticRewardMetrics
 
 
 def _val_prefixed(metrics: dict[str, float]) -> dict[str, float]:
@@ -39,7 +38,7 @@ def test_aggregate_includes_rpco_dimensions_and_pr1_fields():
         "reward_done": np.array([1.0, 0.0]),
         "reward_tool_call": np.array([1.0, 1.0]),
     }
-    metrics = aggregate_agentic_reward_metrics(batch)
+    metrics = AgenticRewardMetrics.aggregate(batch)
 
     assert metrics["agentic_reward/reflect/mean"] == pytest.approx(0.85)
     assert metrics["agentic_reward/plan/max"] == pytest.approx(0.6)
@@ -54,7 +53,7 @@ def test_aggregate_includes_rpco_dimensions_and_pr1_fields():
 
 
 def test_aggregate_pr1_correctness_aesthetics_when_present():
-    metrics = aggregate_agentic_reward_metrics(
+    metrics = AgenticRewardMetrics.aggregate(
         {
             "reward_tool_call": np.array([1.0]),
             "reward_correctness": np.array([0.8]),
@@ -68,7 +67,7 @@ def test_aggregate_pr1_correctness_aesthetics_when_present():
 
 
 def test_val_prefix_transform():
-    metrics = aggregate_agentic_reward_metrics(
+    metrics = AgenticRewardMetrics.aggregate(
         {
             "reward_reflect": np.array([0.8, 0.9]),
             "reward_tool_call": np.array([1.0, 1.0]),
@@ -82,7 +81,7 @@ def test_val_prefix_transform():
 
 
 def test_absent_keys_are_skipped():
-    metrics = aggregate_agentic_reward_metrics({"reward_plan": np.array([0.4])})
+    metrics = AgenticRewardMetrics.aggregate({"reward_plan": np.array([0.4])})
 
     assert set(metrics) == {
         "agentic_reward/plan/mean",
@@ -92,7 +91,7 @@ def test_absent_keys_are_skipped():
 
 
 def test_empty_arrays_are_skipped():
-    metrics = aggregate_agentic_reward_metrics({"reward_plan": np.array([])})
+    metrics = AgenticRewardMetrics.aggregate({"reward_plan": np.array([])})
 
     assert metrics == {}
 
@@ -133,12 +132,11 @@ def test_cafe_trajectory_dump_writes_samples_without_overwriting_monitor(tmp_pat
             ),
         },
     )
-    manager = types.SimpleNamespace(_monitor_tokenizer=_Tokenizer())
-    monkeypatch.setattr(metrics_module, "_run_dir", lambda: tmp_path)
-    monkeypatch.setattr(metrics_module, "_materialize_rollout_images", lambda **kwargs: [])
-    monkeypatch.setattr(metrics_module, "_artifact_reward_metrics", lambda output, i: {})
+    monkeypatch.setattr(dump_module, "resolve_run_dir", lambda: tmp_path)
+    monkeypatch.setattr(dump_module, "materialize_rollout_images", lambda **kwargs: [])
+    monkeypatch.setattr(dump_module.AgenticRewardMetrics, "for_rollout", lambda output, i: {})
     monkeypatch.setattr(
-        metrics_module,
+        dump_module,
         "split_rollout_turns",
         lambda *args, **kwargs: [
             {
@@ -152,8 +150,8 @@ def test_cafe_trajectory_dump_writes_samples_without_overwriting_monitor(tmp_pat
         ],
     )
 
-    ImageGenMetricsAgentLoopManager._dump_raw_rollouts(
-        manager, None, output, 10, write_monitor=False, validate=True
+    dump_raw_rollouts(
+        tokenizer=_Tokenizer(), output=output, step=10, write_monitor=False, validate=True
     )
 
     trajectory_dir = tmp_path / "rollout_trajectories" / "step_000010"
@@ -191,23 +189,23 @@ _REWRITE_DECODE = (
 def test_turn_kind_uses_good_enough_and_policy_decode_not_injected_cue():
     """Injected continue-cue must not hide a sampled Done / rewrite."""
     done = "Reflection: The image meets the original request. Done.<|im_end|>"
-    assert _turn_kind(done, _JUDGE_NO, _CONTINUE_CUE) == "agent_reflection_done"
-    assert _turn_kind(done, _JUDGE_YES, _STOP_CUE) == "agent_done_after_forced_reflection"
-    assert _turn_kind(_REWRITE_DECODE, _JUDGE_NO, _CONTINUE_CUE) == (
+    assert turn_kind(done, _JUDGE_NO, _CONTINUE_CUE) == "agent_reflection_done"
+    assert turn_kind(done, _JUDGE_YES, _STOP_CUE) == "agent_done_after_forced_reflection"
+    assert turn_kind(_REWRITE_DECODE, _JUDGE_NO, _CONTINUE_CUE) == (
         "agent_rewrite_after_forced_reflection"
     )
 
 
 def test_turn_kind_forced_reflection_continue_only_when_decode_empty():
-    assert _turn_kind("", _JUDGE_NO, _CONTINUE_CUE) == "forced_reflection_continue"
-    assert _turn_kind("", _JUDGE_YES, _STOP_CUE) == "forced_reflection_stop_cue"
+    assert turn_kind("", _JUDGE_NO, _CONTINUE_CUE) == "forced_reflection_continue"
+    assert turn_kind("", _JUDGE_YES, _STOP_CUE) == "forced_reflection_stop_cue"
 
 
 def test_val_holdout_runs_before_main_validate_generate():
     """Cafe 9001/9002 + W&B table commit must precede the UniCoT val set."""
     import inspect
 
-    src = inspect.getsource(ImageGenMetricsAgentLoopManager.generate_sequences)
+    src = inspect.getsource(OmniAgentLoopManager.generate_sequences)
     # Strip the holdout body call inside ``_maybe_run_val_viz`` by looking only
     # at the outer method: viz gate, then parent generate for the val batch.
     viz_gate = src.index("self._maybe_run_val_viz(step)")

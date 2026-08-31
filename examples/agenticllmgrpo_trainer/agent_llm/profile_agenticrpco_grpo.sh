@@ -12,9 +12,9 @@
 #   -> `judge_image` timeline, and `metric_histogram` publishes
 #   `agentic_tool_{generate_image,judge_image}_latency_seconds` — surfacing the
 #   sidecar bubbles that layer 1 cannot see. Instrumentation lives in
-#   verl_omni/agent_loop/rl_insight_profiler.py (facade), image_gen_tool_agent_loop.py
-#   (decode lanes), tools.py (tool lanes + latency histograms), and
-#   image_gen_metrics_manager.py (init in driver + workers). All of it is a
+#   verl_omni/agent_loop/rl_insight_profiler.py (facade), tool_agent_loop.py
+#   (decode lanes), image_gen.py (tool lanes + latency histograms), and
+#   omni_agent_loop.py (init in driver + workers). All of it is a
 #   no-op unless `rl-insight` is installed and RL_INSIGHT_SERVER_URL is set.
 #
 # Usage (four panes — gen sidecar, judge sidecar, rl-insight server, then this):
@@ -262,7 +262,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.multi_turn.max_user_turns=$MAX_USER_TURNS \
     actor_rollout_ref.rollout.multi_turn.max_tool_response_length=2048 \
     actor_rollout_ref.rollout.agent.default_agent_loop=image_gen_tool_agent \
-    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.image_gen_metrics_manager.ImageGenMetricsAgentLoopManager \
+    +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.omni_agent_loop.OmniAgentLoopManager \
     actor_rollout_ref.rollout.agent.num_workers=$AGENT_NUM_WORKERS \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=true \

@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen agentic function tools for verl's stock ``ToolAgentLoop``.
+"""Frozen image-generation tools for verl's stock ``ToolAgentLoop``.
 
-Recipe path: ``examples/agenticllmgrpo_trainer/function_tools/tools.py``.
-Bound automatically via ``ImageGenAgentLoopWorker`` (``function_tool_path``).
+Bound automatically via ``OmniAgentLoopWorker`` (``function_tool_path``).
 
 Provides ``generate_image`` + ``judge_image``. Agentic LLM RL keeps image
 generation **outside** the actor optimizer. GRPO trains the actor as the
@@ -57,7 +56,7 @@ from verl.tools.function_tool import function_tool
 from verl.tools.schemas import ToolResponse
 
 # Trajectory binding for artifact paths (no monkey-patch; agent loop sets ContextVars).
-from verl_omni.agent_loop.image_gen_trajectory_context import (  # noqa: F401
+from verl_omni.tools.trajectory import (
     build_artifact_id,
     build_generate_call_meta,
     count_live_generate_artifacts_for_active_rollout,
@@ -157,7 +156,7 @@ def _decode_images(payload: dict) -> list[Image.Image]:
 
 def _e2e_run_root() -> Path:
     """``<e2e_root>/<experiment>/rollout_images`` — same tree as traj/hermes."""
-    from verl_omni.agent_loop.image_gen_trajectory_context import resolve_rollout_images_root
+    from verl_omni.tools.trajectory import resolve_rollout_images_root
 
     return resolve_rollout_images_root()
 
