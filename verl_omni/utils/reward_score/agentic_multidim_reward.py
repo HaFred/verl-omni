@@ -42,20 +42,7 @@ DIMS = ("reflect", "plan", "format", "tool", "result")
 REWARD_COMPONENTS = tuple(f"reward_{name}" for name in (*DIMS, "done", "tool_call"))
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
-_FUNCTION_RE = re.compile(r"<function=([^>\s]+)\s*>(.*?)</function>", re.IGNORECASE | re.DOTALL)
-_PARAM_RE = re.compile(r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>", re.IGNORECASE | re.DOTALL)
-_TOOL_OK_RE = re.compile(r"\bagentic_tool\s+ok=1\b", re.IGNORECASE)
-_PATH_RE = re.compile(r"\bpath=([^\s'\"]+)", re.IGNORECASE)
 _JUDGE_OK_RE = re.compile(r"\bagentic_judge\s+ok=1\b", re.IGNORECASE)
-_JUDGE_FAIL_RE = re.compile(r"\bagentic_judge\s+ok=0\b|\bparse_ok\s*=\s*0\b", re.IGNORECASE)
-_CORRECTNESS_RE = re.compile(r"\bcorrectness\s*=\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
-_AESTHETICS_RE = re.compile(r"\baesthetics\s*=\s*([0-9]*\.?[0-9]+)", re.IGNORECASE)
-_GOOD_ENOUGH_RE = re.compile(r"\bgood_enough\s*=\s*(YES|NO|1|0|true|false)\b", re.IGNORECASE)
-_FORCED_REFLECTION_RE = re.compile(r"\bagentic_forced_reflection=1\b", re.IGNORECASE)
-_BLOCKED_GENERATE_RE = re.compile(
-    r"\b(?:blocked_after_yes|blocked_after_max_passes)=1\b|generate_image blocked:",
-    re.IGNORECASE,
-)
 _TOOL_OBS_LINE_RE = re.compile(
     r"(?im)^(?!.*\bReflection\s*:).*\b("
     r"agentic_tool|agentic_reflect|agentic_judge|"
@@ -64,40 +51,31 @@ _TOOL_OBS_LINE_RE = re.compile(
     r")\b.*$"
 )
 _REFLECTION_RE = re.compile(r"\bReflection\s*:", re.IGNORECASE)
-_JUDGE_OBS_HEADER = "VL judge on the last generated image"
-_PLAN_HEADER_RE = re.compile(r"\bPlan\s*:", re.IGNORECASE)
-_PLAN_ITEM_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+(.+)$")
-_FINDINGS_RE = re.compile(r"(?im)^\s*(?:findings|suggested_fixes)\s*:\s*(.*)$")
-_TOKEN_RE = re.compile(r"[a-z0-9_']+")
-
-_BASE_SCHEMA: dict[str, float | str | int | None] = {
-    "score": 0.0,
-    **{f"reward_{dim}": 0.0 for dim in DIMS},
-    "reward_done": 0.0,
-    "reward_tool_call": 0.0,
-    "num_hermes_tool_calls": 0,
-    "num_generate_image_prompts": 0,
-    "num_judge_image_calls": 0,
-    "judge_parse_ok": 0,
-    "judge_parse_fail": 0,
-    "judge_parse_ok_rate": 1.0,
-    "protocol_ok": 0,
-    "rewrite_after_yes": 0,
-    "rollout_valid": 0,
-    "terminal_done": 0,
-    "terminal_policy_reflection": 0,
-    "forced_reflection_context": 0,
-    "n_successful_generates": 0,
-    "expected_num_images": 0,
-    "task_type": "",
-    "method": "",
-}
 
 
 def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
-    result = dict(_BASE_SCHEMA)
-    result["method"] = method
-    return result
+    return {
+        "score": 0.0,
+        **{f"reward_{dim}": 0.0 for dim in DIMS},
+        "reward_done": 0.0,
+        "reward_tool_call": 0.0,
+        "num_hermes_tool_calls": 0,
+        "num_generate_image_prompts": 0,
+        "num_judge_image_calls": 0,
+        "judge_parse_ok": 0,
+        "judge_parse_fail": 0,
+        "judge_parse_ok_rate": 1.0,
+        "protocol_ok": 0,
+        "rewrite_after_yes": 0,
+        "rollout_valid": 0,
+        "terminal_done": 0,
+        "terminal_policy_reflection": 0,
+        "forced_reflection_context": 0,
+        "n_successful_generates": 0,
+        "expected_num_images": 0,
+        "task_type": "",
+        "method": method,
+    }
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -126,7 +104,7 @@ def _parse_tool_call_body(body: str) -> dict[str, Any] | None:
             return None
         return call if isinstance(call, dict) and call.get("name") else None
 
-    function = _FUNCTION_RE.search(body)
+    function = re.search(r"<function=([^>\s]+)\s*>(.*?)</function>", body, re.IGNORECASE | re.DOTALL)
     if function is None:
         return None
     name = (function.group(1) or "").strip()
@@ -134,7 +112,11 @@ def _parse_tool_call_body(body: str) -> dict[str, Any] | None:
         return None
     arguments = {
         match.group(1).strip(): (match.group(2) or "").strip()
-        for match in _PARAM_RE.finditer(function.group(2) or "")
+        for match in re.finditer(
+            r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>",
+            function.group(2) or "",
+            re.IGNORECASE | re.DOTALL,
+        )
         if match.group(1).strip()
     }
     return {"name": name, "arguments": arguments}
@@ -201,7 +183,7 @@ def _assistant_prose_lines(text: str) -> str:
 
 
 def _tokens(text: str) -> set[str]:
-    return set(_TOKEN_RE.findall((text or "").lower()))
+    return set(re.findall(r"[a-z0-9_']+", (text or "").lower()))
 
 
 def _coverage(candidate: str, reference: str) -> float:
@@ -226,7 +208,8 @@ def _count_successful_generates(text: str) -> int:
     return sum(
         1
         for line in (text or "").splitlines()
-        if _TOOL_OK_RE.search(line) and any(path.lower().endswith(".png") for path in _PATH_RE.findall(line))
+        if re.search(r"\bagentic_tool\s+ok=1\b", line, re.IGNORECASE)
+        and any(path.lower().endswith(".png") for path in re.findall(r"\bpath=([^\s'\"]+)", line, re.IGNORECASE))
     )
 
 
@@ -242,7 +225,7 @@ def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] |
         if _follows_judge_image_call(marker.start(), parsed_calls):
             failed += 1
     if failed == 0:
-        for marker in _JUDGE_FAIL_RE.finditer(blob):
+        for marker in re.finditer(r"\bagentic_judge\s+ok=0\b|\bparse_ok\s*=\s*0\b", blob, re.IGNORECASE):
             if _follows_judge_image_call(marker.start(), parsed_calls):
                 failed += 1
     total = ok + failed
@@ -250,7 +233,7 @@ def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] |
 
 
 def _good_enough(window: str) -> bool | None:
-    matches = list(_GOOD_ENOUGH_RE.finditer(window or ""))
+    matches = list(re.finditer(r"\bgood_enough\s*=\s*(YES|NO|1|0|true|false)\b", window or "", re.IGNORECASE))
     if not matches:
         return None
     value = matches[-1].group(1).lower()
@@ -270,12 +253,12 @@ def _successful_judges(text: str) -> list[tuple[float, float, bool | None, int]]
         if not _follows_judge_image_call(marker.start(), calls):
             continue
         window = blob[max(0, marker.start() - 1400) : marker.end()]
-        if _JUDGE_OBS_HEADER not in window:
+        if "VL judge on the last generated image" not in window:
             continue
         if re.search(r"\bparse_ok\s*=\s*0\b", window, re.IGNORECASE):
             continue
-        correctness = list(_CORRECTNESS_RE.finditer(window))
-        aesthetics = list(_AESTHETICS_RE.finditer(window))
+        correctness = list(re.finditer(r"\bcorrectness\s*=\s*([0-9]*\.?[0-9]+)", window, re.IGNORECASE))
+        aesthetics = list(re.finditer(r"\baesthetics\s*=\s*([0-9]*\.?[0-9]+)", window, re.IGNORECASE))
         if not correctness or not aesthetics:
             continue
         try:
@@ -296,7 +279,9 @@ def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
     line_end = text.find("\n", judge_end)
     anchor = len(text) if line_end < 0 else line_end + 1
     forced_context = False
-    for marker in _FORCED_REFLECTION_RE.finditer(text, anchor):
+    for marker in re.finditer(r"\bagentic_forced_reflection=1\b", text, re.IGNORECASE):
+        if marker.start() < anchor:
+            continue
         anchor = marker.end()
         forced_context = True
 
@@ -321,9 +306,13 @@ def _generates_after_first_yes(text: str, calls: list[tuple[int, int, dict[str, 
 
 def _extract_plan_lines(text: str) -> list[str]:
     prose = _assistant_prose_lines(text)
-    header = _PLAN_HEADER_RE.search(prose)
+    header = re.search(r"\bPlan\s*:", prose, re.IGNORECASE)
     body = prose[header.end() :] if header else prose
-    return [line for match in _PLAN_ITEM_RE.finditer(body) if len(_tokens(line := match.group(1).strip())) >= 4]
+    return [
+        line
+        for match in re.finditer(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+(.+)$", body)
+        if len(_tokens(line := match.group(1).strip())) >= 4
+    ]
 
 
 def _reflection_text(text: str) -> str:
@@ -345,7 +334,10 @@ def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
         feedback = []
         for _, _, _, end in judges:
             window = text[max(0, end - 1400) : end]
-            feedback.extend(match.group(1).strip() for match in _FINDINGS_RE.finditer(window))
+            feedback.extend(
+                match.group(1).strip()
+                for match in re.finditer(r"(?im)^\s*(?:findings|suggested_fixes)\s*:\s*(.*)$", window)
+            )
         reference = " ".join(item for item in feedback if item.lower() not in {"", "none", "n/a"}).strip()
     if not reference:
         return quality
@@ -449,7 +441,13 @@ def compute_score(
     judge_ok, judge_failed, judge_rate = _judge_parse_stats(text, calls)
     successful_generates = _count_successful_generates(text)
     terminal_done, policy_reflection, forced_context = _terminal_decision(text)
-    blocked = bool(_BLOCKED_GENERATE_RE.search(text))
+    blocked = bool(
+        re.search(
+            r"\b(?:blocked_after_yes|blocked_after_max_passes)=1\b|generate_image blocked:",
+            text,
+            re.IGNORECASE,
+        )
+    )
     rewrites_after_yes = _generates_after_first_yes(text, calls)
 
     result = _zero_result(method="agentic_multidim")
