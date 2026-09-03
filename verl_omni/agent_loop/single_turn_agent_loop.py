@@ -19,7 +19,7 @@ from uuid import uuid4
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopOutput, register
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.utils.profiler import simple_timer
-from verl.utils.tokenizer.chat_template import apply_chat_template as _apply_chat_template
+from verl.utils.chat_template import apply_chat_template as _apply_chat_template
 
 from verl_omni.agent_loop.diffusion_agent_loop import DiffusionAgentLoopOutput
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase

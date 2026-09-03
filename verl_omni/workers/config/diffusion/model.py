@@ -64,6 +64,9 @@ class DiffusionModelConfig(BaseConfig):
     # model type, e.g., "diffusion_model"
     model_type: str = "diffusion_model"
 
+    # Bagel Co-RL: dual UND+GEN loss on one FSDP owner. Empty for GEN-only FlowGRPO.
+    composite_mode: Optional[str] = None
+
     # whether to load tokenizer. This is useful when we only want to load model config
     load_tokenizer: bool = True
     tokenizer: Any = None

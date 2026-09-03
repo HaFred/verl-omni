@@ -35,7 +35,12 @@ from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 from verl_omni.workers.config import DiffusionModelConfig
 
-from .bagel_model import BagelForTraining, get_flattened_position_ids
+from verl_omni.pipelines.bagel_flow_grpo.bagel_corl import (
+    BagelForCoRL,
+    dual_lora_param_groups,
+    validate_disjoint_lora_targets,
+)
+from verl_omni.pipelines.bagel_flow_grpo.bagel_model import BagelForTraining, get_flattened_position_ids
 from .common import BAGEL_FLOWGRPO_CFG_DEFAULTS, setup_bagel_sigmas
 
 logger = logging.getLogger(__name__)
@@ -47,8 +52,17 @@ class BagelDiffusion(DiffusionModelBase):
 
     @classmethod
     def build_module(cls, model_config: DiffusionModelConfig, torch_dtype: torch.dtype):
-        logger.info("Loading BagelForTraining from %s", model_config.local_path)
+        logger.info("Loading Bagel training module from %s", model_config.local_path)
+        if model_config.get("composite_mode") == "bagel_corl":
+            return BagelForCoRL.from_pretrained(model_config.local_path, torch_dtype=torch_dtype)
         return BagelForTraining.from_pretrained(model_config.local_path, torch_dtype=torch_dtype)
+
+    @classmethod
+    def get_optimizer_param_groups(cls, module, model_config: DiffusionModelConfig):
+        """Two optimizer param groups (UND LoRA vs GEN LoRA) when Co-RL dual LoRA is enabled."""
+        if model_config.get("composite_mode") != "bagel_corl":
+            return None
+        return dual_lora_param_groups(module)
 
     @classmethod
     def configure_train_mode(cls, module):
@@ -65,7 +79,15 @@ class BagelDiffusion(DiffusionModelBase):
 
     @classmethod
     def configure_trainable_params(cls, module, model_config):
-        """Freeze all params except the generation (``moe_gen``) pathway."""
+        """Freeze all params except the generation (``moe_gen``) pathway.
+
+        Bagel Co-RL dual LoRA is applied by PEFT; this hook is skipped when
+        ``lora_rank > 0``. Non-LoRA Co-RL is out of PR1 scope.
+        """
+        if model_config.get("composite_mode") == "bagel_corl":
+            targets = model_config.get("target_modules") or []
+            validate_disjoint_lora_targets(targets)
+            raise ValueError("Bagel CoRL PR1 requires LoRA (lora_rank > 0); shared-base training is out of scope")
         for name, param in module.named_parameters():
             param.requires_grad = "moe_gen" in name
 
@@ -73,6 +95,12 @@ class BagelDiffusion(DiffusionModelBase):
         for name, param in module.named_parameters():
             if param.requires_grad:
                 param.data = param.data.to(torch.float32)
+
+    @classmethod
+    def validate_lora_config(cls, model_config: DiffusionModelConfig) -> None:
+        if model_config.get("composite_mode") == "bagel_corl":
+            targets = model_config.get("target_modules") or []
+            validate_disjoint_lora_targets(targets)
 
     @classmethod
     def build_scheduler(cls, model_config: DiffusionModelConfig):

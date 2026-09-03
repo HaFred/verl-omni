@@ -14,6 +14,7 @@
 
 from . import model
 from .actor import OmniActorConfig, OmniLossConfig
+from .agent_loop import BagelCorlAgentLoopConfig
 from .model import *  # noqa: F401
 
-__all__ = list(model.__all__) + ["OmniLossConfig", "OmniActorConfig"]
+__all__ = list(model.__all__) + ["OmniLossConfig", "OmniActorConfig", "BagelCorlAgentLoopConfig"]

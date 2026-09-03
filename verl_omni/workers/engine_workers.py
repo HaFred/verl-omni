@@ -69,7 +69,7 @@ from verl_omni.workers.config import (
 )
 from verl_omni.workers.config.diffusion import DiffusionDistillationTeacherModelConfig
 from verl_omni.workers.rollout.vllm_rollout.zmq_utils import make_update_zmq_handle, make_update_zmq_id
-from verl_omni.workers.utils.losses import diffusion_loss, omni_loss
+from verl_omni.workers.utils.losses import bagel_composite_loss, diffusion_loss, omni_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -741,8 +741,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                     assert self.config.rollout.get("log_prob_micro_batch_size_per_gpu") is not None
                     assert self.config.actor.ppo_micro_batch_size_per_gpu is not None
             actor_model_type = actor_config.model_config.get("model_type", "language_model")
+            composite_mode = actor_config.model_config.get("composite_mode") or actor_config.get("composite_mode")
             # Diffusion distillation lives inside diffusion_loss; distillation_ppo_loss is token-level only.
-            if is_diffusion:
+            # Bagel Co-RL is not exclusive: UND ppo_loss and GEN diffusion_loss share one optimizer step.
+            if composite_mode == "bagel_corl":
+                self.loss_fn = partial(bagel_composite_loss, config=actor_config)
+            elif is_diffusion:
                 self.loss_fn = partial(diffusion_loss, config=actor_config)
             elif actor_model_type == "omni_model" and actor_config.trainer_type == "direct_preference":
                 self.loss_fn = partial(omni_loss, config=actor_config)

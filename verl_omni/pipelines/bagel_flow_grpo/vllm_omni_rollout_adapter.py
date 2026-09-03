@@ -32,6 +32,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
+from verl_omni.pipelines.bagel_flow_grpo.bagel_corl import route_actor_weight_for_und_replica
 from verl_omni.pipelines.bagel_flow_grpo.common import (
     BAGEL_FLOWGRPO_CFG_DEFAULTS,
     maybe_to_cpu,
@@ -263,10 +264,14 @@ class BagelPipelineWithLogProb(BagelPipeline):
         Other weights (initial checkpoint load) defer to the parent.
         """
         actor_weights: list[tuple[str, torch.Tensor]] = []
+        und_head_weights: list[tuple[str, torch.Tensor]] = []
         checkpoint_weights: list[tuple[str, torch.Tensor]] = []
         for name, tensor in weights:
-            if name.startswith("transformer."):
-                actor_weights.append((f"model.{name[len('transformer.') :]}", tensor))
+            routed = route_actor_weight_for_und_replica(name)
+            if routed is not None and routed.startswith("lm_head."):
+                und_head_weights.append((routed, tensor))
+            elif routed is not None:
+                actor_weights.append((routed, tensor))
             else:
                 checkpoint_weights.append((name, tensor))
 
@@ -275,6 +280,8 @@ class BagelPipelineWithLogProb(BagelPipeline):
             loaded |= super().load_weights(checkpoint_weights)
         if actor_weights:
             loaded |= self.language_model.load_weights(actor_weights)
+        if und_head_weights:
+            loaded |= self.language_model.load_weights(und_head_weights)
         return loaded
 
     def _decode_token_prompt(self, token_ids: Any) -> str | None:

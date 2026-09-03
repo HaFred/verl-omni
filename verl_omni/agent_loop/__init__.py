@@ -19,6 +19,7 @@ from verl_omni.pipelines.minimax_h3_diffusion_nft.agent_loop import MiniMaxH3Dif
 
 # Register image_gen_tool_agent (forces Reflection after successful judge_image).
 from . import image_gen_tool_agent_loop as _image_gen_tool_agent_loop  # noqa: F401
+from .bagel_corl import BagelMultiturnAgentLoop, MultiturnAgentLoopWorker
 from .composite_agent_loop import CompositeAgentLoopWorker
 from .diffusion_agent_loop import DiffusionAgentLoopOutput, DiffusionAgentLoopWorker
 from .diffusion_agent_loop_tq import (
@@ -29,6 +30,8 @@ from .single_turn_agent_loop import DiffusionSingleTurnAgentLoop, OmniSingleTurn
 
 __all__ = [
     "CompositeAgentLoopWorker",
+    "BagelMultiturnAgentLoop",
+    "MultiturnAgentLoopWorker",
     "DiffusionAgentLoopOutput",
     "DiffusionAgentLoopWorker",
     "DiffusionAgentLoopWorkerTQ",

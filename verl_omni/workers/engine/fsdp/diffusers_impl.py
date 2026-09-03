@@ -439,7 +439,14 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
     def _build_optimizer(self, module):
         from verl.workers.config.optimizer import build_optimizer
 
-        optimizer = build_optimizer(module.parameters(), self.optimizer_config)
+        adapter_cls = DiffusionModelBase.get_class(self.model_config)
+        param_groups = None
+        if hasattr(adapter_cls, "get_optimizer_param_groups"):
+            param_groups = adapter_cls.get_optimizer_param_groups(module, self.model_config)
+        optimizer = build_optimizer(
+            param_groups if param_groups is not None else module.parameters(),
+            self.optimizer_config,
+        )
 
         return optimizer
 

@@ -67,6 +67,9 @@ trainer:
     # Use the omni trainer mode for omni models.
     trainer_mode: omni_sync
 
+    # Bagel UND+GEN Co-RL (PR1 serial gather, one composite optimizer step).
+    bagel_corl_sync: {}
+
 
 # Config for the algorithm.
 algorithm:

@@ -66,6 +66,10 @@ _SPECIAL_TOKENS = [
     "<|vision_start|>",
     "<|vision_end|>",
     "<|image_pad|>",
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>",
 ]
 
 
@@ -113,7 +117,7 @@ def _tiny_llm_config(vocab_size: int, *, bos_token_id: int, eos_token_id: int) -
         "rms_norm_eps": 1e-6,
         "rope_theta": 1000000.0,
         "sliding_window": 4096,
-        "tie_word_embeddings": True,  # BagelForTraining has no separate lm_head to checkpoint
+        "tie_word_embeddings": False,  # Co-RL / Qwen2MoT keep an untied lm_head
         "torch_dtype": "bfloat16",
         "use_cache": True,
         "use_sliding_window": False,

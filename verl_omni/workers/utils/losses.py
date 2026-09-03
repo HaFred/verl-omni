@@ -129,6 +129,52 @@ def diffusion_loss(config: DiffusionActorConfig, model_output, data: TensorDict,
     return loss_value, metrics
 
 
+def bagel_composite_loss(config, model_output, data, dp_group=None):
+    """Composite Co-RL loss: token PPO on UND tensors + FlowGRPO on complete GEN groups.
+
+    Skips ``diffusion_loss`` when the step has no complete K-group (``gen/skipped_no_groups``).
+    """
+    from verl.utils.metric import AggregationType, Metric
+    from verl.workers.utils.losses import ppo_loss
+
+    metrics = {}
+    has_complete = bool(tu.get_non_tensor_data(data, "has_complete_gen_groups", default=False))
+    skip_gen = bool(tu.get_non_tensor_data(data, "skip_gen", default=not has_complete))
+    num_gen_rows = tu.get_non_tensor_data(data, "num_gen_rows", default=0) or 0
+
+    loss_value = None
+    und_output = model_output.get("und") if isinstance(model_output, dict) else None
+    if und_output is None and isinstance(model_output, dict) and "log_probs" in model_output:
+        und_output = model_output
+        und_data = data
+    else:
+        und_data = data.get("bagel_corl_und") if hasattr(data, "get") else None
+
+    if und_output is not None and und_data is not None and "log_probs" in und_output:
+        und_loss, und_metrics = ppo_loss(config, und_output, und_data, dp_group=dp_group)
+        loss_value = und_loss
+        metrics.update(und_metrics)
+
+    if skip_gen or not has_complete or int(num_gen_rows) <= 0:
+        metrics["gen/skipped_no_groups"] = Metric(value=1.0, aggregation=AggregationType.MEAN)
+        if loss_value is None:
+            loss_value = torch.zeros((), requires_grad=True)
+        return loss_value, metrics
+
+    gen_output = model_output.get("gen") if isinstance(model_output, dict) else model_output
+    gen_data = data.get("bagel_corl_gen") if hasattr(data, "get") else data
+    if gen_data is None:
+        gen_data = data
+    gen_loss, gen_metrics = diffusion_loss(config, gen_output, gen_data, dp_group=dp_group)
+    metrics.update(gen_metrics)
+    metrics["gen/skipped_no_groups"] = Metric(value=0.0, aggregation=AggregationType.MEAN)
+    if loss_value is None:
+        loss_value = gen_loss
+    else:
+        loss_value = loss_value + gen_loss
+    return loss_value, metrics
+
+
 def omni_loss(config: OmniActorConfig, model_output, data: TensorDict, dp_group=None):
     """Compute loss for omni AR direct-preference training."""
 
