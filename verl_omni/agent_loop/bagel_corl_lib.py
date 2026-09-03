@@ -26,6 +26,20 @@ from typing import Any, Callable
 
 import numpy as np
 
+from verl_omni.agent_loop.image_gen_trajectory_context import (
+    build_generate_call_meta,
+    clear_good_enough_yes_reached,
+    get_active_user_prompt,
+    get_good_enough_yes_reached,
+    register_tool_artifact,
+    set_good_enough_yes_reached,
+)
+from verl_omni.agent_loop.rpco_turn_protocol import (
+    build_forced_reflection,
+    derive_good_enough_from_scores,
+    format_rm_scores_as_judge_text,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -126,11 +140,12 @@ class GenSample:
     rm_score: float | None = None
     image_path: str | None = None
     call_role: str = "initial"
+    good_enough: bool | None = None
 
 
 @dataclass
 class EpisodeRollout:
-    """One serial UND episode (zero or one GEN call in PR1)."""
+    """One serial UND episode (zero or more GEN calls)."""
 
     und_group_uid: str
     episode_uid: str
@@ -142,6 +157,9 @@ class EpisodeRollout:
     gen_samples: list[GenSample] = field(default_factory=list)
     used_image_credit: bool = False
     forced_reflection: bool = False
+    und_reward: float = 0.0
+    judge_text: str | None = None
+    stop_required: bool = False
 
 
 class BagelGenerateImageTool:
@@ -220,6 +238,38 @@ def compact_image_observation(path: str) -> str:
     return f"path={path}"
 
 
+def judge_text_from_gen_samples(samples: list[GenSample]) -> str | None:
+    """Average RM scores into Mode-2a judge text for ``build_forced_reflection``."""
+    scores = [float(s.rm_score) for s in samples if s.valid and s.rm_score is not None]
+    if not scores:
+        return None
+    mean = float(sum(scores) / len(scores))
+    explicit = [bool(s.good_enough) for s in samples if s.good_enough is not None]
+    if explicit:
+        good_enough = any(explicit)
+    else:
+        good_enough = derive_good_enough_from_scores(
+            correctness=mean,
+            aesthetics=mean,
+            similarity=None,
+        )
+    for sample in samples:
+        if sample.good_enough is None:
+            sample.good_enough = good_enough
+    return format_rm_scores_as_judge_text(
+        correctness=mean,
+        aesthetics=mean,
+        good_enough=good_enough,
+        similarity=None,
+    )
+
+
+def _encode_text(tokenizer: Any | None, text: str, *, fallback_ids: list[int] | None = None) -> list[int]:
+    if tokenizer is not None:
+        return list(tokenizer.encode(text, add_special_tokens=False))
+    return list(fallback_ids or [])
+
+
 def turn_histogram(turns: list[int]) -> dict[str, float]:
     if not turns:
         return {
@@ -250,6 +300,9 @@ async def run_serial_episode(
     und_decode: Callable[..., Any],
     generate_tool: BagelGenerateImageTool,
     score_fn: Callable[[list[GenSample]], Any] | None = None,
+    build_judge_text_fn: Callable[[list[GenSample]], str | None] | None = None,
+    tokenizer: Any | None = None,
+    user_prompt: str = "",
     max_und_turns: int = 8,
     forced_reflection_text: str = "Done.",
     episode_uid: str | None = None,
@@ -266,6 +319,10 @@ async def run_serial_episode(
     used_image_credit = False
     forced = False
     turns = 0
+    judge_text: str | None = None
+    stop_required = False
+    clear_good_enough_yes_reached()
+    active_user_prompt = user_prompt or get_active_user_prompt() or ""
 
     for _ in range(max_und_turns):
         turns += 1
@@ -278,46 +335,129 @@ async def run_serial_episode(
         response_mask.extend([1] * len(token_ids))
         if kind == "done":
             break
-        if kind == "generate_image":
-            call = parse_hermes_tool_call(text) or {}
-            arguments = call.get("arguments", call.get("parameters", {}))
-            if isinstance(arguments, str):
-                arguments = json.loads(arguments)
-            prompt = str(arguments.get("prompt", ""))
-            gen_samples = await generate_tool(
-                prompt=prompt,
-                prompt_token_ids=list(prompt_ids) + list(response_ids),
-                gen_call_id=str(ids["gen_call_id"]),
-            )
-            if score_fn is not None:
-                scored = score_fn(gen_samples)
-                if asyncio.iscoroutine(scored):
-                    scored = await scored
-                gen_samples = scored
-            valid_paths = [s.image_path for s in gen_samples if s.valid and s.image_path]
-            if valid_paths:
-                used_image_credit = True
-                obs = compact_image_observation(valid_paths[0])
-                obs_ids: list[int] = list(step.get("obs_token_ids", []))
-                if not obs_ids:
-                    obs_ids = [0]
-                _ = obs
-                response_ids.extend(obs_ids)
-                response_mask.extend([0] * len(obs_ids))
-            forced_ids: list[int] = list(step.get("forced_token_ids", []))
-            if forced_ids:
-                forced = True
-                response_ids.extend(forced_ids)
-                response_mask.extend([0] * len(forced_ids))
-            else:
-                done_ids: list[int] = list(step.get("done_token_ids", []))
-                if done_ids:
-                    response_ids.extend(done_ids)
-                    response_mask.extend([1] * len(done_ids))
+        if kind != "generate_image":
+            continue
+
+        if get_good_enough_yes_reached():
+            # Env hard-stop: prior YES latch blocks further generate_image.
             break
+
+        call = parse_hermes_tool_call(text) or {}
+        arguments = call.get("arguments", call.get("parameters", {}))
+        if isinstance(arguments, str):
+            arguments = json.loads(arguments)
+        prompt = str(arguments.get("prompt", ""))
+        meta = build_generate_call_meta(prompt=prompt, user_prompt=active_user_prompt)
+        gen_call_id = str(ids["gen_call_id"]) if generate_tool._passes == 0 else str(uuid.uuid4())
+        call_samples = await generate_tool(
+            prompt=prompt,
+            prompt_token_ids=list(prompt_ids) + list(response_ids),
+            gen_call_id=gen_call_id,
+        )
+        call_role = str(meta.get("call_role") or "initial")
+        for sample in call_samples:
+            sample.call_role = call_role
+
+        valid_paths = [s.image_path for s in call_samples if s.valid and s.image_path]
+        if valid_paths:
+            register_tool_artifact(prompt=prompt, paths=[str(p) for p in valid_paths])
+
+        if score_fn is not None:
+            scored = score_fn(call_samples)
+            if asyncio.iscoroutine(scored):
+                scored = await scored
+            call_samples = scored
+
+        gen_samples = call_samples
+
+        if valid_paths:
+            used_image_credit = True
+            obs = compact_image_observation(valid_paths[0])
+            obs_ids = _encode_text(
+                tokenizer,
+                obs,
+                fallback_ids=list(step.get("obs_token_ids") or [0]),
+            )
+            if not obs_ids:
+                obs_ids = [0]
+            response_ids.extend(obs_ids)
+            response_mask.extend([0] * len(obs_ids))
+
+        if build_judge_text_fn is not None:
+            maybe_text = build_judge_text_fn(call_samples)
+            if asyncio.iscoroutine(maybe_text):
+                maybe_text = await maybe_text
+            judge_text = maybe_text
+        if not judge_text:
+            judge_text = judge_text_from_gen_samples(call_samples)
+
+        if judge_text:
+            remaining = generate_tool.remaining_passes()
+            force_done = remaining == 0
+            reflection = build_forced_reflection(
+                judge_text,
+                force_done=force_done,
+                generate_pass=generate_tool.max_generate_passes - remaining,
+                max_passes=generate_tool.max_generate_passes,
+            )
+            if reflection is not None:
+                reflection_text, stop_required = reflection
+                forced_ids = _encode_text(
+                    tokenizer,
+                    reflection_text,
+                    fallback_ids=list(step.get("forced_token_ids") or []),
+                )
+                if forced_ids:
+                    forced = True
+                    response_ids.extend(forced_ids)
+                    response_mask.extend([0] * len(forced_ids))
+                if any(s.good_enough for s in call_samples if s.good_enough is not None):
+                    set_good_enough_yes_reached(True)
+                elif "good_enough=YES" in judge_text:
+                    set_good_enough_yes_reached(True)
+
+                if stop_required:
+                    done_decode = und_decode(prompt_ids=prompt_ids, response_ids=response_ids)
+                    done_step = await done_decode if asyncio.iscoroutine(done_decode) else done_decode
+                    done_ids = list(done_step.get("token_ids") or [])
+                    done_text = str(done_step.get("text") or "")
+                    if done_ids and und_turn_kind(done_text) == "done":
+                        response_ids.extend(done_ids)
+                        response_mask.extend([1] * len(done_ids))
+                    else:
+                        fallback = _encode_text(
+                            tokenizer,
+                            "Done.",
+                            fallback_ids=list(done_step.get("done_token_ids") or step.get("done_token_ids") or []),
+                        )
+                        if fallback:
+                            response_ids.extend(fallback)
+                            response_mask.extend([1] * len(fallback))
+                    break
+
+                if remaining > 0:
+                    continue
+                # remaining == 0 should have set stop_required via force_done
+                break
+
+        # No judge text: keep legacy forced/done token fallbacks for unit tests.
+        forced_ids = list(step.get("forced_token_ids") or [])
+        if forced_ids:
+            forced = True
+            response_ids.extend(forced_ids)
+            response_mask.extend([0] * len(forced_ids))
+        else:
+            done_ids = list(step.get("done_token_ids") or [])
+            if done_ids:
+                response_ids.extend(done_ids)
+                response_mask.extend([1] * len(done_ids))
+        break
     else:
         forced = True
         _ = forced_reflection_text
+
+    image_scores = [float(s.rm_score) for s in gen_samples if s.valid and s.rm_score is not None]
+    und_reward = float(np.mean(image_scores)) if image_scores else 0.0
 
     return EpisodeRollout(
         und_group_uid=str(ids["und_group_uid"]),
@@ -330,6 +470,9 @@ async def run_serial_episode(
         gen_samples=gen_samples,
         used_image_credit=used_image_credit,
         forced_reflection=forced,
+        und_reward=und_reward,
+        judge_text=judge_text,
+        stop_required=stop_required,
     )
 
 

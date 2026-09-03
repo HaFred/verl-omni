@@ -1,31 +1,18 @@
-# Dual-role Bagel Co-RL deploy (UND Hermes AR + GEN bagel_single_stage).
+# Co-RL-only vLLM-Omni deploy. Does not affect FlowGRPO / other Bagel recipes:
+# those use ``examples/flowgrpo_trainer/bagel/bagel_deploy_config.yaml``.
+# This path is only passed from ``run_agentic_bagel_rpco_lora.sh``.
 #
-# ``examples/flowgrpo_trainer/bagel/bagel_deploy_config.yaml`` is GEN-only
-# (``bagel_single_stage``) and is **not** UND proof. Prefer one vLLM-Omni
-# dual-role stack when the engine supports it; otherwise run two colocated
-# replicas from the **same** published Bagel checkpoint (no Qwen3-VL UND).
-#
-# Stage 0: autoregressive UND (Hermes ``<tool_call>``). Stage 1: existing GEN
-# FlowGRPO path (``BagelPipelineWithLogProb`` / bagel_single_stage).
+# Use the registered ``bagel_single_stage`` pipeline (same topology as FlowGRPO).
+# Do not invent ``bagel_und_gen_corl`` (not in OMNI_PIPELINES).
+# Do not switch to dual-stage ``bagel``: that is Thinker→KV-transfer→DiT, not
+# Co-RL's serial UND generate() then GEN generate() on one replica.
+# ``bagel_single_stage`` is still not UND Hermes proof; that is a serving spike.
 
-pipeline: bagel_und_gen_corl
+pipeline: bagel_single_stage
 async_chunk: false
 
 stages:
   - stage_id: 0
-    stage_type: llm
-    max_num_batched_tokens: 8192
-    max_num_seqs: 1
-    enforce_eager: true
-    trust_remote_code: true
-    enable_prefix_caching: false
-    devices: "0"
-    default_sampling_params:
-      temperature: 0.7
-      max_tokens: 512
-
-  - stage_id: 1
-    stage_type: diffusion
     max_num_batched_tokens: 32768
     max_num_seqs: 1
     enforce_eager: true

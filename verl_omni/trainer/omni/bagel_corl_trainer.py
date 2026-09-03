@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import fields
 
 from omegaconf import OmegaConf, open_dict
 from verl.trainer.ppo.utils import Role
@@ -24,6 +25,7 @@ from verl.utils.config import omega_conf_to_dataclass
 
 from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
 from verl_omni.workers.config import DiffusionModelConfig
+from verl_omni.workers.config.diffusion import DiffusionRolloutConfig
 
 logger = logging.getLogger(__name__)
 
@@ -77,14 +79,18 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     Weight sync runs once in ``on_step_end`` (inherited) to every replica. No mid-episode sync.
     Replay uses the sync ``ReplayBuffer`` even though ``trainer_mode`` is not the string ``sync``.
 
-    ``main_omni`` defaults to ``OmniModelConfig`` / ``OmniActorConfig``. Bagel Co-RL needs the
-    diffusion model surface (``algorithm``, ``pipeline``, ``algo``) for FlowGRPO GEN while
-    keeping the omni actor for UND ``ppo_loss``. Rewrite model config and inject
-    ``diffusion_loss`` before tokenizer / worker init.
+    ``main_omni`` defaults to omni ``OmniModelConfig`` / ``RolloutConfig``. Bagel Co-RL needs
+    the diffusion model + rollout surfaces (``algorithm``, ``pipeline``, ``algo``,
+    ``rollout_adapter``) for FlowGRPO GEN / weight sync while keeping the omni actor for UND
+    ``ppo_loss``. Rewrite those configs and inject ``diffusion_loss`` before tokenizer /
+    worker init.
+
+    Do **not** only add ``rollout_adapter`` onto omni ``RolloutConfig``: ``init_model``
+    instantiates via Hydra ``_target_``, and verl's ``RolloutConfig`` rejects that kwarg.
     """
 
     def _rewrite_bagel_corl_configs(self) -> None:
-        """Point model at ``DiffusionModelConfig`` and ensure actor has ``diffusion_loss``."""
+        """Retarget model/rollout to diffusion configs; inject actor ``diffusion_loss``."""
         raw = OmegaConf.to_container(self.config.actor_rollout_ref.model, resolve=True) or {}
         filtered = {k: v for k, v in raw.items() if k in _DIFFUSION_MODEL_KEYS}
         filtered["_target_"] = "verl_omni.workers.config.diffusion.DiffusionModelConfig"
@@ -94,8 +100,22 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         filtered.setdefault("composite_mode", "bagel_corl")
         filtered.setdefault("trust_remote_code", True)
 
+        # Strip omni-only rollout keys (response_length, do_sample, …) before Hydra instantiate.
+        rollout_allowed = {f.name for f in fields(DiffusionRolloutConfig)}
+        rollout_raw = OmegaConf.to_container(self.config.actor_rollout_ref.rollout, resolve=True) or {}
+        rollout_filtered = {k: v for k, v in rollout_raw.items() if k in rollout_allowed}
+        rollout_filtered["_target_"] = "verl_omni.workers.config.diffusion.DiffusionRolloutConfig"
+        rollout_filtered.setdefault("rollout_adapter", "default")
+        agent = dict(rollout_filtered.get("agent") or {})
+        agent["_target_"] = "verl_omni.workers.config.omni.BagelCorlAgentLoopConfig"
+        agent.setdefault("gen_samples_per_call", 4)
+        agent.setdefault("max_generate_passes", 1)
+        agent.setdefault("max_und_turns", 8)
+        rollout_filtered["agent"] = agent
+
         with open_dict(self.config):
             self.config.actor_rollout_ref.model = OmegaConf.create(filtered)
+            self.config.actor_rollout_ref.rollout = OmegaConf.create(rollout_filtered)
             actor = self.config.actor_rollout_ref.actor
             if actor.get("diffusion_loss") is None:
                 actor.diffusion_loss = OmegaConf.create(
@@ -106,16 +126,6 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 )
             elif actor.diffusion_loss.get("loss_mode") is None:
                 actor.diffusion_loss.loss_mode = filtered.get("algorithm", "flow_grpo")
-
-            # Use verl-omni AgentLoopConfig subclass so Co-RL fields are legal without patching verl.
-            agent = self.config.actor_rollout_ref.rollout.agent
-            agent._target_ = "verl_omni.workers.config.omni.BagelCorlAgentLoopConfig"
-            if agent.get("gen_samples_per_call") is None:
-                agent.gen_samples_per_call = 4
-            if agent.get("max_generate_passes") is None:
-                agent.max_generate_passes = 1
-            if agent.get("max_und_turns") is None:
-                agent.max_und_turns = 8
 
     def _init_tokenizer(self):
         self._rewrite_bagel_corl_configs()

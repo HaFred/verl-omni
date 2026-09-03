@@ -83,6 +83,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             und_decode=_und_decode,
             generate_tool=tool,
             score_fn=self._score_gen_samples,
+            tokenizer=self.tokenizer,
             max_und_turns=max_und_turns,
         )
         extra = {
@@ -110,7 +111,11 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         )
 
     async def _score_gen_samples(self, samples: list[GenSample]) -> list[GenSample]:
-        """Score via OmniRewardLoopManager handles (C/A, UniCoT similarity, good_enough)."""
+        """Score via OmniRewardLoopManager handles (C/A, UniCoT similarity, good_enough).
+
+        RM wiring is a separate workstream. For CPU tests, the fake score_fn sets
+        ``rm_score`` / ``good_enough`` directly; this passthrough leaves them intact.
+        """
         return samples
 
 
@@ -127,4 +132,26 @@ class MultiturnAgentLoopWorker(CompositeAgentLoopWorker):
         hist = turn_histogram(turns)
         output.meta_info.setdefault("bagel_corl", {}).update(hist)
         logger.info("bagel_corl turn histogram: %s", hist)
+        try:
+            from verl_omni.utils.agentic.image_gen_rollout_dump import (
+                dump_bagel_corl_episode_images,
+                dump_raw_rollouts,
+            )
+
+            step = None
+            if hasattr(batch, "meta_info") and isinstance(batch.meta_info, dict):
+                step = batch.meta_info.get("global_steps") or batch.meta_info.get("step")
+            if step is None and isinstance(getattr(output, "meta_info", None), dict):
+                step = output.meta_info.get("global_steps") or output.meta_info.get("step")
+            try:
+                dump_raw_rollouts(
+                    tokenizer=getattr(self, "tokenizer", None),
+                    output=output,
+                    step=step,
+                )
+            except (TypeError, KeyError, AttributeError) as exc:
+                logger.debug("dump_raw_rollouts skipped for Bagel Co-RL batch shape: %s", exc)
+                dump_bagel_corl_episode_images(output, step=step)
+        except ImportError as exc:
+            logger.debug("rollout dump unavailable: %s", exc)
         return output

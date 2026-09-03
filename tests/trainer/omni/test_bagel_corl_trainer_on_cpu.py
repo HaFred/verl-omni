@@ -74,10 +74,14 @@ def test_rewrite_bagel_corl_configs_strips_omni_model_keys():
                     "trainer_type": "policy_gradient",
                 },
                 "rollout": {
+                    "_target_": "verl.workers.config.RolloutConfig",
+                    "name": "vllm_omni",
+                    "response_length": 512,
+                    "do_sample": True,
                     "agent": {
                         "_target_": "verl.workers.config.AgentLoopConfig",
                         "default_agent_loop": "bagel_multiturn_agent",
-                    }
+                    },
                 },
             }
         }
@@ -90,7 +94,12 @@ def test_rewrite_bagel_corl_configs_strips_omni_model_keys():
     assert "override_config" not in model
     assert "model_stage" not in model
     assert trainer.config.actor_rollout_ref.actor.diffusion_loss.loss_mode == "flow_grpo"
-    agent = trainer.config.actor_rollout_ref.rollout.agent
+    rollout = trainer.config.actor_rollout_ref.rollout
+    assert rollout._target_.endswith("DiffusionRolloutConfig")
+    assert rollout.rollout_adapter == "default"
+    assert "response_length" not in rollout
+    assert "do_sample" not in rollout
+    agent = rollout.agent
     assert agent._target_.endswith("BagelCorlAgentLoopConfig")
     assert agent.gen_samples_per_call == 4
     assert agent.max_generate_passes == 1
