@@ -356,6 +356,8 @@ actor_rollout_ref:
     target_modules: all-linear
     target_parameters: null
     exclude_modules: null
+    lora:
+      merge: false
     lora_adapter_path: null
     policy_state_adapters:
     - default
@@ -510,6 +512,7 @@ reward:
   custom_reward_function:
     path: null
     name: compute_score
+    use_accelerator: false
   reward_functions: {}
   aggregation: weighted_sum
   reward_manager:
