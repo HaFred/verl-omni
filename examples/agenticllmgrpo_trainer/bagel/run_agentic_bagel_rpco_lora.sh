@@ -3,6 +3,10 @@
 # Fail-closed: UND must be the published Bagel checkpoint (Hermes tool-call).
 # Do not swap Qwen3-VL for UND. Do not edit Mode (2a) run_agenticrpco_grpo_lora.sh.
 #
+# Required on vllm-omni >= 0.24: actor_rollout_ref.model.lora.merge=True.
+# Fused MoT gen experts cannot bind *_moe_gen adapters (verl-omni#552 / vllm-omni#7190);
+# merged full-weight sync is the same fix as run_bagel_ocr_lora.sh.
+#
 # UniCoT parquet must carry extra_info.reference_image_path. Rebuild with:
 #   REBUILD_UNICOT=1 python3 examples/agenticllmgrpo_trainer/bagel/stamp_unicot_reference_paths.py \
 #       --input $UNICOT_PARQUET --output $UNICOT_PARQUET
@@ -100,6 +104,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.model.lora_rank=$LORA_RANK \
     actor_rollout_ref.model.lora_alpha=$LORA_ALPHA \
     actor_rollout_ref.model.lora_dtype=bfloat16 \
+    actor_rollout_ref.model.lora.merge=True \
     actor_rollout_ref.model.target_modules="['q_proj','k_proj','v_proj','o_proj','mlp.gate_proj','mlp.up_proj','mlp.down_proj','q_proj_moe_gen','k_proj_moe_gen','v_proj_moe_gen','o_proj_moe_gen','mlp_moe_gen.gate_proj','mlp_moe_gen.up_proj','mlp_moe_gen.down_proj']" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['layers.']" \
     actor_rollout_ref.actor.optim.lr=1e-4 \
