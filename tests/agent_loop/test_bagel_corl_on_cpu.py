@@ -400,3 +400,64 @@ def test_seeds_s_fail_closed_when_below_two():
     )
     with pytest.raises(ValueError, match="gen_samples_per_call >= 2"):
         cfg_mod.validate_bagel_corl_config(cfg)
+
+
+def _done_und_decode():
+    async def und_decode(**kwargs):
+        # Pattern 3 (K=0): policy emits Done. with no tool call.
+        return {"token_ids": [7], "text": "Done."}
+
+    return und_decode
+
+
+def test_pattern3_non_image_reward_replaces_zero():
+    """K=0 episodes must use the non-image UND scalar, not a hard-coded 0."""
+    episode = asyncio.run(
+        lib.run_serial_episode(
+            dataset_task_uid="task",
+            policy_version=1,
+            prompt_ids=[1],
+            und_decode=_done_und_decode(),
+            generate_tool=lib.BagelGenerateImageTool(gen_samples_per_call=2),
+            non_image_reward=0.42,
+        )
+    )
+    assert episode.num_gen_calls == 0
+    assert episode.gen_samples == []
+    assert episode.und_reward == pytest.approx(0.42)
+
+    flat = lib.flatten_multiturn_rollouts([episode], expected_k=2)
+    assert flat.und_batch[0]["token_level_scores"] == pytest.approx(0.42)
+    assert flat.metrics["und/no_image_credit"] == 1.0
+
+
+def test_pattern3_no_non_image_reward_keeps_zero():
+    """Without a non-image scalar, K=0 reward stays 0 (backward compatible)."""
+    episode = asyncio.run(
+        lib.run_serial_episode(
+            dataset_task_uid="task",
+            policy_version=1,
+            prompt_ids=[1],
+            und_decode=_done_und_decode(),
+            generate_tool=lib.BagelGenerateImageTool(gen_samples_per_call=2),
+        )
+    )
+    assert episode.und_reward == pytest.approx(0.0)
+
+
+def test_flatten_propagates_episode_und_reward_for_no_image():
+    """flatten_multiturn_rollouts must not zero out a pre-set non-image reward."""
+    episode = lib.EpisodeRollout(
+        und_group_uid="task",
+        episode_uid="task-ep",
+        policy_version=1,
+        prompt_ids=[1],
+        response_ids=[7],
+        response_mask=[1],
+        turns=1,
+        gen_samples=[],
+        used_image_credit=False,
+        und_reward=0.73,
+    )
+    result = lib.flatten_multiturn_rollouts([episode], expected_k=2)
+    assert result.und_batch[0]["token_level_scores"] == pytest.approx(0.73)

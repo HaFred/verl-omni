@@ -23,7 +23,7 @@ from verl.trainer.ppo.v1.trainer_base import get_trainer_cls
 from verl.utils.tensordict_utils import assign_non_tensor_data
 
 import verl_omni.trainer.omni  # noqa: F401  registers bagel_corl_sync
-from verl_omni.trainer.omni.bagel_corl_trainer import OmniBagelCoRLTrainerSync
+from verl_omni.trainer.omni.bagel_corl_trainer import OmniBagelCoRLTrainerSync, _normalize_tq_kv_get_result
 from verl_omni.utils.config import validate_bagel_corl_config, validate_config
 from verl_omni.workers.utils.losses import bagel_composite_loss
 
@@ -238,6 +238,41 @@ def test_gen_flowgrpo_advantage_groups_by_gen_group_uid():
     finally:
         OmniPPOTrainerSync._compute_advantage = original
     assert order == ["und"]
+
+
+def test_normalize_tq_kv_get_result_columnar_tensordict():
+    """kv_batch_get returns a columnar TensorDict, not a keyed dict."""
+    keys = ["k0::gen::c::0", "k0::gen::c::1"]
+    td = TensorDict(
+        {
+            "rm_scores": torch.tensor([[0.9], [0.1]]),
+            "all_latents": torch.zeros(2, 4),
+        },
+        batch_size=[2],
+    )
+    assign_non_tensor_data(td, "gen_group_uid", ["c", "c"])
+    out = _normalize_tq_kv_get_result(td, keys)
+    assert set(out.keys()) == set(keys)
+    assert out[keys[0]]["fields"]["gen_group_uid"] == "c"
+    assert out[keys[1]]["fields"]["rm_scores"] is not None
+
+
+def test_normalize_tq_kv_get_result_alt_shapes():
+    keys = ["k0::gen::c::0", "k0::gen::c::1"]
+    # keyed dict
+    out = _normalize_tq_kv_get_result({k: {"rm_score": 0.5} for k in keys}, keys)
+    assert out[keys[0]]["fields"]["rm_score"] == 0.5
+    # columnar dict with a keys column
+    out = _normalize_tq_kv_get_result({"keys": keys, "rm_score": [0.5, 0.6]}, keys)
+    assert out[keys[1]]["fields"]["rm_score"] == 0.6
+    # positional list
+    out = _normalize_tq_kv_get_result([{"rm_score": 0.1}, {"rm_score": 0.2}], keys)
+    assert out[keys[1]]["fields"]["rm_score"] == 0.2
+
+
+def test_normalize_tq_kv_get_result_fails_loud_on_unknown_shape():
+    with pytest.raises(ValueError, match="unrecognized"):
+        _normalize_tq_kv_get_result(object(), ["k0"])
 
 
 def test_gen_adv_estimator_rejects_token_grpo_collision():

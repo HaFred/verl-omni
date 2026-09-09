@@ -311,8 +311,15 @@ async def run_serial_episode(
     max_und_turns: int = 8,
     forced_reflection_text: str = "Done.",
     episode_uid: str | None = None,
+    non_image_reward: float | None = None,
 ) -> EpisodeRollout:
-    """Serial UND decode → optional GEN (K seeds) → RM → forced reflection / Done."""
+    """Serial UND decode → optional GEN (K seeds) → RM → forced reflection / Done.
+
+    ``non_image_reward`` is the RFC "non-image UND scalar" used when the episode
+    makes zero ``generate_image`` calls (pattern 3, ``K = 0``). When it is ``None``
+    and no image was scored, the episode reward is 0.0 and the caller should let the
+    reward model fill it post-hoc.
+    """
     ids = bind_episode_ids(
         dataset_task_uid=dataset_task_uid,
         episode_uid=episode_uid,
@@ -464,7 +471,14 @@ async def run_serial_episode(
         _ = forced_reflection_text
 
     image_scores = [float(s.rm_score) for s in gen_samples if s.valid and s.rm_score is not None]
-    und_reward = float(np.mean(image_scores)) if image_scores else 0.0
+    if image_scores:
+        und_reward = float(np.mean(image_scores))
+    elif non_image_reward is not None:
+        # Pattern 3 (K=0): use the non-image UND scalar (RFC und/no_image_credit),
+        # never a hard-coded 0 that would zero out token GRPO signal.
+        und_reward = float(non_image_reward)
+    else:
+        und_reward = 0.0
 
     return EpisodeRollout(
         und_group_uid=str(ids["und_group_uid"]),
@@ -514,7 +528,9 @@ def flatten_multiturn_rollouts(
         if image_scores:
             und_reward = float(np.mean(image_scores))
         else:
-            und_reward = 0.0
+            # Pattern 3 (K=0): propagate the non-image UND scalar instead of zeroing
+            # token GRPO signal (RFC und/no_image_credit).
+            und_reward = float(episode.und_reward)
             no_image_credit += 1
         und_batch.append(
             {

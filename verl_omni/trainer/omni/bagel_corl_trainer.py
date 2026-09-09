@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import fields
+from typing import Any
 
 from omegaconf import OmegaConf, open_dict
 from verl.trainer.ppo.utils import Role
@@ -71,6 +72,88 @@ _DIFFUSION_MODEL_KEYS = {
     "config_path",
     "transformer_subfolder",
 }
+
+
+def _normalize_tq_kv_get_result(data, keys: list[str]) -> dict[str, dict]:
+    """Normalize ``transfer_queue.kv_batch_get`` output into ``{key: {"fields": row}}``.
+
+    ``kv_batch_get`` returns a columnar TensorDict (one entry per requested key, in
+    request order). It is **not** a plain dict. Fail-loud on any shape we do not
+    recognize so a silent ``{}`` can never drop the GEN lane.
+    """
+    if data is None:
+        return {}
+
+    # Columnar TensorDict (the canonical TQ shape): each field is a stacked column.
+    td = data
+    if hasattr(td, "items") and hasattr(td, "get") and not isinstance(td, (dict, list)):
+        # Iterate ``td[field]`` (not ``td.items()``): TensorDict ``__getitem__`` already
+        # unwraps non-tensor columns to plain lists, while ``.items()`` yields wrapped
+        # NonTensorData entries whose ``[i]`` does not index the underlying data.
+        if hasattr(td, "keys") and callable(getattr(td, "keys", None)):
+            try:
+                field_names = [str(k) for k in td.keys()]
+                out: dict[str, dict] = {}
+                for i, key in enumerate(keys):
+                    row: dict[str, Any] = {}
+                    for field_name in field_names:
+                        row[field_name] = _index_column(td[field_name], i)
+                    out[str(key)] = {"fields": row}
+                if out:
+                    return out
+            except (TypeError, KeyError, IndexError):
+                pass
+
+    if isinstance(data, dict):
+        # Keyed dict {key: row} — only if every key maps back to a requested key.
+        if all(k in keys for k in data.keys()) and keys:
+            out = {}
+            for key in keys:
+                row = data.get(key)
+                if row is not None:
+                    out[str(key)] = {"fields": row if isinstance(row, dict) else {"value": row}}
+            return out
+        # Columnar dict {field: [values...]} optionally carrying a "keys" column.
+        got_keys = data.get("keys")
+        if got_keys is None:
+            got_keys = keys
+        got_keys = [str(k) for k in got_keys]
+        out = {}
+        for i, key in enumerate(got_keys):
+            row = {}
+            for field_name, col in data.items():
+                if field_name == "keys":
+                    continue
+                try:
+                    row[field_name] = col[i]
+                except (TypeError, IndexError, KeyError):
+                    row[field_name] = None
+            out[key] = {"fields": row}
+        return out
+
+    if isinstance(data, (list, tuple)):
+        # Positional list: zip with requested keys.
+        out = {}
+        for i, (key, row) in enumerate(zip(keys, data)):
+            if row is None:
+                continue
+            out[str(key)] = {"fields": row if isinstance(row, dict) else {"value": row}}
+        return out
+
+    raise ValueError(
+        f"bagel_corl: unrecognized transfer_queue.kv_batch_get return type {type(data)!r}; "
+        "refusing to silently drop the GEN lane"
+    )
+
+
+def _index_column(col, i: int):
+    """Index a stacked TQ column (Tensor / NonTensorStack / list) at position ``i``."""
+    if col is None:
+        return None
+    try:
+        return col[i]
+    except (TypeError, IndexError, KeyError):
+        return None
 
 
 @register_trainer("bagel_corl_sync")
@@ -279,7 +362,14 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         return records
 
     def _fetch_gen_records_by_keys(self, batch, und_records: list[dict]) -> dict[str, dict]:
-        """Lookup GEN TQ rows by ``child_gen_keys``. Returns key → {fields: ...}."""
+        """Lookup GEN TQ rows by ``child_gen_keys``. Returns key → {fields: ...}.
+
+        ``transfer_queue.kv_batch_get`` returns a **columnar TensorDict** (one entry
+        per requested key, in request order), not a keyed dict. Treating it as a dict
+        silently yields ``{}`` and drops the whole GEN lane. Normalize every known
+        return shape here and fail-loud on an unrecognized one instead of silently
+        skipping GEN.
+        """
         extra = self._extra_info(batch)
         if isinstance(extra.get("gen_by_key"), dict):
             return {str(k): ({"fields": v} if "fields" not in v else v) for k, v in extra["gen_by_key"].items()}
@@ -291,39 +381,34 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         if not keys:
             return {}
         if not hasattr(batch, "partition_id"):
+            logger.warning(
+                "bagel_corl: batch has child_gen_keys=%d but no partition_id; cannot fetch GEN TQ rows",
+                len(keys),
+            )
             return {}
+
         try:
             import transfer_queue as tq
 
             data = tq.kv_batch_get(keys=keys, partition_id=batch.partition_id)
-        except (KeyError, AttributeError, RuntimeError, TypeError, ValueError) as exc:
-            logger.debug("bagel_corl GEN key fetch skipped: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - any fetch failure must be loud, not silent
+            logger.warning("bagel_corl GEN key fetch FAILED for %d keys: %s", len(keys), exc)
+            extra["gen/tq_fetch_failed"] = 1.0
             return {}
 
-        out: dict[str, dict] = {}
-        if isinstance(data, dict):
-            # transfer_queue may return {key: fields} or columnar {field: [..]}
-            if all(isinstance(k, str) and k in keys for k in data.keys()) and keys and keys[0] in data:
-                for key in keys:
-                    row = data.get(key)
-                    if row is not None:
-                        out[key] = {"fields": row if isinstance(row, dict) else {"value": row}}
-                return out
-            # Columnar: zip by position if "keys" present
-            got_keys = data.get("keys") or keys
-            n = len(got_keys)
-            for i, key in enumerate(got_keys):
-                fields = {}
-                for field_name, col in data.items():
-                    if field_name == "keys":
-                        continue
-                    try:
-                        fields[field_name] = col[i]
-                    except (TypeError, IndexError, KeyError):
-                        continue
-                out[str(key)] = {"fields": fields}
-            if out:
-                return out
+        out = _normalize_tq_kv_get_result(data, keys)
+        missing = [k for k in keys if k not in out]
+        if missing:
+            logger.warning(
+                "bagel_corl GEN fetch returned %d/%d rows; missing=%d (first: %s)",
+                len(out),
+                len(keys),
+                len(missing),
+                missing[:3],
+            )
+            extra["gen/tq_fetch_missing"] = float(len(missing)) / max(1, len(keys))
+        if len(out) != len(keys):
+            extra["gen/tq_fetch_incomplete"] = 1.0
         return out
 
     @staticmethod

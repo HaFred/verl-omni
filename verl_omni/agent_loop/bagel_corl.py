@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from typing import Any
@@ -30,6 +31,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     turn_histogram,
 )
 from verl_omni.agent_loop.composite_agent_loop import CompositeAgentLoopWorker
+from verl_omni.agent_loop.rpco_turn_protocol import derive_good_enough_from_scores
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,9 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
     """Per-episode serial UND→GEN→RM loop. Outer gather stays on the worker."""
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
+        # Stash for the GEN tool (``_generate_image_k``) so it can build diffusion
+        # sampling params (seed / logprobs / num_inference_steps) per seed.
+        self._sampling_params = sampling_params
         dataset_task_uid = str(
             kwargs.get("dataset_task_uid")
             or kwargs.get("uid")
@@ -75,6 +80,10 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             max_generate_passes=max_passes,
             generate_fn=self._generate_image_k,
         )
+        # Non-image UND scalar for pattern-3 (K=0) episodes. The reward model computes
+        # the authoritative token-GRPO reward post-hoc (via the worker's ``_compute_score``);
+        # this is only a fallback used when no RM is attached.
+        non_image_reward = kwargs.get("non_image_reward")
         episode = await run_serial_episode(
             dataset_task_uid=dataset_task_uid,
             policy_version=policy_version,
@@ -84,6 +93,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             score_fn=self._score_gen_samples,
             tokenizer=self.tokenizer,
             max_und_turns=max_und_turns,
+            non_image_reward=float(non_image_reward) if non_image_reward is not None else None,
         )
         extra = {
             "text_encoder_responses": "",
@@ -102,6 +112,9 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         }
         # V1 TQ path expects AgentLoopOutput (token trajectory). Dual-lane packing
         # in BagelCorlAgentLoopWorkerTQ splits GEN seeds onto separate TQ keys.
+        # reward_score must stay None so the worker's reward loop computes the real
+        # reward (image-grounded when K>=1, text-only when K=0); pre-setting 0.0 here
+        # would block the RM and zero out token-GRPO signal for pattern-3 episodes.
         return AgentLoopOutput(
             prompt_ids=episode.prompt_ids,
             response_ids=episode.response_ids,
@@ -109,34 +122,85 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             response_logprobs=None,
             num_turns=episode.turns,
             metrics=AgentLoopMetrics(),
-            reward_score=float(episode.und_reward),
+            reward_score=None,
             extra_fields=extra,
         )
 
     async def _generate_image_k(self, **kwargs) -> list[dict[str, Any]]:
-        """GEN replica contract: return ``S = gen_samples_per_call`` seed dicts.
+        """Call the GEN vLLM-Omni replica ``S`` times (one per seed) and stash trajectories.
 
-        Each row must include:
-          - ``valid`` (bool)
-          - ``all_latents``, ``timesteps``, ``rollout_log_probs`` when valid
-          - ``image_path`` (optional; UND observation uses path only)
-          - ``prompt_token_ids`` may be omitted (tool fills from the call)
+        Each returned row carries ``valid`` / ``all_latents`` / ``timesteps`` /
+        ``rollout_log_probs`` / ``image_path``. Fails closed when the server returns a
+        token (not diffusion) output, i.e. dual-role serving is not yet active — do not
+        fall back to a Qwen image sidecar (RFC stop-gate).
 
         Incomplete / invalid S-groups are dropped at dual-lane ingest (no dummy pads).
-        Pattern 3 (K=0) never calls this. Live GEN serving wires the vLLM-Omni replica here.
+        Pattern 3 (K=0) never calls this.
         """
-        raise NotImplementedError(
-            "BagelGenerateImageTool.generate_fn must be wired to the GEN vLLM-Omni replica in serving; "
-            "expected list[dict] length S with keys valid/all_latents/timesteps/rollout_log_probs"
-        )
+        prompt = str(kwargs.get("prompt", ""))
+        seeds = list(kwargs.get("seeds") or [])
+        if not prompt:
+            raise ValueError("_generate_image_k requires a non-empty diffusion prompt")
+
+        sampling = dict(getattr(self, "_sampling_params", None) or {})
+        rows: list[dict[str, Any]] = []
+        for seed in seeds:
+            request_params = dict(sampling)
+            request_params["seed"] = int(seed)
+            request_params["logprobs"] = True
+            # BagelPipeline reads text from the request prompt; encode the diffusion
+            # prompt directly (not the whole UND conversation) so the GEN replica
+            # denoises the right conditioning.
+            gen_prompt_ids = list(self.tokenizer.encode(prompt, add_special_tokens=False))
+            output = await self.server_manager.generate(
+                request_id=str(uuid.uuid4()),
+                prompt_ids=gen_prompt_ids,
+                sampling_params=request_params,
+            )
+            if not self._is_diffusion_output(output):
+                raise RuntimeError(
+                    "Bagel Co-RL generate_image returned a token output: dual-role GEN "
+                    "serving is not wired (bagel_single_stage is GEN-only / the AR replica "
+                    "is not diffusion-capable). Do not fall back to a Qwen sidecar."
+                )
+            extra = dict(getattr(output, "extra_fields", None) or {})
+            rows.append(
+                {
+                    "valid": getattr(output, "stop_reason", None) not in ("aborted", "abort", "error"),
+                    "all_latents": extra.get("all_latents"),
+                    "timesteps": extra.get("all_timesteps"),
+                    "rollout_log_probs": getattr(output, "log_probs", None),
+                    "image_path": extra.get("image_path") or extra.get("path"),
+                }
+            )
+        return rows
+
+    @staticmethod
+    def _is_diffusion_output(output: Any) -> bool:
+        """verl_omni ``DiffusionOutput`` carries ``diffusion_output``; ``TokenOutput`` does not."""
+        return hasattr(output, "diffusion_output")
 
     async def _score_gen_samples(self, samples: list[GenSample]) -> list[GenSample]:
-        """Score via OmniRewardLoopManager handles (C/A, UniCoT similarity, good_enough).
+        """Score GEN samples via an injected RM hook (C/A, UniCoT similarity, good_enough).
 
-        RM wiring is a separate workstream. For CPU tests, the fake score_fn sets
-        ``rm_score`` / ``good_enough`` directly; this passthrough leaves them intact.
+        When no hook is wired (no mid-episode RM), derive ``good_enough`` from any
+        pre-populated ``rm_score`` and otherwise leave the samples unscored so the
+        post-episode reward loop supplies the authoritative scalar. Never hardcode a
+        zero score.
         """
-        return samples
+        rm_fn = getattr(self, "_rm_score_fn", None)
+        if rm_fn is None:
+            for sample in samples:
+                if sample.rm_score is not None and sample.good_enough is None:
+                    sample.good_enough = derive_good_enough_from_scores(
+                        correctness=float(sample.rm_score),
+                        aesthetics=float(sample.rm_score),
+                    )
+            return samples
+        result = rm_fn(samples)
+        if asyncio.iscoroutine(result):
+            result = await result
+        return result
 
 
 class MultiturnAgentLoopWorker(CompositeAgentLoopWorker):
