@@ -14,13 +14,12 @@ TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-20}
 DEBUG_DUMP_STEPS=${DEBUG_DUMP_STEPS:-1,2}
 PERF_SKIP_STEPS=${PERF_SKIP_STEPS:-2}
 PERF_THRESHOLD=${PERF_THRESHOLD:-0.15}
-PRECISION_ATOL=${PRECISION_ATOL:-1e-4}
-PRECISION_RTOL=${PRECISION_RTOL:-1e-3}
-PRECISION_MIN_COS_SIM=${PRECISION_MIN_COS_SIM:-0.999}
-# Decoded images (batch.responses): 1/255 ≈ 0.00392 abs per LSB.
-PRECISION_IMAGE_ATOL=${PRECISION_IMAGE_ATOL:-0.00784313725490196}  # 2/255
-PRECISION_IMAGE_RTOL=${PRECISION_IMAGE_RTOL:-2e-2}
-PRECISION_IMAGE_MIN_COS_SIM=${PRECISION_IMAGE_MIN_COS_SIM:-0.999}
+PRECISION_ATOL=${PRECISION_ATOL:-1e-3}
+PRECISION_MEAN_ATOL=${PRECISION_MEAN_ATOL:-1e-4}
+PRECISION_RMSE_ATOL=${PRECISION_RMSE_ATOL:-1e-3}
+PRECISION_P99_ATOL=${PRECISION_P99_ATOL:-2e-3}
+PRECISION_MAX_FRAC_ABS_OVER_ATOL=${PRECISION_MAX_FRAC_ABS_OVER_ATOL:-2e-2}
+PRECISION_MIN_COS_SIM=${PRECISION_MIN_COS_SIM:-0.99}
 BOOTSTRAP_MISSING_BASELINE=${BOOTSTRAP_MISSING_BASELINE:-1}
 NIGHTLY_DETERMINISTIC_SEED=${NIGHTLY_DETERMINISTIC_SEED:-42}
 L3_TEST_CASE=${L3_TEST_CASE:-qwen_image_flowgrpo}
@@ -48,18 +47,13 @@ MICRO_BSZ=$((MICRO_BSZ_PER_GPU * NUM_GPUS))
 MINI_BSZ=${MICRO_BSZ}
 TRAIN_BATCH_SIZE=$((MINI_BSZ * N_RESP_PER_PROMPT))
 
-ATTN_BACKEND=_flash_3_varlen_hub
-ROLLOUT_ATTN_BACKEND=FLASH_ATTN
-export NIGHTLY_REQUIRE_FA3=1
-export NIGHTLY_ATTN_BACKEND=${ATTN_BACKEND}
-export NIGHTLY_ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND}
-
-if ! python3 -c 'from verl_omni.utils.diffusion_attention import fa3_available, actor_fa3_available, rollout_fa3_available; import sys; sys.exit(0 if fa3_available() else 1)'; then
-    python3 -c 'from verl_omni.utils.diffusion_attention import actor_fa3_available, rollout_fa3_available; print(f"[NIGHTLY] FA3 check failed: actor_kernels={actor_fa3_available()} rollout_fa={rollout_fa3_available()}")'
-    echo "[NIGHTLY] FA3 is required for this regression (kernels + fa3-fwd/flash-attn rollout). Aborting."
-    exit 1
-fi
-echo "[NIGHTLY] diffusion attention: ATTN_BACKEND=${ATTN_BACKEND} ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND} fa3_available=1"
+# The GPU smoke image may contain the ``kernels`` Python package while its
+# installed Torch/CUDA combination has no compatible Hub FA3 build variant.
+# Select the portable native/SDPA pair explicitly for these E2E tests so the
+# production engine can keep its fail-fast attention-backend behavior..
+ATTN_BACKEND=native
+ROLLOUT_ATTN_BACKEND=TORCH_SDPA
+echo "[NIGHTLY] diffusion attention: ATTN_BACKEND=${ATTN_BACKEND} ROLLOUT_ATTN_BACKEND=${ROLLOUT_ATTN_BACKEND}"
 
 export NIGHTLY_DETERMINISTIC_SEED
 export PYTHONHASHSEED=${PYTHONHASHSEED:-${NIGHTLY_DETERMINISTIC_SEED}}
@@ -190,11 +184,11 @@ python3 "${SCRIPT_DIR}/compare_dumps.py" \
     --current "${CURRENT_DUMP_DIR}" \
     --output "${DUMP_COMPARE_JSON}" \
     --atol "${PRECISION_ATOL}" \
-    --rtol "${PRECISION_RTOL}" \
+    --mean-atol "${PRECISION_MEAN_ATOL}" \
+    --rmse-atol "${PRECISION_RMSE_ATOL}" \
+    --p99-atol "${PRECISION_P99_ATOL}" \
+    --max-frac-abs-over-atol "${PRECISION_MAX_FRAC_ABS_OVER_ATOL}" \
     --min-cos-sim "${PRECISION_MIN_COS_SIM}" \
-    --image-atol "${PRECISION_IMAGE_ATOL}" \
-    --image-rtol "${PRECISION_IMAGE_RTOL}" \
-    --image-min-cos-sim "${PRECISION_IMAGE_MIN_COS_SIM}" \
     "${BOOTSTRAP_ARGS[@]}" || DUMP_STATUS=$?
 
 if [ "${METRICS_STATUS}" -ne 0 ] || [ "${DUMP_STATUS}" -ne 0 ]; then

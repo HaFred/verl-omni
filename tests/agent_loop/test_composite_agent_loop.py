@@ -78,14 +78,19 @@ def _assert_text_encoder_outputs(result: DataProto, *, batch_size: int, max_toke
     """Validate Qwen-Image text-encoder returns by rollout."""
     llm_response_ids = result.batch["llm_response_ids"]
     llm_all_log_probs = result.batch.get("rollout_llm_log_probs")
+    llm_attention_mask = result.batch["llm_response_attention_mask"]
     text_encoder_responses = result.non_tensor_batch["text_encoder_responses"]  # list[str]
     _assert_non_empty_tensor(llm_response_ids, "llm_response_ids")
     _assert_non_empty_tensor(llm_all_log_probs, "llm_all_log_probs")
+    _assert_non_empty_tensor(llm_attention_mask, "llm_response_attention_mask")
 
     assert llm_response_ids.shape == (batch_size, max_token_len)
     if llm_all_log_probs is not None:
         assert llm_all_log_probs.shape[1] <= max_token_len
         assert llm_all_log_probs.shape == (batch_size, llm_all_log_probs.shape[1], llm_all_log_probs.shape[-1])
+    assert llm_attention_mask.shape == (batch_size, max_token_len)
+    assert llm_attention_mask.dtype == torch.long
+    assert llm_attention_mask.min() >= 0 and llm_attention_mask.max() <= 1
     assert len(text_encoder_responses) == batch_size
 
 
@@ -96,9 +101,9 @@ def _assert_qwen_image_outputs(result: DataProto, *, batch_size: int, height: in
     assert responses.shape == (batch_size, 3, height, width), (
         f"Expected responses shape {(batch_size, 3, height, width)}, got {tuple(responses.shape)}"
     )
-    assert torch.isfinite(responses).all(), "Generated image tensor contains non-finite values"
-    assert responses.min() >= 0.0 and responses.max() <= 1.0, (
-        f"Generated image pixels should be in [0, 1], got [{responses.min():.4f}, {responses.max():.4f}]"
+    assert responses.dtype == torch.uint8, f"Generated image tensor should be uint8, got {responses.dtype}"
+    assert responses.min() >= 0 and responses.max() <= 255, (
+        f"Generated image pixels should be in [0, 255], got [{responses.min()}, {responses.max()}]"
     )
 
 
@@ -267,6 +272,7 @@ def test_single_turn(init_config, agent_reward_loop: bool):
             "negative_prompt_embeds_mask",
             "rollout_log_probs",
             "rollout_llm_log_probs",
+            "llm_response_attention_mask",
         ]
         expected_non_tensor_batch_keys = ["text_encoder_responses"]
         if agent_reward_loop:

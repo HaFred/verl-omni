@@ -19,7 +19,7 @@ import logging
 from verl import DataProto
 from verl.utils.import_utils import load_extern_object
 
-from .visual import VisualRewardManager
+from .visual import VisualRewardManager, _validate_visual_response
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +115,7 @@ class MultiVisualRewardManager(VisualRewardManager):
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
         response_visual = data_item.batch["responses"]
+        _validate_visual_response(response_visual, self.config, is_validate=data_item.meta_info.get("validate", False))
         data_source = data_item.non_tensor_batch["data_source"]
         ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
@@ -180,7 +181,12 @@ class MultiVisualRewardManager(VisualRewardManager):
             except Exception as e:
                 if required:
                     raise RuntimeError(f"Required sub-reward '{key}' failed: {e}") from e
-                logger.error(f"Sub-reward '{key}' raised an exception: {e}. Contributing 0 to weighted sum.")
+                logger.exception(
+                    "Sub-reward '%s' raised an exception: %s. Contributing 0 to weighted sum.",
+                    key,
+                    e,
+                )
+                reward_extra_info[f"reward/{key}/errors"] = 1
                 score = 0.0
 
             reward_extra_info[f"reward/{key}"] = score

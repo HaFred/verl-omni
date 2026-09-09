@@ -72,6 +72,17 @@ class OmniPPOTrainerSync(PPOTrainerSync):
         self.tokenizer = model_config.tokenizer
         self.processor = model_config.processor
 
+    # The rollout server resumes admission after every successful wake; this
+    # bridge remains a safety net for holds not preceded by a wake (init).
+    # TODO (long): check and fix the resume bridge on the rollout side.
+    def on_init_end(self):
+        super().on_init_end()
+        self.checkpoint_manager.resume_generation_replicas()
+
+    def on_step_end(self):
+        super().on_step_end()
+        self.checkpoint_manager.resume_generation_replicas()
+
 
 class OmniDirectPreferenceRayTrainer:
     """Standalone Omni AR direct-preference Ray trainer.
@@ -218,8 +229,8 @@ class OmniDirectPreferenceRayTrainer:
             with open_dict(self.config):
                 if OmegaConf.select(self.config, "actor_rollout_ref.actor.optim"):
                     self.config.actor_rollout_ref.actor.optim.total_training_steps = total_training_steps
-        except Exception as exc:
-            print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {exc}")
+        except (KeyError, TypeError, AttributeError, OmegaConf.errors.OmegaConfBaseException) as exc:
+            raise RuntimeError("Failed to propagate trainer.total_training_steps to actor optimizer config.") from exc
 
     def init_workers(self) -> None:
         """Initialize actor/ref workers for offline omni direct-preference training."""
@@ -368,6 +379,11 @@ class OmniDirectPreferenceRayTrainer:
             global_step_folder = self.config.trainer.resume_from_path
             if not os.path.isabs(global_step_folder):
                 global_step_folder = os.path.join(os.getcwd(), global_step_folder)
+        else:
+            raise ValueError(
+                f"Unknown trainer.resume_mode={self.config.trainer.resume_mode!r}. "
+                "Available options: ['disable', 'auto', 'resume_path']."
+            )
 
         print(f"Load from checkpoint folder: {global_step_folder}")
         self.global_steps = int(global_step_folder.split("global_step_")[-1])
