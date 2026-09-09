@@ -82,6 +82,9 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             output.extra_fields.setdefault("forced_first_judge", False)
             output.extra_fields.setdefault("rewrote_judge_before_generate", False)
             output.extra_fields.setdefault("force_first_probability", 0.0)
+            output.extra_fields.setdefault("num_generate_image_prompts", 0)
+            output.extra_fields.setdefault("rollout_has_generate", 0)
+            output.extra_fields.setdefault("rollout_valid", 0)
             output.extra_fields["trajectory_relpath"] = self._agentic_trajectory_relpath or ""
             return output
         finally:
@@ -281,28 +284,36 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         agent_data.extra_fields.setdefault("force_stop_max_passes", False)
         agent_data.extra_fields.setdefault("stop_decision_required", False)
         state = await super()._handle_processing_tools_state(agent_data)
+        # Stamp generate-count after every tool turn so discard_invalid_rollouts
+        # can run in generate_sequences before the reward manager writes keys.
+        n_gen = count_successful_generates(agent_data.messages)
+        agent_data.extra_fields["num_generate_image_prompts"] = int(n_gen)
+        agent_data.extra_fields["rollout_has_generate"] = int(n_gen >= 1)
+        agent_data.extra_fields["rollout_valid"] = int(n_gen >= 1)
         if state == AgentState.TERMINATED:
             return state
 
-        forced: tuple[str, bool] | None = None
-        gen_passes = 0
-        max_passes = max_generate_passes()
+        last_tool: dict[str, Any] | None = None
         for message in reversed(agent_data.messages):
             if message.get("role") != "tool":
                 break
-            gen_passes = count_successful_generates(agent_data.messages)
-            force_done = gen_passes >= max_passes
-            # With force off, only inject at the generate-pass cap (budget guard).
-            if not force_enabled() and not force_done:
-                return state
-            forced = build_forced_reflection(
-                tool_message_text(message),
-                force_done=force_done,
-                generate_pass=gen_passes,
-                max_passes=max_passes,
-            )
-            if forced is not None:
-                break
+            last_tool = message
+            break
+        if last_tool is None:
+            return state
+
+        gen_passes = n_gen
+        max_passes = max_generate_passes()
+        force_done = gen_passes >= max_passes
+        if not force_enabled() and not force_done:
+            return state
+
+        forced = build_forced_reflection(
+            tool_message_text(last_tool),
+            force_done=force_done,
+            generate_pass=gen_passes,
+            max_passes=max_passes,
+        )
         if forced is None:
             return state
 
@@ -310,15 +321,11 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         if not force_enabled():
             if not stop_required:
                 return state
-            force_done = gen_passes >= max_passes
             if not force_done:
                 return state
         reflection_text = f"{reflection_text} agentic_forced_reflection=1"
         assistant_msg = {"role": "assistant", "content": reflection_text}
-        response_ids = await self.apply_chat_template(
-            [assistant_msg],
-            remove_system_prompt=True,
-        )
+        response_ids = await self._encode_assistant_completion(reflection_text)
         if not fits_response_budget(
             len(agent_data.response_mask),
             len(response_ids),

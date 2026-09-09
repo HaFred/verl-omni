@@ -567,6 +567,52 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
     return result
 
 
+def _resolve_solution_text(
+    solution_str: str,
+    *,
+    kwargs: dict[str, Any],
+    extra_info: dict[str, Any],
+) -> str:
+    """Resolve trajectory text for Mode (2a).
+
+    Prefer ``solution_str`` (NaiveRewardManager). Optionally decode ``responses``
+    when a tokenizer is available. ``solution_image`` from VisualRewardManager is
+    the wrong modality — raise instead of scoring an empty blob as zeros.
+    """
+    blob = (solution_str or "").strip()
+    if not blob:
+        alt = kwargs.get("solution_str")
+        if isinstance(alt, str):
+            blob = alt.strip()
+    if blob:
+        return blob
+
+    responses = kwargs.get("responses")
+    tokenizer = kwargs.get("tokenizer") or extra_info.get("tokenizer")
+    if responses is not None and tokenizer is not None:
+        try:
+            if hasattr(responses, "tolist"):
+                ids = responses.tolist()
+            else:
+                ids = list(responses)
+            # Batched row: take first sequence if nested.
+            if ids and isinstance(ids[0], list | tuple):
+                ids = list(ids[0])
+            decoded = tokenizer.decode(ids, skip_special_tokens=False)
+            if isinstance(decoded, str) and decoded.strip():
+                return decoded.strip()
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("agentic_reward.compute_score failed to decode responses into solution_str") from exc
+
+    if "solution_image" in kwargs:
+        raise ValueError(
+            "agentic_reward.compute_score requires solution_str (text trajectory). "
+            "Got solution_image from VisualRewardManager — set "
+            "reward.reward_manager.name=naive for Mode (2a)."
+        )
+    return ""
+
+
 def compute_score(
     data_source: str = "",
     solution_str: str = "",
@@ -575,13 +621,15 @@ def compute_score(
     **kwargs: Any,
 ) -> dict[str, float | str | int | None]:
     """Score an agentic image-generation trajectory for GRPO."""
-    del data_source, kwargs
+    del data_source
     extra_info = dict(extra_info or {})
     gt = _as_dict(ground_truth)
 
-    blob = solution_str or ""
-    if not blob.strip():
-        return _zero_result(method="agentic_hermes_tool_calls")
+    blob = _resolve_solution_text(solution_str, kwargs=kwargs, extra_info=extra_info)
+    # Ignore visual payloads explicitly; do not let them leak into scoring.
+    kwargs.pop("solution_image", None)
+    if not blob:
+        return _zero_result(method="agentic_missing_solution_str")
 
     calls = _extract_tool_calls(blob)
     prompts = _gen_image_prompts(calls)
@@ -634,7 +682,7 @@ def compute_score(
     w_rewrite_yes = float(extra_info.get("w_rewrite_yes", gt.get("w_rewrite_yes", 0.12)))
     w_sum = w_tool_call + w_correctness + w_aesthetics + w_done
     if w_sum <= 0:
-        w_tool_call, w_correctness, w_aesthetics, w_done, w_sum = 0.10, 0.35, 0.35, 0.20, 1.0
+        return _zero_result(method="agentic_bad_weights")
 
     prose = _assistant_prose(blob)
     has_refl = _has_agent_reflection_prose(prose)

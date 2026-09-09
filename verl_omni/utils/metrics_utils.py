@@ -117,6 +117,15 @@ class AgenticRewardMetrics:
         "reward_aesthetics",
         "reward_done",
     )
+    # Available at generate_sequences time (before the reward manager).
+    ROLLOUT_KEYS: tuple[str, ...] = (
+        "num_generate_image_prompts",
+        "rollout_has_generate",
+        "rollout_valid",
+        "forced_reflection",
+        "forced_first_generate",
+        "forced_first_judge",
+    )
     ARTIFACT_KEYS: tuple[str, ...] = (
         "reward_tool_call",
         "reward_correctness",
@@ -148,7 +157,7 @@ class AgenticRewardMetrics:
 
     @classmethod
     def aggregate(cls, non_tensor_batch: dict[str, Any]) -> dict[str, float]:
-        """Batch mean/min/max for mix terms already returned by the reward manager."""
+        """Batch mean/min/max for mix terms and rollout-time counters."""
         metrics: dict[str, float] = {}
         for key in cls.MIX_KEYS:
             if key not in non_tensor_batch:
@@ -160,6 +169,16 @@ class AgenticRewardMetrics:
             metrics[f"{prefix}/mean"] = float(np.mean(values))
             metrics[f"{prefix}/min"] = float(np.min(values))
             metrics[f"{prefix}/max"] = float(np.max(values))
+        for key in cls.ROLLOUT_KEYS:
+            if key not in non_tensor_batch:
+                continue
+            try:
+                values = np.asarray(non_tensor_batch[key], dtype=np.float64)
+            except (TypeError, ValueError):
+                continue
+            if values.size == 0:
+                continue
+            metrics[f"agentic_rollout/{key}/mean"] = float(np.mean(values))
         return metrics
 
     @classmethod

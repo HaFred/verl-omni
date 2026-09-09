@@ -34,6 +34,64 @@ from verl_omni.utils.agentic_image_judge_parse import build_judge_prompt, parse_
 logger = logging.getLogger(__name__)
 
 
+def judge_enable_thinking() -> bool:
+    """Qwen3.5 defaults to long CoT; that burns ``max_tokens`` before JSON lands."""
+    return os.getenv("AGENTIC_JUDGE_ENABLE_THINKING", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def post_vllm_chat(
+    *,
+    vllm_url: str,
+    image_b64: str,
+    prompt_text: str,
+    max_tokens: int,
+    enable_thinking: bool | None = None,
+) -> tuple[str | None, str | None]:
+    """POST OpenAI ``/v1/chat/completions``. Returns ``(raw_text, error)``."""
+    thinking = judge_enable_thinking() if enable_thinking is None else bool(enable_thinking)
+    payload: dict = {
+        "model": os.getenv("AGENTIC_VLLM_MODEL", "").strip() or "",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
+                    {"type": "text", "text": prompt_text},
+                ],
+            }
+        ],
+        "max_tokens": int(max_tokens),
+        "temperature": 0.0,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+    }
+    if not payload["model"]:
+        del payload["model"]
+    timeout = float(os.getenv("AGENTIC_REFLECT_VLM_TIMEOUT", "120"))
+    try:
+        req = Request(
+            f"{vllm_url.rstrip('/')}/v1/chat/completions",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured
+            data = json.loads(resp.read().decode())
+    except Exception as exc:  # noqa: BLE001
+        return None, str(exc)
+    choices = data.get("choices") or []
+    raw_text = ""
+    if choices:
+        raw_text = str(choices[0].get("message", {}).get("content", "") or "")
+    if not raw_text:
+        return None, "empty_response"
+    return raw_text, None
+
+
 def _normalize_scored(data: dict, *, backend: str) -> dict | None:
     try:
         correctness = float(data.get("correctness", 0.0))
@@ -88,54 +146,20 @@ def _call_vllm_openai(
 
     base_tokens = int(os.getenv("AGENTIC_REFLECT_MAX_NEW_TOKENS", "1024"))
     max_retries = max(0, int(os.getenv("AGENTIC_JUDGE_PARSE_RETRIES", "1")))
-    timeout = float(os.getenv("AGENTIC_REFLECT_VLM_TIMEOUT", "120"))
 
     for attempt in range(max_retries + 1):
         strict = attempt > 0
         tokens = base_tokens if attempt == 0 else max(base_tokens, 1536)
-        enable_thinking = os.getenv("AGENTIC_JUDGE_ENABLE_THINKING", "0").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        payload: dict = {
-            "model": os.getenv("AGENTIC_VLLM_MODEL", "").strip() or "",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                        {
-                            "type": "text",
-                            "text": build_judge_prompt(user_request, image_prompt, notes, strict_json=strict),
-                        },
-                    ],
-                }
-            ],
-            "max_tokens": tokens,
-            "temperature": 0.0,
-            # Match judge_image: thinking burns the token budget before JSON lands.
-            "chat_template_kwargs": {"enable_thinking": enable_thinking},
-        }
-        if not payload["model"]:
-            del payload["model"]
-        try:
-            req = Request(
-                f"{vllm_url.rstrip('/')}/v1/chat/completions",
-                data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured
-                data = json.loads(resp.read().decode())
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("reflect VLM OpenAI call failed (%s); C/A will be zeroed", exc)
+        raw_text, err = post_vllm_chat(
+            vllm_url=vllm_url,
+            image_b64=image_b64,
+            prompt_text=build_judge_prompt(user_request, image_prompt, notes, strict_json=strict),
+            max_tokens=tokens,
+        )
+        if err is not None:
+            logger.warning("reflect VLM OpenAI call failed (%s); C/A will be zeroed", err)
             return None
-        choices = data.get("choices") or []
-        raw_text = ""
-        if choices:
-            raw_text = str(choices[0].get("message", {}).get("content", "") or "")
+        assert raw_text is not None
         parsed = parse_judge_json(raw_text)
         if parsed is not None:
             return _normalize_scored(parsed, backend="vllm")

@@ -94,12 +94,14 @@ def materialize_rollout_images(
 def discard_invalid_rollouts(output: Any) -> None:
     """Drop no-``generate_image`` rollouts from the policy update.
 
-    Sets ``response_mask`` to 0 so GRPO/PPO give them no gradient. Their
-    scalar reward is already 0 with ``rollout_valid=0`` from
-    ``agentic_reward``; they can still slightly affect the GRPO group mean,
-    which is acceptable (penalizes skip-gen relative to siblings).
+    Prefers rollout-time stamps (``rollout_valid`` / ``rollout_has_generate`` /
+    ``num_generate_image_prompts`` on ``non_tensor_batch`` from the agent loop).
+    Reward-manager keys arrive later and must not be required here.
+
+    Sets ``response_mask`` to 0 so GRPO/PPO give them no gradient.
     """
     valid = output.non_tensor_batch.get("rollout_valid")
+    has_gen = output.non_tensor_batch.get("rollout_has_generate")
     n_gen = output.non_tensor_batch.get("num_generate_image_prompts")
     response_mask = output.batch.get("response_mask")
     if response_mask is None:
@@ -110,17 +112,7 @@ def discard_invalid_rollouts(output: Any) -> None:
     original_mask = response_mask.clone()
     dropped = 0
     for i in range(n):
-        is_valid = True
-        if valid is not None:
-            try:
-                is_valid = int(np.asarray(valid[i]).reshape(-1)[0]) == 1
-            except (TypeError, ValueError, IndexError):
-                is_valid = True
-        elif n_gen is not None:
-            try:
-                is_valid = int(np.asarray(n_gen[i]).reshape(-1)[0]) >= 1
-            except (TypeError, ValueError, IndexError):
-                is_valid = True
+        is_valid = _row_has_generate(valid=valid, has_gen=has_gen, n_gen=n_gen, index=i)
         if is_valid:
             continue
         response_mask[i].zero_()
@@ -139,6 +131,37 @@ def discard_invalid_rollouts(output: Any) -> None:
             dropped,
             n,
         )
+
+
+def _row_int(values: Any, index: int) -> int | None:
+    if values is None:
+        return None
+    try:
+        return int(np.asarray(values[index]).reshape(-1)[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _row_has_generate(*, valid: Any, has_gen: Any, n_gen: Any, index: int) -> bool:
+    """Fail-closed when a stamp is present but unparsable; True only if generate count >= 1."""
+    for values, predicate in (
+        (valid, lambda v: v == 1),
+        (has_gen, lambda v: v == 1),
+        (n_gen, lambda v: v >= 1),
+    ):
+        parsed = _row_int(values, index)
+        if parsed is None:
+            if values is not None:
+                # Key present for the batch but this row failed to parse → treat as invalid.
+                try:
+                    _ = values[index]
+                except Exception:  # noqa: BLE001
+                    continue
+                return False
+            continue
+        return bool(predicate(parsed))
+    # No validity stamps at all (non-agentic loop) → keep the row.
+    return True
 
 
 def _resolve_sample_relpath(

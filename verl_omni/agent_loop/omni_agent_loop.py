@@ -61,7 +61,7 @@ class OmniAgentLoopWorker(AgentLoopWorker):
     Overrides on the Manager class never run per-rollout — they must live here.
 
     Also hard-binds agentic multi-turn defaults (Hermes + ``verl_omni/tools``)
-    so launch recipes need not pass ``function_tool_path`` / ``format`` Hydra overrides.
+    when ``default_agent_loop == image_gen_tool_agent`` (only fills unset keys).
     """
 
     _AGENTIC_TOOL_FORMAT = "hermes"
@@ -72,14 +72,24 @@ class OmniAgentLoopWorker(AgentLoopWorker):
 
         # Bind by path string only — importing image_gen.py would double-register tools.
         bind_run_artifact_env(config)
-        tool_path = self._AGENTIC_FUNCTION_TOOLS
-        if not tool_path.is_file():
-            raise FileNotFoundError(
-                f"agentic function tools not found at {tool_path}. Expected verl_omni/tools/image_gen.py"
-            )
-        with open_dict(config.actor_rollout_ref.rollout.multi_turn):
-            config.actor_rollout_ref.rollout.multi_turn.function_tool_path = str(tool_path)
-            config.actor_rollout_ref.rollout.multi_turn.format = self._AGENTIC_TOOL_FORMAT
+        default_loop = None
+        try:
+            default_loop = config.actor_rollout_ref.rollout.agent.get("default_agent_loop")
+        except Exception:  # noqa: BLE001
+            default_loop = None
+        if default_loop == "image_gen_tool_agent":
+            tool_path = self._AGENTIC_FUNCTION_TOOLS
+            if not tool_path.is_file():
+                raise FileNotFoundError(
+                    f"agentic function tools not found at {tool_path}. Expected verl_omni/tools/image_gen.py"
+                )
+            with open_dict(config.actor_rollout_ref.rollout.multi_turn):
+                mt = config.actor_rollout_ref.rollout.multi_turn
+                # Only fill unset keys so explicit Hydra overrides still win.
+                if not mt.get("function_tool_path"):
+                    mt.function_tool_path = str(tool_path)
+                if not mt.get("format"):
+                    mt.format = self._AGENTIC_TOOL_FORMAT
         super().__init__(config, *args, **kwargs)
 
     async def _run_agent_loop(
@@ -141,11 +151,43 @@ class OmniAgentLoopManager(AgentLoopManager):
         discard_invalid_rollouts(output)
         metrics = AgenticRewardMetrics.aggregate(output.non_tensor_batch)
         if metrics:
+            # Stash for trainers / Tracking; avoid bare wandb.log (drops tensorboard).
+            meta = getattr(output, "meta_info", None)
+            if not isinstance(meta, dict):
+                output.meta_info = {}
+                meta = output.meta_info
+            existing = meta.get("agentic_metrics")
+            if isinstance(existing, dict):
+                existing.update(metrics)
+            else:
+                meta["agentic_metrics"] = dict(metrics)
+            # Fold into timing so stock PPO's timing_raw.update carries them into
+            # compute_timing_metrics → logger.log for every configured backend.
+            # Keys keep the agentic_reward/ prefix (logged as timing_s/... only if
+            # left in timing; prefer a parallel meta key + explicit emit below).
+            self._emit_agentic_metrics(metrics, step=step)
+        return output
+
+    def _emit_agentic_metrics(self, metrics: dict[str, float], *, step) -> None:
+        """Emit rollout metrics without assuming W&B is the only backend."""
+        backends: list[str] = []
+        try:
+            raw = self.config.trainer.get("logger", ["console"])
+            if isinstance(raw, str):
+                backends = [raw]
+            else:
+                backends = [str(b) for b in list(raw)]
+        except Exception:  # noqa: BLE001
+            backends = ["console"]
+
+        step_i = int(step) if step is not None else None
+        if "wandb" in backends or "tracking" in backends:
             try:
                 import wandb
 
                 if wandb.run is not None:
-                    wandb.log(metrics, step=int(step) if step is not None else None, commit=False)
+                    wandb.log(metrics, step=step_i, commit=False)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to log agentic reward metrics to W&B: %s", exc)
-        return output
+                logger.warning("Failed to log agentic metrics to W&B: %s", exc)
+        # Console / file backends: always leave a structured breadcrumb.
+        logger.info("agentic_metrics step=%s %s", step_i, metrics)

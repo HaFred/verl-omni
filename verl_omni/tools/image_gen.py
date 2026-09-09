@@ -70,12 +70,14 @@ from verl_omni.tools.trajectory import (
     set_good_enough_yes_reached,
     set_latest_tool_image_path,
 )
+from verl_omni.utils.agentic.max_passes import max_generate_passes
 from verl_omni.utils.agentic_image_judge_parse import (
     build_judge_prompt,
     format_judge_observation,
     format_judge_parse_error,
     parse_judge_json,
 )
+from verl_omni.utils.reward_score.agentic_image_judge_client import post_vllm_chat
 
 logger = logging.getLogger(__file__)
 
@@ -424,10 +426,7 @@ def _block_generate_after_yes_enabled() -> bool:
 
 
 def _max_generate_passes() -> int:
-    try:
-        return max(1, int(os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")))
-    except ValueError:
-        return 3
+    return max_generate_passes()
 
 
 def _block_generate_after_max_passes_enabled() -> bool:
@@ -710,61 +709,6 @@ def _call_judge_vlm(
 # ── vLLM judge path (OpenAI /v1/chat/completions, continuous batching) ──────
 
 
-def _judge_enable_thinking() -> bool:
-    """Qwen3.5 defaults to long chain-of-thought; that burns ``max_tokens`` before JSON.
-
-    Leave off unless debugging. Override with ``AGENTIC_JUDGE_ENABLE_THINKING=1``.
-    """
-    return os.getenv("AGENTIC_JUDGE_ENABLE_THINKING", "0").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _post_vllm_chat(
-    *,
-    vllm_url: str,
-    image_b64: str,
-    prompt_text: str,
-    max_tokens: int,
-) -> tuple[str | None, str | None]:
-    """Returns ``(raw_text, error)``. Exactly one is non-None on success/failure."""
-    payload: dict = {
-        "model": os.getenv("AGENTIC_VLLM_MODEL", "").strip() or "",
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }
-        ],
-        "max_tokens": int(max_tokens),
-        "temperature": 0.0,
-        # Disable thinking so the reply is JSON-first (avoids finish=length → parse_ok=0).
-        "chat_template_kwargs": {"enable_thinking": _judge_enable_thinking()},
-    }
-    if not payload["model"]:
-        del payload["model"]
-    timeout = float(os.getenv("AGENTIC_REFLECT_VLM_TIMEOUT", "120"))
-    try:
-        req = Request(
-            f"{vllm_url.rstrip('/')}/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(req, timeout=timeout) as resp:  # noqa: S310
-            data = json.loads(resp.read().decode())
-    except Exception as exc:  # noqa: BLE001
-        return None, str(exc)
-    choices = data.get("choices") or []
-    raw_text = ""
-    if choices:
-        raw_text = str(choices[0].get("message", {}).get("content", "") or "")
-    if not raw_text:
-        return None, "empty_response"
-    return raw_text, None
-
-
 def _call_judge_vllm(
     user_request: str,
     image_prompt: str,
@@ -798,7 +742,7 @@ def _call_judge_vllm(
         prompt_text = build_judge_prompt(user_request, image_prompt, strict_json=strict)
         # Give truncated JSON more room on retry.
         tokens = base_tokens if attempt == 0 else max(base_tokens, 1536)
-        raw_text, err = _post_vllm_chat(
+        raw_text, err = post_vllm_chat(
             vllm_url=vllm_url,
             image_b64=image_b64,
             prompt_text=prompt_text,

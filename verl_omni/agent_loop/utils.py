@@ -21,6 +21,8 @@ import os
 import re
 from typing import Any, Optional
 
+from verl_omni.utils.agentic.max_passes import max_generate_passes
+
 __all__ = [
     "build_forced_reflection",
     "count_successful_generates",
@@ -102,13 +104,6 @@ def force_enabled() -> bool:
         "no",
         "",
     }
-
-
-def max_generate_passes() -> int:
-    try:
-        return max(1, int(os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")))
-    except ValueError:
-        return 3
 
 
 def fits_response_budget(mask_len: int, n_new_ids: int, response_length: int) -> bool:
