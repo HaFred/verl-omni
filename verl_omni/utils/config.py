@@ -43,31 +43,37 @@ def validate_config(config: Any) -> None:
 
 
 def validate_bagel_corl_config(config: Any) -> None:
-    """Fail-closed Bagel Co-RL recipe checks (``J = 2K``, LoRA, no Qwen UND fallback)."""
+    """Fail-closed Bagel Co-RL recipe checks (sibling N, seeds S, LoRA, no Qwen UND).
+
+    In-episode ``J`` (UND turns) and ``K`` (GEN calls) are runtime with ``J >= K``;
+    they are **not** ``rollout.n`` / ``gen_samples_per_call``. Do not require ``N == 2S``.
+    """
     mode = _select(config, "trainer.v1.trainer_mode")
     if mode != "bagel_corl_sync":
         return
 
     n = _select(config, "actor_rollout_ref.rollout.n")
-    k = _select(config, "actor_rollout_ref.rollout.agent.gen_samples_per_call")
-    if n is None or k is None:
+    s = _select(config, "actor_rollout_ref.rollout.agent.gen_samples_per_call")
+    if n is None or s is None:
         raise ValueError(
-            "bagel_corl_sync requires actor_rollout_ref.rollout.n and "
-            "actor_rollout_ref.rollout.agent.gen_samples_per_call"
+            "bagel_corl_sync requires actor_rollout_ref.rollout.n (sibling episodes N) and "
+            "actor_rollout_ref.rollout.agent.gen_samples_per_call (seeds per call S)"
         )
     try:
         n_int = int(n)
-        k_int = int(k)
+        s_int = int(s)
     except (TypeError, ValueError) as exc:
         raise ValueError("rollout.n and gen_samples_per_call must be integers") from exc
-    if n_int != 2 * k_int:
+    if n_int < 1:
+        raise ValueError(f"bagel_corl_sync requires rollout.n >= 1 (sibling episodes N), got n={n_int}")
+    if s_int < 2:
         raise ValueError(
-            f"bagel_corl_sync requires rollout.n == 2 * gen_samples_per_call (J=2K), got n={n_int} K={k_int}"
+            f"bagel_corl_sync requires gen_samples_per_call >= 2 (FlowGRPO seeds S), got S={s_int}"
         )
 
     max_passes = _select(config, "actor_rollout_ref.rollout.agent.max_generate_passes", default=1)
     if int(max_passes) != 1:
-        raise ValueError("PR1 bagel_corl_sync requires max_generate_passes=1")
+        raise ValueError("PR1 bagel_corl_sync requires max_generate_passes=1 (bounds in-episode K)")
 
     lora_rank = _select(config, "actor_rollout_ref.model.lora_rank") or _select(
         config, "actor_rollout_ref.model.lora.rank", default=0

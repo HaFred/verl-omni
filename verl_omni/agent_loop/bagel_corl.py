@@ -20,8 +20,7 @@ import logging
 import uuid
 from typing import Any
 
-import torch
-from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, register
+from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
 
 from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
@@ -30,7 +29,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     run_serial_episode,
     turn_histogram,
 )
-from verl_omni.agent_loop.composite_agent_loop import CompositeAgentLoopOutput, CompositeAgentLoopWorker
+from verl_omni.agent_loop.composite_agent_loop import CompositeAgentLoopWorker
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +38,7 @@ logger = logging.getLogger(__name__)
 class BagelMultiturnAgentLoop(AgentLoopBase):
     """Per-episode serial UND→GEN→RM loop. Outer gather stays on the worker."""
 
-    async def run(self, sampling_params: dict[str, Any], **kwargs) -> CompositeAgentLoopOutput:
+    async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         dataset_task_uid = str(
             kwargs.get("dataset_task_uid")
             or kwargs.get("uid")
@@ -88,26 +87,47 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         )
         extra = {
             "text_encoder_responses": "",
+            "prompt_ids": episode.prompt_ids,
             "response_ids": episode.response_ids,
             "response_mask": episode.response_mask,
             "gen_samples": episode.gen_samples,
             "und_group_uid": episode.und_group_uid,
+            "episode_uid": episode.episode_uid,
+            "used_image_credit": episode.used_image_credit,
             "turns": episode.turns,
+            "num_gen_calls": episode.num_gen_calls,
+            "und_reward": episode.und_reward,
+            "policy_version": episode.policy_version,
             "llm_all_log_probs": None,
         }
-        return CompositeAgentLoopOutput(
+        # V1 TQ path expects AgentLoopOutput (token trajectory). Dual-lane packing
+        # in BagelCorlAgentLoopWorkerTQ splits GEN seeds onto separate TQ keys.
+        return AgentLoopOutput(
             prompt_ids=episode.prompt_ids,
-            response_diffusion_output=torch.zeros(3, 8, 8),
+            response_ids=episode.response_ids,
+            response_mask=episode.response_mask,
             response_logprobs=None,
             num_turns=episode.turns,
             metrics=AgentLoopMetrics(),
+            reward_score=float(episode.und_reward),
             extra_fields=extra,
         )
 
     async def _generate_image_k(self, **kwargs) -> list[dict[str, Any]]:
-        """GEN replica: K seeds, stash latents / logprobs / prompt_token_ids (not prompt_embeds)."""
+        """GEN replica contract: return ``S = gen_samples_per_call`` seed dicts.
+
+        Each row must include:
+          - ``valid`` (bool)
+          - ``all_latents``, ``timesteps``, ``rollout_log_probs`` when valid
+          - ``image_path`` (optional; UND observation uses path only)
+          - ``prompt_token_ids`` may be omitted (tool fills from the call)
+
+        Incomplete / invalid S-groups are dropped at dual-lane ingest (no dummy pads).
+        Pattern 3 (K=0) never calls this. Live GEN serving wires the vLLM-Omni replica here.
+        """
         raise NotImplementedError(
-            "BagelGenerateImageTool.generate_fn must be wired to the GEN vLLM-Omni replica in serving"
+            "BagelGenerateImageTool.generate_fn must be wired to the GEN vLLM-Omni replica in serving; "
+            "expected list[dict] length S with keys valid/all_latents/timesteps/rollout_log_probs"
         )
 
     async def _score_gen_samples(self, samples: list[GenSample]) -> list[GenSample]:
@@ -120,7 +140,10 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
 
 
 class MultiturnAgentLoopWorker(CompositeAgentLoopWorker):
-    """Composite worker that gathers J serial episodes, then flattens UND vs GEN."""
+    """Composite worker that gathers J serial episodes, then flattens UND vs GEN.
+
+    Prefer ``BagelCorlAgentLoopWorkerTQ`` for bagel_corl_sync (dual-lane TQ).
+    """
 
     async def generate_sequences(self, batch):
         output = await super().generate_sequences(batch)
@@ -130,8 +153,21 @@ class MultiturnAgentLoopWorker(CompositeAgentLoopWorker):
                 if isinstance(row, dict) and "turns" in row:
                     turns.append(int(row["turns"]))
         hist = turn_histogram(turns)
-        output.meta_info.setdefault("bagel_corl", {}).update(hist)
+        extra = output.meta_info.setdefault("bagel_corl", {})
+        extra.update(hist)
         logger.info("bagel_corl turn histogram: %s", hist)
+        agent_cfg = getattr(self.config.actor_rollout_ref.rollout, "agent", None)
+        expected_k = int(getattr(agent_cfg, "gen_samples_per_call", None) or 4)
+        try:
+            from verl_omni.agent_loop.bagel_corl_lib import flatten_from_agent_output, strip_pixels_for_actor
+
+            flat = flatten_from_agent_output(output, expected_k=expected_k)
+            extra.update(flat.metrics)
+            extra["gen_batch"] = [strip_pixels_for_actor(row) for row in flat.gen_batch]
+            extra["und_batch"] = flat.und_batch
+            extra["gen_episode_map"] = flat.gen_episode_map
+        except (TypeError, KeyError, AttributeError, ValueError) as exc:
+            logger.warning("bagel_corl flatten skipped: %s", exc)
         try:
             from verl_omni.utils.agentic.image_gen_rollout_dump import (
                 dump_bagel_corl_episode_images,

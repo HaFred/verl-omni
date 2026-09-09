@@ -163,6 +163,42 @@ def test_flatten_complete_k_group_keeps_prompt_token_ids():
     assert "prompt_embeds" not in stripped
 
 
+def test_flatten_from_agent_output_reads_extra_fields():
+    call = "g1"
+    samples = [
+        lib.GenSample(
+            gen_sample_uid=lib.gen_sample_uid(call, i),
+            gen_group_uid=call,
+            seed_index=i,
+            valid=True,
+            prompt_token_ids=[2],
+            rm_score=1.0,
+            rollout_log_probs=[0.1, 0.2],
+        )
+        for i in range(2)
+    ]
+    output = types.SimpleNamespace(
+        non_tensor_batch={
+            "extra_fields": [
+                {
+                    "und_group_uid": "task",
+                    "episode_uid": "ep0",
+                    "prompt_ids": [1],
+                    "response_ids": [3],
+                    "response_mask": [1],
+                    "turns": 2,
+                    "used_image_credit": True,
+                    "gen_samples": samples,
+                }
+            ]
+        }
+    )
+    result = lib.flatten_from_agent_output(output, expected_k=2)
+    assert len(result.gen_batch) == 2
+    assert result.gen_batch[0]["gen_group_uid"] == "g1"
+    assert result.metrics["gen/skipped_no_groups"] == 0.0
+
+
 def test_max_generate_passes_one_refuses_second_gen():
     tool = lib.BagelGenerateImageTool(gen_samples_per_call=2, max_generate_passes=1)
 
@@ -349,7 +385,7 @@ def _load_config_mod():
     )
 
 
-def test_j_equals_two_k_config_fail_closed():
+def test_seeds_s_fail_closed_when_below_two():
     from omegaconf import OmegaConf
 
     cfg_mod = _load_config_mod()
@@ -358,9 +394,9 @@ def test_j_equals_two_k_config_fail_closed():
             "trainer": {"resume_mode": "disable", "v1": {"trainer_mode": "bagel_corl_sync"}},
             "actor_rollout_ref": {
                 "model": {"path": "/models/ByteDance-Seed/BAGEL-7B-MoT", "lora_rank": 64},
-                "rollout": {"n": 8, "agent": {"gen_samples_per_call": 3, "max_generate_passes": 1}},
+                "rollout": {"n": 8, "agent": {"gen_samples_per_call": 1, "max_generate_passes": 1}},
             },
         }
     )
-    with pytest.raises(ValueError, match="J=2K"):
+    with pytest.raises(ValueError, match="gen_samples_per_call >= 2"):
         cfg_mod.validate_bagel_corl_config(cfg)

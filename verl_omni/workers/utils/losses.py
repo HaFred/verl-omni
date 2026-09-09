@@ -129,10 +129,17 @@ def diffusion_loss(config: DiffusionActorConfig, model_output, data: TensorDict,
     return loss_value, metrics
 
 
-def bagel_composite_loss(config, model_output, data, dp_group=None):
-    """Composite Co-RL loss: token PPO on UND tensors + FlowGRPO on complete GEN groups.
+def _bagel_corl_view(data: TensorDict, key: str):
+    """Unwrap ``bagel_corl_{und,gen}`` NonTensorData views; never invent a fallback."""
+    return tu.get_non_tensor_data(data, key, default=None)
 
-    Skips ``diffusion_loss`` when the step has no complete K-group (``gen/skipped_no_groups``).
+
+def bagel_composite_loss(config, model_output, data, dp_group=None):
+    """Composite Co-RL loss: UND token PPO + GEN FlowGRPO on *separate* advantage views.
+
+    UND uses token GRPO advantages on the main / ``bagel_corl_und`` tensors.
+    GEN uses FlowGRPO advantages only from ``bagel_corl_gen`` — never the UND
+    token ``advantages`` field (that would cross-wire MoT GEN to token GRPO).
     """
     from verl.utils.metric import AggregationType, Metric
     from verl.workers.utils.losses import ppo_loss
@@ -143,28 +150,50 @@ def bagel_composite_loss(config, model_output, data, dp_group=None):
     num_gen_rows = tu.get_non_tensor_data(data, "num_gen_rows", default=0) or 0
 
     loss_value = None
-    und_output = model_output.get("und") if isinstance(model_output, dict) else None
-    if und_output is None and isinstance(model_output, dict) and "log_probs" in model_output:
+    model_output = model_output if isinstance(model_output, dict) else {}
+    und_output = model_output.get("und")
+    und_data = _bagel_corl_view(data, "bagel_corl_und")
+    # Legacy single-dict UND forward: only when an explicit UND view exists or
+    # the payload is tagged und — never treat a GEN-only diffusion forward as UND.
+    if und_output is None and und_data is not None and "log_probs" in model_output:
+        und_output = model_output
+    if und_output is None and und_data is None and model_output.get("modality") == "und":
         und_output = model_output
         und_data = data
-    else:
-        und_data = data.get("bagel_corl_und") if hasattr(data, "get") else None
+    if und_data is None and und_output is not None and "bagel_corl_gen" not in data.keys():
+        # Pure UND step (no GEN view attached): main batch holds token GRPO advantages.
+        und_data = data
 
     if und_output is not None and und_data is not None and "log_probs" in und_output:
         und_loss, und_metrics = ppo_loss(config, und_output, und_data, dp_group=dp_group)
         loss_value = und_loss
         metrics.update(und_metrics)
 
-    if skip_gen or not has_complete or int(num_gen_rows) <= 0:
+    gen_data = _bagel_corl_view(data, "bagel_corl_gen")
+    if skip_gen or not has_complete or int(num_gen_rows) <= 0 or gen_data is None:
+        metrics["gen/skipped_no_groups"] = Metric(value=1.0, aggregation=AggregationType.MEAN)
+        if gen_data is None and has_complete and not skip_gen and int(num_gen_rows) > 0:
+            metrics["gen/missing_flowgrpo_view"] = Metric(value=1.0, aggregation=AggregationType.MEAN)
+        if loss_value is None:
+            loss_value = torch.zeros((), requires_grad=True)
+        return loss_value, metrics
+
+    gen_output = model_output.get("gen")
+    if gen_output is None and "log_probs" in model_output and und_output is None:
+        gen_output = model_output
+    if gen_output is None or "log_probs" not in gen_output:
         metrics["gen/skipped_no_groups"] = Metric(value=1.0, aggregation=AggregationType.MEAN)
         if loss_value is None:
             loss_value = torch.zeros((), requires_grad=True)
         return loss_value, metrics
 
-    gen_output = model_output.get("gen") if isinstance(model_output, dict) else model_output
-    gen_data = data.get("bagel_corl_gen") if hasattr(data, "get") else data
-    if gen_data is None:
-        gen_data = data
+    # Fail closed: GEN must see FlowGRPO advantages from bagel_corl_gen only.
+    if isinstance(gen_data, TensorDict):
+        if "advantages" not in gen_data.keys():
+            raise ValueError("bagel_corl_gen is missing FlowGRPO advantages; refusing to use UND token advantages")
+    elif not hasattr(gen_data, "keys") or "advantages" not in gen_data:
+        raise ValueError("bagel_corl_gen must carry FlowGRPO advantages for MoT GEN")
+
     gen_loss, gen_metrics = diffusion_loss(config, gen_output, gen_data, dp_group=dp_group)
     metrics.update(gen_metrics)
     metrics["gen/skipped_no_groups"] = Metric(value=0.0, aggregation=AggregationType.MEAN)

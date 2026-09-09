@@ -30,9 +30,9 @@ class BagelCorlAgentLoopConfig(AgentLoopConfig):
     Kept in verl-omni so upstream ``verl.workers.config.AgentLoopConfig`` stays untouched.
     """
 
-    # K seeds per generate_image; recipe validates J == 2K.
+    # S seeds per generate_image (FlowGRPO group). Independent of sibling N / in-episode J,K.
     gen_samples_per_call: Optional[int] = None
-    # PR1 fail-closed: must be 1.
+    # PR1 fail-closed: must be 1 (bounds in-episode K).
     max_generate_passes: Optional[int] = None
-    # UND turn budget before force-stop.
+    # UND turn budget before force-stop (bounds in-episode J).
     max_und_turns: Optional[int] = None

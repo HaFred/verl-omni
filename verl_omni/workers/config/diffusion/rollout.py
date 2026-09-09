@@ -24,6 +24,7 @@ from verl.workers.config.rollout import (
     CheckpointEngineConfig,
     MultiTurnConfig,
     PrometheusConfig,
+    TraceConfig,
 )
 
 __all__ = [
@@ -134,6 +135,8 @@ class DiffusionRolloutConfig(BaseConfig):
     full_determinism: bool = False
 
     prompt_length: int = 512
+    # Kept for verl AgentLoopWorker (UND token pad / max decode). Diffusion GEN uses pipeline.
+    response_length: int = 512
 
     # Final prompt-embedding sequence length after combining all text encoders.
     # Falls back to pipeline.max_sequence_length for single-encoder models.
@@ -188,6 +191,9 @@ class DiffusionRolloutConfig(BaseConfig):
     rollout_adapter: str = "default"
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
+
+    # AgentLoopWorker reads this at init; Co-RL rewrites omni RolloutConfig → this class.
+    trace: TraceConfig = field(default_factory=TraceConfig)
 
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
 

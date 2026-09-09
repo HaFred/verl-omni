@@ -991,10 +991,29 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
         model_output = self.prepare_model_outputs(output=raw_output, micro_batch=micro_batch)
 
         if loss_function is not None:
+            from verl_omni.trainer.omni.bagel_corl_gen_adv import select_gen_advantages_for_step
+
+            composite_mode = None
+            if self.model_config is not None:
+                composite_mode = self.model_config.get("composite_mode")
+            # Fail closed only when GEN is expected to run; pattern-3 / skip_gen has no GEN view.
+            has_complete = bool(tu.get_non_tensor_data(micro_batch, "has_complete_gen_groups", default=False))
+            skip_gen = bool(tu.get_non_tensor_data(micro_batch, "skip_gen", default=not has_complete))
+            require_gen = composite_mode == "bagel_corl" and has_complete and not skip_gen
+            advantages = select_gen_advantages_for_step(
+                micro_batch, step, require_bagel_corl_gen=require_gen
+            )
+            # Prefer GEN-lane old_log_probs when dual-lane view is attached.
+            gen_view = tu.get_non_tensor_data(micro_batch, "bagel_corl_gen", default=None)
+            if gen_view is not None and "old_log_probs" in gen_view.keys():
+                old_log_probs = gen_view["old_log_probs"][:, step]
+            else:
+                old_log_probs = micro_batch["old_log_probs"][:, step]
+
             data = tu.get_tensordict(
                 {
-                    "old_log_probs": micro_batch["old_log_probs"][:, step],
-                    "advantages": micro_batch["advantages"][:, step],
+                    "old_log_probs": old_log_probs,
+                    "advantages": advantages,
                 },
             )
             tu.assign_non_tensor(
@@ -1004,6 +1023,12 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
                 ),
                 sp_size=tu.get_non_tensor_data(micro_batch, "sp_size", default=None),
             )
+            if gen_view is not None:
+                tu.assign_non_tensor(data, bagel_corl_gen=gen_view)
+                for flag in ("has_complete_gen_groups", "skip_gen", "num_gen_rows"):
+                    val = tu.get_non_tensor_data(micro_batch, flag, default=None)
+                    if val is not None:
+                        tu.assign_non_tensor(data, **{flag: val})
 
             # TODO (mike): refactor the data preparation logic here
             if micro_batch.get("ref_log_prob", None) is not None:

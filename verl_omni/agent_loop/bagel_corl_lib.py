@@ -145,7 +145,11 @@ class GenSample:
 
 @dataclass
 class EpisodeRollout:
-    """One serial UND episode (zero or more GEN calls)."""
+    """One serial UND episode (zero or more GEN calls).
+
+    Runtime counters (RFC): ``turns`` is in-episode ``J`` (UND policy turns);
+    ``num_gen_calls`` is in-episode ``K`` (``generate_image`` invocations). Invariant ``J >= K``.
+    """
 
     und_group_uid: str
     episode_uid: str
@@ -160,6 +164,7 @@ class EpisodeRollout:
     und_reward: float = 0.0
     judge_text: str | None = None
     stop_required: bool = False
+    num_gen_calls: int = 0
 
 
 class BagelGenerateImageTool:
@@ -319,6 +324,7 @@ async def run_serial_episode(
     used_image_credit = False
     forced = False
     turns = 0
+    num_gen_calls = 0
     judge_text: str | None = None
     stop_required = False
     clear_good_enough_yes_reached()
@@ -349,6 +355,7 @@ async def run_serial_episode(
         prompt = str(arguments.get("prompt", ""))
         meta = build_generate_call_meta(prompt=prompt, user_prompt=active_user_prompt)
         gen_call_id = str(ids["gen_call_id"]) if generate_tool._passes == 0 else str(uuid.uuid4())
+        num_gen_calls += 1
         call_samples = await generate_tool(
             prompt=prompt,
             prompt_token_ids=list(prompt_ids) + list(response_ids),
@@ -473,6 +480,7 @@ async def run_serial_episode(
         und_reward=und_reward,
         judge_text=judge_text,
         stop_required=stop_required,
+        num_gen_calls=num_gen_calls,
     )
 
 
@@ -562,6 +570,104 @@ def flatten_multiturn_rollouts(
         gen_episode_map=gen_episode_map,
         metrics=metrics,
     )
+
+
+def _as_gen_sample(item: Any) -> GenSample | None:
+    if isinstance(item, GenSample):
+        return item
+    if not isinstance(item, dict):
+        return None
+    return GenSample(
+        gen_sample_uid=str(item.get("gen_sample_uid", "")),
+        gen_group_uid=str(item.get("gen_group_uid", "")),
+        seed_index=int(item.get("seed_index", 0)),
+        valid=bool(item.get("valid", False)),
+        prompt_token_ids=list(item.get("prompt_token_ids") or []),
+        all_latents=item.get("all_latents"),
+        timesteps=item.get("timesteps"),
+        rollout_log_probs=item.get("rollout_log_probs"),
+        rm_score=item.get("rm_score"),
+        image_path=item.get("image_path"),
+        call_role=str(item.get("call_role", "initial")),
+        good_enough=item.get("good_enough"),
+    )
+
+
+def _ntb_from_extra_fields(extras: Any) -> dict[str, list[Any]]:
+    rows = list(extras or [])
+    ntb: dict[str, list[Any]] = {
+        "gen_samples": [],
+        "und_group_uid": [],
+        "episode_uid": [],
+        "prompt_ids": [],
+        "response_ids": [],
+        "response_mask": [],
+        "turns": [],
+        "used_image_credit": [],
+    }
+    for extra in rows:
+        mapping = extra if isinstance(extra, dict) else {}
+        ntb["gen_samples"].append(mapping.get("gen_samples") or [])
+        ntb["und_group_uid"].append(mapping.get("und_group_uid", "missing_task"))
+        ntb["episode_uid"].append(mapping.get("episode_uid"))
+        ntb["prompt_ids"].append(mapping.get("prompt_ids") or [])
+        ntb["response_ids"].append(mapping.get("response_ids") or [])
+        ntb["response_mask"].append(mapping.get("response_mask") or [])
+        ntb["turns"].append(mapping.get("turns", 1))
+        ntb["used_image_credit"].append(mapping.get("used_image_credit", False))
+    return ntb
+
+
+def flatten_from_agent_output(output: Any, *, expected_k: int) -> FlattenResult:
+    """RFC Flatten after ``generate_sequences``: UND vs GEN rows from extra_fields."""
+    ntb = dict(getattr(output, "non_tensor_batch", None) or {})
+    if ntb.get("gen_samples") is None and ntb.get("extra_fields") is not None:
+        ntb.update(_ntb_from_extra_fields(ntb["extra_fields"]))
+    gen_col = ntb.get("gen_samples")
+    if gen_col is None:
+        return flatten_multiturn_rollouts([], expected_k=expected_k)
+
+    length = len(gen_col)
+
+    def _col(name: str, default: Any) -> list[Any]:
+        arr = ntb.get(name)
+        if arr is None:
+            return [default] * length
+        values = list(arr)
+        if len(values) < length:
+            values.extend([default] * (length - len(values)))
+        return values[:length]
+
+    episodes: list[EpisodeRollout] = []
+    und_groups = _col("und_group_uid", "missing_task")
+    episode_uids = _col("episode_uid", None)
+    prompt_ids = _col("prompt_ids", [])
+    response_ids = _col("response_ids", [])
+    response_mask = _col("response_mask", [])
+    turns = _col("turns", 1)
+    used = _col("used_image_credit", False)
+    for index in range(length):
+        raw_samples = gen_col[index] or []
+        samples = []
+        for item in raw_samples:
+            sample = _as_gen_sample(item)
+            if sample is not None:
+                samples.append(sample)
+        episodes.append(
+            EpisodeRollout(
+                und_group_uid=str(und_groups[index]),
+                episode_uid=str(episode_uids[index] or f"ep{index}"),
+                policy_version=0,
+                prompt_ids=list(prompt_ids[index] or []),
+                response_ids=list(response_ids[index] or []),
+                response_mask=list(response_mask[index] or []),
+                turns=int(turns[index] or 1),
+                gen_samples=samples,
+                used_image_credit=bool(used[index]),
+                num_gen_calls=len({str(s.gen_group_uid) for s in samples if s.valid}),
+            )
+        )
+    return flatten_multiturn_rollouts(episodes, expected_k=expected_k)
 
 
 def strip_pixels_for_actor(row: dict[str, Any]) -> dict[str, Any]:

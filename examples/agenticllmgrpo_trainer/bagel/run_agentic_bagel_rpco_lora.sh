@@ -13,6 +13,8 @@
 #
 # GPUs: trainer.n_gpus_per_node follows CUDA_VISIBLE_DEVICES (e.g. 2,3,4,5 → 4).
 # Default REWARD_TP=N so one Qwen RM is TP-sharded, not copied per GPU.
+# 1-GPU smoke (CUDA_VISIBLE_DEVICES=3): ENABLE_RM=0 by default — actor+Omni+RM cannot fit.
+# Re-enable with ENABLE_RM=1 once you have ≥2 empty cards.
 set -x
 # Prefer local verl checkout (tokenizer package layout) over site-packages flat tokenizer.py.
 _SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -71,28 +73,70 @@ if (( NUM_GPUS_ACTOR_ROLLOUT_REWARD % REWARD_TP != 0 )); then
   echo "n_gpus_per_node=${NUM_GPUS_ACTOR_ROLLOUT_REWARD} must be divisible by REWARD_TP=${REWARD_TP}." >&2
   exit 1
 fi
-# Tight util when few cards (2-GPU OOM: actor FSDP + vLLM-Omni + RM). More GPUs → slightly more KV.
-if [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -le 2 ]]; then
+# 1-GPU cannot colocate Bagel FSDP + vLLM-Omni + Qwen RM. Default: drop RM, tiny util.
+# 2-GPU: actor + Omni + RM still tight. More GPUs → slightly more KV.
+if [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -eq 1 ]]; then
+  ENABLE_RM=${ENABLE_RM:-0}
+  REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.08}
+  ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.18}
+  TRAIN_BSZ=${TRAIN_BSZ:-1}
+  MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-512}
+  GEN_STEPS=${GEN_STEPS:-4}
+  GEN_HW=${GEN_HW:-256}
+  LORA_RANK=${LORA_RANK:-4}
+  LORA_ALPHA=${LORA_ALPHA:-8}
+elif [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -le 2 ]]; then
+  ENABLE_RM=${ENABLE_RM:-1}
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.12}
   ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.30}
+  TRAIN_BSZ=${TRAIN_BSZ:-2}
+  MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1024}
+  GEN_STEPS=${GEN_STEPS:-10}
+  GEN_HW=${GEN_HW:-512}
+  LORA_RANK=${LORA_RANK:-8}
+  LORA_ALPHA=${LORA_ALPHA:-16}
 else
+  ENABLE_RM=${ENABLE_RM:-1}
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.15}
   ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.40}
+  TRAIN_BSZ=${TRAIN_BSZ:-2}
+  MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1024}
+  GEN_STEPS=${GEN_STEPS:-10}
+  GEN_HW=${GEN_HW:-512}
+  LORA_RANK=${LORA_RANK:-8}
+  LORA_ALPHA=${LORA_ALPHA:-16}
+fi
+if [[ "$ENABLE_RM" != "1" ]]; then
+  ENABLE_RM=0
 fi
 
-# Tiny smoke defaults (override for production: J=8 K=4, larger LoRA). J must stay 2K.
-J=${J:-2}
-K=${K:-1}
-LORA_RANK=${LORA_RANK:-8}
-LORA_ALPHA=${LORA_ALPHA:-16}
-TRAIN_BSZ=${TRAIN_BSZ:-2}
+# Smoke defaults. N = sibling episodes (Token GRPO); S = seeds per generate_image (FlowGRPO).
+# In-episode J (UND turns) and K (GEN calls) are runtime with J>=K — not these env vars.
+# Production example: N=8 S=4. S must be >= 2.
+# Do not inherit stale K=1 from an old shell (`S=${K:-2}` would still pick K=1).
+if [[ -z "${N:-}" ]]; then
+  if [[ -n "${J:-}" ]]; then N=$J; else N=2; fi
+fi
+if [[ -z "${S:-}" ]]; then
+  if [[ -n "${K:-}" && "$K" -ge 2 ]]; then S=$K; else S=2; fi
+fi
+if [[ "$S" -lt 2 ]]; then
+  echo "gen_samples_per_call S must be >= 2 (FlowGRPO seeds; got S=$S). Use S=2 or unset stale K." >&2
+  exit 1
+fi
+if [[ "$N" -lt 1 ]]; then
+  echo "rollout.n N must be >= 1 (got N=$N)." >&2
+  exit 1
+fi
+echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runtime)"
 
 python3 -m verl_omni.trainer.main_omni \
     trainer.v1.trainer_mode=bagel_corl_sync \
     data.train_files=$unicot_train_path \
     data.val_files=$unicot_test_path \
     data.train_batch_size=$TRAIN_BSZ \
-    data.max_prompt_length=1024 \
+    data.max_prompt_length=$MAX_PROMPT_LEN \
+    data.max_response_length=$MAX_PROMPT_LEN \
     data.trust_remote_code=True \
     actor_rollout_ref.model.path=$model_name \
     actor_rollout_ref.model.tokenizer_path=$model_name \
@@ -101,6 +145,7 @@ python3 -m verl_omni.trainer.main_omni \
     +actor_rollout_ref.model.composite_mode=bagel_corl \
     +actor_rollout_ref.model.architecture=OmniBagelForConditionalGeneration \
     actor_rollout_ref.model.trust_remote_code=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.model.lora_rank=$LORA_RANK \
     actor_rollout_ref.model.lora_alpha=$LORA_ALPHA \
     actor_rollout_ref.model.lora_dtype=bfloat16 \
@@ -115,22 +160,30 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     +actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_grpo \
     actor_rollout_ref.rollout.name=vllm_omni \
-    actor_rollout_ref.rollout.n=$J \
+    actor_rollout_ref.rollout.n=$N \
     actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEM_UTIL \
+    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.max_model_len=$MAX_PROMPT_LEN \
+    +actor_rollout_ref.rollout.pipeline.height=$GEN_HW \
+    +actor_rollout_ref.rollout.pipeline.width=$GEN_HW \
+    +actor_rollout_ref.rollout.pipeline.num_inference_steps=$GEN_STEPS \
+    +actor_rollout_ref.rollout.pipeline.max_sequence_length=$MAX_PROMPT_LEN \
     actor_rollout_ref.rollout.agent.default_agent_loop=bagel_multiturn_agent \
-    +actor_rollout_ref.rollout.agent.gen_samples_per_call=$K \
+    +actor_rollout_ref.rollout.agent.gen_samples_per_call=$S \
     +actor_rollout_ref.rollout.agent.max_generate_passes=1 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.deploy_config=$BAGEL_DEPLOY_CONFIG \
-    reward.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP)) \
-    reward.reward_model.enable=True \
+    reward.num_workers=$(( ENABLE_RM == 1 ? NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP : 0 )) \
+    reward.reward_model.enable=$ENABLE_RM \
     reward.reward_model.model_path=$reward_model_name \
     reward.reward_model.rollout.name=$REWARD_ENGINE \
     reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_TP \
     reward.reward_model.rollout.gpu_memory_utilization=$REWARD_GPU_MEM_UTIL \
     reward.reward_model.rollout.enforce_eager=True \
+    trainer.val_before_train=False \
     trainer.total_epochs=1 \
     trainer.total_training_steps=1 \
     trainer.logger="['console']" \
