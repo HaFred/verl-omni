@@ -12,23 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Shared ``AGENTIC_MAX_GENERATE_IMAGE_PASSES`` reader (tool + agent loop)."""
+"""Shared ``agentic_image_gen.max_generate_image_passes`` reader (tool + agent loop)."""
 
 from __future__ import annotations
 
-import os
+from verl_omni.tools.trajectory.hydra_env import agentic_get
 
 
 def max_generate_passes() -> int:
-    """Return ``AGENTIC_MAX_GENERATE_IMAGE_PASSES`` (default 3).
+    """Return Hydra ``max_generate_image_passes`` (default 3).
 
-    Raises ``ValueError`` when the env is set but not an integer ``>= 1``.
+    Raises ``ValueError`` when the bound value is not an integer ``>= 1``.
     """
-    raw = os.getenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "3")
+    raw = agentic_get("max_generate_image_passes", 3)
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"AGENTIC_MAX_GENERATE_IMAGE_PASSES must be an integer >= 1, got {raw!r}") from exc
+        raise ValueError(f"agentic_image_gen.max_generate_image_passes must be an integer >= 1, got {raw!r}") from exc
     if value < 1:
-        raise ValueError(f"AGENTIC_MAX_GENERATE_IMAGE_PASSES must be >= 1, got {value}")
+        raise ValueError(f"agentic_image_gen.max_generate_image_passes must be >= 1, got {value}")
     return value

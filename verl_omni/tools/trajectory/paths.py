@@ -20,15 +20,24 @@ import hashlib
 import os
 import re
 from pathlib import Path
+from typing import Any
+
+from verl_omni.tools.trajectory.hydra_env import agentic_get
 
 __all__ = [
     "bind_run_artifact_env",
     "build_artifact_id",
     "build_trajectory_relpath",
+    "clear_run_artifacts",
+    "get_run_name",
     "resolve_rollout_images_root",
     "resolve_run_dir",
     "rollout_id_from_relpath",
 ]
+
+_run_name: str = "agentic_run"
+_e2e_root: Path | None = None
+_diffusion_image_dir: Path | None = None
 
 
 def default_e2e_root() -> Path:
@@ -40,47 +49,79 @@ def default_e2e_root() -> Path:
     return Path(__file__).resolve().parents[3] / "outputs" / "e2e"
 
 
+def clear_run_artifacts() -> None:
+    """Reset process-local run-dir bindings (tests)."""
+    global _run_name, _e2e_root, _diffusion_image_dir
+    _run_name = "agentic_run"
+    _e2e_root = None
+    _diffusion_image_dir = None
+
+
+def get_run_name() -> str:
+    """Bound experiment / run name (from ``trainer.experiment_name``)."""
+    return _run_name or "agentic_run"
+
+
 def resolve_e2e_root() -> Path:
     """Shared e2e artifact root for traj / images / hermes_actions."""
-    explicit = os.getenv("AGENTIC_E2E_ROOT", "").strip()
-    if explicit:
-        return Path(explicit).expanduser().resolve()
+    if _e2e_root is not None:
+        return _e2e_root
     return default_e2e_root()
 
 
 def resolve_run_dir() -> Path:
     """Per-run dir: ``<e2e_root>/<experiment_name>/``."""
-    image_dir = os.getenv("AGENTIC_DIFFUSION_IMAGE_DIR", "").strip()
-    if image_dir:
-        return Path(image_dir).expanduser().resolve().parent
-    run = os.getenv("AGENTIC_E2E_RUN_NAME", "").strip() or "agentic_run"
-    return resolve_e2e_root() / run
+    if _diffusion_image_dir is not None:
+        return _diffusion_image_dir.parent
+    return resolve_e2e_root() / get_run_name()
 
 
 def resolve_rollout_images_root() -> Path:
-    """``<run_dir>/rollout_images`` (or explicit ``AGENTIC_DIFFUSION_IMAGE_DIR``)."""
-    explicit = os.getenv("AGENTIC_DIFFUSION_IMAGE_DIR", "").strip()
-    if explicit:
-        return Path(explicit).expanduser().resolve()
+    """``<run_dir>/rollout_images`` (or explicit diffusion image dir override)."""
+    if _diffusion_image_dir is not None:
+        return _diffusion_image_dir
     return resolve_run_dir() / "rollout_images"
 
 
-def bind_run_artifact_env(config) -> None:
-    """Bind ``AGENTIC_E2E_{ROOT,RUN_NAME}`` so driver + Ray workers share one run dir.
+def bind_run_artifact_env(config: Any) -> None:
+    """Bind run-dir knobs from Hydra so driver + Ray workers share one layout.
 
-    Must run on each AgentLoop worker before ``generate_image``: Ray's
-    ``runtime_env`` is snapshotted at job start (often without RUN_NAME), while
-    traj dumps use the manager's process env. Without this, images historically
-    fell back to ``/tmp/agentic_qwen_image_t2i/...`` while traj landed under
-    ``outputs/e2e/<experiment>/``.
+    ``RUN_NAME`` comes from ``trainer.experiment_name``. ``ROOT`` comes from
+    Hydra ``agentic_image_gen.e2e_root`` when set, else ``outputs/e2e``.
+
+    Must run on each AgentLoop worker before ``generate_image``. Historical
+    name kept; this no longer writes ``AGENTIC_E2E_*`` process env.
     """
-    if config is not None:
+    global _run_name, _e2e_root, _diffusion_image_dir
+    # Drop stale explicit image-dir overrides from a previous bind/test.
+    _diffusion_image_dir = None
+    if config is None:
+        _e2e_root = default_e2e_root()
+        return
+
+    try:
         experiment_name = config.trainer.get("experiment_name")
-        if experiment_name:
-            os.environ["AGENTIC_E2E_RUN_NAME"] = str(experiment_name)
-    # Avoid a stale explicit image path from a previously sourced launcher.
-    os.environ.pop("AGENTIC_DIFFUSION_IMAGE_DIR", None)
-    os.environ["AGENTIC_E2E_ROOT"] = str(resolve_e2e_root())
+    except Exception:  # noqa: BLE001
+        experiment_name = None
+    if experiment_name:
+        _run_name = str(experiment_name)
+
+    e2e_root = None
+    try:
+        node = config.get("agentic_image_gen")
+    except Exception:  # noqa: BLE001
+        node = getattr(config, "agentic_image_gen", None)
+    if node is not None:
+        try:
+            e2e_root = node.get("e2e_root")
+        except Exception:  # noqa: BLE001
+            e2e_root = getattr(node, "e2e_root", None)
+    if e2e_root is None:
+        e2e_root = agentic_get("e2e_root")
+    if e2e_root:
+        _e2e_root = Path(str(e2e_root)).expanduser().resolve()
+    else:
+        _e2e_root = default_e2e_root()
 
 
 def rollout_id_from_relpath(relpath: str | None) -> str | None:

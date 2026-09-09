@@ -215,12 +215,16 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
                 return rewritten
 
         active_tools = getattr(agent_data, "_active_tools", self.tools)
+        # Do not gate on ``len(response_mask) >= response_length`` here: stock
+        # ToolAgentLoop length-terminates *before* tool extraction, and random
+        # / tiny models often fill the budget with prose. Force-first *replaces*
+        # that last assistant span, so budget is checked inside
+        # ``_replace_last_assistant_with_tool_call`` after the swap.
         if (
             state != AgentState.TERMINATED
             or agent_data.tool_calls
             or probability <= 0.0
             or random.random() >= probability
-            or len(agent_data.response_mask) >= self.response_length
         ):
             return state
 

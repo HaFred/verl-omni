@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for Hydra ``agentic_image_gen`` → ``AGENTIC_*`` env bind.
+"""CPU tests for Hydra ``agentic_image_gen`` process-local bind.
 
 Loads ``hydra_env`` via importlib so collection does not run
 ``verl_omni/__init__.py`` (pipelines → heavy deps).
@@ -21,7 +21,6 @@ Loads ``hydra_env`` via importlib so collection does not run
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 import types
 from pathlib import Path
@@ -60,7 +59,11 @@ def _load_hydra_env():
 
 
 _hydra_env = _load_hydra_env()
-bind_agentic_image_gen_env = _hydra_env.bind_agentic_image_gen_env
+bind_agentic_image_gen = _hydra_env.bind_agentic_image_gen
+clear_agentic_image_gen = _hydra_env.clear_agentic_image_gen
+agentic_get = _hydra_env.agentic_get
+agentic_get_bool = _hydra_env.agentic_get_bool
+agentic_get_str = _hydra_env.agentic_get_str
 
 
 def test_omni_trainer_composes_agentic_image_gen():
@@ -69,13 +72,14 @@ def test_omni_trainer_composes_agentic_image_gen():
     assert "agentic_image_gen" in cfg
     assert cfg.agentic_image_gen.max_generate_image_passes == 3
     assert cfg.agentic_image_gen.block_generate_after_yes is True
+    assert cfg.agentic_image_gen.force_first_generate is False
+    assert cfg.agentic_image_gen.force_reflection_after_judge is True
+    assert cfg.agentic_image_gen.rewrite_judge_before_generate is True
+    assert cfg.agentic_image_gen.e2e_root is None
 
 
-def test_bind_agentic_image_gen_env_sets_diffusion_url(monkeypatch):
-    monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
-    monkeypatch.delenv("AGENTIC_BLOCK_GENERATE_AFTER_YES", raising=False)
-    monkeypatch.delenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", raising=False)
-
+def test_bind_agentic_image_gen_stores_diffusion_url():
+    clear_agentic_image_gen()
     cfg = OmegaConf.create(
         {
             "agentic_image_gen": {
@@ -83,18 +87,39 @@ def test_bind_agentic_image_gen_env_sets_diffusion_url(monkeypatch):
                 "diffusion_tool_token": None,
                 "block_generate_after_yes": False,
                 "max_generate_image_passes": 5,
+                "force_first_generate": True,
+                "force_first_warmup_steps": 100,
+                "force_first_end_step": 200,
+                "force_reflection_after_judge": False,
             }
         }
     )
-    bind_agentic_image_gen_env(cfg)
+    bind_agentic_image_gen(cfg)
 
-    assert os.environ["AGENTIC_DIFFUSION_TOOL_URL"] == "http://127.0.0.1:9999/generate"
-    assert os.environ["AGENTIC_BLOCK_GENERATE_AFTER_YES"] == "0"
-    assert os.environ["AGENTIC_MAX_GENERATE_IMAGE_PASSES"] == "5"
-    assert "AGENTIC_DIFFUSION_TOOL_TOKEN" not in os.environ
+    assert agentic_get_str("diffusion_tool_url") == "http://127.0.0.1:9999/generate"
+    assert agentic_get_bool("block_generate_after_yes") is False
+    assert agentic_get("max_generate_image_passes") == 5
+    assert agentic_get_bool("force_first_generate") is True
+    assert agentic_get("force_first_warmup_steps") == 100
+    assert agentic_get("force_first_end_step") == 200
+    assert agentic_get_bool("force_reflection_after_judge") is False
+    assert agentic_get("diffusion_tool_token") is None
+    clear_agentic_image_gen()
 
 
-def test_bind_skips_missing_agentic_image_gen(monkeypatch):
-    monkeypatch.setenv("AGENTIC_DIFFUSION_TOOL_URL", "keep-me")
-    bind_agentic_image_gen_env(OmegaConf.create({"trainer": {}}))
-    assert os.environ["AGENTIC_DIFFUSION_TOOL_URL"] == "keep-me"
+def test_bind_skips_missing_agentic_image_gen():
+    clear_agentic_image_gen()
+    bind_agentic_image_gen(
+        OmegaConf.create(
+            {
+                "agentic_image_gen": {
+                    "diffusion_tool_url": "keep-me",
+                }
+            }
+        )
+    )
+    bind_agentic_image_gen(OmegaConf.create({"trainer": {}}))
+    # Missing node leaves prior bind intact.
+    assert agentic_get_str("diffusion_tool_url") == "keep-me"
+    clear_agentic_image_gen()
+    assert agentic_get_str("diffusion_tool_url") == ""

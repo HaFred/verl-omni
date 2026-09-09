@@ -12,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""L2 GPU smoke: OmniAgentLoopManager + ImageGenToolAgentLoop.
+"""L2 GPU smoke: OmniAgentLoopWorker + OmniAgentLoopManager.
 
 Exercises Mode (2a) agent-loop wiring on a tiny AR checkpoint:
   - ``default_agent_loop=image_gen_tool_agent``
-  - teacher-forced first ``generate_image`` (force-first curriculum)
+  - Hydra ``agentic_image_gen`` (force-first curriculum + fake diffusion URL)
   - local HTTP fake for diffusion tool pixels (no real DiT / VL sidecar)
-  - rollout validity stamps + discard path in ``generate_sequences``
+  - ``OmniAgentLoopManager.generate_sequences`` dump → discard → agentic_metrics
+    (``omni_agent_loop.py`` manager post-process; CPU tests mock this path)
 
 This is intentionally narrower than a full PPO recipe ([4/N]).
 """
@@ -45,7 +46,18 @@ from verl.workers.rollout.llm_server import LLMServerManager
 
 from tests.special_e2e.build_qwen3_omni_tiny_random import ensure_tiny_qwen3_omni_checkpoint
 from tests.utils.gpu_test_topology import resolve_requested_num_gpus
-from verl_omni.agent_loop.omni_agent_loop import OmniAgentLoopManager
+from verl_omni.agent_loop.omni_agent_loop import OmniAgentLoopManager, OmniAgentLoopWorker
+from verl_omni.tools.trajectory import resolve_run_dir
+
+
+def _register_vllm_omni_rollout_on_ray_worker() -> None:
+    """Ray CheckpointEngineWorker processes import verl, not verl_omni.
+
+    ``verl_omni.workers.rollout.base`` is what inserts ``("vllm_omni", "async")``
+    into verl's ``_ROLLOUT_REGISTRY``.
+    """
+    import verl_omni.workers.rollout.base  # noqa: F401
+
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for L2 agent-loop smoke")
 
@@ -78,7 +90,7 @@ class _FakeDiffusionHandler(BaseHTTPRequestHandler):
 
 
 class _FakeDiffusionServer:
-    """Local HTTP stand-in for ``AGENTIC_DIFFUSION_TOOL_URL`` (returns a tiny PNG)."""
+    """Local HTTP stand-in for Hydra ``agentic_image_gen.diffusion_tool_url``."""
 
     def __init__(self):
         self._httpd: HTTPServer | None = None
@@ -159,6 +171,8 @@ def init_config(tmp_path_factory) -> tuple[DictConfig, Path]:
 
         config.actor_rollout_ref.rollout.agent.num_workers = 1
         config.actor_rollout_ref.rollout.agent.default_agent_loop = "image_gen_tool_agent"
+        # Standalone LLMServerManager.create() requires rollout.nnodes > 0 (not trainer.nnodes).
+        config.actor_rollout_ref.rollout.nnodes = 1
 
         config.data.max_prompt_length = 256
         config.data.max_response_length = 256
@@ -167,7 +181,7 @@ def init_config(tmp_path_factory) -> tuple[DictConfig, Path]:
         config.trainer.nnodes = 1
         config.trainer.logger = ["console"]
         config.trainer.project_name = "verl_omni_gpu_smoke"
-        config.trainer.experiment_name = "image_gen_tool_agent"
+        config.trainer.experiment_name = "omni_agent_loop_worker"
         config.trainer.default_local_dir = str(run_root / "ckpt")
 
         # Reward manager is unused for this generate_sequences-only smoke, but keep naive
@@ -175,37 +189,35 @@ def init_config(tmp_path_factory) -> tuple[DictConfig, Path]:
         if hasattr(config, "reward") and hasattr(config.reward, "reward_manager"):
             config.reward.reward_manager.name = "naive"
 
+        config.agentic_image_gen.vllm_omni_url = ""
+        config.agentic_image_gen.qwen_image_url = ""
+        config.agentic_image_gen.vllm_url = ""
+        config.agentic_image_gen.force_first_generate = True
+        config.agentic_image_gen.force_first_warmup_steps = 100
+        config.agentic_image_gen.force_first_end_step = 200
+        config.agentic_image_gen.force_reflection_after_judge = False
+        config.agentic_image_gen.e2e_root = str(run_root)
+
     return config, run_root
 
 
-def test_image_gen_tool_agent_generate_sequences_stamps_validity(init_config, monkeypatch):
-    config, run_root = init_config
+def test_omni_agent_loop_worker_image_gen_generate_sequences(init_config):
+    config, _run_root = init_config
     with _FakeDiffusionServer() as tool_url:
-        monkeypatch.setenv("AGENTIC_DIFFUSION_TOOL_URL", tool_url)
-        monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
-        monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
-        monkeypatch.delenv("AGENTIC_VLLM_URL", raising=False)
-        monkeypatch.setenv("AGENTIC_FORCE_FIRST_GENERATE", "1")
-        monkeypatch.setenv("AGENTIC_FORCE_FIRST_WARMUP_STEPS", "100")
-        monkeypatch.setenv("AGENTIC_FORCE_FIRST_END_STEP", "200")
-        monkeypatch.setenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE", "0")
-        monkeypatch.setenv("AGENTIC_E2E_ROOT", str(run_root))
-        monkeypatch.setenv("AGENTIC_E2E_RUN_NAME", "image_gen_tool_gpu_smoke")
+        with open_dict(config):
+            config.agentic_image_gen.diffusion_tool_url = tool_url
 
         ray.init(
             runtime_env={
+                "worker_process_setup_hook": _register_vllm_omni_rollout_on_ray_worker,
                 "env_vars": {
                     "TOKENIZERS_PARALLELISM": "true",
                     "NCCL_DEBUG": "WARN",
                     "VLLM_LOGGING_LEVEL": "INFO",
-                    "AGENTIC_DIFFUSION_TOOL_URL": tool_url,
-                    "AGENTIC_FORCE_FIRST_GENERATE": "1",
-                    "AGENTIC_FORCE_FIRST_WARMUP_STEPS": "100",
-                    "AGENTIC_FORCE_FIRST_END_STEP": "200",
-                    "AGENTIC_FORCE_REFLECTION_AFTER_JUDGE": "0",
-                    "AGENTIC_E2E_ROOT": str(run_root),
-                    "AGENTIC_E2E_RUN_NAME": "image_gen_tool_gpu_smoke",
-                }
+                    "PYTHONPATH": os.pathsep.join(
+                        p for p in (os.path.abspath("."), os.environ.get("PYTHONPATH", "")) if p
+                    ),
+                },
             }
         )
         try:
@@ -214,6 +226,16 @@ def test_image_gen_tool_agent_generate_sequences_stamps_validity(init_config, mo
                 config=config,
                 llm_client=llm_server_manager.get_client(),
             )
+
+            assert getattr(agent_loop_manager, "_monitor_tokenizer", None) is not None
+            worker_cls = getattr(agent_loop_manager, "agent_loop_workers_class", None)
+            assert worker_cls is not None, "Manager must bind Ray OmniAgentLoopWorker before generate"
+            inner = getattr(worker_cls, "__ray_metadata__", None)
+            inner_cls = getattr(inner, "modified_class", None) if inner is not None else None
+            if inner_cls is None:
+                inner_cls = getattr(worker_cls, "_cls", None)
+            if inner_cls is not None:
+                assert inner_cls is OmniAgentLoopWorker or getattr(inner_cls, "__name__", "") == "OmniAgentLoopWorker"
 
             raw_prompts = [
                 [
@@ -254,7 +276,19 @@ def test_image_gen_tool_agent_generate_sequences_stamps_validity(init_config, mo
 
             metrics = result.meta_info.get("agentic_metrics") or {}
             assert any(k.startswith("agentic_rollout/") for k in metrics), metrics
-            print("image_gen_tool_agent GPU smoke passed:", {"n_gen": n_gen, "valid": valid, "metrics": metrics})
+
+            run_dir = resolve_run_dir()
+            hermes_dir = run_dir / "hermes_actions"
+            traj_dir = run_dir / "rollout_trajectories" / "step_000000"
+            assert hermes_dir.is_dir(), f"expected dump under {hermes_dir}"
+            assert any(hermes_dir.iterdir()), f"empty hermes_actions dump in {hermes_dir}"
+            assert traj_dir.is_dir(), f"expected trajectory dump {traj_dir}"
+            assert any(traj_dir.iterdir()), f"empty trajectory dump in {traj_dir}"
+
+            print(
+                "OmniAgentLoopWorker GPU smoke passed:",
+                {"n_gen": n_gen, "valid": valid, "metrics": metrics, "run_dir": str(run_dir)},
+            )
         finally:
             ray.shutdown()
             gc.collect()

@@ -36,11 +36,32 @@ def _load_utils():
     for name, path in (
         ("verl_omni", root),
         ("verl_omni.agent_loop", root / "agent_loop"),
+        ("verl_omni.tools", root / "tools"),
+        ("verl_omni.tools.trajectory", root / "tools" / "trajectory"),
+        ("verl_omni.utils", root / "utils"),
+        ("verl_omni.utils.agentic", root / "utils" / "agentic"),
     ):
         if name not in sys.modules:
             mod = types.ModuleType(name)
             mod.__path__ = [str(path)]  # type: ignore[attr-defined]
             sys.modules[name] = mod
+    # Prefetch hydra store + max_passes so utils imports resolve without package __init__.
+    for modname, path in (
+        (
+            "verl_omni.tools.trajectory.hydra_env",
+            root / "tools" / "trajectory" / "hydra_env.py",
+        ),
+        (
+            "verl_omni.utils.agentic.max_passes",
+            root / "utils" / "agentic" / "max_passes.py",
+        ),
+    ):
+        if modname not in sys.modules or not hasattr(sys.modules[modname], "__file__"):
+            spec = importlib.util.spec_from_file_location(modname, path)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[modname] = mod
+            spec.loader.exec_module(mod)
     if "verl_omni.agent_loop.utils" in sys.modules and hasattr(sys.modules["verl_omni.agent_loop.utils"], "__file__"):
         return sys.modules["verl_omni.agent_loop.utils"]
     spec = importlib.util.spec_from_file_location("verl_omni.agent_loop.utils", _UTILS_PATH)
@@ -69,6 +90,15 @@ tool_calls_are_premature_judge = _utils.tool_calls_are_premature_judge
 tool_message_text = _utils.tool_message_text
 
 
+def _hydra_env():
+    """Bind the hydra store ``force_enabled`` closed over (not a later sys.modules clone)."""
+    g = force_enabled.__globals__["agentic_get_bool"].__globals__
+    return SimpleNamespace(
+        bind_agentic_image_gen=g["bind_agentic_image_gen"],
+        clear_agentic_image_gen=g["clear_agentic_image_gen"],
+    )
+
+
 def _judge_obs(*, correctness=0.80, aesthetics=0.76, good_enough="YES", findings="text is legible", fixes="none"):
     return (
         "VL judge on the last generated image:\n"
@@ -85,45 +115,69 @@ def _gen_obs(prompt="a poster", backend="qwen_image"):
     )
 
 
-@pytest.mark.parametrize("value", ["0", "false", "off", "no"])
-def test_force_enabled_env_gate(monkeypatch, value):
-    monkeypatch.setenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE", value)
+@pytest.mark.parametrize("value", [False, "0", "false", "off", "no"])
+def test_force_enabled_hydra_gate(value):
+    from omegaconf import OmegaConf
+
+    hydra = _hydra_env()
+    hydra.clear_agentic_image_gen()
+    hydra.bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"force_reflection_after_judge": value}}))
     assert force_enabled() is False
-    monkeypatch.delenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE")
+    hydra.clear_agentic_image_gen()
     assert force_enabled() is True  # default on
 
 
-def test_max_generate_passes_env(monkeypatch):
-    monkeypatch.delenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", raising=False)
+def test_max_generate_passes_hydra():
+    from omegaconf import OmegaConf
+
+    hydra = _hydra_env()
+    hydra.clear_agentic_image_gen()
     assert max_generate_passes() == 3
-    monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "5")
+    hydra.bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"max_generate_image_passes": 5}}))
     assert max_generate_passes() == 5
-    monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "garbage")
-    with pytest.raises(ValueError, match="AGENTIC_MAX_GENERATE_IMAGE_PASSES"):
+    hydra.bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"max_generate_image_passes": "garbage"}}))
+    with pytest.raises(ValueError, match="max_generate_image_passes"):
         max_generate_passes()
-    monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "0")
+    hydra.bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"max_generate_image_passes": 0}}))
     with pytest.raises(ValueError, match=">= 1"):
         max_generate_passes()
+    hydra.clear_agentic_image_gen()
 
 
-def test_force_first_generate_probability_schedule(monkeypatch):
-    monkeypatch.delenv("AGENTIC_FORCE_FIRST_GENERATE", raising=False)
+def test_force_first_generate_probability_schedule():
+    from omegaconf import OmegaConf
+
+    hydra = _hydra_env()
+    hydra.clear_agentic_image_gen()
     assert force_first_generate_probability(5) == 0.0  # off by default
     assert force_first_generate_probability(5, validate=True) == 0.0  # never on val
-    monkeypatch.setenv("AGENTIC_FORCE_FIRST_GENERATE", "1")
-    monkeypatch.setenv("AGENTIC_FORCE_FIRST_WARMUP_STEPS", "10")
-    monkeypatch.setenv("AGENTIC_FORCE_FIRST_END_STEP", "20")
+    hydra.bind_agentic_image_gen(
+        OmegaConf.create(
+            {
+                "agentic_image_gen": {
+                    "force_first_generate": True,
+                    "force_first_warmup_steps": 10,
+                    "force_first_end_step": 20,
+                }
+            }
+        )
+    )
     assert force_first_generate_probability(5) == 1.0  # warmup
     assert force_first_generate_probability(15) == pytest.approx(0.5)  # linear anneal
     assert force_first_generate_probability(20) == 0.0  # annealed off
     assert force_first_generate_probability("not-an-int") == 1.0  # step coerced to 0
+    hydra.clear_agentic_image_gen()
 
 
-def test_rewrite_judge_before_generate_env(monkeypatch):
-    monkeypatch.delenv("AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE", raising=False)
+def test_rewrite_judge_before_generate_hydra():
+    from omegaconf import OmegaConf
+
+    hydra = _hydra_env()
+    hydra.clear_agentic_image_gen()
     assert rewrite_judge_before_generate() is True  # default on
-    monkeypatch.setenv("AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE", "0")
+    hydra.bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"rewrite_judge_before_generate": False}}))
     assert rewrite_judge_before_generate() is False
+    hydra.clear_agentic_image_gen()
 
 
 def test_tool_calls_are_premature_judge():

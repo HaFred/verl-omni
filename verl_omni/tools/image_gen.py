@@ -27,18 +27,16 @@ writes ``Reflection:`` / ``Done.`` or a rewritten ``generate_image``.
 Config: Hydra ``agentic_image_gen`` (see
 ``verl_omni/trainer/config/agentic/image_gen_tools.yaml``) is the source of
 truth. ``OmniAgentLoopWorker`` / ``OmniAgentLoopManager`` call
-``bind_agentic_image_gen_env`` so those knobs land in ``AGENTIC_*`` process
-env. Tools keep reading ``os.getenv`` because ``@function_tool`` sync bodies
-run under ``asyncio.to_thread`` and never receive Hydra / ``agent_data``.
-CPU tests may still monkeypatch the same env vars.
+``bind_agentic_image_gen`` so FunctionTool bodies (``asyncio.to_thread``) read
+the bound process-local knobs — no AGENTIC_* env.
 
 Backends (first match wins):
-  1. ``AGENTIC_VLLM_OMNI_URL`` — vLLM-Omni OpenAI image generations
+  1. ``agentic_image_gen.vllm_omni_url`` — vLLM-Omni OpenAI image generations
      (``/v1/images/generations``).
-  2. ``AGENTIC_QWEN_IMAGE_URL`` — bundled Qwen-Image HTTP service
+  2. ``agentic_image_gen.qwen_image_url`` — bundled Qwen-Image HTTP service
      (POST ``{"prompt"}`` → base64 image JSON).
-  3. ``AGENTIC_DIFFUSION_TOOL_URL`` — generic service with the same response
-     contract.
+  3. ``agentic_image_gen.diffusion_tool_url`` — generic service with the same
+     response contract.
   4. Else text-only stub (acceptance smoke when no gen service is up).
 
 Observation modality is always text: PNGs are written under the rollout image
@@ -71,12 +69,14 @@ from verl_omni.tools.trajectory import (
     get_active_user_prompt,
     get_good_enough_yes_reached,
     get_latest_generate_prompt_for_active_rollout,
+    get_run_name,
     register_tool_artifact,
     resolve_rollout_images_root,
     resolve_tool_image_path,
     set_good_enough_yes_reached,
     set_latest_tool_image_path,
 )
+from verl_omni.tools.trajectory.hydra_env import agentic_get_bool, agentic_get_float, agentic_get_int, agentic_get_str
 from verl_omni.utils.agentic.max_passes import max_generate_passes
 from verl_omni.utils.agentic_image_judge_parse import (
     build_judge_prompt,
@@ -187,7 +187,7 @@ def _update_traj_meta(traj_dir: Path, entry: dict) -> None:
     else:
         meta = {}
     meta.setdefault("trajectory", traj_dir.name)
-    meta.setdefault("experiment", os.getenv("AGENTIC_E2E_RUN_NAME", ""))
+    meta.setdefault("experiment", get_run_name())
     user_prompt = entry.get("user_prompt") or get_active_user_prompt() or ""
     if user_prompt:
         meta["user_prompt"] = user_prompt
@@ -266,7 +266,8 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
                 f"reflection={provenance.get('reflection')!r}\n"
                 f"backend={backend}\n"
                 f"artifact_id={aid}\n"
-                "Set AGENTIC_QWEN_IMAGE_URL to a running Qwen-Image service for real images.\n"
+                "Set agentic_image_gen.qwen_image_url (or vllm_omni_url / diffusion_tool_url) "
+                "for real images.\n"
             )
             paths.append(str(stub_path))
             artifact_ids.append(aid)
@@ -301,7 +302,7 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
         "backend": backend,
         "tool_stubbed": tool_stubbed,
         "num_images": len(images),
-        "experiment": os.getenv("AGENTIC_E2E_RUN_NAME", ""),
+        "experiment": get_run_name(),
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     for i, img in enumerate(images):
@@ -315,7 +316,8 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
             f"user_prompt={user_prompt!r}\n"
             f"tool_prompt={prompt!r}\n"
             f"backend={backend}\n"
-            "Set AGENTIC_QWEN_IMAGE_URL to a running Qwen-Image service for real images.\n"
+            "Set agentic_image_gen.qwen_image_url (or vllm_omni_url / diffusion_tool_url) "
+            "for real images.\n"
         )
         paths.append(str(stub_path))
     (call_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
@@ -381,7 +383,7 @@ def _call_generic_http(
     backend: str = "http",
 ) -> tuple[ToolResponse, float, dict]:
     headers = {"Content-Type": "application/json"}
-    token = os.getenv("AGENTIC_DIFFUSION_TOOL_TOKEN")
+    token = agentic_get_str("diffusion_tool_token", "")
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = Request(
@@ -392,7 +394,7 @@ def _call_generic_http(
     )
     # Offloaded Qwen-Image requests may queue behind other rollout workers on
     # the single frozen-tool GPU.
-    timeout = float(os.getenv("AGENTIC_DIFFUSION_TOOL_TIMEOUT", "900"))
+    timeout = agentic_get_float("diffusion_tool_timeout", 900.0)
     try:
         with urlopen(request, timeout=timeout) as result:  # noqa: S310 - endpoint is operator-configured
             payload = json.loads(result.read())
@@ -424,12 +426,7 @@ def _call_generic_http(
 
 
 def _block_generate_after_yes_enabled() -> bool:
-    return os.getenv("AGENTIC_BLOCK_GENERATE_AFTER_YES", "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    return agentic_get_bool("block_generate_after_yes", True)
 
 
 def _max_generate_passes() -> int:
@@ -437,16 +434,11 @@ def _max_generate_passes() -> int:
 
 
 def _block_generate_after_max_passes_enabled() -> bool:
-    return os.getenv("AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES", "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    return agentic_get_bool("block_generate_after_max_passes", True)
 
 
 def _blocked_generate_after_yes(prompt: str) -> tuple[ToolResponse, float, dict]:
-    """Env hard-stop: refuse generate_image after good_enough=YES (no diffusion call)."""
+    """Hydra hard-stop: refuse generate_image after good_enough=YES (no diffusion call)."""
     prompt_snip = (prompt or "").replace("\n", " ")[:240]
     text = (
         "generate_image blocked: a prior judge_image already returned good_enough=YES. "
@@ -467,7 +459,7 @@ def _blocked_generate_after_yes(prompt: str) -> tuple[ToolResponse, float, dict]
 
 
 def _blocked_generate_after_max_passes(prompt: str, *, n_gen: int, max_passes: int) -> tuple[ToolResponse, float, dict]:
-    """Env hard-stop: refuse further generate_image after the pass cap."""
+    """Hydra hard-stop: refuse further generate_image after the pass cap."""
     prompt_snip = (prompt or "").replace("\n", " ")[:240]
     text = (
         f"generate_image blocked: already completed {n_gen}/{max_passes} successful "
@@ -512,22 +504,19 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
             return _blocked_generate_after_max_passes(prompt, n_gen=n_gen, max_passes=max_passes)
 
     # vLLM-omni (continuous batching) — preferred.
-    vllm_omni_url = os.getenv("AGENTIC_VLLM_OMNI_URL", "").strip()
+    vllm_omni_url = agentic_get_str("vllm_omni_url")
     if vllm_omni_url:
         return _call_vllm_omni(prompt, vllm_omni_url)
 
-    qwen_image_url = os.getenv("AGENTIC_QWEN_IMAGE_URL", "").strip()
+    qwen_image_url = agentic_get_str("qwen_image_url")
     if qwen_image_url:
         return _call_generic_http(prompt, qwen_image_url, backend="qwen_image")
 
-    endpoint = os.getenv("AGENTIC_DIFFUSION_TOOL_URL", "").strip()
+    endpoint = agentic_get_str("diffusion_tool_url")
     if endpoint:
         return _call_generic_http(prompt, endpoint)
 
-    logger.warning(
-        "AGENTIC_QWEN_IMAGE_URL / AGENTIC_VLLM_OMNI_URL unset; "
-        "using text-only stub diffusion tool (acceptance smoke only)"
-    )
+    logger.warning("agentic_image_gen image URLs unset; using text-only stub diffusion tool (acceptance smoke only)")
     text = f"[stub diffusion result] No image service is configured. The requested prompt was: {prompt}"
     return _pack_response(prompt, text, images=[], reward=0.0, backend="stub", tool_stubbed=True)
 
@@ -572,10 +561,10 @@ def _call_vllm_omni(
         payload["seed"] = seed
 
     headers = {"Content-Type": "application/json"}
-    token = os.getenv("AGENTIC_DIFFUSION_TOOL_TOKEN")
+    token = agentic_get_str("diffusion_tool_token", "")
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    timeout = float(os.getenv("AGENTIC_DIFFUSION_TOOL_TIMEOUT", "900"))
+    timeout = agentic_get_float("diffusion_tool_timeout", 900.0)
     try:
         req = Request(
             f"{base}/v1/images/generations",
@@ -696,18 +685,18 @@ def _call_judge_vlm(
 ) -> tuple[str, dict]:
     """Call the frozen image-judge sidecar to judge the last generated image.
 
-    Requires ``AGENTIC_VLLM_URL`` (OpenAI ``/v1/chat/completions``).
+    Requires Hydra ``agentic_image_gen.vllm_url`` (OpenAI ``/v1/chat/completions``).
 
     Returns ``(text, meta)`` where *text* is formatted for the agent to read
     and *meta* carries per-dimension scores for logging.
     """
     user_request = _expand_judge_user_request(user_request)
     image_prompt = _expand_judge_image_prompt(image_prompt)
-    vllm_url = os.getenv("AGENTIC_VLLM_URL", "").strip()
+    vllm_url = agentic_get_str("vllm_url")
     if not vllm_url:
         return (
-            "[judge stub] AGENTIC_VLLM_URL unset — cannot score the image. "
-            "Start run_judge_image_tool_server.sh and export AGENTIC_VLLM_URL.",
+            "[judge stub] agentic_image_gen.vllm_url unset — cannot score the image. "
+            "Start run_judge_image_tool_server.sh and set agentic_image_gen.vllm_url.",
             {"stub": True},
         )
     return _call_judge_vllm(user_request, image_prompt, vllm_url)
@@ -739,8 +728,8 @@ def _call_judge_vllm(
         logger.error("%s", msg)
         return msg, {"error": str(exc), "image_path": image_path, "parse_ok": 0}
 
-    base_tokens = int(os.getenv("AGENTIC_REFLECT_MAX_NEW_TOKENS", "1024"))
-    max_retries = max(0, int(os.getenv("AGENTIC_JUDGE_PARSE_RETRIES", "1")))
+    base_tokens = agentic_get_int("reflect_max_new_tokens", 1024)
+    max_retries = max(0, agentic_get_int("judge_parse_retries", 1))
 
     last_raw = ""
     last_err = None

@@ -123,7 +123,7 @@ def _open_high_ca() -> str:
 @pytest.fixture(autouse=True)
 def _no_vl_sidecar(monkeypatch):
     """Stub VL fallback: gen-only / missing-judge blobs would otherwise call
-    ``call_reflect_vlm`` when ``AGENTIC_VLLM_URL`` is set in the operator env."""
+    ``call_reflect_vlm`` when ``agentic_image_gen.vllm_url`` is bound."""
     monkeypatch.setattr(agentic_reward, "call_reflect_vlm", lambda **_: None)
 
 

@@ -79,6 +79,35 @@ reset_active_trajectory_relpath = traj.reset_active_trajectory_relpath
 reset_active_user_prompt = traj.reset_active_user_prompt
 set_active_trajectory_relpath = traj.set_active_trajectory_relpath
 set_active_user_prompt = traj.set_active_user_prompt
+bind_agentic_image_gen = traj.bind_agentic_image_gen
+bind_run_artifact_env = traj.bind_run_artifact_env
+clear_agentic_image_gen = traj.clear_agentic_image_gen
+clear_run_artifacts = traj.clear_run_artifacts
+
+
+def _bind_tool_cfg(*, e2e_root=None, run_name="cpu_test", **overrides):
+    from omegaconf import OmegaConf
+
+    node = {
+        "vllm_omni_url": "",
+        "qwen_image_url": "",
+        "diffusion_tool_url": "",
+        "vllm_url": "",
+        "block_generate_after_yes": True,
+        "block_generate_after_max_passes": True,
+        "max_generate_image_passes": 3,
+        **overrides,
+    }
+    if e2e_root is not None:
+        node["e2e_root"] = str(e2e_root)
+    cfg = OmegaConf.create(
+        {
+            "trainer": {"experiment_name": run_name},
+            "agentic_image_gen": node,
+        }
+    )
+    bind_agentic_image_gen(cfg)
+    bind_run_artifact_env(cfg)
 
 
 def _load_tools_module():
@@ -108,8 +137,12 @@ def _clear_all_tool_artifacts() -> None:
 def _isolate_tool_artifact_registry():
     """Prior tests share ``step_*/sample_*`` keys; wipe leftover registry rows."""
     _clear_all_tool_artifacts()
+    clear_agentic_image_gen()
+    clear_run_artifacts()
     yield
     _clear_all_tool_artifacts()
+    clear_agentic_image_gen()
+    clear_run_artifacts()
 
 
 def _png_b64(color=(12, 34, 56)) -> str:
@@ -127,12 +160,8 @@ def test_tool_schemas_declare_both_functions():
     assert judge["parameters"]["required"] == ["user_request", "image_prompt"]
 
 
-def test_generate_image_stub_without_service(monkeypatch, tmp_path):
-    monkeypatch.delenv("AGENTIC_VLLM_OMNI_URL", raising=False)
-    monkeypatch.delenv("AGENTIC_QWEN_IMAGE_URL", raising=False)
-    monkeypatch.delenv("AGENTIC_DIFFUSION_TOOL_URL", raising=False)
-    monkeypatch.setenv("AGENTIC_E2E_ROOT", str(tmp_path))
-    monkeypatch.setenv("AGENTIC_E2E_RUN_NAME", "cpu_test")
+def test_generate_image_stub_without_service(tmp_path):
+    _bind_tool_cfg(e2e_root=tmp_path, run_name="cpu_test")
 
     response, reward, metrics = tools.generate_image("a cafe poster")
 
@@ -141,9 +170,8 @@ def test_generate_image_stub_without_service(monkeypatch, tmp_path):
     assert metrics["tool_stubbed"] is True
 
 
-def test_generate_image_blocked_after_yes(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENTIC_E2E_ROOT", str(tmp_path))
-    monkeypatch.setenv("AGENTIC_E2E_RUN_NAME", "cpu_test")
+def test_generate_image_blocked_after_yes(tmp_path):
+    _bind_tool_cfg(e2e_root=tmp_path, run_name="cpu_test")
     yes_token = tools.set_good_enough_yes_reached(True)
     try:
         response, reward, metrics = tools.generate_image("a cafe poster")
@@ -157,10 +185,8 @@ def test_generate_image_blocked_after_yes(monkeypatch, tmp_path):
     assert metrics["blocked_after_yes"] == 1
 
 
-def test_generate_image_blocked_after_max_passes(monkeypatch, tmp_path):
-    monkeypatch.setenv("AGENTIC_E2E_ROOT", str(tmp_path))
-    monkeypatch.setenv("AGENTIC_E2E_RUN_NAME", "cpu_test")
-    monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "1")
+def test_generate_image_blocked_after_max_passes(tmp_path):
+    _bind_tool_cfg(e2e_root=tmp_path, run_name="cpu_test", max_generate_image_passes=1)
     png = tmp_path / "image.png"
     Image.new("RGB", (1, 1), (1, 2, 3)).save(png)
 
@@ -177,10 +203,10 @@ def test_generate_image_blocked_after_max_passes(monkeypatch, tmp_path):
     assert metrics["generate_passes"] == 1
 
 
-def test_judge_image_stub_without_vllm(monkeypatch):
-    monkeypatch.delenv("AGENTIC_VLLM_URL", raising=False)
+def test_judge_image_stub_without_vllm():
+    _bind_tool_cfg(vllm_url="")
     response, reward, metrics = tools.judge_image("same as user message", "last")
-    assert "AGENTIC_VLLM_URL unset" in response.text
+    assert "agentic_image_gen.vllm_url unset" in response.text
     assert metrics["judge_stub"] is True
 
 

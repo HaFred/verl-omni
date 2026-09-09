@@ -16,8 +16,9 @@
 Primary reward C/A comes from ``agentic_judge ok=1`` observations already in the
 trajectory. This client is the fallback when those markers are missing.
 
-Uses ``AGENTIC_VLLM_URL`` (OpenAI ``/v1/chat/completions``, same as ``judge_image``).
-E2E runs require the vLLM judge sidecar; there is no legacy ``/reflect`` path.
+Uses Hydra ``agentic_image_gen.vllm_url`` (OpenAI ``/v1/chat/completions``,
+same as ``judge_image``). E2E runs require the vLLM judge sidecar; there is no
+legacy ``/reflect`` path.
 """
 
 from __future__ import annotations
@@ -25,10 +26,10 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 from pathlib import Path
 from urllib.request import Request, urlopen
 
+from verl_omni.tools.trajectory.hydra_env import agentic_get_bool, agentic_get_float, agentic_get_int, agentic_get_str
 from verl_omni.utils.agentic_image_judge_parse import build_judge_prompt, parse_judge_json
 
 logger = logging.getLogger(__name__)
@@ -36,12 +37,7 @@ logger = logging.getLogger(__name__)
 
 def judge_enable_thinking() -> bool:
     """Qwen3.5 defaults to long CoT; that burns ``max_tokens`` before JSON lands."""
-    return os.getenv("AGENTIC_JUDGE_ENABLE_THINKING", "0").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return agentic_get_bool("judge_enable_thinking", False)
 
 
 def post_vllm_chat(
@@ -54,8 +50,9 @@ def post_vllm_chat(
 ) -> tuple[str | None, str | None]:
     """POST OpenAI ``/v1/chat/completions``. Returns ``(raw_text, error)``."""
     thinking = judge_enable_thinking() if enable_thinking is None else bool(enable_thinking)
+    model = agentic_get_str("vllm_model")
     payload: dict = {
-        "model": os.getenv("AGENTIC_VLLM_MODEL", "").strip() or "",
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -71,7 +68,7 @@ def post_vllm_chat(
     }
     if not payload["model"]:
         del payload["model"]
-    timeout = float(os.getenv("AGENTIC_REFLECT_VLM_TIMEOUT", "120"))
+    timeout = agentic_get_float("reflect_vlm_timeout", 120.0)
     try:
         req = Request(
             f"{vllm_url.rstrip('/')}/v1/chat/completions",
@@ -144,8 +141,8 @@ def _call_vllm_openai(
         logger.warning("reflect VLM cannot read image %s: %s", image_path, exc)
         return None
 
-    base_tokens = int(os.getenv("AGENTIC_REFLECT_MAX_NEW_TOKENS", "1024"))
-    max_retries = max(0, int(os.getenv("AGENTIC_JUDGE_PARSE_RETRIES", "1")))
+    base_tokens = agentic_get_int("reflect_max_new_tokens", 1024)
+    max_retries = max(0, agentic_get_int("judge_parse_retries", 1))
 
     for attempt in range(max_retries + 1):
         strict = attempt > 0
@@ -174,13 +171,13 @@ def call_reflect_vlm(
     notes: str = "",
     image_path: str | None = None,
 ) -> dict | None:
-    """Score an image via frozen VL on ``AGENTIC_VLLM_URL``; ``None`` on failure.
+    """Score an image via frozen VL on ``agentic_image_gen.vllm_url``; ``None`` on failure.
 
     Requires a running vLLM OpenAI chat sidecar. On unset URL, missing image, or
     any transport/parse error, returns ``None`` so the reward scorer can zero C/A
     (no heuristic / legacy ``/reflect`` fallback).
     """
-    vllm_url = os.getenv("AGENTIC_VLLM_URL", "").strip()
+    vllm_url = agentic_get_str("vllm_url")
     if not vllm_url:
         return None
     if not image_path or not Path(image_path).is_file():

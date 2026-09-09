@@ -25,7 +25,7 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.utils import hf_tokenizer
 
 from verl_omni.tools.trajectory import (
-    bind_agentic_image_gen_env,
+    bind_agentic_image_gen,
     bind_run_artifact_env,
     build_trajectory_relpath,
     clear_good_enough_yes_reached,
@@ -73,7 +73,7 @@ class OmniAgentLoopWorker(AgentLoopWorker):
 
         # Bind by path string only — importing image_gen.py would double-register tools.
         bind_run_artifact_env(config)
-        bind_agentic_image_gen_env(config)
+        bind_agentic_image_gen(config)
         default_loop = None
         try:
             default_loop = config.actor_rollout_ref.rollout.agent.get("default_agent_loop")
@@ -140,7 +140,7 @@ class OmniAgentLoopManager(AgentLoopManager):
             config = args[0]
         if config is not None:
             bind_run_artifact_env(config)
-            bind_agentic_image_gen_env(config)
+            bind_agentic_image_gen(config)
         super().__init__(*args, **kwargs)
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))

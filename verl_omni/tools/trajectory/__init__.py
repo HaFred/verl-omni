@@ -42,7 +42,7 @@ from .context import (
     set_active_trajectory_relpath,
     set_active_user_prompt,
 )
-from .hydra_env import bind_agentic_image_gen_env
+from .hydra_env import bind_agentic_image_gen, bind_agentic_image_gen_env, clear_agentic_image_gen
 from .judge_latch import (
     clear_good_enough_yes_reached,
     get_good_enough_yes_reached,
@@ -52,23 +52,29 @@ from .paths import (
     bind_run_artifact_env,
     build_artifact_id,
     build_trajectory_relpath,
+    clear_run_artifacts,
+    get_run_name,
     resolve_rollout_images_root,
     resolve_run_dir,
 )
 
 __all__ = [
+    "bind_agentic_image_gen",
     "bind_agentic_image_gen_env",
     "bind_run_artifact_env",
     "build_artifact_id",
     "build_trajectory_relpath",
+    "clear_agentic_image_gen",
     "clear_good_enough_yes_reached",
     "clear_latest_tool_image_for_active_rollout",
+    "clear_run_artifacts",
     "count_live_generate_artifacts_for_active_rollout",
     "get_active_rollout_id",
     "get_active_trajectory_relpath",
     "get_active_user_prompt",
     "get_good_enough_yes_reached",
     "get_latest_generate_prompt_for_active_rollout",
+    "get_run_name",
     "register_tool_artifact",
     "reset_active_trajectory_relpath",
     "reset_active_user_prompt",

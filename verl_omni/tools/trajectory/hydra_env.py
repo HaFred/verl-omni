@@ -12,47 +12,95 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bind Hydra ``agentic_image_gen`` knobs into ``AGENTIC_*`` process env.
+"""Process-local store for Hydra ``agentic_image_gen`` knobs.
 
-FunctionTool sync bodies run under ``asyncio.to_thread`` and only see
-``os.getenv``. OmniAgentLoopWorker/Manager call this so Hydra is the source of
-truth while tools keep reading env (CPU tests may still monkeypatch env).
+``OmniAgentLoopWorker`` / ``OmniAgentLoopManager`` call
+``bind_agentic_image_gen`` so FunctionTool bodies (``asyncio.to_thread``) and
+agent-loop helpers can read the same knobs without ``os.getenv`` / AGENTIC_*
+env. Defaults mirror ``trainer/config/agentic/image_gen_tools.yaml``.
 """
 
 from __future__ import annotations
 
-import os
-from typing import Any
+from typing import Any, Mapping
 
-__all__ = ["bind_agentic_image_gen_env"]
+__all__ = [
+    "agentic_get",
+    "agentic_get_bool",
+    "agentic_get_float",
+    "agentic_get_int",
+    "agentic_get_str",
+    "bind_agentic_image_gen",
+    "bind_agentic_image_gen_env",
+    "clear_agentic_image_gen",
+    "get_agentic_image_gen",
+]
 
-# Hydra field name → AGENTIC_* env var.
-_AGENTIC_IMAGE_GEN_ENV: tuple[tuple[str, str], ...] = (
-    ("vllm_omni_url", "AGENTIC_VLLM_OMNI_URL"),
-    ("qwen_image_url", "AGENTIC_QWEN_IMAGE_URL"),
-    ("diffusion_tool_url", "AGENTIC_DIFFUSION_TOOL_URL"),
-    ("diffusion_tool_token", "AGENTIC_DIFFUSION_TOOL_TOKEN"),
-    ("diffusion_tool_timeout", "AGENTIC_DIFFUSION_TOOL_TIMEOUT"),
-    ("vllm_url", "AGENTIC_VLLM_URL"),
-    ("vllm_model", "AGENTIC_VLLM_MODEL"),
-    ("reflect_max_new_tokens", "AGENTIC_REFLECT_MAX_NEW_TOKENS"),
-    ("judge_parse_retries", "AGENTIC_JUDGE_PARSE_RETRIES"),
-    ("reflect_vlm_timeout", "AGENTIC_REFLECT_VLM_TIMEOUT"),
-    ("judge_enable_thinking", "AGENTIC_JUDGE_ENABLE_THINKING"),
-    ("block_generate_after_yes", "AGENTIC_BLOCK_GENERATE_AFTER_YES"),
-    ("block_generate_after_max_passes", "AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES"),
-    ("max_generate_image_passes", "AGENTIC_MAX_GENERATE_IMAGE_PASSES"),
-)
+# Defaults mirror verl_omni/trainer/config/agentic/image_gen_tools.yaml.
+_DEFAULTS: dict[str, Any] = {
+    "vllm_omni_url": "",
+    "qwen_image_url": "",
+    "diffusion_tool_url": "",
+    "diffusion_tool_token": None,
+    "diffusion_tool_timeout": 900,
+    "vllm_url": "",
+    "vllm_model": "",
+    "reflect_max_new_tokens": 1024,
+    "judge_parse_retries": 1,
+    "reflect_vlm_timeout": 120,
+    "judge_enable_thinking": False,
+    "block_generate_after_yes": True,
+    "block_generate_after_max_passes": True,
+    "max_generate_image_passes": 3,
+    "force_first_generate": False,
+    "force_first_warmup_steps": 10,
+    "force_first_end_step": 20,
+    "force_reflection_after_judge": True,
+    "rewrite_judge_before_generate": True,
+    "e2e_root": None,
+}
+
+_MISSING = object()
+
+_cfg: dict[str, Any] = {}
 
 
-def _as_env_str(value: Any) -> str:
-    if isinstance(value, bool):
-        return "1" if value else "0"
-    return str(value)
+def _node_to_dict(node: Any) -> dict[str, Any]:
+    if node is None:
+        return {}
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(node):
+            raw = OmegaConf.to_container(node, resolve=True)
+            return dict(raw) if isinstance(raw, dict) else {}
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(node, Mapping):
+        return dict(node)
+    out: dict[str, Any] = {}
+    for key in _DEFAULTS:
+        if hasattr(node, key):
+            out[key] = getattr(node, key)
+    return out
 
 
-def bind_agentic_image_gen_env(config: Any) -> None:
-    """Push non-null ``config.agentic_image_gen`` fields into ``AGENTIC_*`` env."""
+def clear_agentic_image_gen() -> None:
+    """Drop bound knobs so readers fall back to yaml defaults (tests)."""
+    global _cfg
+    _cfg = {}
+
+
+def get_agentic_image_gen() -> dict[str, Any]:
+    """Return bound knobs merged over defaults (shallow copy)."""
+    merged = dict(_DEFAULTS)
+    merged.update(_cfg)
+    return merged
+
+
+def bind_agentic_image_gen(config: Any) -> None:
+    """Store ``config.agentic_image_gen`` for process-local readers."""
+    global _cfg
     if config is None:
         return
     try:
@@ -61,12 +109,50 @@ def bind_agentic_image_gen_env(config: Any) -> None:
         node = getattr(config, "agentic_image_gen", None)
     if node is None:
         return
+    _cfg = _node_to_dict(node)
 
-    for field, env_name in _AGENTIC_IMAGE_GEN_ENV:
-        try:
-            value = node.get(field)
-        except Exception:  # noqa: BLE001
-            value = getattr(node, field, None)
-        if value is None:
-            continue
-        os.environ[env_name] = _as_env_str(value)
+
+def bind_agentic_image_gen_env(config: Any) -> None:
+    """Alias for ``bind_agentic_image_gen`` (historical name; no longer sets env)."""
+    bind_agentic_image_gen(config)
+
+
+def agentic_get(key: str, default: Any = _MISSING) -> Any:
+    """Read one ``agentic_image_gen`` field (bound value, else default, else yaml default)."""
+    if key in _cfg:
+        return _cfg[key]
+    if default is not _MISSING:
+        return default
+    return _DEFAULTS.get(key)
+
+
+def agentic_get_str(key: str, default: str = "") -> str:
+    value = agentic_get(key, default)
+    if value is None:
+        return default
+    return str(value).strip()
+
+
+def agentic_get_bool(key: str, default: bool = False) -> bool:
+    value = agentic_get(key, default)
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, int | float):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def agentic_get_int(key: str, default: int = 0) -> int:
+    value = agentic_get(key, default)
+    if value is None:
+        return default
+    return int(value)
+
+
+def agentic_get_float(key: str, default: float = 0.0) -> float:
+    value = agentic_get(key, default)
+    if value is None:
+        return default
+    return float(value)

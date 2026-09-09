@@ -17,10 +17,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any, Optional
 
+from verl_omni.tools.trajectory.hydra_env import agentic_get_bool, agentic_get_int
 from verl_omni.utils.agentic.max_passes import max_generate_passes
 
 __all__ = [
@@ -97,13 +97,7 @@ def maybe_per_rollout_seeds(meta_info: dict, batch_size: int, global_indices=Non
 
 
 def force_enabled() -> bool:
-    return os.getenv("AGENTIC_FORCE_REFLECTION_AFTER_JUDGE", "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-        "",
-    }
+    return agentic_get_bool("force_reflection_after_judge", True)
 
 
 def fits_response_budget(mask_len: int, n_new_ids: int, response_length: int) -> bool:
@@ -113,20 +107,19 @@ def fits_response_budget(mask_len: int, n_new_ids: int, response_length: int) ->
 
 def force_first_generate_probability(step: Any, *, validate: bool = False) -> float:
     """Return the linearly annealed probability of forcing the first tool call."""
-    enabled = os.getenv("AGENTIC_FORCE_FIRST_GENERATE", "0").strip().lower()
-    if validate or enabled not in {"1", "true", "yes", "on"}:
+    if validate or not agentic_get_bool("force_first_generate", False):
         return 0.0
     try:
         step_i = max(0, int(step))
     except (TypeError, ValueError):
         step_i = 0
     try:
-        warmup = max(0, int(os.getenv("AGENTIC_FORCE_FIRST_WARMUP_STEPS", "10")))
-    except ValueError:
+        warmup = max(0, agentic_get_int("force_first_warmup_steps", 10))
+    except (TypeError, ValueError):
         warmup = 10
     try:
-        end = max(warmup + 1, int(os.getenv("AGENTIC_FORCE_FIRST_END_STEP", "20")))
-    except ValueError:
+        end = max(warmup + 1, agentic_get_int("force_first_end_step", 20))
+    except (TypeError, ValueError):
         end = 20
     if step_i <= warmup:
         return 1.0
@@ -137,12 +130,7 @@ def force_first_generate_probability(step: Any, *, validate: bool = False) -> fl
 
 def rewrite_judge_before_generate() -> bool:
     """Return whether a first-turn judge call is rewritten to generate."""
-    return os.getenv("AGENTIC_REWRITE_JUDGE_BEFORE_GENERATE", "1").strip().lower() not in {
-        "0",
-        "false",
-        "off",
-        "no",
-    }
+    return agentic_get_bool("rewrite_judge_before_generate", True)
 
 
 def tool_calls_are_premature_judge(tool_calls: list[Any] | None) -> bool:

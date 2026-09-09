@@ -6,8 +6,9 @@
 
 # Mode (2a) frozen image-gen / judge tool knobs.
 # Composed as top-level ``agentic_image_gen`` on omni_trainer.
-# OmniAgentLoopWorker binds these into ``AGENTIC_*`` env vars so FunctionTool
-# bodies (asyncio.to_thread) can keep reading os.getenv.
+# OmniAgentLoopWorker / Manager bind this node into a process-local store
+# (``bind_agentic_image_gen``) so FunctionTool bodies and agent-loop helpers
+# read Hydra knobs without AGENTIC_* env vars.
 
 # vLLM-Omni OpenAI image generations base URL (``/v1/images/generations``).
 vllm_omni_url: ""
@@ -50,3 +51,21 @@ block_generate_after_max_passes: true
 
 # Cap on successful generate_image passes per rollout.
 max_generate_image_passes: 3
+
+# Teacher-force the first generate_image tool call (curriculum).
+force_first_generate: false
+
+# Steps at p=1.0 before linear anneal of force-first.
+force_first_warmup_steps: 10
+
+# Step at which force-first probability reaches 0.
+force_first_end_step: 20
+
+# Insert a forced reflection turn after a successful judge_image.
+force_reflection_after_judge: true
+
+# Rewrite a premature first-turn judge_image call into generate_image.
+rewrite_judge_before_generate: true
+
+# Optional dump root for traj / hermes / images (null → repo ``outputs/e2e``).
+e2e_root: null
