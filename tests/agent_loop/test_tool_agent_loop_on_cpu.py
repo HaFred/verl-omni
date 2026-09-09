@@ -99,9 +99,11 @@ def test_max_generate_passes_env(monkeypatch):
     monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "5")
     assert max_generate_passes() == 5
     monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "garbage")
-    assert max_generate_passes() == 3
+    with pytest.raises(ValueError, match="AGENTIC_MAX_GENERATE_IMAGE_PASSES"):
+        max_generate_passes()
     monkeypatch.setenv("AGENTIC_MAX_GENERATE_IMAGE_PASSES", "0")
-    assert max_generate_passes() == 1  # floored at 1
+    with pytest.raises(ValueError, match=">= 1"):
+        max_generate_passes()
 
 
 def test_force_first_generate_probability_schedule(monkeypatch):

@@ -150,10 +150,26 @@ def test_reward_tool_call_binary():
 def test_empty_response_is_hard_zero():
     out = compute_score("smoke", solution_str="")
     assert out["score"] == 0.0
+    assert out["method"] == "agentic_missing_solution_str"
     assert out["reward_tool_call"] == 0.0
     assert out["reward_correctness"] == 0.0
     assert out["reward_aesthetics"] == 0.0
     assert out["reward_done"] == 0.0
+
+
+def test_solution_image_without_text_raises():
+    with pytest.raises(ValueError, match="solution_str"):
+        compute_score("smoke", solution_image=object())
+
+
+def test_bad_weights_fail_loud():
+    out = compute_score(
+        "smoke",
+        solution_str=_closed(),
+        extra_info={"w_tool_call": 0.0, "w_correctness": 0.0, "w_aesthetics": 0.0, "w_done": 0.0},
+    )
+    assert out["method"] == "agentic_bad_weights"
+    assert out["score"] == 0.0
 
 
 def test_generate_image_tool_ok_zero_is_invalid_rollout():
