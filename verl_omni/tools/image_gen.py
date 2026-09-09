@@ -50,7 +50,6 @@ import hashlib
 import io
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -76,7 +75,13 @@ from verl_omni.tools.trajectory import (
     set_good_enough_yes_reached,
     set_latest_tool_image_path,
 )
-from verl_omni.tools.trajectory.hydra_env import agentic_get_bool, agentic_get_float, agentic_get_int, agentic_get_str
+from verl_omni.tools.trajectory.hydra_env import (
+    agentic_get,
+    agentic_get_bool,
+    agentic_get_float,
+    agentic_get_int,
+    agentic_get_str,
+)
 from verl_omni.utils.agentic.max_passes import max_generate_passes
 from verl_omni.utils.agentic_image_judge_parse import (
     build_judge_prompt,
@@ -521,13 +526,32 @@ def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
     return _pack_response(prompt, text, images=[], reward=0.0, backend="stub", tool_stubbed=True)
 
 
+def _require_hydra_int(key: str, default: int) -> int:
+    raw = agentic_get(key, default)
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"agentic_image_gen.{key} must be an integer, got {raw!r}") from exc
+
+
+def _require_hydra_float(key: str, default: float) -> float:
+    raw = agentic_get(key, default)
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"agentic_image_gen.{key} must be a float, got {raw!r}") from exc
+
+
 def _qwen_image_seed(prompt: str) -> int | None:
-    seed = os.getenv("QWEN_IMAGE_SEED")
-    if seed is None or seed == "":
+    raw = agentic_get("qwen_image_seed", None)
+    if raw is None or raw == "":
         return None
-    base_seed = int(seed)
+    try:
+        base_seed = int(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"agentic_image_gen.qwen_image_seed must be an integer or null, got {raw!r}") from exc
     relpath = get_active_trajectory_relpath() or get_active_rollout_id()
-    if not relpath or os.getenv("QWEN_IMAGE_DIVERSIFY_SEED", "1").strip().lower() in {"0", "false", "no"}:
+    if not relpath or not agentic_get_bool("qwen_image_diversify_seed", True):
         return base_seed
     generate_pass = count_live_generate_artifacts_for_active_rollout()
     material = f"{relpath}|{generate_pass}|{prompt}".encode()
@@ -541,10 +565,10 @@ def _call_vllm_omni(
 ) -> tuple[ToolResponse, float, dict]:
     """Call vLLM-Omni's OpenAI-compatible image-generation endpoint."""
     base = vllm_omni_url.rstrip("/")
-    height = int(os.getenv("QWEN_IMAGE_HEIGHT", "512"))
-    width = int(os.getenv("QWEN_IMAGE_WIDTH", "512"))
-    steps = int(os.getenv("QWEN_IMAGE_STEPS", "20"))
-    cfg = float(os.getenv("QWEN_IMAGE_TRUE_CFG_SCALE", "4.0"))
+    height = _require_hydra_int("qwen_image_height", 512)
+    width = _require_hydra_int("qwen_image_width", 512)
+    steps = _require_hydra_int("qwen_image_steps", 20)
+    cfg = _require_hydra_float("qwen_image_true_cfg_scale", 4.0)
     seed = _qwen_image_seed(prompt)
 
     payload: dict = {

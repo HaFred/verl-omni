@@ -24,7 +24,7 @@ Frozen Qwen3-VL judge serves dual role: (1) in-turn ``judge_image`` agent tool
 scores from the first ``good_enough=YES`` ``agentic_judge ok=1`` observation
 (protocol: YES → Done); otherwise the last successful judge. This blocks
 rewrite-after-YES roulette from replacing a good C/A with a failed last image.
-If absent, it falls back to ``call_reflect_vlm`` via ``AGENTIC_VLLM_URL``
+If absent, it falls back to ``call_reflect_vlm`` via ``agentic_image_gen.vllm_url``
 (OpenAI chat) **only** for a PNG under the rollout images root (never an
 arbitrary ``path=`` the policy wrote). There is no legacy ``/reflect`` path.
 C/A and closed-protocol credit require a real ``judge_image`` ``<tool_call>``;

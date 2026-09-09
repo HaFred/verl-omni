@@ -31,7 +31,6 @@ __all__ = [
     "agentic_get_int",
     "agentic_get_str",
     "bind_agentic_image_gen",
-    "bind_agentic_image_gen_env",
     "clear_agentic_image_gen",
     "get_agentic_image_gen",
 ]
@@ -40,6 +39,12 @@ __all__ = [
 _DEFAULTS: dict[str, Any] = {
     "vllm_omni_url": "",
     "qwen_image_url": "",
+    "qwen_image_seed": None,
+    "qwen_image_diversify_seed": True,
+    "qwen_image_height": 512,
+    "qwen_image_width": 512,
+    "qwen_image_steps": 20,
+    "qwen_image_true_cfg_scale": 4.0,
     "diffusion_tool_url": "",
     "diffusion_tool_token": None,
     "diffusion_tool_timeout": 900,
@@ -49,6 +54,7 @@ _DEFAULTS: dict[str, Any] = {
     "judge_parse_retries": 1,
     "reflect_vlm_timeout": 120,
     "judge_enable_thinking": False,
+    "good_enough_threshold": 0.80,
     "block_generate_after_yes": True,
     "block_generate_after_max_passes": True,
     "max_generate_image_passes": 3,
@@ -99,22 +105,23 @@ def get_agentic_image_gen() -> dict[str, Any]:
 
 
 def bind_agentic_image_gen(config: Any) -> None:
-    """Store ``config.agentic_image_gen`` for process-local readers."""
+    """Store ``config.agentic_image_gen`` for process-local readers.
+
+    Missing ``config`` or missing ``agentic_image_gen`` node clears a prior bind
+    so worker/test reuse cannot keep stale URLs or curriculum knobs.
+    """
     global _cfg
     if config is None:
+        _cfg = {}
         return
     try:
         node = config.get("agentic_image_gen")
     except Exception:  # noqa: BLE001 — DictConfig / plain dict / missing
         node = getattr(config, "agentic_image_gen", None)
     if node is None:
+        _cfg = {}
         return
     _cfg = _node_to_dict(node)
-
-
-def bind_agentic_image_gen_env(config: Any) -> None:
-    """Alias for ``bind_agentic_image_gen`` (historical name; no longer sets env)."""
-    bind_agentic_image_gen(config)
 
 
 def agentic_get(key: str, default: Any = _MISSING) -> Any:

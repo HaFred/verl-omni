@@ -26,7 +26,7 @@ from verl.utils import hf_tokenizer
 
 from verl_omni.tools.trajectory import (
     bind_agentic_image_gen,
-    bind_run_artifact_env,
+    bind_run_artifacts,
     build_trajectory_relpath,
     clear_good_enough_yes_reached,
     reset_active_trajectory_relpath,
@@ -72,7 +72,7 @@ class OmniAgentLoopWorker(AgentLoopWorker):
         from omegaconf import open_dict
 
         # Bind by path string only — importing image_gen.py would double-register tools.
-        bind_run_artifact_env(config)
+        bind_run_artifacts(config)
         bind_agentic_image_gen(config)
         default_loop = None
         try:
@@ -139,7 +139,7 @@ class OmniAgentLoopManager(AgentLoopManager):
         if config is None and args:
             config = args[0]
         if config is not None:
-            bind_run_artifact_env(config)
+            bind_run_artifacts(config)
             bind_agentic_image_gen(config)
         super().__init__(*args, **kwargs)
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")

@@ -25,7 +25,7 @@ from typing import Any
 from verl_omni.tools.trajectory.hydra_env import agentic_get
 
 __all__ = [
-    "bind_run_artifact_env",
+    "bind_run_artifacts",
     "build_artifact_id",
     "build_trajectory_relpath",
     "clear_run_artifacts",
@@ -83,14 +83,13 @@ def resolve_rollout_images_root() -> Path:
     return resolve_run_dir() / "rollout_images"
 
 
-def bind_run_artifact_env(config: Any) -> None:
+def bind_run_artifacts(config: Any) -> None:
     """Bind run-dir knobs from Hydra so driver + Ray workers share one layout.
 
     ``RUN_NAME`` comes from ``trainer.experiment_name``. ``ROOT`` comes from
     Hydra ``agentic_image_gen.e2e_root`` when set, else ``outputs/e2e``.
 
-    Must run on each AgentLoop worker before ``generate_image``. Historical
-    name kept; this no longer writes ``AGENTIC_E2E_*`` process env.
+    Must run on each AgentLoop worker before ``generate_image``.
     """
     global _run_name, _e2e_root, _diffusion_image_dir
     # Drop stale explicit image-dir overrides from a previous bind/test.

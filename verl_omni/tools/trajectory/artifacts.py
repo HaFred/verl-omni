@@ -44,8 +44,6 @@ _latest_image_by_rollout: dict[str, str] = {}
 _latest_tool_image_path: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentic_latest_tool_image_path", default=None
 )
-# Kept only as a same-thread fallback for unit tests / smoke without rollout_id.
-_latest_tool_image_tls = threading.local()
 
 
 def register_tool_artifact(
@@ -122,7 +120,7 @@ def clear_tool_artifacts_for_active_rollout() -> None:
 def count_live_generate_artifacts_for_active_rollout() -> int:
     """Count successful live ``generate_image`` PNGs for the active rollout.
 
-    Used by ``AGENTIC_BLOCK_GENERATE_AFTER_MAX_PASSES`` so the 4th+ generate is
+    Used by ``block_generate_after_max_passes`` so the 4th+ generate is
     refused even when force-reflection is off for RL.
     """
     rid = get_active_rollout_id()
@@ -163,7 +161,6 @@ def set_latest_tool_image_path(path: str | None) -> contextvars.Token:
                 _latest_image_by_rollout[rid] = str(path)
             else:
                 _latest_image_by_rollout.pop(rid, None)
-    _latest_tool_image_tls.path = path
     return _latest_tool_image_path.set(path)
 
 
@@ -177,9 +174,6 @@ def get_latest_tool_image_path() -> str | None:
     path = _latest_tool_image_path.get()
     if path and Path(path).is_file():
         return path
-    tls = getattr(_latest_tool_image_tls, "path", None)
-    if tls and Path(tls).is_file():
-        return tls
     return None
 
 

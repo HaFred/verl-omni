@@ -11,193 +11,92 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for OmniAgentLoop wiring and the dump helpers it delegates to.
-
-Helpers are loaded from source so this file stays runnable when the full
-``verl_omni`` package import chain is unavailable (heavy pipeline / CUDA deps).
-"""
+"""CPU tests for OmniAgentLoop wiring and the dump helpers it delegates to."""
 
 from __future__ import annotations
 
 import asyncio
-import importlib.util
-import sys
-import types
-from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
+from verl.experimental.agent_loop import AgentLoopManager
+from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 
-_VERL_OMNI = Path(__file__).resolve().parents[2] / "verl_omni"
-_AGENT_LOOP = _VERL_OMNI / "agent_loop"
-_TOOLS = _VERL_OMNI / "tools"
-_AGENTIC_UTILS = _VERL_OMNI / "utils" / "agentic"
-
-
-def _ensure_package(name: str, path: Path) -> types.ModuleType:
-    mod = sys.modules.get(name)
-    if mod is not None:
-        return mod
-    mod = types.ModuleType(name)
-    mod.__path__ = [str(path)]  # type: ignore[attr-defined]
-    sys.modules[name] = mod
-    return mod
-
-
-def _load(modname: str, path: Path, *, package_dir: Path | None = None):
-    _ensure_package("verl_omni", _VERL_OMNI)
-    _ensure_package("verl_omni.agent_loop", _AGENT_LOOP)
-    _ensure_package("verl_omni.tools", _TOOLS)
-    _ensure_package("verl_omni.utils", _VERL_OMNI / "utils")
-    _ensure_package("verl_omni.utils.agentic", _AGENTIC_UTILS)
-    if modname in sys.modules and hasattr(sys.modules[modname], "__file__"):
-        return sys.modules[modname]
-    search = [str(package_dir)] if package_dir is not None else None
-    spec = importlib.util.spec_from_file_location(modname, path, submodule_search_locations=search)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    if package_dir is not None:
-        mod.__path__ = [str(package_dir)]  # type: ignore[attr-defined]
-    sys.modules[modname] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_load(
-    "verl_omni.utils.metrics_utils",
-    _VERL_OMNI / "utils" / "metrics_utils.py",
+import verl_omni  # noqa: F401
+from verl_omni.agent_loop import omni_agent_loop
+from verl_omni.agent_loop.omni_agent_loop import OmniAgentLoopManager, OmniAgentLoopWorker
+from verl_omni.tools.trajectory import (
+    get_active_trajectory_relpath,
+    get_active_user_prompt,
+    reset_active_trajectory_relpath,
+    reset_active_user_prompt,
+    set_active_trajectory_relpath,
+    set_active_user_prompt,
 )
-rollout_parse = _load(
-    "verl_omni.utils.agentic.image_gen_rollout_parse",
-    _AGENTIC_UTILS / "image_gen_rollout_parse.py",
-)
-_TRAJECTORY = _TOOLS / "trajectory"
-traj_ctx = _load(
-    "verl_omni.tools.trajectory",
-    _TRAJECTORY / "__init__.py",
-    package_dir=_TRAJECTORY,
-)
-rollout_dump = _load(
-    "verl_omni.utils.agentic.image_gen_rollout_dump",
-    _AGENTIC_UTILS / "image_gen_rollout_dump.py",
+from verl_omni.utils.agentic.image_gen_rollout_dump import discard_invalid_rollouts
+from verl_omni.utils.agentic.image_gen_rollout_parse import (
+    extract_generate_image_prompts,
+    split_env_blob,
+    split_rollout_turns,
+    turn_kind,
 )
 
-turn_kind = rollout_parse.turn_kind
-extract_generate_image_prompts = rollout_parse.extract_generate_image_prompts
-split_env_blob = rollout_parse.split_env_blob
-split_rollout_turns = rollout_parse.split_rollout_turns
-discard_invalid_rollouts = rollout_dump.discard_invalid_rollouts
 
-
-def _load_omni_agent_loop():
-    """Load omni_agent_loop.py against stub AgentLoop* bases (no Ray)."""
+def test_worker_stamps_rollout_kwargs_and_resets_context(monkeypatch):
     captured: dict = {"kwargs": None}
 
-    class _AgentLoopWorker:
-        def __init__(self, *args, **kwargs):
-            del args, kwargs
+    async def _parent_run(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
+        del sampling_params, trajectory, agent_name, trace
+        captured["kwargs"] = dict(kwargs)
+        captured["relpath_during_run"] = get_active_trajectory_relpath()
+        captured["user_prompt_during_run"] = get_active_user_prompt()
+        return "ok"
 
-        async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
-            del sampling_params, trajectory, agent_name, trace
-            captured["kwargs"] = dict(kwargs)
-            captured["relpath_during_run"] = traj_ctx.get_active_trajectory_relpath()
-            captured["user_prompt_during_run"] = traj_ctx.get_active_user_prompt()
-            return "ok"
+    monkeypatch.setattr(AgentLoopWorker, "_run_agent_loop", _parent_run)
+    worker = OmniAgentLoopWorker.__new__(OmniAgentLoopWorker)
+    assert OmniAgentLoopWorker._AGENTIC_FUNCTION_TOOLS.is_file()
 
-    class _AgentLoopManager:
-        def __init__(self, *args, **kwargs):
-            del args, kwargs
-            self.model_config = {"path": "stub", "trust_remote_code": False}
-
-        def generate_sequences(self, prompts):
-            return prompts.output
-
-    agent_loop_pkg = types.ModuleType("verl.experimental.agent_loop")
-    agent_loop_mod = types.ModuleType("verl.experimental.agent_loop.agent_loop")
-    tool_loop_mod = types.ModuleType("verl.experimental.agent_loop.tool_agent_loop")
-    parser_mod = types.ModuleType("verl.experimental.agent_loop.tool_parser")
-    agent_loop_pkg.AgentLoopManager = _AgentLoopManager
-    agent_loop_mod.AgentLoopWorker = _AgentLoopWorker
-    agent_loop_mod.AgentLoopOutput = type("AgentLoopOutput", (), {})
-    agent_loop_mod.register = lambda name: (lambda cls: cls)
-    tool_loop_mod.AgentData = type("AgentData", (), {})
-    tool_loop_mod.AgentState = type("AgentState", (), {})
-    tool_loop_mod.ToolAgentLoop = type("ToolAgentLoop", (), {})
-    parser_mod.FunctionCall = type("FunctionCall", (), {})
-    utils_mod = types.ModuleType("verl.utils")
-    utils_mod.hf_tokenizer = lambda *args, **kwargs: object()
-
-    overlays = {
-        "verl": sys.modules.get("verl") or types.ModuleType("verl"),
-        "verl.experimental": sys.modules.get("verl.experimental") or types.ModuleType("verl.experimental"),
-        "verl.experimental.agent_loop": agent_loop_pkg,
-        "verl.experimental.agent_loop.agent_loop": agent_loop_mod,
-        "verl.experimental.agent_loop.tool_agent_loop": tool_loop_mod,
-        "verl.experimental.agent_loop.tool_parser": parser_mod,
-        "verl.utils": utils_mod,
-    }
-    saved = {name: sys.modules.get(name) for name in overlays}
-    sys.modules.update(overlays)
-    sys.modules.pop("verl_omni.agent_loop.omni_agent_loop", None)
-    sys.modules.pop("verl_omni.agent_loop.tool_agent_loop", None)
-    try:
-        omni = _load("verl_omni.agent_loop.omni_agent_loop", _AGENT_LOOP / "omni_agent_loop.py")
-    finally:
-        for name, prev in saved.items():
-            if prev is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
-    omni._captured = captured
-    return omni
-
-
-def test_worker_stamps_rollout_kwargs_and_resets_context():
-    omni = _load_omni_agent_loop()
-    worker = omni.OmniAgentLoopWorker.__new__(omni.OmniAgentLoopWorker)
-    assert omni.OmniAgentLoopWorker._AGENTIC_FUNCTION_TOOLS.is_file()
-
-    prior_path = traj_ctx.set_active_trajectory_relpath("prior/path")
-    prior_prompt = traj_ctx.set_active_user_prompt("prior prompt")
+    prior_path = set_active_trajectory_relpath("prior/path")
+    prior_prompt = set_active_user_prompt("prior prompt")
 
     async def _run_then_read_context():
-        result = await omni.OmniAgentLoopWorker._run_agent_loop(
+        result = await OmniAgentLoopWorker._run_agent_loop(
             worker,
             {},
             {"step": 7, "sample_index": 3, "rollout_n": 1, "validate": False},
             agent_name="image_gen_tool_agent",
             raw_prompt=[{"role": "user", "content": "draw a cafe poster"}],
         )
-        return result, traj_ctx.get_active_trajectory_relpath(), traj_ctx.get_active_user_prompt()
+        return result, get_active_trajectory_relpath(), get_active_user_prompt()
 
     try:
         result, path_after, prompt_after = asyncio.run(_run_then_read_context())
     finally:
-        traj_ctx.reset_active_user_prompt(prior_prompt)
-        traj_ctx.reset_active_trajectory_relpath(prior_path)
+        reset_active_user_prompt(prior_prompt)
+        reset_active_trajectory_relpath(prior_path)
 
-    captured = omni._captured["kwargs"]
     assert result == "ok"
-    assert captured["_agentic_step"] == 7
-    assert captured["_agentic_validate"] is False
-    assert captured["_agentic_trajectory_relpath"] == "step_000007/sample_3.01"
-    assert omni._captured["relpath_during_run"] == "step_000007/sample_3.01"
-    assert omni._captured["user_prompt_during_run"] == "draw a cafe poster"
+    assert captured["kwargs"]["_agentic_step"] == 7
+    assert captured["kwargs"]["_agentic_validate"] is False
+    assert captured["kwargs"]["_agentic_trajectory_relpath"] == "step_000007/sample_3.01"
+    assert captured["relpath_during_run"] == "step_000007/sample_3.01"
+    assert captured["user_prompt_during_run"] == "draw a cafe poster"
     assert path_after == "prior/path"
     assert prompt_after == "prior prompt"
 
 
-def test_manager_dumps_before_discarding_invalid_rollouts():
-    omni = _load_omni_agent_loop()
+def test_manager_dumps_before_discarding_invalid_rollouts(monkeypatch):
     order: list[str] = []
-    omni.dump_raw_rollouts = lambda **kwargs: order.append("dump") or kwargs
-    omni.discard_invalid_rollouts = lambda output: order.append("discard") or output
-    omni.AgenticRewardMetrics = types.SimpleNamespace(aggregate=lambda batch: {})
+    monkeypatch.setattr(AgentLoopManager, "generate_sequences", lambda self, prompts: prompts.output)
+    monkeypatch.setattr(omni_agent_loop, "dump_raw_rollouts", lambda **kwargs: order.append("dump") or kwargs)
+    monkeypatch.setattr(omni_agent_loop, "discard_invalid_rollouts", lambda output: order.append("discard") or output)
+    monkeypatch.setattr(omni_agent_loop, "AgenticRewardMetrics", SimpleNamespace(aggregate=lambda batch: {}))
 
-    manager = omni.OmniAgentLoopManager.__new__(omni.OmniAgentLoopManager)
+    manager = OmniAgentLoopManager.__new__(OmniAgentLoopManager)
     manager._monitor_tokenizer = object()
-    output = types.SimpleNamespace(non_tensor_batch={})
-    prompts = types.SimpleNamespace(meta_info={"global_steps": 4}, output=output)
-    assert omni.OmniAgentLoopManager.generate_sequences(manager, prompts) is output
+    output = SimpleNamespace(non_tensor_batch={})
+    prompts = SimpleNamespace(meta_info={"global_steps": 4}, output=output)
+    assert OmniAgentLoopManager.generate_sequences(manager, prompts) is output
     assert order == ["dump", "discard"]
 
 
@@ -277,16 +176,14 @@ def test_discard_invalid_rollouts_zeros_mask_but_restores_if_all_invalid():
 
     mask = _Mask([_MaskRow([1, 1]), _MaskRow([1, 1])])
     discard_invalid_rollouts(
-        types.SimpleNamespace(batch={"response_mask": mask}, non_tensor_batch={"rollout_valid": np.array([1, 0])})
+        SimpleNamespace(batch={"response_mask": mask}, non_tensor_batch={"rollout_valid": np.array([1, 0])})
     )
     assert mask.rows[0].vals == [1, 1]
     assert mask.rows[1].vals == [0, 0]
 
     all_invalid = _Mask([_MaskRow([1, 1]), _MaskRow([1, 0])])
     discard_invalid_rollouts(
-        types.SimpleNamespace(
-            batch={"response_mask": all_invalid}, non_tensor_batch={"rollout_valid": np.array([0, 0])}
-        )
+        SimpleNamespace(batch={"response_mask": all_invalid}, non_tensor_batch={"rollout_valid": np.array([0, 0])})
     )
     assert all_invalid.rows[0].vals == [1, 1]
     assert all_invalid.rows[1].vals == [1, 0]

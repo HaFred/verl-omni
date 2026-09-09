@@ -12,62 +12,31 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""CPU tests for Hydra ``agentic_image_gen`` process-local bind.
-
-Loads ``hydra_env`` via importlib so collection does not run
-``verl_omni/__init__.py`` (pipelines → heavy deps).
-"""
+"""CPU tests for Hydra ``agentic_image_gen`` process-local bind."""
 
 from __future__ import annotations
 
-import importlib.util
-import sys
-import types
-from pathlib import Path
+import os
 
+import pytest
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
-_VERL_OMNI = Path(__file__).resolve().parents[2] / "verl_omni"
-_HYDRA_ENV_PATH = _VERL_OMNI / "tools" / "trajectory" / "hydra_env.py"
-_OMNI_CONFIG_DIR = str(_VERL_OMNI / "trainer" / "config")
+import verl_omni
+from verl_omni.tools.trajectory.hydra_env import (
+    agentic_get,
+    agentic_get_bool,
+    agentic_get_str,
+    bind_agentic_image_gen,
+    clear_agentic_image_gen,
+)
+from verl_omni.utils.agentic_image_judge_parse import good_enough_threshold
 
-
-def _ensure_package(name: str, path: Path) -> types.ModuleType:
-    mod = sys.modules.get(name)
-    if mod is not None:
-        return mod
-    mod = types.ModuleType(name)
-    mod.__path__ = [str(path)]  # type: ignore[attr-defined]
-    sys.modules[name] = mod
-    return mod
-
-
-def _load_hydra_env():
-    _ensure_package("verl_omni", _VERL_OMNI)
-    _ensure_package("verl_omni.tools", _VERL_OMNI / "tools")
-    _ensure_package("verl_omni.tools.trajectory", _VERL_OMNI / "tools" / "trajectory")
-    spec = importlib.util.spec_from_file_location(
-        "verl_omni.tools.trajectory.hydra_env",
-        _HYDRA_ENV_PATH,
-    )
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-_hydra_env = _load_hydra_env()
-bind_agentic_image_gen = _hydra_env.bind_agentic_image_gen
-clear_agentic_image_gen = _hydra_env.clear_agentic_image_gen
-agentic_get = _hydra_env.agentic_get
-agentic_get_bool = _hydra_env.agentic_get_bool
-agentic_get_str = _hydra_env.agentic_get_str
+CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(verl_omni.__file__)), "trainer", "config")
 
 
 def test_omni_trainer_composes_agentic_image_gen():
-    with initialize_config_dir(config_dir=_OMNI_CONFIG_DIR, version_base=None):
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
         cfg = compose(config_name="omni_trainer")
     assert "agentic_image_gen" in cfg
     assert cfg.agentic_image_gen.max_generate_image_passes == 3
@@ -76,6 +45,13 @@ def test_omni_trainer_composes_agentic_image_gen():
     assert cfg.agentic_image_gen.force_reflection_after_judge is True
     assert cfg.agentic_image_gen.rewrite_judge_before_generate is True
     assert cfg.agentic_image_gen.e2e_root is None
+    assert cfg.agentic_image_gen.good_enough_threshold == 0.80
+    assert cfg.agentic_image_gen.qwen_image_height == 512
+    assert cfg.agentic_image_gen.qwen_image_width == 512
+    assert cfg.agentic_image_gen.qwen_image_steps == 20
+    assert cfg.agentic_image_gen.qwen_image_true_cfg_scale == 4.0
+    assert cfg.agentic_image_gen.qwen_image_seed is None
+    assert cfg.agentic_image_gen.qwen_image_diversify_seed is True
 
 
 def test_bind_agentic_image_gen_stores_diffusion_url():
@@ -107,19 +83,63 @@ def test_bind_agentic_image_gen_stores_diffusion_url():
     clear_agentic_image_gen()
 
 
-def test_bind_skips_missing_agentic_image_gen():
+def test_bind_stores_qwen_image_geometry_and_threshold():
     clear_agentic_image_gen()
     bind_agentic_image_gen(
         OmegaConf.create(
             {
                 "agentic_image_gen": {
-                    "diffusion_tool_url": "keep-me",
+                    "qwen_image_height": 256,
+                    "qwen_image_width": 384,
+                    "qwen_image_steps": 8,
+                    "qwen_image_true_cfg_scale": 2.5,
+                    "qwen_image_seed": 7,
+                    "qwen_image_diversify_seed": False,
+                    "good_enough_threshold": 0.6,
                 }
             }
         )
     )
-    bind_agentic_image_gen(OmegaConf.create({"trainer": {}}))
-    # Missing node leaves prior bind intact.
-    assert agentic_get_str("diffusion_tool_url") == "keep-me"
+    assert agentic_get("qwen_image_height") == 256
+    assert agentic_get("qwen_image_width") == 384
+    assert agentic_get("qwen_image_steps") == 8
+    assert agentic_get("qwen_image_true_cfg_scale") == 2.5
+    assert agentic_get("qwen_image_seed") == 7
+    assert agentic_get_bool("qwen_image_diversify_seed") is False
+    assert agentic_get("good_enough_threshold") == 0.6
     clear_agentic_image_gen()
+
+
+def test_bind_clears_stale_cfg_when_agentic_image_gen_missing():
+    clear_agentic_image_gen()
+    bind_agentic_image_gen(
+        OmegaConf.create(
+            {
+                "agentic_image_gen": {
+                    "diffusion_tool_url": "stale-url",
+                    "force_first_generate": True,
+                }
+            }
+        )
+    )
+    assert agentic_get_str("diffusion_tool_url") == "stale-url"
+    bind_agentic_image_gen(OmegaConf.create({"trainer": {}}))
     assert agentic_get_str("diffusion_tool_url") == ""
+    assert agentic_get_bool("force_first_generate") is False
+    bind_agentic_image_gen(None)
+    assert agentic_get_str("diffusion_tool_url") == ""
+    clear_agentic_image_gen()
+
+
+def test_good_enough_threshold_hydra_fail_closed():
+    clear_agentic_image_gen()
+    assert good_enough_threshold() == 0.80
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"good_enough_threshold": 0.6}}))
+    assert good_enough_threshold() == 0.6
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"good_enough_threshold": "garbage"}}))
+    with pytest.raises(ValueError, match="good_enough_threshold"):
+        good_enough_threshold()
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"good_enough_threshold": 1.5}}))
+    with pytest.raises(ValueError, match="good_enough_threshold"):
+        good_enough_threshold()
+    clear_agentic_image_gen()

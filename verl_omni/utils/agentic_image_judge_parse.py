@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from typing import Any
 
@@ -66,15 +65,20 @@ _AESTHETICS_QUESTIONS = {
 def good_enough_threshold() -> float:
     """Min C and A for good_enough=YES (client-side vLLM judge path).
 
-    Default 0.80: both axes must reach the 0.8 grid band (aligned with discrete
-    facet scores). Override with ``AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD`` or
-    ``AGENTIC_REFLECT_GOOD_ENOUGH``.
+    Reads Hydra ``agentic_image_gen.good_enough_threshold`` (default 0.80: both
+    axes must reach the 0.8 discrete-grid band). Garbage or out-of-range values
+    raise; they do not silently fall back to 0.80.
     """
-    raw = os.getenv("AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD") or os.getenv("AGENTIC_REFLECT_GOOD_ENOUGH") or "0.80"
+    from verl_omni.tools.trajectory.hydra_env import agentic_get
+
+    raw = agentic_get("good_enough_threshold", 0.80)
     try:
-        return float(raw)
-    except ValueError:
-        return 0.80
+        value = float(str(raw).strip())
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"agentic_image_gen.good_enough_threshold must be a float in [0, 1], got {raw!r}") from exc
+    if not 0.0 <= value <= 1.0:
+        raise ValueError(f"agentic_image_gen.good_enough_threshold must be in [0, 1], got {value}")
+    return value
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -205,8 +209,8 @@ def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
     thr = good_enough_threshold()
-    # Always derive YES/NO from scores × env threshold. Ignore any model-emitted
-    # ``good_enough`` flag so AGENTIC_JUDGE_GOOD_ENOUGH_THRESHOLD actually controls
+    # Always derive YES/NO from scores × Hydra threshold. Ignore any model-emitted
+    # ``good_enough`` flag so ``agentic_image_gen.good_enough_threshold`` controls
     # rewrite pressure. Rubber-stamps never count as YES.
     good_enough = (not rubber_stamp) and correctness >= thr and aesthetics >= thr
 

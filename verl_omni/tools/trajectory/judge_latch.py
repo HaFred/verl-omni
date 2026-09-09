@@ -36,7 +36,6 @@ __all__ = [
 _good_enough_yes_reached: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "agentic_good_enough_yes_reached", default=False
 )
-_good_enough_yes_tls = threading.local()
 _good_enough_yes_lock = threading.Lock()
 _good_enough_yes_by_scope: dict[object, bool] = {}
 
@@ -54,6 +53,7 @@ def _rollout_scope_key() -> object:
             return ("task", id(task))
     except RuntimeError:
         pass
+    # Sync unit tests with no task / rollout_id: isolate by OS thread.
     return ("thread", threading.get_ident())
 
 
@@ -66,7 +66,6 @@ def set_good_enough_yes_reached(reached: bool) -> contextvars.Token:
             _good_enough_yes_by_scope[key] = True
         else:
             _good_enough_yes_by_scope.pop(key, None)
-    _good_enough_yes_tls.reached = flag
     return _good_enough_yes_reached.set(flag)
 
 
@@ -75,12 +74,7 @@ def get_good_enough_yes_reached() -> bool:
         return True
     key = _rollout_scope_key()
     with _good_enough_yes_lock:
-        if _good_enough_yes_by_scope.get(key, False):
-            return True
-    # Sync unit-test / no-running-task fallback only.
-    if isinstance(key, tuple) and key[0] == "thread":
-        return bool(getattr(_good_enough_yes_tls, "reached", False))
-    return False
+        return bool(_good_enough_yes_by_scope.get(key, False))
 
 
 def clear_good_enough_yes_reached() -> None:
@@ -88,5 +82,4 @@ def clear_good_enough_yes_reached() -> None:
     key = _rollout_scope_key()
     with _good_enough_yes_lock:
         _good_enough_yes_by_scope.pop(key, None)
-    _good_enough_yes_tls.reached = False
     _good_enough_yes_reached.set(False)

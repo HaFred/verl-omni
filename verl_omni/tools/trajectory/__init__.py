@@ -42,14 +42,14 @@ from .context import (
     set_active_trajectory_relpath,
     set_active_user_prompt,
 )
-from .hydra_env import bind_agentic_image_gen, bind_agentic_image_gen_env, clear_agentic_image_gen
+from .hydra_env import bind_agentic_image_gen, clear_agentic_image_gen
 from .judge_latch import (
     clear_good_enough_yes_reached,
     get_good_enough_yes_reached,
     set_good_enough_yes_reached,
 )
 from .paths import (
-    bind_run_artifact_env,
+    bind_run_artifacts,
     build_artifact_id,
     build_trajectory_relpath,
     clear_run_artifacts,
@@ -60,8 +60,7 @@ from .paths import (
 
 __all__ = [
     "bind_agentic_image_gen",
-    "bind_agentic_image_gen_env",
-    "bind_run_artifact_env",
+    "bind_run_artifacts",
     "build_artifact_id",
     "build_trajectory_relpath",
     "clear_agentic_image_gen",
