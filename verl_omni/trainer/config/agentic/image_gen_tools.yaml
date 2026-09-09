@@ -1,0 +1,52 @@
+# Format checks enforced on CI:
+# 1. Comments must appear above each field.
+# 2. There must be a blank line between each field.
+# 3. Inline comments (after a field on the same line) are not allowed.
+# 4. Indentation level is respected for nested fields.
+
+# Mode (2a) frozen image-gen / judge tool knobs.
+# Composed as top-level ``agentic_image_gen`` on omni_trainer.
+# OmniAgentLoopWorker binds these into ``AGENTIC_*`` env vars so FunctionTool
+# bodies (asyncio.to_thread) can keep reading os.getenv.
+
+# vLLM-Omni OpenAI image generations base URL (``/v1/images/generations``).
+vllm_omni_url: ""
+
+# Bundled Qwen-Image HTTP service URL.
+qwen_image_url: ""
+
+# Generic diffusion tool HTTP endpoint (POST ``{"prompt"}`` → base64 images).
+diffusion_tool_url: ""
+
+# Optional bearer token for diffusion tool / vLLM-Omni image calls.
+diffusion_tool_token: null
+
+# HTTP timeout seconds for diffusion tool / vLLM-Omni image calls.
+diffusion_tool_timeout: 900
+
+# Frozen VL judge sidecar OpenAI chat base URL (``/v1/chat/completions``).
+vllm_url: ""
+
+# Optional model id for the judge OpenAI chat payload.
+vllm_model: ""
+
+# Max new tokens for judge / reflect VLM calls.
+reflect_max_new_tokens: 1024
+
+# Extra judge parse retries after the first attempt.
+judge_parse_retries: 1
+
+# HTTP timeout seconds for judge / reflect VLM calls.
+reflect_vlm_timeout: 120
+
+# Enable long chain-of-thought on the judge chat template (usually off).
+judge_enable_thinking: false
+
+# Block further generate_image after good_enough=YES.
+block_generate_after_yes: true
+
+# Block further generate_image after max successful passes.
+block_generate_after_max_passes: true
+
+# Cap on successful generate_image passes per rollout.
+max_generate_image_passes: 3

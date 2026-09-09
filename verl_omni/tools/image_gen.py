@@ -24,6 +24,13 @@ A separate frozen VL sidecar (``judge_image``) scores those images; the actor
 only sees text tool observations (scores / findings / ``path=``) and then
 writes ``Reflection:`` / ``Done.`` or a rewritten ``generate_image``.
 
+Config: Hydra ``agentic_image_gen`` (see
+``verl_omni/trainer/config/agentic/image_gen_tools.yaml``) is the source of
+truth. ``OmniAgentLoopWorker`` / ``OmniAgentLoopManager`` call
+``bind_agentic_image_gen_env`` so those knobs land in ``AGENTIC_*`` process
+env. Tools keep reading ``os.getenv`` because ``@function_tool`` sync bodies
+run under ``asyncio.to_thread`` and never receive Hydra / ``agent_data``.
+CPU tests may still monkeypatch the same env vars.
 
 Backends (first match wins):
   1. ``AGENTIC_VLLM_OMNI_URL`` — vLLM-Omni OpenAI image generations
