@@ -32,5 +32,8 @@ sample's first ``generate_image``). ContextVars + a rollout_id-keyed latch avoid
 
 ``BaseTool.execute(..., agent_data=...)`` remains the upstream path for truly stateful
 tools; we deliberately did not take it here so sidecar tools stay file-path registered
-and HTTP-stateless. See ``trajectory/`` for the ContextVar / registry / latch helpers.
+and HTTP-stateless. See ``trajectory/`` for ContextVar / registry / latch used by
+the tool bodies. See ``agent_helper/`` for *tool-agent* readers used by
+``ImageGenToolAgentLoop`` (curriculum / Hermes / forced Reflection) — not by
+``generate_image`` / ``judge_image``.
 """

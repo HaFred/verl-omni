@@ -16,77 +16,21 @@
 Primary reward C/A comes from ``agentic_judge ok=1`` observations already in the
 trajectory. This client is the fallback when those markers are missing.
 
-Uses Hydra ``agentic_image_gen.vllm_url`` (OpenAI ``/v1/chat/completions``,
-same as ``judge_image``). E2E runs require the vLLM judge sidecar; there is no
-legacy ``/reflect`` path.
+Scorer knobs come from ``extra_info`` (same channel as ``w_*``), not process-local
+``hydra_env`` — reward workers never call ``bind_agentic_image_gen``. Shared HTTP
+POST lives in ``verl_omni.utils.agentic.vllm_chat``.
 """
 
 from __future__ import annotations
 
 import base64
-import json
 import logging
 from pathlib import Path
-from urllib.request import Request, urlopen
 
-from verl_omni.tools.trajectory.hydra_env import agentic_get_bool, agentic_get_float, agentic_get_int, agentic_get_str
+from verl_omni.utils.agentic.vllm_chat import post_vllm_chat
 from verl_omni.utils.agentic_image_judge_parse import build_judge_prompt, parse_judge_json
 
 logger = logging.getLogger(__name__)
-
-
-def judge_enable_thinking() -> bool:
-    """Qwen3.5 defaults to long CoT; that burns ``max_tokens`` before JSON lands."""
-    return agentic_get_bool("judge_enable_thinking", False)
-
-
-def post_vllm_chat(
-    *,
-    vllm_url: str,
-    image_b64: str,
-    prompt_text: str,
-    max_tokens: int,
-    enable_thinking: bool | None = None,
-) -> tuple[str | None, str | None]:
-    """POST OpenAI ``/v1/chat/completions``. Returns ``(raw_text, error)``."""
-    thinking = judge_enable_thinking() if enable_thinking is None else bool(enable_thinking)
-    model = agentic_get_str("vllm_model")
-    payload: dict = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-                    {"type": "text", "text": prompt_text},
-                ],
-            }
-        ],
-        "max_tokens": int(max_tokens),
-        "temperature": 0.0,
-        "chat_template_kwargs": {"enable_thinking": thinking},
-    }
-    if not payload["model"]:
-        del payload["model"]
-    timeout = agentic_get_float("reflect_vlm_timeout", 120.0)
-    try:
-        req = Request(
-            f"{vllm_url.rstrip('/')}/v1/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(req, timeout=timeout) as resp:  # noqa: S310 - operator-configured
-            data = json.loads(resp.read().decode())
-    except Exception as exc:  # noqa: BLE001
-        return None, str(exc)
-    choices = data.get("choices") or []
-    raw_text = ""
-    if choices:
-        raw_text = str(choices[0].get("message", {}).get("content", "") or "")
-    if not raw_text:
-        return None, "empty_response"
-    return raw_text, None
 
 
 def _normalize_scored(data: dict, *, backend: str) -> dict | None:
@@ -134,6 +78,12 @@ def _call_vllm_openai(
     notes: str,
     image_path: str,
     vllm_url: str,
+    vllm_model: str = "",
+    reflect_max_new_tokens: int = 1024,
+    judge_parse_retries: int = 1,
+    reflect_vlm_timeout: float = 120.0,
+    judge_enable_thinking: bool = False,
+    good_enough_threshold: object | None = None,
 ) -> dict | None:
     try:
         image_b64 = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
@@ -141,8 +91,8 @@ def _call_vllm_openai(
         logger.warning("reflect VLM cannot read image %s: %s", image_path, exc)
         return None
 
-    base_tokens = agentic_get_int("reflect_max_new_tokens", 1024)
-    max_retries = max(0, agentic_get_int("judge_parse_retries", 1))
+    base_tokens = int(reflect_max_new_tokens)
+    max_retries = max(0, int(judge_parse_retries))
 
     for attempt in range(max_retries + 1):
         strict = attempt > 0
@@ -152,16 +102,25 @@ def _call_vllm_openai(
             image_b64=image_b64,
             prompt_text=build_judge_prompt(user_request, image_prompt, notes, strict_json=strict),
             max_tokens=tokens,
+            model=vllm_model,
+            timeout=float(reflect_vlm_timeout),
+            enable_thinking=bool(judge_enable_thinking),
         )
         if err is not None:
             logger.warning("reflect VLM OpenAI call failed (%s); C/A will be zeroed", err)
             return None
         assert raw_text is not None
-        parsed = parse_judge_json(raw_text)
+        parsed = parse_judge_json(raw_text, good_enough_threshold_value=good_enough_threshold)
         if parsed is not None:
             return _normalize_scored(parsed, backend="vllm")
         logger.warning("reflect VLM OpenAI unparseable (attempt=%d)", attempt)
     return None
+
+
+def _scorer_knob(extra_info: dict, key: str, default):
+    if key not in extra_info or extra_info[key] is None:
+        return default
+    return extra_info[key]
 
 
 def call_reflect_vlm(
@@ -170,14 +129,17 @@ def call_reflect_vlm(
     image_prompt: str,
     notes: str = "",
     image_path: str | None = None,
+    extra_info: dict | None = None,
 ) -> dict | None:
-    """Score an image via frozen VL on ``agentic_image_gen.vllm_url``; ``None`` on failure.
+    """Score an image via frozen VL; ``None`` on failure.
 
-    Requires a running vLLM OpenAI chat sidecar. On unset URL, missing image, or
-    any transport/parse error, returns ``None`` so the reward scorer can zero C/A
-    (no heuristic / legacy ``/reflect`` fallback).
+    Knobs (``vllm_url``, ``vllm_model``, reflect/judge timeouts & tokens) come from
+    ``extra_info`` — the same channel as ``w_*``. Does not read process-local
+    ``hydra_env`` (reward workers never bind it). On unset URL, missing image, or
+    any transport/parse error, returns ``None`` so the reward scorer can zero C/A.
     """
-    vllm_url = agentic_get_str("vllm_url")
+    info = dict(extra_info or {})
+    vllm_url = str(_scorer_knob(info, "vllm_url", "") or "").strip()
     if not vllm_url:
         return None
     if not image_path or not Path(image_path).is_file():
@@ -188,4 +150,10 @@ def call_reflect_vlm(
         notes=notes,
         image_path=image_path,
         vllm_url=vllm_url,
+        vllm_model=str(_scorer_knob(info, "vllm_model", "") or "").strip(),
+        reflect_max_new_tokens=int(_scorer_knob(info, "reflect_max_new_tokens", 1024)),
+        judge_parse_retries=int(_scorer_knob(info, "judge_parse_retries", 1)),
+        reflect_vlm_timeout=float(_scorer_knob(info, "reflect_vlm_timeout", 120.0)),
+        judge_enable_thinking=bool(_scorer_knob(info, "judge_enable_thinking", False)),
+        good_enough_threshold=_scorer_knob(info, "good_enough_threshold", 0.80),
     )

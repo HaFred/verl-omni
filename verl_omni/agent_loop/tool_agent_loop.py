@@ -30,7 +30,7 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.tool_parser import FunctionCall
 
-from verl_omni.agent_loop.utils import (
+from verl_omni.tools.agent_helper.image_gen_utils import (
     build_forced_reflection,
     count_successful_generates,
     count_successful_judges,
@@ -90,19 +90,6 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         finally:
             clear_good_enough_yes_reached()
             clear_latest_tool_image_for_active_rollout()
-            if path_tokens is not None:
-                reset_active_trajectory_relpath(path_tokens)
-
-    async def _call_tool(self, tool_call, tools_kwargs, agent_data):
-        # Re-bind trajectory path before each tool (tool threads may not see run()'s bind).
-        relpath = getattr(self, "_agentic_trajectory_relpath", None) or get_active_trajectory_relpath()
-        path_tokens = None
-        if relpath:
-            path_tokens = set_active_trajectory_relpath(relpath)
-            agent_data.extra_fields["trajectory_relpath"] = relpath
-        try:
-            return await super()._call_tool(tool_call, tools_kwargs, agent_data)
-        finally:
             if path_tokens is not None:
                 reset_active_trajectory_relpath(path_tokens)
 

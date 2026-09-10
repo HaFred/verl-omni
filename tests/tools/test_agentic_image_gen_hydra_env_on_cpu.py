@@ -133,6 +133,9 @@ def test_bind_clears_stale_cfg_when_agentic_image_gen_missing():
 
 def test_good_enough_threshold_hydra_fail_closed():
     clear_agentic_image_gen()
+    with pytest.raises(RuntimeError, match="unbound"):
+        good_enough_threshold()
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
     assert good_enough_threshold() == 0.80
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"good_enough_threshold": 0.6}}))
     assert good_enough_threshold() == 0.6
@@ -143,3 +146,25 @@ def test_good_enough_threshold_hydra_fail_closed():
     with pytest.raises(ValueError, match="good_enough_threshold"):
         good_enough_threshold()
     clear_agentic_image_gen()
+
+
+def test_agentic_get_unbound_fails_loud():
+    clear_agentic_image_gen()
+    with pytest.raises(RuntimeError, match="unbound"):
+        agentic_get("vllm_url")
+    with pytest.raises(RuntimeError, match="unbound"):
+        agentic_get_str("vllm_url")
+    # Explicit defaults still allowed for test helpers.
+    assert agentic_get("vllm_url", "") == ""
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
+    assert agentic_get_str("vllm_url") == ""
+    clear_agentic_image_gen()
+
+
+def test_yaml_defaults_are_single_source_of_truth():
+    from verl_omni.tools.trajectory.hydra_env import yaml_agentic_image_gen_defaults
+
+    defaults = yaml_agentic_image_gen_defaults()
+    assert defaults["max_generate_image_passes"] == 3
+    assert defaults["good_enough_threshold"] == 0.80
+    assert "vllm_url" in defaults

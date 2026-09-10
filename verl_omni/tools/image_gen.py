@@ -83,13 +83,13 @@ from verl_omni.tools.trajectory.hydra_env import (
     agentic_get_str,
 )
 from verl_omni.utils.agentic.max_passes import max_generate_passes
+from verl_omni.utils.agentic.vllm_chat import post_vllm_chat
 from verl_omni.utils.agentic_image_judge_parse import (
     build_judge_prompt,
     format_judge_observation,
     format_judge_parse_error,
     parse_judge_json,
 )
-from verl_omni.utils.reward_score.agentic_image_judge_client import post_vllm_chat
 
 logger = logging.getLogger(__file__)
 
@@ -767,6 +767,9 @@ def _call_judge_vllm(
             image_b64=image_b64,
             prompt_text=prompt_text,
             max_tokens=tokens,
+            model=agentic_get_str("vllm_model"),
+            timeout=agentic_get_float("reflect_vlm_timeout"),
+            enable_thinking=agentic_get_bool("judge_enable_thinking"),
         )
         if err is not None:
             last_err = err

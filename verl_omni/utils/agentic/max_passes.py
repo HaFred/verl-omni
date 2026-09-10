@@ -20,11 +20,12 @@ from verl_omni.tools.trajectory.hydra_env import agentic_get
 
 
 def max_generate_passes() -> int:
-    """Return Hydra ``max_generate_image_passes`` (default 3).
+    """Return Hydra ``max_generate_image_passes`` (yaml default when bound).
 
-    Raises ``ValueError`` when the bound value is not an integer ``>= 1``.
+    Raises ``RuntimeError`` when ``agentic_image_gen`` is unbound, and
+    ``ValueError`` when the bound value is not an integer ``>= 1``.
     """
-    raw = agentic_get("max_generate_image_passes", 3)
+    raw = agentic_get("max_generate_image_passes")
     try:
         value = int(str(raw).strip())
     except (TypeError, ValueError) as exc:

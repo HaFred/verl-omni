@@ -62,16 +62,18 @@ _AESTHETICS_QUESTIONS = {
 }
 
 
-def good_enough_threshold() -> float:
+def good_enough_threshold(raw: object | None = None) -> float:
     """Min C and A for good_enough=YES (client-side vLLM judge path).
 
-    Reads Hydra ``agentic_image_gen.good_enough_threshold`` (default 0.80: both
-    axes must reach the 0.8 discrete-grid band). Garbage or out-of-range values
-    raise; they do not silently fall back to 0.80.
+    When ``raw`` is omitted, reads Hydra ``agentic_image_gen.good_enough_threshold``
+    (yaml default 0.80 when bound). Reward workers should pass ``raw`` from
+    ``extra_info`` instead of relying on process-local bind. Garbage or
+    out-of-range values raise; they do not silently fall back to 0.80.
     """
-    from verl_omni.tools.trajectory.hydra_env import agentic_get
+    if raw is None:
+        from verl_omni.tools.trajectory.hydra_env import agentic_get
 
-    raw = agentic_get("good_enough_threshold", 0.80)
+        raw = agentic_get("good_enough_threshold")
     try:
         value = float(str(raw).strip())
     except (TypeError, ValueError) as exc:
@@ -148,7 +150,11 @@ def _annotate_rubber_stamp_findings(findings: str) -> str:
     return f"{text} {note}"
 
 
-def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
+def normalize_judge_payload(
+    data: dict[str, Any],
+    *,
+    good_enough_threshold_value: object | None = None,
+) -> dict[str, Any] | None:
     """Normalize a parsed judge dict into the canonical scored shape.
 
     Facet scores are snapped onto ``_SCORE_GRID``. Rubber-stamps (flat identical
@@ -208,7 +214,7 @@ def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     else:
         return None
 
-    thr = good_enough_threshold()
+    thr = good_enough_threshold(good_enough_threshold_value)
     # Always derive YES/NO from scores × Hydra threshold. Ignore any model-emitted
     # ``good_enough`` flag so ``agentic_image_gen.good_enough_threshold`` controls
     # rewrite pressure. Rubber-stamps never count as YES.
@@ -230,7 +236,7 @@ def normalize_judge_payload(data: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def parse_judge_json(text: str) -> dict[str, Any] | None:
+def parse_judge_json(text: str, *, good_enough_threshold_value: object | None = None) -> dict[str, Any] | None:
     """Extract C/A judge scores from VLM text (think blocks / fences / truncation)."""
     blob = (text or "").strip()
     blob = re.sub(r"<think>[\s\S]*?</think>", " ", blob, flags=re.IGNORECASE)
@@ -248,7 +254,7 @@ def parse_judge_json(text: str) -> dict[str, Any] | None:
             continue
         if not isinstance(data, dict):
             continue
-        normalized = normalize_judge_payload(data)
+        normalized = normalize_judge_payload(data, good_enough_threshold_value=good_enough_threshold_value)
         if normalized is None:
             continue
         # Prefer full facet dicts over scalar-only parses.
@@ -269,7 +275,8 @@ def parse_judge_json(text: str) -> dict[str, Any] | None:
                 "aesthetics": float(a_m.group(1)),
                 "findings": "parsed from truncated VLM text",
                 "suggested_fixes": "none",
-            }
+            },
+            good_enough_threshold_value=good_enough_threshold_value,
         )
     return None
 

@@ -529,6 +529,7 @@ def _vl_judge_correctness_aesthetics(
         image_prompt=image_prompt or "",
         notes="",
         image_path=image_path,
+        extra_info=extra_info or {},
     )
     if scored is None:
         return None, None, {}, {}

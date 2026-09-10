@@ -42,7 +42,11 @@ from .context import (
     set_active_trajectory_relpath,
     set_active_user_prompt,
 )
-from .hydra_env import bind_agentic_image_gen, clear_agentic_image_gen
+from .hydra_env import (
+    bind_agentic_image_gen,
+    clear_agentic_image_gen,
+    merge_agentic_scorer_knobs,
+)
 from .judge_latch import (
     clear_good_enough_yes_reached,
     get_good_enough_yes_reached,
@@ -60,6 +64,7 @@ from .paths import (
 
 __all__ = [
     "bind_agentic_image_gen",
+    "merge_agentic_scorer_knobs",
     "bind_run_artifacts",
     "build_artifact_id",
     "build_trajectory_relpath",

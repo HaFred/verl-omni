@@ -22,7 +22,7 @@ import pytest
 from omegaconf import OmegaConf
 
 import verl_omni  # noqa: F401
-from verl_omni.agent_loop import utils
+from verl_omni.tools.agent_helper import image_gen_utils as utils
 from verl_omni.tools.trajectory.hydra_env import bind_agentic_image_gen, clear_agentic_image_gen
 
 
@@ -48,13 +48,17 @@ def test_force_enabled_hydra_gate(value):
     clear_agentic_image_gen()
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"force_reflection_after_judge": value}}))
     assert u.force_enabled() is False
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
+    assert u.force_enabled() is True  # yaml default on
     clear_agentic_image_gen()
-    assert u.force_enabled() is True  # default on
 
 
 def test_max_generate_passes_hydra():
     u = utils
     clear_agentic_image_gen()
+    with pytest.raises(RuntimeError, match="unbound"):
+        u.max_generate_passes()
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
     assert u.max_generate_passes() == 3
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"max_generate_image_passes": 5}}))
     assert u.max_generate_passes() == 5
@@ -70,6 +74,7 @@ def test_max_generate_passes_hydra():
 def test_force_first_generate_probability_schedule():
     u = utils
     clear_agentic_image_gen()
+    # force_first_generate defaults False via explicit getter default → 0.0 even unbound
     assert u.force_first_generate_probability(5) == 0.0  # off by default
     assert u.force_first_generate_probability(5, validate=True) == 0.0  # never on val
     bind_agentic_image_gen(
@@ -84,16 +89,32 @@ def test_force_first_generate_probability_schedule():
         )
     )
     assert u.force_first_generate_probability(5) == 1.0  # warmup
+    assert u.force_first_generate_probability(None) == 1.0  # missing step → 0
     assert u.force_first_generate_probability(15) == pytest.approx(0.5)  # linear anneal
     assert u.force_first_generate_probability(20) == 0.0  # annealed off
-    assert u.force_first_generate_probability("not-an-int") == 1.0  # step coerced to 0
+    with pytest.raises(ValueError, match="step must be an int"):
+        u.force_first_generate_probability("not-an-int")
+    bind_agentic_image_gen(
+        OmegaConf.create(
+            {
+                "agentic_image_gen": {
+                    "force_first_generate": True,
+                    "force_first_warmup_steps": "garbage",
+                    "force_first_end_step": 20,
+                }
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="force_first_warmup_steps"):
+        u.force_first_generate_probability(5)
     clear_agentic_image_gen()
 
 
 def test_rewrite_judge_before_generate_hydra():
     u = utils
     clear_agentic_image_gen()
-    assert u.rewrite_judge_before_generate() is True  # default on
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
+    assert u.rewrite_judge_before_generate() is True  # yaml default on
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"rewrite_judge_before_generate": False}}))
     assert u.rewrite_judge_before_generate() is False
     clear_agentic_image_gen()
