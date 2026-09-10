@@ -272,6 +272,21 @@ def test_mismatched_transition_uris_are_rejected(tmp_path):
     assert report["rejections"][0]["reason"] == "transition_hash_mismatch"
 
 
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_empty_reflection_image_uris_are_rejected(tmp_path, blank):
+    bad = _reflection_row("blank", states=2)
+    bad["input_image"][0] = blank
+    output = _build(
+        tmp_path,
+        reflection_rows=[_reflection_row(f"good{i}", 1) for i in range(20)] + [bad],
+        breakdown_rows=[],
+    )
+    report = json.loads((output / "build_report.json").read_text())
+    assert report["rejection_count"] == 1
+    assert report["rejections"][0]["data_id"] == "blank"
+    assert report["rejections"][0]["reason"] == "missing_image"
+
+
 def test_hub_refs_main_beats_lexicographically_later_snapshot(tmp_path):
     root = tmp_path / "reflection"
     stale_sha = "ffffffffffffffffffffffffffffffffffffffff"

@@ -43,7 +43,7 @@ from typing import Any
 import pandas as pd
 
 from verl_omni.utils.dataset.visual_reflection import VisualReflectionDataError
-from verl_omni.utils.dataset.visual_reflection.contracts import derive_prompt_source_dedup_key
+from verl_omni.utils.dataset.visual_reflection.contracts import RejectionReason, derive_prompt_source_dedup_key
 from verl_omni.utils.dataset.visual_reflection.partition import assign_source_splits
 from verl_omni.utils.dataset.visual_reflection.unicot import (
     UNICOT_DATASET_ID,
@@ -108,10 +108,14 @@ class _TextOnlyImageResolver:
         index: int = 0,
         source_record_id: str | None = None,
     ) -> dict[str, str]:
-        del field, index
         uri = str(value).strip() if value is not None else ""
         if not uri:
-            uri = f"<no-image>:{source_record_id or 'unknown'}"
+            raise VisualReflectionDataError(
+                RejectionReason.MISSING_IMAGE,
+                f"{field}[{index}] has an empty image URI",
+                field=f"{field}[{index}]",
+                source_record_id=source_record_id,
+            )
         # Hash the URI/path only (no pixel IO) so mismatched output→next-input
         # chains still raise TRANSITION_HASH_MISMATCH.
         return {"uri": uri, "sha256": hashlib.sha256(uri.encode()).hexdigest()}
