@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import torch
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.tracking import RLInsightLogger
 from vllm_omni.lora.request import LoRARequest
 
 from verl_omni.pipelines.rollout_request import OmniRolloutRequest
@@ -213,7 +214,8 @@ class OmniStrategyBase(ABC):
         )
         lora_request = await self.server._resolve_lora_request()
         prompt, params = self.preprocess_input(request, sampling_params, lora_request)
-        final_res = await self.run_generation(prompt, params, request_id, lora_request, priority)
+        with RLInsightLogger.trace_state("vllm_generate", state_lane_id=f"replica_{self.server.replica_rank}"):
+            final_res = await self.run_generation(prompt, params, request_id, lora_request, priority)
         return self.process_output(final_res, params, sampling_params)
 
     @staticmethod
