@@ -54,6 +54,51 @@ __all__ = [
 ]
 
 
+def _stamp_scorer_knobs(output, config) -> None:
+    """Copy composed ``SCORER_KNOB_KEYS`` onto each sample ``extra_info``.
+
+    Args:
+        output: ``DataProto`` (or test stub) with ``non_tensor_batch``.
+        config: Composed Hydra config from the agent-loop manager.
+
+    Returns:
+        None. Mutates ``output.non_tensor_batch["extra_info"]`` in place.
+        Existing row keys win (same precedence as ``w_*``).
+    """
+    import numpy as np
+
+    from verl_omni.tools.trajectory.hydra_env import agentic_scorer_knobs_from_config
+
+    knobs = agentic_scorer_knobs_from_config(config)
+    ntb = getattr(output, "non_tensor_batch", None)
+    if ntb is None:
+        output.non_tensor_batch = {}
+        ntb = output.non_tensor_batch
+    extras = ntb.get("extra_info")
+    if extras is None:
+        n = 0
+        for value in ntb.values():
+            n = len(value)
+            break
+        if n == 0:
+            batch = getattr(output, "batch", None) or {}
+            for value in batch.values():
+                shape = getattr(value, "shape", None)
+                if shape:
+                    n = int(shape[0])
+                    break
+        extras = np.empty(n, dtype=object)
+        extras[:] = [{} for _ in range(n)]
+        ntb["extra_info"] = extras
+    stamped = np.empty(len(extras), dtype=object)
+    for index, info in enumerate(extras):
+        row = dict(info) if isinstance(info, dict) else {}
+        for key, value in knobs.items():
+            row.setdefault(key, value)
+        stamped[index] = row
+    ntb["extra_info"] = stamped
+
+
 class OmniAgentLoopWorker(AgentLoopWorker):
     """Bind trajectory Hydra knobs and pass step kwargs into the agent loop.
 
@@ -152,9 +197,13 @@ class OmniAgentLoopManager(AgentLoopManager):
         Returns:
             ``DataProto`` with invalid rollouts masked and metrics on
             ``meta_info["agentic_metrics"]`` and ``meta_info["timing"]``.
+            Each row ``extra_info`` also carries ``SCORER_KNOB_KEYS``.
         """
         step = prompts.meta_info.get("global_steps")
         output = super().generate_sequences(prompts)
+        # Stamp composed judge knobs onto each row before reward actors run.
+        # NaiveRewardManager / compute_score.remote never pass Hydra ``config``.
+        _stamp_scorer_knobs(output, self.config)
         # Dump before discard: discard zeros response_mask and hides tool-less prose.
         dump_raw_rollouts(tokenizer=self._monitor_tokenizer, output=output, step=step)
         discard_invalid_rollouts(output)

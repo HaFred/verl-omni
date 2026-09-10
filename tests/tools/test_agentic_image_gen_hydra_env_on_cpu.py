@@ -161,6 +161,13 @@ def test_agentic_get_unbound_fails_loud():
     clear_agentic_image_gen()
 
 
+def test_agentic_scorer_knobs_from_config_rejects_none():
+    from verl_omni.tools.trajectory.hydra_env import agentic_scorer_knobs_from_config
+
+    with pytest.raises(ValueError, match="composed Hydra config"):
+        agentic_scorer_knobs_from_config(None)
+
+
 def test_yaml_defaults_are_single_source_of_truth():
     from verl_omni.tools.trajectory.hydra_env import yaml_agentic_image_gen_defaults
 
@@ -170,18 +177,22 @@ def test_yaml_defaults_are_single_source_of_truth():
     assert "vllm_url" in defaults
 
 
-def test_merge_agentic_scorer_knobs_fills_defaults():
+def test_merge_agentic_scorer_knobs_requires_stamp_or_config():
     from omegaconf import OmegaConf
 
-    from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
+    from verl_omni.tools.trajectory.hydra_env import SCORER_KNOB_KEYS, merge_agentic_scorer_knobs
 
-    merged = merge_agentic_scorer_knobs({"w_tool_call": 0.1}, None)
+    with pytest.raises(ValueError, match="missing from extra_info"):
+        merge_agentic_scorer_knobs({"w_tool_call": 0.1}, None)
+
+    stamped = {key: "x" for key in SCORER_KNOB_KEYS}
+    stamped["w_tool_call"] = 0.1
+    merged = merge_agentic_scorer_knobs(stamped, None)
     assert merged["w_tool_call"] == 0.1
-    assert "good_enough_threshold" in merged
-    assert merged["good_enough_threshold"] == 0.80
-    assert "vllm_url" in merged
+    assert merged["good_enough_threshold"] == "x"
 
     cfg = OmegaConf.create({"agentic_image_gen": {"good_enough_threshold": 0.6, "vllm_url": "http://x"}})
-    merged2 = merge_agentic_scorer_knobs({}, cfg)
+    merged2 = merge_agentic_scorer_knobs({"w_tool_call": 0.1}, cfg)
     assert merged2["good_enough_threshold"] == 0.6
     assert merged2["vllm_url"] == "http://x"
+    assert merged2["w_tool_call"] == 0.1

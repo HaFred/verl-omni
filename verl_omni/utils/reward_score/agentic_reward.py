@@ -624,7 +624,8 @@ def compute_score(
         solution_str: Decoded trajectory text (tool calls + observations).
         ground_truth: Optional dict of mix weights / user request.
         extra_info: Mix weights and VL scorer knobs (same channel as ``w_*``).
-        **kwargs: May include ``config`` for ``merge_agentic_scorer_knobs``.
+            ``SCORER_KNOB_KEYS`` must already be stamped, or pass ``config``.
+        **kwargs: Optional ``config`` for ``merge_agentic_scorer_knobs``.
 
     Returns:
         Dict with ``score`` and per-term ``reward_*`` fields for the reward manager.
@@ -632,8 +633,9 @@ def compute_score(
     del data_source
     from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
 
-    # Reward actors never bind hydra_env; fill scorer knobs from yaml / driver.
-    # Existing extra_info values win (same precedence as w_*).
+    # Reward actors never bind hydra_env or receive Hydra ``config``.
+    # Driver stamps SCORER_KNOB_KEYS onto extra_info in generate_sequences;
+    # merge fails loud if those keys are missing when config is None.
     extra_info = merge_agentic_scorer_knobs(extra_info, kwargs.get("config"))
     gt = _as_dict(ground_truth)
 

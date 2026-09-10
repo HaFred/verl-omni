@@ -15,7 +15,9 @@
 """Process-local store for Hydra ``agentic_image_gen`` knobs.
 
 Yaml ``image_gen_tools.yaml`` is the default source of truth. Bind on the
-rollout worker; reward scorers should use ``merge_agentic_scorer_knobs``.
+rollout worker; stamp scorer knobs onto row ``extra_info`` in
+``generate_sequences``. Reward scorers call ``merge_agentic_scorer_knobs``
+and fail loud if those keys are missing when Hydra ``config`` is absent.
 """
 
 from __future__ import annotations
@@ -256,22 +258,30 @@ def agentic_get_float(key: str, default: Any = _MISSING) -> float:
 
 
 def agentic_scorer_knobs_from_config(config: Any) -> dict[str, Any]:
-    """Extract reward-side judge knobs from Hydra without binding this process.
+    """Extract reward-side judge knobs from a composed Hydra config.
 
     Args:
-        config: Hydra config, or ``None`` to use yaml defaults only.
+        config: Composed Hydra config (must include ``agentic_image_gen`` or yaml
+            defaults apply for missing keys). Must not be ``None``.
 
     Returns:
         Dict of ``SCORER_KNOB_KEYS`` values.
+
+    Raises:
+        ValueError: If ``config`` is ``None`` (yaml-only fill would hide CLI
+            overrides from ``compute_score.remote``).
     """
-    defaults = yaml_agentic_image_gen_defaults()
     if config is None:
-        node: Any = None
-    else:
-        try:
-            node = config.get("agentic_image_gen")
-        except (AttributeError, TypeError, KeyError):
-            node = getattr(config, "agentic_image_gen", None)
+        raise ValueError(
+            "agentic_scorer_knobs_from_config requires composed Hydra config; "
+            "OmniAgentLoopManager.generate_sequences stamps SCORER_KNOB_KEYS onto "
+            "extra_info so reward actors do not yaml-fill"
+        )
+    defaults = yaml_agentic_image_gen_defaults()
+    try:
+        node = config.get("agentic_image_gen")
+    except (AttributeError, TypeError, KeyError):
+        node = getattr(config, "agentic_image_gen", None)
     overrides = _node_to_dict(node) if node is not None else {}
     out: dict[str, Any] = {}
     for key in SCORER_KNOB_KEYS:
@@ -280,17 +290,30 @@ def agentic_scorer_knobs_from_config(config: Any) -> dict[str, Any]:
 
 
 def merge_agentic_scorer_knobs(extra_info: dict[str, Any] | None, config: Any = None) -> dict[str, Any]:
-    """Fill missing scorer knobs on ``extra_info`` from ``config`` or yaml defaults.
+    """Fill missing scorer knobs from composed ``config``, or require them on ``extra_info``.
 
     Args:
         extra_info: Existing sample knobs; present values win.
-        config: Optional composed Hydra config. ``None`` uses yaml file defaults.
+        config: Composed Hydra config. ``None`` means a reward actor: do not
+            yaml-fill; ``SCORER_KNOB_KEYS`` must already be on ``extra_info``.
 
     Returns:
-        Shallow copy of ``extra_info`` with missing scorer keys filled.
+        Shallow copy of ``extra_info`` with scorer keys present.
+
+    Raises:
+        ValueError: If ``config`` is ``None`` and any ``SCORER_KNOB_KEYS`` entry
+            is missing (driver failed to stamp).
     """
     merged = dict(extra_info or {})
-    knobs = agentic_scorer_knobs_from_config(config)
-    for key, value in knobs.items():
-        merged.setdefault(key, value)
+    if config is not None:
+        for key, value in agentic_scorer_knobs_from_config(config).items():
+            merged.setdefault(key, value)
+        return merged
+    missing = [key for key in SCORER_KNOB_KEYS if key not in merged or merged[key] is None]
+    if missing:
+        raise ValueError(
+            f"agentic scorer knobs missing from extra_info: {missing}; "
+            "OmniAgentLoopManager.generate_sequences must stamp SCORER_KNOB_KEYS "
+            "(NaiveRewardManager / compute_score.remote never pass Hydra config)"
+        )
     return merged

@@ -27,7 +27,20 @@ from pathlib import Path
 import pytest
 
 import verl_omni.utils.reward_score.agentic_reward as agentic_reward
-from verl_omni.utils.reward_score.agentic_reward import compute_score
+from verl_omni.tools.trajectory.hydra_env import SCORER_KNOB_KEYS, yaml_agentic_image_gen_defaults
+from verl_omni.utils.reward_score.agentic_reward import compute_score as _compute_score
+
+
+def _stamped_extra(extra_info: dict | None = None) -> dict:
+    """Simulate driver-stamped SCORER_KNOB_KEYS (generate_sequences)."""
+    filled = {key: yaml_agentic_image_gen_defaults()[key] for key in SCORER_KNOB_KEYS}
+    if extra_info:
+        filled.update(extra_info)
+    return filled
+
+
+def compute_score(*args, extra_info=None, **kwargs):
+    return _compute_score(*args, extra_info=_stamped_extra(extra_info), **kwargs)
 
 
 def _gen(prompt: str = "a bright red apple", path: str = "/tmp/a.png") -> str:
@@ -418,6 +431,11 @@ def test_vl_fallback_reads_png_under_rollout_root(tmp_path, monkeypatch):
     assert out["reward_aesthetics"] == pytest.approx(0.70)
     # Closed Done still requires a successful in-trajectory judge obs.
     assert out["reward_done"] == 0.0
+
+
+def test_compute_score_without_stamped_knobs_fails_loud():
+    with pytest.raises(ValueError, match="missing from extra_info"):
+        agentic_reward.compute_score(solution_str=_gen(), extra_info={"w_tool_call": 0.1})
 
 
 def test_compute_score_merges_scorer_knobs_into_extra_info(monkeypatch):

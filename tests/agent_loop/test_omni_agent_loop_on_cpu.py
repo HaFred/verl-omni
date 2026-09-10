@@ -84,6 +84,8 @@ def test_worker_stamps_rollout_kwargs_and_resets_context(monkeypatch):
 
 
 def test_manager_dumps_before_discarding_invalid_rollouts(monkeypatch):
+    from omegaconf import OmegaConf
+
     order: list[str] = []
     monkeypatch.setattr(AgentLoopManager, "generate_sequences", lambda self, prompts: prompts.output)
     monkeypatch.setattr(omni_agent_loop, "dump_raw_rollouts", lambda **kwargs: order.append("dump") or kwargs)
@@ -92,10 +94,31 @@ def test_manager_dumps_before_discarding_invalid_rollouts(monkeypatch):
 
     manager = OmniAgentLoopManager.__new__(OmniAgentLoopManager)
     manager._monitor_tokenizer = object()
-    output = SimpleNamespace(non_tensor_batch={})
+    manager.config = OmegaConf.create({"agentic_image_gen": {"vllm_url": "http://cli", "good_enough_threshold": 0.55}})
+    output = SimpleNamespace(non_tensor_batch={"extra_info": np.array([{"w_tool_call": 0.1}], dtype=object)})
     prompts = SimpleNamespace(meta_info={"global_steps": 4}, output=output)
     assert OmniAgentLoopManager.generate_sequences(manager, prompts) is output
     assert order == ["dump", "discard"]
+    extra = output.non_tensor_batch["extra_info"][0]
+    assert extra["vllm_url"] == "http://cli"
+    assert extra["good_enough_threshold"] == 0.55
+    assert extra["w_tool_call"] == 0.1
+
+
+def test_stamp_scorer_knobs_does_not_override_row_values():
+    from omegaconf import OmegaConf
+
+    output = SimpleNamespace(
+        non_tensor_batch={"extra_info": np.array([{"vllm_url": "http://row", "w_done": 0.2}], dtype=object)}
+    )
+    omni_agent_loop._stamp_scorer_knobs(
+        output,
+        OmegaConf.create({"agentic_image_gen": {"vllm_url": "http://cli", "good_enough_threshold": 0.55}}),
+    )
+    extra = output.non_tensor_batch["extra_info"][0]
+    assert extra["vllm_url"] == "http://row"
+    assert extra["good_enough_threshold"] == 0.55
+    assert extra["w_done"] == 0.2
 
 
 def test_turn_kind_stop_rewrite_and_continue():
