@@ -144,6 +144,20 @@ def test_plan_reward_covers_each_reference_subtask():
     assert output["reward_format"] == 1.0
 
 
+def test_plan_forced_reflection_counts_toward_format():
+    subtasks = ["A snowy market with wooden stalls and warm string lights."]
+    parts = ["Plan:", f"1. {subtasks[0]}", _generate(subtasks[0], "/tmp/image_00.png"), _judge("/tmp/image_00.png")]
+    parts.extend(("Reflection: injected stop cue agentic_forced_reflection=1", "Done."))
+    output = compute_score(
+        solution_str="\n".join(parts),
+        ground_truth=_ground_truth(task_type="plan", expected=1, reference_subtasks=subtasks),
+    )
+    assert output["forced_reflection_context"] == 1
+    assert output["terminal_policy_reflection"] == 0
+    assert output["reward_format"] == 1.0
+    assert output["protocol_ok"] == 1
+
+
 def test_format_reward_is_structural_check_ratio():
     complete = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth())
     open_loop = compute_score(
@@ -161,11 +175,20 @@ def test_format_reward_is_structural_check_ratio():
     assert open_loop["protocol_ok"] == 0
 
 
-def test_tool_reward_matches_pr1_tool_call_presence_indicator():
+def test_tool_reward_requires_successful_generate_and_trusted_judge():
     output = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth())
 
     assert output["reward_tool"] == 1.0
     assert output["reward_tool_call"] == 1.0
+
+    open_loop = compute_score(
+        solution_str=_generate("A poster.", "/tmp/image.png"),
+        ground_truth=_ground_truth(),
+    )
+    assert open_loop["rollout_valid"] == 1
+    assert open_loop["reward_tool"] == 0.0
+    assert open_loop["reward_tool_call"] == 1.0
+    assert open_loop["judge_parse_ok_rate"] == 0.0
 
     malformed = compute_score(
         solution_str="<tool_call>{bad json}</tool_call>\nagentic_tool ok=1 path=/tmp/image.png",
@@ -194,8 +217,12 @@ def test_plan_result_requires_exact_successful_image_count():
     assert short["reward_result"] == 0.0
 
 
-def test_reflect_result_allows_early_stop_but_rejects_over_generation():
-    early = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(expected=3))
+def test_reflect_result_requires_terminal_yes_and_rejects_over_generation():
+    early_yes = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(expected=3))
+    early_no = compute_score(
+        solution_str=_reflect_trajectory(accepted=False),
+        ground_truth=_ground_truth(expected=3),
+    )
     over = "\n".join(
         (
             _generate("version one", "/tmp/one.png"),
@@ -206,7 +233,8 @@ def test_reflect_result_allows_early_stop_but_rejects_over_generation():
     )
     over_output = compute_score(solution_str=over, ground_truth=_ground_truth(expected=1))
 
-    assert early["reward_result"] == 1.0
+    assert early_yes["reward_result"] == 1.0
+    assert early_no["reward_result"] == 0.0
     assert over_output["reward_result"] == 0.0
 
 
@@ -239,6 +267,16 @@ def test_zero_weights_keep_valid_rollout_but_zero_score():
 
     assert output["rollout_valid"] == 1
     assert output["score"] == 0.0
+
+
+def test_garbage_weights_fail_closed():
+    garbage = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(w_reflect="not-a-float"))
+    assert garbage["method"] == "agentic_multidim_bad_weights"
+    assert garbage["rollout_valid"] == 0
+    assert garbage["score"] == 0.0
+
+    negative = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(w_format=-1.0))
+    assert negative["method"] == "agentic_multidim_bad_weights"
 
 
 def test_done_indicator_requires_successful_judge_and_terminal_decision():
@@ -284,6 +322,8 @@ def test_forced_reflection_text_does_not_count_as_policy_reflection():
     assert output["terminal_policy_reflection"] == 0
     assert output["terminal_done"] == 1
     assert output["reward_done"] == 1.0
+    assert output["reward_format"] == 1.0
+    assert output["protocol_ok"] == 1
 
 
 def test_forced_reflection_text_does_not_inflate_reference_coverage():
@@ -303,6 +343,30 @@ def test_forced_reflection_text_does_not_inflate_reference_coverage():
 
     # Injected text contributes no coverage: only half of the 0.7 judge quality.
     assert output["reward_reflect"] == pytest.approx(0.35)
+
+
+def test_missing_or_invalid_task_type_fails_closed():
+    missing = compute_score(solution_str=_reflect_trajectory(), ground_truth={"user_request": "x"})
+    assert missing["method"] == "agentic_multidim_missing_task_type"
+    assert missing["rollout_valid"] == 0
+    assert missing["score"] == 0.0
+
+    bad = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(task_type="other"))
+    assert bad["method"] == "agentic_multidim_missing_task_type"
+    assert bad["score"] == 0.0
+
+    from_extra = compute_score(
+        solution_str=_reflect_trajectory(),
+        ground_truth={"user_request": "x", "expected_num_images": 1},
+        extra_info={"task_type": "reflect"},
+    )
+    assert from_extra["rollout_valid"] == 1
+    assert from_extra["task_type"] == "reflect"
+
+
+def test_solution_image_without_text_raises():
+    with pytest.raises(ValueError, match="solution_str"):
+        compute_score(ground_truth=_ground_truth(), solution_image=object())
 
 
 def test_qwen_xml_tool_calls_are_supported():
@@ -337,6 +401,7 @@ def test_empty_and_failed_generate_rollouts_are_hard_zero():
 
     assert empty["score"] == failed["score"] == 0.0
     assert empty["rollout_valid"] == failed["rollout_valid"] == 0
+    assert empty["judge_parse_ok_rate"] == 0.0
     assert failed["reward_tool_call"] == 1.0
 
 

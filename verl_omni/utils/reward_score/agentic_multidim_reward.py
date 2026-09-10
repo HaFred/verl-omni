@@ -18,16 +18,21 @@ and merged independently of RFC #302's rollout and data PRs. It accepts the
 trajectory text emitted by those PRs once they are present, but does not import
 their agent-loop or dataset modules.
 
+Wire with ``reward.reward_manager.name=naive`` so verl passes ``solution_str``.
+``VisualRewardManager``'s ``solution_image`` is the wrong modality and raises.
+
 The active reward set is ``{reflect, plan, format, tool, result}``. ``plan`` is
 active only for plan rows. ``done`` and ``tool_call`` reproduce the PR1
 closed-loop indicators for metrics, but are not additional score dimensions.
 Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
-receive score zero and ``rollout_valid=0``.
+receive score zero and ``rollout_valid=0``. ``task_type`` is required.
 
 Judge C/A is trusted only after a parsed ``judge_image`` ``<tool_call>`` and the
 tool observation header. Coverage is token F1 (not recall-only), so dumping
 reference words into a long blob does not max ``R_reflect`` / ``R_plan``.
-Rewrite-after-YES zeros ``R_result`` as well as the Done indicator.
+Rewrite-after-YES zeros ``R_result`` as well as the Done indicator. Reflect
+``R_result`` requires a terminal trusted YES. ``R_tool`` needs a successful
+PNG generate plus a trusted judge (not merely a parsed tool call).
 """
 
 from __future__ import annotations
@@ -64,7 +69,7 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
         "num_judge_image_calls": 0,
         "judge_parse_ok": 0,
         "judge_parse_fail": 0,
-        "judge_parse_ok_rate": 1.0,
+        "judge_parse_ok_rate": 0.0,
         "protocol_ok": 0,
         "rewrite_after_yes": 0,
         "rollout_valid": 0,
@@ -229,7 +234,7 @@ def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] |
             if _follows_judge_image_call(marker.start(), parsed_calls):
                 failed += 1
     total = ok + failed
-    return ok, failed, ok / total if total else 1.0
+    return ok, failed, (ok / total) if total else 0.0
 
 
 def _good_enough(window: str) -> bool | None:
@@ -354,7 +359,13 @@ def _plan_reward(text: str, ground_truth: dict[str, Any]) -> float:
     )
 
 
-def _format_reward(text: str, *, task_type: str, successful_generates: int) -> float:
+def _format_reward(
+    text: str,
+    *,
+    task_type: str,
+    successful_generates: int,
+    forced_context: bool = False,
+) -> float:
     raw_blocks = len(_TOOL_CALL_RE.findall(text))
     calls = _extract_tool_calls(text)
     names = [_tool_name(call) for _, _, call in calls]
@@ -368,9 +379,11 @@ def _format_reward(text: str, *, task_type: str, successful_generates: int) -> f
         terminal_done,
     ]
     if task_type == "plan":
-        checks.extend((bool(_extract_plan_lines(text)), policy_reflection))
+        checks.extend((bool(_extract_plan_lines(text)), policy_reflection or forced_context))
     else:
-        checks.append(bool(_REFLECTION_RE.search(_assistant_prose(text))))
+        # #409 force-injects Reflection (stripped from prose) then policy Done.
+        # Count forced_context so the default curriculum can still saturate format.
+        checks.append(bool(_REFLECTION_RE.search(_assistant_prose(text))) or forced_context)
     return sum(checks) / len(checks)
 
 
@@ -390,10 +403,72 @@ def _result_reward(
         return 1.0 if successful_generates == expected else 0.0
     judges = _successful_judges(text)
     final_yes = bool(judges) and judges[-1][2] is True
-    return 1.0 if successful_generates <= expected or final_yes else 0.0
+    # Fail closed on a terminal NO: early-stop alone is not a free result point.
+    return 1.0 if final_yes and successful_generates <= expected else 0.0
 
 
-def _active_weights(ground_truth: dict[str, Any], extra_info: dict[str, Any], *, task_type: str) -> dict[str, float]:
+def _resolve_solution_text(
+    solution_str: str,
+    *,
+    kwargs: dict[str, Any],
+    extra_info: dict[str, Any],
+) -> str:
+    """Resolve trajectory text for NaiveRewardManager (and optional decode).
+
+    ``solution_image`` from VisualRewardManager is the wrong modality — raise
+    instead of scoring an empty blob as zeros.
+    """
+    blob = (solution_str or "").strip()
+    if not blob:
+        alt = kwargs.get("solution_str")
+        if isinstance(alt, str):
+            blob = alt.strip()
+    if blob:
+        return blob
+
+    responses = kwargs.get("responses")
+    tokenizer = kwargs.get("tokenizer") or extra_info.get("tokenizer")
+    if responses is not None and tokenizer is not None:
+        try:
+            if hasattr(responses, "tolist"):
+                ids = responses.tolist()
+            else:
+                ids = list(responses)
+            if ids and isinstance(ids[0], list | tuple):
+                ids = list(ids[0])
+            decoded = tokenizer.decode(ids, skip_special_tokens=False)
+            if isinstance(decoded, str) and decoded.strip():
+                return decoded.strip()
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                "agentic_multidim_reward.compute_score failed to decode responses into solution_str"
+            ) from exc
+
+    if "solution_image" in kwargs:
+        raise ValueError(
+            "agentic_multidim_reward.compute_score requires solution_str (text trajectory). "
+            "Got solution_image from VisualRewardManager — set "
+            "reward.reward_manager.name=naive for Mode (2a)."
+        )
+    return ""
+
+
+def _require_task_type(ground_truth: dict[str, Any], extra_info: dict[str, Any]) -> str | None:
+    raw = ground_truth.get("task_type")
+    if raw is None:
+        raw = extra_info.get("task_type")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    task_type = str(raw).strip()
+    if task_type not in {"reflect", "plan"}:
+        return None
+    return task_type
+
+
+def _active_weights(
+    ground_truth: dict[str, Any], extra_info: dict[str, Any], *, task_type: str
+) -> dict[str, float] | None:
+    """Return positive active-set weights, or None if a ``w_*`` value is garbage."""
     weights = {}
     for dim in DIMS:
         if dim == "plan" and task_type != "plan":
@@ -401,10 +476,15 @@ def _active_weights(ground_truth: dict[str, Any], extra_info: dict[str, Any], *,
         raw = ground_truth.get(f"w_{dim}")
         if raw is None:
             raw = extra_info.get(f"w_{dim}")
-        try:
-            value = float(raw if raw is not None else 1.0)
-        except (TypeError, ValueError):
+        if raw is None:
             value = 1.0
+        else:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if value < 0:
+                return None
         if value > 0:
             weights[dim] = value
     return weights
@@ -417,19 +497,37 @@ def compute_score(
     extra_info: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, float | str | int | None]:
-    """Compute the RFC #302 stage-3 reward and its complete metric schema."""
-    del data_source, kwargs
-    text = solution_str or ""
+    """Compute the RFC #302 stage-3 reward and its complete metric schema.
+
+    Args:
+        data_source: Unused; kept for the verl ``compute_score`` signature.
+        solution_str: Decoded trajectory text (NaiveRewardManager).
+        ground_truth: Must include ``task_type`` (``reflect`` / ``plan``) plus
+            optional references and ``w_*`` weights.
+        extra_info: Fallback for ``task_type`` / weights; optional tokenizer.
+        **kwargs: May include ``responses`` + tokenizer, or ``solution_image``
+            (rejected).
+
+    Returns:
+        Dict with ``score``, per-dim ``reward_*``, and metric schema fields.
+    """
+    del data_source
     gt = _as_dict(ground_truth)
     metadata = dict(extra_info or {})
-    task_type = str(gt.get("task_type") or metadata.get("task_type") or "reflect")
-    if task_type not in {"reflect", "plan"}:
-        task_type = "reflect"
+    task_type = _require_task_type(gt, metadata)
+    if task_type is None:
+        return _zero_result(method="agentic_multidim_missing_task_type")
+    weights = _active_weights(gt, metadata, task_type=task_type)
+    if weights is None:
+        return _zero_result(method="agentic_multidim_bad_weights")
+
     try:
         expected = max(1, int(gt.get("expected_num_images", metadata.get("expected_num_images", 1))))
     except (TypeError, ValueError):
         expected = 1
 
+    text = _resolve_solution_text(solution_str, kwargs=kwargs, extra_info=metadata)
+    kwargs.pop("solution_image", None)
     if not text.strip():
         result = _zero_result(method="agentic_multidim_empty")
         result.update(task_type=task_type, expected_num_images=expected)
@@ -449,6 +547,7 @@ def compute_score(
         )
     )
     rewrites_after_yes = _generates_after_first_yes(text, calls)
+    tool_reward = float(successful_generates >= 1 and judge_ok >= 1)
 
     result = _zero_result(method="agentic_multidim")
     result.update(
@@ -466,6 +565,7 @@ def compute_score(
         task_type=task_type,
         rewrite_after_yes=rewrites_after_yes,
         reward_tool_call=float(bool(calls)),
+        reward_tool=tool_reward,
     )
     if not prompts or successful_generates == 0:
         return result
@@ -475,8 +575,13 @@ def compute_score(
     rewards = {
         "reflect": _reflection_reward(text, gt),
         "plan": _plan_reward(text, gt),
-        "format": _format_reward(text, task_type=task_type, successful_generates=successful_generates),
-        "tool": float(bool(calls)),
+        "format": _format_reward(
+            text,
+            task_type=task_type,
+            successful_generates=successful_generates,
+            forced_context=forced_context,
+        ),
+        "tool": tool_reward,
         "result": _result_reward(
             text,
             task_type=task_type,
@@ -487,7 +592,6 @@ def compute_score(
             rewrite_after_yes=rewrites_after_yes,
         ),
     }
-    weights = _active_weights(gt, metadata, task_type=task_type)
     weight_sum = sum(weights.values())
     score = sum(weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
     result.update(
