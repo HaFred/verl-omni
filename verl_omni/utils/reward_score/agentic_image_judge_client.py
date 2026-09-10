@@ -123,6 +123,15 @@ def _scorer_knob(extra_info: dict, key: str, default):
     return extra_info[key]
 
 
+def _require_scorer_knob(extra_info: dict, key: str):
+    if key not in extra_info or extra_info[key] is None:
+        raise KeyError(
+            f"agentic scorer knob {key!r} missing from extra_info; "
+            "driver must call merge_agentic_scorer_knobs (or pass the key explicitly)"
+        )
+    return extra_info[key]
+
+
 def call_reflect_vlm(
     *,
     user_request: str,
@@ -131,18 +140,25 @@ def call_reflect_vlm(
     image_path: str | None = None,
     extra_info: dict | None = None,
 ) -> dict | None:
-    """Score an image via frozen VL; ``None`` on failure.
+    """Score an image via frozen VL; ``None`` on transport/parse failure.
 
     Knobs (``vllm_url``, ``vllm_model``, reflect/judge timeouts & tokens) come from
     ``extra_info`` — the same channel as ``w_*``. Does not read process-local
-    ``hydra_env`` (reward workers never bind it). On unset URL, missing image, or
-    any transport/parse error, returns ``None`` so the reward scorer can zero C/A.
+    ``hydra_env`` (reward workers never bind it). ``good_enough_threshold`` must
+    be present on ``extra_info`` (raise if missing). Empty ``vllm_url`` logs a
+    warning and returns ``None`` (no silent 0.80 default).
     """
     info = dict(extra_info or {})
+    # Threshold must be explicit on extra_info (driver merge / compute_score).
+    good_enough_threshold = _require_scorer_knob(info, "good_enough_threshold")
     vllm_url = str(_scorer_knob(info, "vllm_url", "") or "").strip()
-    if not vllm_url:
-        return None
     if not image_path or not Path(image_path).is_file():
+        return None
+    if not vllm_url:
+        logger.warning(
+            "agentic VL fallback skipped: extra_info['vllm_url'] empty "
+            "(set agentic_image_gen.vllm_url or rely on trajectory judge markers)"
+        )
         return None
     return _call_vllm_openai(
         user_request=user_request,
@@ -155,5 +171,5 @@ def call_reflect_vlm(
         judge_parse_retries=int(_scorer_knob(info, "judge_parse_retries", 1)),
         reflect_vlm_timeout=float(_scorer_knob(info, "reflect_vlm_timeout", 120.0)),
         judge_enable_thinking=bool(_scorer_knob(info, "judge_enable_thinking", False)),
-        good_enough_threshold=_scorer_knob(info, "good_enough_threshold", 0.80),
+        good_enough_threshold=good_enough_threshold,
     )

@@ -122,12 +122,17 @@ def count_live_generate_artifacts_for_active_rollout() -> int:
 
     Used by ``block_generate_after_max_passes`` so the 4th+ generate is
     refused even when force-reflection is off for RL.
+
+    Returns 0 when no active rollout id is bound — never count every registry
+    row across concurrent rollouts.
     """
     rid = get_active_rollout_id()
+    if not rid:
+        return 0
     n = 0
     with _artifact_registry_lock:
         for entry in _artifact_registry:
-            if rid and entry.get("rollout_id") != rid:
+            if entry.get("rollout_id") != rid:
                 continue
             if entry.get("tool_stubbed"):
                 continue

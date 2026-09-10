@@ -168,3 +168,20 @@ def test_yaml_defaults_are_single_source_of_truth():
     assert defaults["max_generate_image_passes"] == 3
     assert defaults["good_enough_threshold"] == 0.80
     assert "vllm_url" in defaults
+
+
+def test_merge_agentic_scorer_knobs_fills_defaults():
+    from omegaconf import OmegaConf
+
+    from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
+
+    merged = merge_agentic_scorer_knobs({"w_tool_call": 0.1}, None)
+    assert merged["w_tool_call"] == 0.1
+    assert "good_enough_threshold" in merged
+    assert merged["good_enough_threshold"] == 0.80
+    assert "vllm_url" in merged
+
+    cfg = OmegaConf.create({"agentic_image_gen": {"good_enough_threshold": 0.6, "vllm_url": "http://x"}})
+    merged2 = merge_agentic_scorer_knobs({}, cfg)
+    assert merged2["good_enough_threshold"] == 0.6
+    assert merged2["vllm_url"] == "http://x"

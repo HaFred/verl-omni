@@ -240,7 +240,12 @@ def _last_successful_generate_image_path(text: str) -> str | None:
 
 
 def _rollout_image_roots(extra_info: dict[str, Any]) -> list[Path]:
-    """Directories the VL fallback is allowed to read."""
+    """Directories the VL fallback is allowed to read.
+
+    Roots must arrive on ``extra_info`` (``rollout_images_root`` /
+    ``agentic_images_root`` + optional ``trajectory_relpath``). Reward workers
+    never bind tools.trajectory — do not import it here.
+    """
     roots: list[Path] = []
     explicit = str(extra_info.get("rollout_images_root") or extra_info.get("agentic_images_root") or "").strip()
     relpath = str(extra_info.get("trajectory_relpath") or "").strip()
@@ -249,15 +254,6 @@ def _rollout_image_roots(extra_info: dict[str, Any]) -> list[Path]:
         roots.append(base)
         if relpath:
             roots.append(base / relpath)
-    try:
-        from verl_omni.tools.trajectory import resolve_rollout_images_root
-
-        env_root = resolve_rollout_images_root()
-        roots.append(env_root)
-        if relpath:
-            roots.append(env_root / relpath)
-    except Exception:  # noqa: BLE001
-        pass
     return roots
 
 
@@ -623,7 +619,11 @@ def compute_score(
 ) -> dict[str, float | str | int | None]:
     """Score an agentic image-generation trajectory for GRPO."""
     del data_source
-    extra_info = dict(extra_info or {})
+    from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
+
+    # Reward actors never bind hydra_env; fill scorer knobs from yaml / driver.
+    # Existing extra_info values win (same precedence as w_*).
+    extra_info = merge_agentic_scorer_knobs(extra_info, kwargs.get("config"))
     gt = _as_dict(ground_truth)
 
     blob = _resolve_solution_text(solution_str, kwargs=kwargs, extra_info=extra_info)

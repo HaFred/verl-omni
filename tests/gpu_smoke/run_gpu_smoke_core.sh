@@ -37,7 +37,7 @@ run_test 6 "diffusion composite agent loop" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
     python3 -m pytest -s tests/agent_loop/test_composite_agent_loop.py
 
-run_test 7 "OmniAgentLoopWorker image_gen too agent loop" \
+run_test 7 "OmniAgentLoopWorker image_gen tool agent loop" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
     python3 -m pytest -s tests/agent_loop/test_omni_agent_loop_worker_gpu.py
 

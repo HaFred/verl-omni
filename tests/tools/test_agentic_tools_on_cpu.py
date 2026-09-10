@@ -216,3 +216,22 @@ def test_qwen_image_geometry_and_seed_from_hydra(tmp_path):
     _bind_tool_cfg(e2e_root=tmp_path, qwen_image_height="garbage")
     with pytest.raises(ValueError, match="qwen_image_height"):
         image_gen._require_hydra_int("qwen_image_height", 512)
+
+
+def test_count_live_generate_artifacts_unbound_rid_is_zero(tmp_path):
+    """Missing active rollout id must not count every registry row."""
+    from verl_omni.tools import trajectory
+
+    _clear_all_tool_artifacts()
+    png = tmp_path / "orphan.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16)
+    # Register with an explicit rid while nothing is active on this task.
+    trajectory.register_tool_artifact(
+        prompt="orphan",
+        paths=[str(png)],
+        backend="qwen_image",
+        rollout_id="some_other_rollout",
+    )
+    assert trajectory.get_active_rollout_id() is None
+    assert trajectory.count_live_generate_artifacts_for_active_rollout() == 0
+    _clear_all_tool_artifacts()

@@ -154,43 +154,23 @@ class OmniAgentLoopManager(AgentLoopManager):
         discard_invalid_rollouts(output)
         metrics = AgenticRewardMetrics.aggregate(output.non_tensor_batch)
         if metrics:
-            # Stash for trainers / Tracking; avoid bare wandb.log (drops tensorboard).
             meta = getattr(output, "meta_info", None)
             if not isinstance(meta, dict):
                 output.meta_info = {}
                 meta = output.meta_info
+            # Keep a dedicated stash for L2 smoke / trainers that read agentic_metrics.
             existing = meta.get("agentic_metrics")
             if isinstance(existing, dict):
                 existing.update(metrics)
             else:
                 meta["agentic_metrics"] = dict(metrics)
-            # Fold into timing so stock PPO's timing_raw.update carries them into
-            # compute_timing_metrics → logger.log for every configured backend.
-            # Keys keep the agentic_reward/ prefix (logged as timing_s/... only if
-            # left in timing; prefer a parallel meta key + explicit emit below).
-            self._emit_agentic_metrics(metrics, step=step)
+            # Fold into timing so stock PPO's timing_raw.update(meta_info["timing"])
+            # carries rollout counters into compute_timing_metrics for every backend.
+            timing = meta.get("timing")
+            if not isinstance(timing, dict):
+                timing = {}
+                meta["timing"] = timing
+            timing.update(metrics)
+            step_i = int(step) if step is not None else None
+            logger.info("agentic_metrics step=%s %s", step_i, metrics)
         return output
-
-    def _emit_agentic_metrics(self, metrics: dict[str, float], *, step) -> None:
-        """Emit rollout metrics without assuming W&B is the only backend."""
-        backends: list[str] = []
-        try:
-            raw = self.config.trainer.get("logger", ["console"])
-            if isinstance(raw, str):
-                backends = [raw]
-            else:
-                backends = [str(b) for b in list(raw)]
-        except Exception:  # noqa: BLE001
-            backends = ["console"]
-
-        step_i = int(step) if step is not None else None
-        if "wandb" in backends or "tracking" in backends:
-            try:
-                import wandb
-
-                if wandb.run is not None:
-                    wandb.log(metrics, step=step_i, commit=False)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Failed to log agentic metrics to W&B: %s", exc)
-        # Console / file backends: always leave a structured breadcrumb.
-        logger.info("agentic_metrics step=%s %s", step_i, metrics)

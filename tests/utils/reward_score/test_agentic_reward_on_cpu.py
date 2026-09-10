@@ -418,3 +418,36 @@ def test_vl_fallback_reads_png_under_rollout_root(tmp_path, monkeypatch):
     assert out["reward_aesthetics"] == pytest.approx(0.70)
     # Closed Done still requires a successful in-trajectory judge obs.
     assert out["reward_done"] == 0.0
+
+
+def test_compute_score_merges_scorer_knobs_into_extra_info(monkeypatch):
+    """compute_score must merge yaml/Hydra scorer knobs onto extra_info before scoring."""
+    import verl_omni.utils.reward_score.agentic_reward as agentic_reward
+
+    captured = {}
+
+    def _fake_merge(extra_info, config=None):
+        merged = dict(extra_info or {})
+        merged.setdefault("good_enough_threshold", 0.80)
+        merged.setdefault("vllm_url", "")
+        captured["merged"] = merged
+        return merged
+
+    monkeypatch.setattr(
+        "verl_omni.tools.trajectory.hydra_env.merge_agentic_scorer_knobs",
+        _fake_merge,
+    )
+    # Minimal valid generate trajectory (no VL fallback needed).
+    text = (
+        "<tool_call>\n"
+        '{"name": "generate_image", "arguments": {"prompt": "a cat"}}\n'
+        "</tool_call>\n"
+        "agentic_tool ok=1 path=/tmp/x.png\n"
+        "agentic_judge ok=1 correctness=0.8 aesthetics=0.8 good_enough=YES\n"
+        "<tool_call>\n"
+        '{"name": "judge_image", "arguments": {"user_request": "a cat", "image_prompt": "last"}}\n'
+        "</tool_call>\n"
+    )
+    agentic_reward.compute_score(solution_str=text, extra_info={"w_tool_call": 0.1})
+    assert captured["merged"]["good_enough_threshold"] == 0.80
+    assert captured["merged"]["w_tool_call"] == 0.1

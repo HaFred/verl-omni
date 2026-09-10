@@ -82,6 +82,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             output.extra_fields.setdefault("forced_first_judge", False)
             output.extra_fields.setdefault("rewrote_judge_before_generate", False)
             output.extra_fields.setdefault("force_first_probability", 0.0)
+            output.extra_fields.setdefault("force_first_swap_rejected", False)
             output.extra_fields.setdefault("num_generate_image_prompts", 0)
             output.extra_fields.setdefault("rollout_has_generate", 0)
             output.extra_fields.setdefault("rollout_valid", 0)
@@ -171,6 +172,14 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         agent_data.tool_calls = [tool_call]
         return AgentState.PROCESSING_TOOLS
 
+    def _record_force_first_swap_rejected(self, agent_data: AgentData, *, reason: str) -> None:
+        agent_data.extra_fields["force_first_swap_rejected"] = True
+        logger.info(
+            "Force-first Hermes swap rejected (%s) at global_step=%s; keeping TERMINATED state",
+            reason,
+            getattr(self, "_agentic_step", 0),
+        )
+
     async def _handle_generating_state(
         self,
         agent_data: AgentData,
@@ -215,6 +224,12 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         ):
             return state
 
+        # Parent may have terminated on max_assistant_turns before tool extract —
+        # do not reopen PROCESSING_TOOLS past that budget.
+        max_turns = getattr(self, "max_assistant_turns", None)
+        if max_turns and int(getattr(agent_data, "assistant_turns", 0)) >= int(max_turns):
+            return state
+
         n_judge = count_successful_judges(agent_data.messages)
 
         # First turn with no tools → teacher-force generate_image.
@@ -229,6 +244,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             )
             new_state = await self._replace_last_assistant_with_tool_call(agent_data, hermes, tool_call)
             if new_state is None:
+                self._record_force_first_swap_rejected(agent_data, reason="generate_image_over_budget")
                 return state
             agent_data.extra_fields["forced_first_generate"] = True
             agent_data.extra_fields["_forced_generate_prompt"] = prompt
@@ -257,6 +273,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             )
             new_state = await self._replace_last_assistant_with_tool_call(agent_data, hermes, tool_call)
             if new_state is None:
+                self._record_force_first_swap_rejected(agent_data, reason="judge_image_over_budget")
                 return state
             agent_data.extra_fields["forced_first_judge"] = True
             logger.info(
