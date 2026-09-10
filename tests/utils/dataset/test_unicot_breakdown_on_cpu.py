@@ -107,6 +107,8 @@ def test_source_record_override_must_match_data_id():
         (lambda row: row["subtasks"].__setitem__(2, "gap"), RejectionReason.CONTRADICTORY_TERMINAL),
         (lambda row: row["subtask_images"].__setitem__(2, "ghost.png"), RejectionReason.CONTRADICTORY_TERMINAL),
         (lambda row: row["subtask_images"].__setitem__(0, 42), RejectionReason.INVALID_FIELD_TYPE),
+        (lambda row: row["subtask_images"].__setitem__(0, None), RejectionReason.MISSING_IMAGE),
+        (lambda row: row["subtask_images"].__setitem__(0, ""), RejectionReason.MISSING_IMAGE),
     ],
 )
 def test_malformed_plan_rows_fail_closed(mutation, reason):

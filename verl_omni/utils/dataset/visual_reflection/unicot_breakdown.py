@@ -147,12 +147,19 @@ def parse_unicot_breakdown_record(
         if index < first_none:
             plan_subtasks.append(require_nonempty_text(value, field=f"subtasks[{index}]", source_record_id=record_id))
             image = subtask_images[index]
-            if image is not None:
-                require_nonempty_text(
-                    image,
+            if image is None:
+                raise VisualReflectionDataError(
+                    RejectionReason.MISSING_IMAGE,
+                    f"subtask_images[{index}] is required for an active plan slot",
                     field=f"subtask_images[{index}]",
                     source_record_id=record_id,
                 )
+            require_nonempty_text(
+                image,
+                field=f"subtask_images[{index}]",
+                reason=RejectionReason.MISSING_IMAGE,
+                source_record_id=record_id,
+            )
             continue
         if value is not None:
             raise VisualReflectionDataError(

@@ -172,6 +172,9 @@ def test_no_breakdown_rows_become_single_image_reflect_tasks(tmp_path):
         assert ground_truth["task_type"] == "reflect"
         assert ground_truth["expected_num_images"] == 1
         assert ground_truth["plan_expected"] is False
+    assert set(rows["data_source"]) == {builder.REFLECT_DATA_SOURCE}
+    for extra in rows["extra_info"]:
+        assert extra["unicot_source"] == builder.UNICOT_BREAKDOWN_DATASET_ID
 
 
 def test_rejections_are_reported_and_dropped(tmp_path):
@@ -253,3 +256,87 @@ def test_requires_a_source_and_valid_ratios(tmp_path):
     common["mix_ratio"] = 1.1
     with pytest.raises(SystemExit):
         builder.main_cli(**common)
+
+
+def test_mismatched_transition_uris_are_rejected(tmp_path):
+    bad = _reflection_row("bad", states=2)
+    bad["output_image"][0] = "./images/not_the_next_input.png"
+    output = _build(
+        tmp_path,
+        reflection_rows=[_reflection_row(f"good{i}", 1) for i in range(20)] + [bad],
+        breakdown_rows=[],
+    )
+    report = json.loads((output / "build_report.json").read_text())
+    assert report["rejection_count"] == 1
+    assert report["rejections"][0]["data_id"] == "bad"
+    assert report["rejections"][0]["reason"] == "transition_hash_mismatch"
+
+
+def test_hub_refs_main_beats_lexicographically_later_snapshot(tmp_path):
+    root = tmp_path / "reflection"
+    stale_sha = "ffffffffffffffffffffffffffffffffffffffff"
+    main_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    stale = root / "snapshots" / stale_sha
+    current = root / "snapshots" / main_sha
+    stale.mkdir(parents=True)
+    current.mkdir(parents=True)
+    (stale / "metadata.json").write_text(json.dumps([_reflection_row("stale", 1)]))
+    (current / "metadata.json").write_text(json.dumps([_reflection_row(f"keep{i}", 1) for i in range(20)]))
+    (root / "refs").mkdir()
+    (root / "refs" / "main").write_text(f"{main_sha}\n")
+
+    output = tmp_path / "output"
+    builder.main_cli(
+        reflection_dir=str(root),
+        breakdown_dir="",
+        local_save_dir=str(output),
+        train_size=None,
+        val_size=None,
+        mix_ratio=0.5,
+        seed=7,
+        val_ratio=0.2,
+    )
+    ids = {extra["data_id"] for extra in pd.concat([_read(output, "train"), _read(output, "val")])["extra_info"]}
+    assert "stale" not in ids
+    assert "keep0" in ids
+
+
+def test_capped_size_fails_closed_when_mix_cannot_be_met(tmp_path):
+    with pytest.raises(SystemExit, match="cannot meet mix_ratio"):
+        _build(
+            tmp_path,
+            reflection_rows=[_reflection_row(f"r{i}", 1) for i in range(40)],
+            breakdown_rows=[],
+            train_size=20,
+            val_size=None,
+            mix_ratio=0.5,
+        )
+
+
+def test_capped_size_fails_closed_when_pool_is_smaller_than_requested(tmp_path):
+    with pytest.raises(SystemExit, match="requested 100"):
+        _build(
+            tmp_path,
+            reflection_rows=[_reflection_row(f"r{i}", 1) for i in range(40)],
+            breakdown_rows=[],
+            train_size=100,
+            val_size=None,
+            mix_ratio=1.0,
+        )
+
+
+def test_build_report_records_requested_and_actual_size(tmp_path):
+    output = _build(
+        tmp_path,
+        reflection_rows=[_reflection_row(f"r{i}", 1) for i in range(40)],
+        breakdown_rows=[_breakdown_row(f"b{i}") for i in range(40)],
+        train_size=20,
+        val_size=8,
+        mix_ratio=0.25,
+    )
+    report = json.loads((output / "build_report.json").read_text())
+    train = report["splits"]["train"]
+    assert train["requested_size"] == 20
+    assert train["actual_size"] == 20
+    assert train["total"] == 20
+    assert train["shortfall"] is None

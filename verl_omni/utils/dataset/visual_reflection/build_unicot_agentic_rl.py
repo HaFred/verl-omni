@@ -33,6 +33,7 @@ prompt. Validation is metadata-only; the builder does not require
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -59,6 +60,8 @@ REFLECT_ABILITY = "agentic_generate_self_reflect"
 PLAN_ABILITY = "agentic_plan_generate"
 REFLECT_DATA_SOURCE = "unicot_reflection"
 BREAKDOWN_DATA_SOURCE = "unicot_breakdown"
+# Parquet data_source follows task_type. Hub corpus stays on extra_info.unicot_source.
+PLAN_DATA_SOURCE = BREAKDOWN_DATA_SOURCE
 REWARD_DIMS = ("reflect", "plan", "format", "tool", "result")
 # Public alias retained for reward/dataset consumers.
 DIMS = REWARD_DIMS
@@ -109,9 +112,9 @@ class _TextOnlyImageResolver:
         uri = str(value).strip() if value is not None else ""
         if not uri:
             uri = f"<no-image>:{source_record_id or 'unknown'}"
-        # A constant valid digest preserves transition-structure validation while
-        # deliberately skipping pixel/hash IO in this text-only builder.
-        return {"uri": uri, "sha256": "0" * 64}
+        # Hash the URI/path only (no pixel IO) so mismatched output→next-input
+        # chains still raise TRANSITION_HASH_MISMATCH.
+        return {"uri": uri, "sha256": hashlib.sha256(uri.encode()).hexdigest()}
 
 
 def _with_brevity(prompt: str) -> str:
@@ -134,18 +137,45 @@ def _weights() -> dict[str, float]:
     return {f"w_{dim}": _env_weight(dim) for dim in REWARD_DIMS}
 
 
+def _hub_ref_files(refs_dir: Path) -> list[Path]:
+    """Prefer ``refs/main``, then other ref files in name order."""
+    if not refs_dir.is_dir():
+        return []
+    files = [path for path in refs_dir.iterdir() if path.is_file()]
+    main = refs_dir / "main"
+    rest = sorted(path for path in files if path.name != "main")
+    return ([main] if main.is_file() else []) + rest
+
+
+def _resolve_hub_snapshot(root: Path) -> Path:
+    """Select the Hub snapshot HF points at, not the max SHA string.
+
+    Order: ``refs/main`` → other ``refs/`` files → newest mtime snapshot that
+    contains ``metadata.json``. Fail closed if none resolve.
+    """
+    snapshots_root = root / "snapshots"
+    for ref_file in _hub_ref_files(root / "refs"):
+        sha = ref_file.read_text().strip()
+        if not sha:
+            continue
+        snapshot = snapshots_root / sha
+        if (snapshot / "metadata.json").is_file():
+            return snapshot
+    candidates = [path for path in snapshots_root.glob("*/") if (path / "metadata.json").is_file()]
+    if not candidates:
+        raise FileNotFoundError(f"no snapshot with metadata.json under {root}")
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
 def _load_metadata(dataset_dir: str, dataset_id: str) -> list[dict[str, Any]]:
     root = Path(dataset_dir).expanduser()
-    snapshots = sorted((root / "snapshots").glob("*/"))
-    for snapshot in reversed(snapshots):
-        metadata_path = snapshot / "metadata.json"
-        if not metadata_path.is_file():
-            continue
-        data = json.loads(metadata_path.read_text())
-        if not isinstance(data, list):
-            raise ValueError(f"{dataset_id}: metadata.json must be a JSON list, got {type(data).__name__}")
-        return data
-    raise FileNotFoundError(f"{dataset_id}: no snapshot with metadata.json under {root}")
+    snapshot = _resolve_hub_snapshot(root)
+    metadata_path = snapshot / "metadata.json"
+    data = json.loads(metadata_path.read_text())
+    if not isinstance(data, list):
+        raise ValueError(f"{dataset_id}: metadata.json must be a JSON list, got {type(data).__name__}")
+    return data
 
 
 def _rejection(record: dict[str, Any], error: VisualReflectionDataError) -> dict[str, Any]:
@@ -273,27 +303,46 @@ def _select_rows(
     size: int | None,
     mix_ratio: float,
     seed: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     split_rows = [row for row in rows if split_by_identity[(row["source_dataset"], row["data_id"])] == split]
     split_rows.sort(key=lambda row: (row["source_dataset"], row["data_id"]))
     if size is None:
-        return split_rows
+        return split_rows, {
+            "requested_size": None,
+            "actual_size": len(split_rows),
+            "shortfall": None,
+        }
 
     reflect = [row for row in split_rows if row["task_type"] == "reflect"]
     plan = [row for row in split_rows if row["task_type"] == "plan"]
-    reflect_count = min(len(reflect), round(size * mix_ratio))
-    plan_count = min(len(plan), size - reflect_count)
+    requested_reflect = round(size * mix_ratio)
+    requested_plan = size - requested_reflect
+    pool = len(reflect) + len(plan)
+    if pool < size:
+        raise SystemExit(f"{split}: requested {size} rows but only {pool} available after split")
+    if len(reflect) < requested_reflect or len(plan) < requested_plan:
+        raise SystemExit(
+            f"{split}: cannot meet mix_ratio={mix_ratio} for size={size}: "
+            f"need reflect={requested_reflect} (have {len(reflect)}), "
+            f"plan={requested_plan} (have {len(plan)})"
+        )
     rng = random.Random(seed)
-    selected = rng.sample(reflect, reflect_count) + rng.sample(plan, plan_count)
+    selected = rng.sample(reflect, requested_reflect) + rng.sample(plan, requested_plan)
     selected.sort(key=lambda row: (row["source_dataset"], row["data_id"]))
-    return selected
+    return selected, {
+        "requested_size": size,
+        "actual_size": len(selected),
+        "shortfall": None,
+        "requested_reflect": requested_reflect,
+        "requested_plan": requested_plan,
+    }
 
 
 def _build_parquet_row(row: dict[str, Any], *, split: str, index: int) -> dict[str, Any]:
     prompt = row["prompt_text"]
     is_plan = row["task_type"] == "plan"
     return {
-        "data_source": (REFLECT_DATA_SOURCE if row["source_dataset"] == UNICOT_DATASET_ID else BREAKDOWN_DATA_SOURCE),
+        "data_source": (PLAN_DATA_SOURCE if is_plan else REFLECT_DATA_SOURCE),
         "prompt": [
             {"role": "system", "content": PLAN_SYSTEM_PROMPT if is_plan else REFLECT_SYSTEM_PROMPT},
             {"role": "user", "content": _with_brevity(prompt)},
@@ -321,8 +370,8 @@ def build_rows(
     size: int | None,
     mix_ratio: float,
     seed: int,
-) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    selected = _select_rows(
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
+    selected, selection = _select_rows(
         rows,
         split_by_identity,
         split=split,
@@ -335,7 +384,7 @@ def build_rows(
     for index, row in enumerate(selected):
         counts[row["task_type"]] += 1
         parquet_rows.append(_build_parquet_row(row, split=split, index=index))
-    return parquet_rows, counts
+    return parquet_rows, counts, selection
 
 
 def main_cli(
@@ -387,7 +436,7 @@ def main_cli(
         "splits": {},
     }
     for split, size in (("train", train_size), ("val", val_size)):
-        parquet_rows, counts = build_rows(
+        parquet_rows, counts, selection = build_rows(
             rows,
             split_by_identity,
             split=split,
@@ -401,7 +450,7 @@ def main_cli(
         )
         destination = output_dir / f"{split}.parquet"
         dataframe.to_parquet(destination)
-        report["splits"][split] = {**counts, "total": len(dataframe)}
+        report["splits"][split] = {**counts, "total": len(dataframe), **selection}
         print(f"[INFO] {split}: wrote {len(dataframe)} rows ({counts}) to {destination}")
     (output_dir / "build_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
