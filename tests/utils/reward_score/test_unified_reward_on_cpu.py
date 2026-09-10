@@ -11,8 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""CPU tests for the UnifiedReward parser."""
 
-from .flash_attention_3 import apply_flash_attention_3_varlen_hub_fix
-from .qwen_image import apply_qwen_image_ulysses_mask_fix
+from verl_omni.utils.reward_score.unified_reward import _parse_unified_reward_scores
 
-__all__ = ["apply_flash_attention_3_varlen_hub_fix", "apply_qwen_image_ulysses_mask_fix"]
+
+def test_unified_reward_requires_all_labeled_axes():
+    assert _parse_unified_reward_scores("Alignment Score: 4\nCoherence Score: 5") == {}
+    assert _parse_unified_reward_scores("Alignment Score: 4\nCoherence Score: 5\nStyle Score: 3") == {
+        "alignment": 4.0,
+        "coherence": 5.0,
+        "style": 3.0,
+    }

@@ -24,11 +24,7 @@ from omegaconf import DictConfig, OmegaConf
 from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from verl.base_config import BaseConfig
-from verl.experimental.agent_loop.agent_loop import (
-    AgentLoopMetrics,
-    DictConfigWrap,
-    _agent_loop_registry,
-)
+from verl.experimental.agent_loop.agent_loop import AgentLoopMetrics, DictConfigWrap, _agent_loop_registry
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.utils.config import omega_conf_to_dataclass
@@ -46,6 +42,39 @@ def _config_to_sampling_dict(config: Optional[BaseConfig]) -> dict:
     return {k: v for k, v in config.items() if not k.startswith("_")}
 
 
+def _pad_reference_rows(
+    key: str,
+    values: list[torch.Tensor],
+    counts: list[torch.Tensor],
+    target_length: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Pad reference rows to one global length and return validity masks."""
+    if len(values) != len(counts):
+        raise ValueError(f"{key} and its row counts must have the same batch size.")
+
+    count_key = key.replace("_rows", "_row_count")
+    padded_values, masks = [], []
+    for value, count in zip(values, counts, strict=True):
+        if value.ndim != 3 or value.shape[0] != 1:
+            raise ValueError(f"{key} must have shape [1, rows, width], got {tuple(value.shape)}.")
+        if count.numel() != 1:
+            raise ValueError(f"{count_key} must contain one value per sample, got shape {tuple(count.shape)}.")
+        actual_rows = int(value.shape[1])
+        declared_rows = int(count.reshape(-1)[0])
+        if declared_rows != actual_rows:
+            raise ValueError(f"{key} row count {declared_rows} does not match tensor rows {actual_rows}.")
+        if actual_rows > target_length:
+            raise ValueError(
+                f"{key} has {actual_rows} rows, exceeding max_prompt_embed_length={target_length} "
+                "used for reference-row padding."
+            )
+        padded_values.append(F.pad(value, (0, 0, 0, target_length - actual_rows)))
+        mask = torch.zeros((1, target_length), dtype=torch.bool, device=value.device)
+        mask[:, :actual_rows] = True
+        masks.append(mask)
+    return padded_values, masks
+
+
 def _pad_prompt_extra_field(key: str, value: torch.Tensor, target_length: int) -> torch.Tensor:
     if key in {"prompt_embeds", "negative_prompt_embeds"}:
         current_length = int(value.shape[0])
@@ -55,7 +84,7 @@ def _pad_prompt_extra_field(key: str, value: torch.Tensor, target_length: int) -
                 "Configure max_prompt_embed_length for the final embedding sequence, not only one text encoder."
             )
         return F.pad(value, (0, 0, 0, target_length - current_length), value=0)
-    if key in {"prompt_embeds_mask", "negative_prompt_embeds_mask"}:
+    if key in {"prompt_embeds_mask", "negative_prompt_embeds_mask", "prompt_token_tags"}:
         current_length = int(value.shape[0])
         if current_length > target_length:
             raise ValueError(
@@ -74,7 +103,7 @@ class DiffusionAgentLoopOutput(BaseModel):
     prompt_ids: list[int]
     """Prompt token ids."""
     response_diffusion_output: Any
-    """Response diffusion output (torch.Tensor): image tensor (CHW) / video tensor (TCHW)."""
+    """Response pixels (CHW/TCHW) as uint8 values in [0, 255], or floating-point latents."""
     response_logprobs: Optional[Any] = None
     """Log probabilities for the response tokens. (torch.Tensor)"""
     reward_score: Optional[float] = None
@@ -95,7 +124,7 @@ class _InternalDiffusionAgentLoopOutput(DiffusionAgentLoopOutput):
     prompt_ids: torch.Tensor
     """Padded prompt token ids."""
     response_diffusion_output: torch.Tensor
-    """Response diffusion output: image (NCHW format) / video (NTCHW format)."""
+    """Response pixels (NCHW/NTCHW) as uint8 values in [0, 255], or floating-point latents."""
     response_logprobs: Optional[torch.Tensor] = None
     """Log probabilities over denoising timesteps."""
     extra_fields: dict[str, Any] = {}
@@ -144,6 +173,9 @@ class DiffusionAgentLoopWorker:
         if self.max_prompt_embed_length <= 0:
             raise ValueError(f"max_prompt_embed_length must be positive, got {self.max_prompt_embed_length}.")
 
+        hf_model_type = getattr(self.model_config.hf_config, "model_type", None)
+        self.hf_model_type: str | None = hf_model_type if isinstance(hf_model_type, str) else None
+
         agent_loop_config_path = self.rollout_config.agent.agent_loop_config_path
         if agent_loop_config_path:
             resolved_path = resolve_config_path(agent_loop_config_path)
@@ -165,8 +197,9 @@ class DiffusionAgentLoopWorker:
             DataProto: Output batch with the following fields.
 
             - ``prompts``: ``[bsz, prompt_length]`` prompt token ids from dataset.
-            - ``responses``: diffusion output, typically ``[bsz, C, H, W]`` (image)
-              or ``[bsz, T, C, H, W]`` (video).
+            - ``responses``: uint8 pixel output in ``[0, 255]``, typically
+              ``[bsz, C, H, W]`` (image) or ``[bsz, T, C, H, W]`` (video).
+              Latent output remains floating point.
             - ``rm_scores`` (optional): ``[bsz, 1]`` reward model scores.
             - ``meta_info``:
 
@@ -239,6 +272,7 @@ class DiffusionAgentLoopWorker:
             processor=self.processor,
             dataset_cls=self.dataset_cls,
             data_config=DictConfigWrap(self.config.data),
+            hf_model_type=self.hf_model_type,
             extra_tokenizer_map=self.model_config.extra_tokenizer_map,
         )
         output: DiffusionAgentLoopOutput = await agent_loop.run(sampling_params, **kwargs)
@@ -337,6 +371,22 @@ class DiffusionAgentLoopWorker:
         input_non_tensor_batch: dict | None = None,
     ) -> DataProto:
         """Process the padded outputs from _run_agent_loop and combine them into a batch."""
+        for key in ("condition_video_rows", "condition_audio_rows"):
+            values = [item.extra_fields.get(key) for item in inputs]
+            present = [value for value in values if isinstance(value, torch.Tensor)]
+            if not present:
+                continue
+            if len(present) != len(inputs):
+                raise ValueError(f"Diffusion batch mixes samples with and without {key}.")
+            count_key = key.replace("_rows", "_row_count")
+            counts = [item.extra_fields.get(count_key) for item in inputs]
+            if not all(isinstance(count, torch.Tensor) for count in counts):
+                raise ValueError(f"{key} requires a tensor {count_key} for every sample.")
+            padded, masks = _pad_reference_rows(key, present, counts, self.max_prompt_embed_length)
+            for item, value, mask in zip(inputs, padded, masks, strict=True):
+                item.extra_fields[key] = value
+                item.extra_fields[f"{key}_mask"] = mask
+
         # Convert lists back to tensors and stack them to create a batch.
         prompt_ids = torch.cat([input.prompt_ids for input in inputs], dim=0)
         response_diffusion_output = torch.cat([input.response_diffusion_output for input in inputs], dim=0)
