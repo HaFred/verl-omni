@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tool-agent helpers for Mode (2a) image-gen (not FunctionTool bodies).
+"""Helpers for ``ImageGenToolAgentLoop`` (not FunctionTool bodies).
 
-``tools/image_gen.py`` + ``tools/trajectory/`` are the frozen sidecars and their
-process-local state. This package is imported by ``ImageGenToolAgentLoop``:
-force-first curriculum, premature-judge rewrite, teacher-forced Hermes, forced
-Reflection. Lives under ``tools/`` so ``agent_loop.utils`` stays diffusion-only.
+Curriculum, Hermes injection, and forced Reflection live here so
+``agent_loop.utils`` stays diffusion-only.
 """

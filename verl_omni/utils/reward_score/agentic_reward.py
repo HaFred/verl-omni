@@ -570,7 +570,7 @@ def _resolve_solution_text(
     kwargs: dict[str, Any],
     extra_info: dict[str, Any],
 ) -> str:
-    """Resolve trajectory text for Mode (2a).
+    """Resolve trajectory text.
 
     Prefer ``solution_str`` (NaiveRewardManager). Optionally decode ``responses``
     when a tokenizer is available. ``solution_image`` from VisualRewardManager is
@@ -605,7 +605,7 @@ def _resolve_solution_text(
         raise ValueError(
             "agentic_reward.compute_score requires solution_str (text trajectory). "
             "Got solution_image from VisualRewardManager — set "
-            "reward.reward_manager.name=naive for Mode (2a)."
+            "reward.reward_manager.name=naive for agent llm."
         )
     return ""
 
@@ -617,7 +617,18 @@ def compute_score(
     extra_info: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, float | str | int | None]:
-    """Score an agentic image-generation trajectory for GRPO."""
+    """Score an image-generation tool trajectory for GRPO.
+
+    Args:
+        data_source: Unused; kept for the verl ``compute_score`` signature.
+        solution_str: Decoded trajectory text (tool calls + observations).
+        ground_truth: Optional dict of mix weights / user request.
+        extra_info: Mix weights and VL scorer knobs (same channel as ``w_*``).
+        **kwargs: May include ``config`` for ``merge_agentic_scorer_knobs``.
+
+    Returns:
+        Dict with ``score`` and per-term ``reward_*`` fields for the reward manager.
+    """
     del data_source
     from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
 

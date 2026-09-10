@@ -12,11 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Image-gen ToolAgentLoop: force-first curriculum + optional forced Reflection.
+"""Image-gen ``ToolAgentLoop`` with force-first curriculum and forced Reflection.
 
 Teacher-forced Hermes tool tokens use ``response_mask=1``; injected Reflection
-after successful ``judge_image`` uses ``response_mask=0``. Terminal ``Done.`` is
-always policy-sampled.
+uses ``response_mask=0``. Terminal ``Done.`` is policy-sampled.
 """
 
 from __future__ import annotations
@@ -35,36 +34,35 @@ from verl_omni.tools.agent_helper.image_gen_utils import (
     count_successful_generates,
     count_successful_judges,
     fits_response_budget,
-    force_enabled,
     force_first_generate_probability,
     hermes_tool_call,
     last_user_text,
     max_generate_passes,
-    rewrite_judge_before_generate,
     tool_calls_are_premature_judge,
     tool_message_text,
 )
 from verl_omni.tools.trajectory import (
+    active_trajectory_relpath,
     clear_good_enough_yes_reached,
     clear_latest_tool_image_for_active_rollout,
-    get_active_trajectory_relpath,
     reset_active_trajectory_relpath,
     set_active_trajectory_relpath,
 )
+from verl_omni.tools.trajectory.hydra_env import agentic_get_bool
 
 logger = logging.getLogger(__name__)
 
 
 @register("image_gen_tool_agent")
 class ImageGenToolAgentLoop(ToolAgentLoop):
-    """Stock tool agent + forced Reflection after successful ``judge_image``."""
+    """Stock tool agent plus force-first curriculum and forced Reflection."""
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         # Per-rollout latch reset: YES from sample N must not block sample N+1.
         self._agentic_step = kwargs.pop("_agentic_step", 0)
         self._agentic_validate = bool(kwargs.pop("_agentic_validate", False))
         self._agentic_trajectory_relpath = (
-            kwargs.pop("_agentic_trajectory_relpath", None) or get_active_trajectory_relpath()
+            kwargs.pop("_agentic_trajectory_relpath", None) or active_trajectory_relpath.get()
         )
         path_tokens = None
         if self._agentic_trajectory_relpath:
@@ -200,7 +198,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         # Premature judge with no live generate → rewrite to generate (independent of anneal).
         n_gen = count_successful_generates(agent_data.messages)
         if (
-            rewrite_judge_before_generate()
+            agentic_get_bool("rewrite_judge_before_generate")
             and state == AgentState.PROCESSING_TOOLS
             and n_gen == 0
             and tool_calls_are_premature_judge(agent_data.tool_calls)
@@ -313,7 +311,8 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         gen_passes = n_gen
         max_passes = max_generate_passes()
         force_done = gen_passes >= max_passes
-        if not force_enabled() and not force_done:
+        force_reflection = agentic_get_bool("force_reflection_after_judge")
+        if not force_reflection and not force_done:
             return state
 
         forced = build_forced_reflection(
@@ -326,7 +325,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             return state
 
         reflection_text, stop_required = forced
-        if not force_enabled():
+        if not force_reflection:
             if not stop_required:
                 return state
             if not force_done:
@@ -357,6 +356,6 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             "Forced Reflection after judge_image (stop_required=%s, chars=%d, force_full=%s)",
             stop_required,
             len(reflection_text),
-            force_enabled(),
+            force_reflection,
         )
         return AgentState.GENERATING

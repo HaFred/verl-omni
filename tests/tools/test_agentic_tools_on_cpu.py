@@ -21,6 +21,7 @@ import io
 import pytest
 from omegaconf import OmegaConf
 from PIL import Image
+from verl.tools.function_tool import FUNCTION_TOOL_REGISTRY
 
 import verl_omni.tools.image_gen as image_gen
 from verl_omni.tools import trajectory
@@ -78,12 +79,12 @@ def _png_b64(color=(12, 34, 56)) -> str:
 
 
 def test_tool_schemas_declare_both_functions():
-    gen = image_gen.DIFFUSION_TOOL_SCHEMA["function"]
-    judge = image_gen.JUDGE_TOOL_SCHEMA["function"]
-    assert gen["name"] == "generate_image"
-    assert gen["parameters"]["required"] == ["prompt"]
-    assert judge["name"] == "judge_image"
-    assert judge["parameters"]["required"] == ["user_request", "image_prompt"]
+    gen = FUNCTION_TOOL_REGISTRY["generate_image"].tool_schema.function
+    judge = FUNCTION_TOOL_REGISTRY["judge_image"].tool_schema.function
+    assert gen.name == "generate_image"
+    assert gen.parameters.required == ["prompt"]
+    assert judge.name == "judge_image"
+    assert judge.parameters.required == ["user_request", "image_prompt"]
 
 
 def test_generate_image_stub_without_service(tmp_path):
@@ -136,13 +137,13 @@ def test_judge_image_stub_without_vllm():
 
 def test_expand_judge_user_request_placeholders():
     bound = "A vertical artistic cafe poster."
-    token = trajectory.set_active_user_prompt(bound)
+    token = trajectory.active_user_prompt.set(bound)
     try:
         assert image_gen._expand_judge_user_request("same as user message") == bound
         assert image_gen._expand_judge_user_request("last") == bound
         assert image_gen._expand_judge_user_request("some other task text") == "some other task text"
     finally:
-        trajectory.reset_active_user_prompt(token)
+        trajectory.active_user_prompt.reset(token)
     assert image_gen._expand_judge_user_request("raw without binding") == "raw without binding"
 
 

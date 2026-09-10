@@ -25,14 +25,13 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.utils import hf_tokenizer
 
 from verl_omni.tools.trajectory import (
+    active_user_prompt,
     bind_agentic_image_gen,
     bind_run_artifacts,
     build_trajectory_relpath,
     clear_good_enough_yes_reached,
     reset_active_trajectory_relpath,
-    reset_active_user_prompt,
     set_active_trajectory_relpath,
-    set_active_user_prompt,
 )
 from verl_omni.utils.agentic.image_gen_rollout_dump import discard_invalid_rollouts, dump_raw_rollouts
 from verl_omni.utils.agentic.image_gen_rollout_parse import (
@@ -56,13 +55,11 @@ __all__ = [
 
 
 class OmniAgentLoopWorker(AgentLoopWorker):
-    """Worker-side hooks: trajectory bind + step kwargs for force-first curriculum.
+    """Bind trajectory Hydra knobs and pass step kwargs into the agent loop.
 
-    ``AgentLoopManager.generate_sequences`` dispatches to Ray ``AgentLoopWorker``s.
-    Overrides on the Manager class never run per-rollout — they must live here.
-
-    Also hard-binds agentic multi-turn defaults (Hermes + ``verl_omni/tools``)
-    when ``default_agent_loop == image_gen_tool_agent`` (only fills unset keys).
+    Overrides must live here: ``AgentLoopManager.generate_sequences`` dispatches
+    to Ray workers. Hermes / ``image_gen.py`` bind is gated on
+    ``default_agent_loop == image_gen_tool_agent`` and only fills unset keys.
     """
 
     _AGENTIC_TOOL_FORMAT = "hermes"
@@ -111,7 +108,7 @@ class OmniAgentLoopWorker(AgentLoopWorker):
         raw_prompt = kwargs.get("raw_prompt")
         user_prompt = last_user_prompt(raw_prompt) if raw_prompt is not None else ""
         path_token = set_active_trajectory_relpath(relpath)
-        prompt_token = set_active_user_prompt(user_prompt)
+        prompt_token = active_user_prompt.set(user_prompt)
         clear_good_enough_yes_reached()
         kwargs["_agentic_step"] = trajectory["step"]
         kwargs["_agentic_validate"] = trajectory["validate"]
@@ -125,7 +122,7 @@ class OmniAgentLoopWorker(AgentLoopWorker):
                 **kwargs,
             )
         finally:
-            reset_active_user_prompt(prompt_token)
+            active_user_prompt.reset(prompt_token)
             reset_active_trajectory_relpath(path_token)
 
 
@@ -147,6 +144,15 @@ class OmniAgentLoopManager(AgentLoopManager):
         self._monitor_tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
 
     def generate_sequences(self, prompts):
+        """Run stock generate, dump, discard invalid rows, and emit rollout metrics.
+
+        Args:
+            prompts: ``DataProto`` batch from the trainer.
+
+        Returns:
+            ``DataProto`` with invalid rollouts masked and metrics on
+            ``meta_info["agentic_metrics"]`` and ``meta_info["timing"]``.
+        """
         step = prompts.meta_info.get("global_steps")
         output = super().generate_sequences(prompts)
         # Dump before discard: discard zeros response_mask and hides tool-less prose.

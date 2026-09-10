@@ -20,10 +20,14 @@ from verl_omni.tools.trajectory.hydra_env import agentic_get
 
 
 def max_generate_passes() -> int:
-    """Return Hydra ``max_generate_image_passes`` (yaml default when bound).
+    """Return Hydra ``max_generate_image_passes``.
 
-    Raises ``RuntimeError`` when ``agentic_image_gen`` is unbound, and
-    ``ValueError`` when the bound value is not an integer ``>= 1``.
+    Returns:
+        Integer ``>= 1`` from the bound config or yaml default.
+
+    Raises:
+        RuntimeError: If ``agentic_image_gen`` is unbound.
+        ValueError: If the bound value is not an integer ``>= 1``.
     """
     raw = agentic_get("max_generate_image_passes")
     try:

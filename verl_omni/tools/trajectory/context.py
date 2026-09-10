@@ -21,17 +21,15 @@ import contextvars
 from .paths import rollout_id_from_relpath
 
 __all__ = [
+    "active_trajectory_relpath",
+    "active_user_prompt",
     "get_active_rollout_id",
-    "get_active_trajectory_relpath",
-    "get_active_user_prompt",
     "reset_active_trajectory_relpath",
-    "reset_active_user_prompt",
     "set_active_trajectory_relpath",
-    "set_active_user_prompt",
 ]
 
 # Relative path under the images/trajectories roots.
-_active_trajectory_relpath: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+active_trajectory_relpath: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentic_active_trajectory_relpath", default=None
 )
 # Stable short id derived from trajectory_relpath (copied into asyncio.to_thread).
@@ -39,7 +37,7 @@ _active_rollout_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentic_active_rollout_id", default=None
 )
 # Dataset / task user request for the active trajectory (written into meta.json).
-_active_user_prompt: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+active_user_prompt: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "agentic_active_user_prompt", default=None
 )
 
@@ -47,14 +45,16 @@ _active_user_prompt: contextvars.ContextVar[str | None] = contextvars.ContextVar
 def set_active_trajectory_relpath(
     relpath: str | None,
 ) -> tuple[contextvars.Token, contextvars.Token]:
-    """Bind (or clear) the relative artifact path + matching rollout_id.
+    """Bind the relative artifact path and matching rollout id.
 
-    Returns ``(path_token, rollout_token)`` for ``reset_active_trajectory_relpath``.
-    Both must be restored together so judge/artifact lookups do not leak across
-    rollouts after the path ContextVar alone is reset.
+    Args:
+        relpath: Path under rollout_images / rollout_trajectories, or ``None``.
+
+    Returns:
+        ``(path_token, rollout_token)`` for ``reset_active_trajectory_relpath``.
     """
     rid = rollout_id_from_relpath(relpath)
-    path_token = _active_trajectory_relpath.set(relpath)
+    path_token = active_trajectory_relpath.set(relpath)
     rollout_token = _active_rollout_id.set(rid)
     return path_token, rollout_token
 
@@ -62,32 +62,26 @@ def set_active_trajectory_relpath(
 def reset_active_trajectory_relpath(
     tokens: tuple[contextvars.Token, contextvars.Token],
 ) -> None:
-    """Restore trajectory path + rollout_id bindings that preceded ``tokens``."""
+    """Restore trajectory path and rollout id bindings.
+
+    Args:
+        tokens: ``(path_token, rollout_token)`` from ``set_active_trajectory_relpath``.
+
+    Returns:
+        None.
+    """
     path_token, rollout_token = tokens
-    _active_trajectory_relpath.reset(path_token)
+    active_trajectory_relpath.reset(path_token)
     _active_rollout_id.reset(rollout_token)
 
 
-def get_active_trajectory_relpath() -> str | None:
-    return _active_trajectory_relpath.get()
-
-
 def get_active_rollout_id() -> str | None:
+    """Return the active rollout id.
+
+    Returns:
+        Rollout id string, or ``None`` if unbound.
+    """
     rid = _active_rollout_id.get()
     if rid:
         return rid
-    return rollout_id_from_relpath(get_active_trajectory_relpath())
-
-
-def set_active_user_prompt(prompt: str | None) -> contextvars.Token:
-    """Bind the dataset user request so ``meta.json`` can record it per call."""
-    return _active_user_prompt.set(prompt)
-
-
-def reset_active_user_prompt(token: contextvars.Token) -> None:
-    """Restore the user-prompt binding that preceded ``token``."""
-    _active_user_prompt.reset(token)
-
-
-def get_active_user_prompt() -> str | None:
-    return _active_user_prompt.get()
+    return rollout_id_from_relpath(active_trajectory_relpath.get())

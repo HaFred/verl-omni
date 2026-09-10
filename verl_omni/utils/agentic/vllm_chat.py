@@ -32,10 +32,19 @@ def post_vllm_chat(
     timeout: float = 120.0,
     enable_thinking: bool = False,
 ) -> tuple[str | None, str | None]:
-    """POST OpenAI ``/v1/chat/completions``. Returns ``(raw_text, error)``.
+    """POST OpenAI ``/v1/chat/completions`` for a single image + text prompt.
 
-    Pure HTTP helper: callers pass model / timeout / thinking (tools via Hydra
-    bind; reward via ``extra_info``). Does not read process-local hydra_env.
+    Args:
+        vllm_url: Base URL of the OpenAI-compatible server.
+        image_b64: PNG as base64 (no data-URL prefix).
+        prompt_text: User text sent with the image.
+        max_tokens: Completion budget.
+        model: Optional model id; omitted from the payload when empty.
+        timeout: HTTP timeout in seconds.
+        enable_thinking: Passed through ``chat_template_kwargs``.
+
+    Returns:
+        ``(raw_text, None)`` on success, or ``(None, error)`` on failure.
     """
     payload: dict = {
         "model": str(model or "").strip(),

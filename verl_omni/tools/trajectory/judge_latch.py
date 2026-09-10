@@ -28,11 +28,7 @@ __all__ = [
 ]
 
 # After judge_image returns good_enough=YES, further generate_image is blocked
-# (env hard-stop — not token force). Key by **rollout_id** (not asyncio task /
-# thread): ``FunctionTool.call`` runs in ``asyncio.to_thread``, where
-# ``current_task()`` is None, so a thread-scoped latch leaked YES across
-# concurrent samples sharing a thread-pool worker and blocked the next sample's
-# first generate (then judge_image(…, "last") had no PNG).
+# for that rollout_id only (thread-pool workers are reused across samples).
 _good_enough_yes_reached: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "agentic_good_enough_yes_reached", default=False
 )
@@ -58,7 +54,14 @@ def _rollout_scope_key() -> object:
 
 
 def set_good_enough_yes_reached(reached: bool) -> contextvars.Token:
-    """Mark that a live judge returned good_enough=YES on this rollout scope."""
+    """Mark that a live judge returned good_enough=YES on this rollout scope.
+
+    Args:
+        reached: True to set the latch, False to clear it.
+
+    Returns:
+        ContextVar token for the process-local flag.
+    """
     flag = bool(reached)
     key = _rollout_scope_key()
     with _good_enough_yes_lock:
@@ -70,6 +73,11 @@ def set_good_enough_yes_reached(reached: bool) -> contextvars.Token:
 
 
 def get_good_enough_yes_reached() -> bool:
+    """Return whether good_enough=YES has been reached for this rollout.
+
+    Returns:
+        True if further ``generate_image`` should be blocked.
+    """
     if _good_enough_yes_reached.get():
         return True
     key = _rollout_scope_key()
@@ -78,7 +86,11 @@ def get_good_enough_yes_reached() -> bool:
 
 
 def clear_good_enough_yes_reached() -> None:
-    """Reset YES latch for the current rollout scope (call at trajectory start/end)."""
+    """Reset the YES latch for the current rollout scope.
+
+    Returns:
+        None.
+    """
     key = _rollout_scope_key()
     with _good_enough_yes_lock:
         _good_enough_yes_by_scope.pop(key, None)

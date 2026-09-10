@@ -34,13 +34,11 @@ from .artifacts import (
     set_latest_tool_image_path,
 )
 from .context import (
+    active_trajectory_relpath,
+    active_user_prompt,
     get_active_rollout_id,
-    get_active_trajectory_relpath,
-    get_active_user_prompt,
     reset_active_trajectory_relpath,
-    reset_active_user_prompt,
     set_active_trajectory_relpath,
-    set_active_user_prompt,
 )
 from .hydra_env import (
     bind_agentic_image_gen,
@@ -57,7 +55,6 @@ from .paths import (
     build_artifact_id,
     build_trajectory_relpath,
     clear_run_artifacts,
-    get_run_name,
     resolve_rollout_images_root,
     resolve_run_dir,
 )
@@ -73,20 +70,17 @@ __all__ = [
     "clear_latest_tool_image_for_active_rollout",
     "clear_run_artifacts",
     "count_live_generate_artifacts_for_active_rollout",
+    "active_trajectory_relpath",
+    "active_user_prompt",
     "get_active_rollout_id",
-    "get_active_trajectory_relpath",
-    "get_active_user_prompt",
     "get_good_enough_yes_reached",
     "get_latest_generate_prompt_for_active_rollout",
-    "get_run_name",
     "register_tool_artifact",
     "reset_active_trajectory_relpath",
-    "reset_active_user_prompt",
     "resolve_rollout_images_root",
     "resolve_run_dir",
     "resolve_tool_image_path",
     "set_active_trajectory_relpath",
-    "set_active_user_prompt",
     "set_good_enough_yes_reached",
     "set_latest_tool_image_path",
 ]

@@ -14,14 +14,11 @@
 
 """L2 GPU smoke: OmniAgentLoopWorker + OmniAgentLoopManager.
 
-Exercises Mode (2a) agent-loop wiring on a tiny AR checkpoint:
+Exercises agent-loop wiring on a tiny AR checkpoint:
   - ``default_agent_loop=image_gen_tool_agent``
-  - Hydra ``agentic_image_gen`` (force-first curriculum + fake diffusion URL)
-  - local HTTP fake for diffusion tool pixels (no real DiT / VL sidecar)
-  - ``OmniAgentLoopManager.generate_sequences`` dump → discard → agentic_metrics
-    (``omni_agent_loop.py`` manager post-process; CPU tests mock this path)
-
-This is intentionally narrower than a full PPO recipe ([4/N]).
+  - Hydra ``agentic_image_gen`` (force-first + fake diffusion URL)
+  - local HTTP fake for diffusion pixels (no real DiT / VL sidecar)
+  - manager dump → discard → agentic_metrics
 """
 
 from __future__ import annotations

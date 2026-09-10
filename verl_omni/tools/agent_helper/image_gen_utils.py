@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Readers used by ``ImageGenToolAgentLoop``, not by ``generate_image`` / ``judge_image``.
-
-Curriculum, Hermes injection, and forced Reflection belong to the tool *agent*
-(the loop that decides which tool to call). Frozen tool bodies live in
-``tools/image_gen.py`` and read Hydra / trajectory state from ``tools/trajectory/``.
-"""
+"""Readers used by ``ImageGenToolAgentLoop``, not by frozen tool bodies."""
 
 from __future__ import annotations
 
@@ -33,34 +28,43 @@ __all__ = [
     "count_successful_generates",
     "count_successful_judges",
     "fits_response_budget",
-    "force_enabled",
     "force_first_generate_probability",
     "hermes_tool_call",
     "last_live_generate_prompt",
     "last_user_text",
     "max_generate_passes",
     "messages_after_last_user",
-    "rewrite_judge_before_generate",
     "tool_calls_are_premature_judge",
     "tool_message_text",
 ]
 
 
-def force_enabled() -> bool:
-    return agentic_get_bool("force_reflection_after_judge")
-
-
 def fits_response_budget(mask_len: int, n_new_ids: int, response_length: int) -> bool:
-    """Return whether appending ``n_new_ids`` stays below ``response_length``."""
+    """Return whether appending new token ids stays under the response budget.
+
+    Args:
+        mask_len: Current response mask length.
+        n_new_ids: Number of token ids to append.
+        response_length: Max response length.
+
+    Returns:
+        True if ``n_new_ids > 0`` and ``mask_len + n_new_ids < response_length``.
+    """
     return n_new_ids > 0 and mask_len + n_new_ids < response_length
 
 
 def force_first_generate_probability(step: Any, *, validate: bool = False) -> float:
     """Return the linearly annealed probability of forcing the first tool call.
 
-    Missing ``global_steps`` (``None``) is treated as step 0 (full force during
-    curriculum). Garbage Hydra ``force_first_warmup_steps`` /
-    ``force_first_end_step`` raise like ``max_generate_passes``.
+    Args:
+        step: Global training step. ``None`` is treated as step 0 (full force).
+        validate: If True, always return 0 (no teacher-force at val).
+
+    Returns:
+        Probability in ``[0, 1]``.
+
+    Raises:
+        ValueError: If ``step`` or Hydra warmup/end knobs are not integers.
     """
     if validate or not agentic_get_bool("force_first_generate", False):
         return 0.0
@@ -91,12 +95,15 @@ def force_first_generate_probability(step: Any, *, validate: bool = False) -> fl
     return float(end - step_i) / float(end - warmup)
 
 
-def rewrite_judge_before_generate() -> bool:
-    """Return whether a first-turn judge call is rewritten to generate."""
-    return agentic_get_bool("rewrite_judge_before_generate")
-
-
 def tool_calls_are_premature_judge(tool_calls: list[Any] | None) -> bool:
+    """Return whether every pending tool call is a premature ``judge_image``.
+
+    Args:
+        tool_calls: Parsed tool calls from the latest assistant turn, or ``None``.
+
+    Returns:
+        True when the list is non-empty and every call is named ``judge_image``.
+    """
     if not tool_calls:
         return False
     names = [getattr(tool_call, "name", None) for tool_call in tool_calls]
@@ -104,6 +111,14 @@ def tool_calls_are_premature_judge(tool_calls: list[Any] | None) -> bool:
 
 
 def last_user_text(messages: list[dict[str, Any]]) -> str:
+    """Return the text of the last user message.
+
+    Args:
+        messages: Chat messages (dicts with ``role`` / ``content``).
+
+    Returns:
+        Stripped user text, or ``""`` if none.
+    """
     for message in reversed(messages):
         if message.get("role") != "user":
             continue
@@ -117,12 +132,28 @@ def last_user_text(messages: list[dict[str, Any]]) -> str:
 
 
 def hermes_tool_call(name: str, **arguments: str) -> str:
+    """Format a Hermes ``<tool_call>`` XML block.
+
+    Args:
+        name: Tool name.
+        **arguments: String tool arguments.
+
+    Returns:
+        Hermes tool-call markup string.
+    """
     payload = {"name": name, "arguments": dict(arguments)}
     return f"<tool_call>\n{json.dumps(payload, ensure_ascii=False)}\n</tool_call>"
 
 
 def messages_after_last_user(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Return the live suffix after the last user turn, excluding few-shot tools."""
+    """Return the live suffix after the last user turn.
+
+    Args:
+        messages: Full chat message list.
+
+    Returns:
+        Messages after the last ``role=user`` turn (may be empty).
+    """
     last_user = -1
     for index, message in enumerate(messages):
         if message.get("role") == "user":
@@ -131,6 +162,14 @@ def messages_after_last_user(messages: list[dict[str, Any]]) -> list[dict[str, A
 
 
 def tool_message_text(message: dict[str, Any]) -> str:
+    """Extract plain text from a tool message.
+
+    Args:
+        message: Chat message dict.
+
+    Returns:
+        Concatenated text content.
+    """
     content = message.get("content", "")
     if isinstance(content, str):
         return content
@@ -157,7 +196,14 @@ def _is_live_generate_observation(text: str) -> bool:
 
 
 def count_successful_judges(messages: list[dict[str, Any]]) -> int:
-    """Count successful live judge observations after the live user turn."""
+    """Count successful live judge observations after the live user turn.
+
+    Args:
+        messages: Full chat message list.
+
+    Returns:
+        Number of live ``agentic_judge ok=1`` tool observations.
+    """
     return sum(
         1
         for message in messages_after_last_user(messages)
@@ -168,7 +214,14 @@ def count_successful_judges(messages: list[dict[str, Any]]) -> int:
 
 
 def last_live_generate_prompt(messages: list[dict[str, Any]]) -> str:
-    """Return the diffusion prompt from the last successful live generation."""
+    """Return the diffusion prompt from the last successful live generation.
+
+    Args:
+        messages: Full chat message list.
+
+    Returns:
+        Prompt string, or ``""`` if none.
+    """
     for message in reversed(messages_after_last_user(messages)):
         if message.get("role") != "tool":
             continue
@@ -185,7 +238,14 @@ def last_live_generate_prompt(messages: list[dict[str, Any]]) -> str:
 
 
 def count_successful_generates(messages: list[dict[str, Any]]) -> int:
-    """Count successful live generation observations after the live user turn."""
+    """Count successful live generation observations after the live user turn.
+
+    Args:
+        messages: Full chat message list.
+
+    Returns:
+        Number of live successful ``generate_image`` tool observations.
+    """
     return sum(
         1
         for message in messages_after_last_user(messages)
@@ -207,7 +267,17 @@ def build_forced_reflection(
     generate_pass: int = 0,
     max_passes: int = 3,
 ) -> tuple[str, bool] | None:
-    """Build ``(assistant_text, stop_required)`` from a successful judge observation."""
+    """Build forced-Reflection assistant text from a successful judge observation.
+
+    Args:
+        tool_text: Last ``judge_image`` tool observation.
+        force_done: If True, require ``Done.`` after max generate passes.
+        generate_pass: Current generate count (for the max-pass message).
+        max_passes: Max generate_image calls allowed.
+
+    Returns:
+        ``(assistant_text, stop_required)``, or ``None`` if the obs is not a live judge.
+    """
     if not _is_successful_judge(tool_text or ""):
         return None
     correctness = _field(tool_text, r"\bcorrectness\s*=\s*([0-9.]+)") or "?"

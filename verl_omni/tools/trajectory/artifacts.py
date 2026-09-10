@@ -21,7 +21,7 @@ import re
 import threading
 from pathlib import Path
 
-from .context import get_active_rollout_id, get_active_trajectory_relpath
+from .context import active_trajectory_relpath, get_active_rollout_id
 from .paths import rollout_id_from_relpath
 
 __all__ = [
@@ -56,8 +56,21 @@ def register_tool_artifact(
     trajectory_relpath: str | None = None,
     rollout_id: str | None = None,
 ) -> None:
-    """Record a live generate_image save for judge lookup (rollout-scoped)."""
-    relpath = trajectory_relpath or get_active_trajectory_relpath()
+    """Record a live ``generate_image`` save for later judge lookup.
+
+    Args:
+        prompt: Diffusion prompt for this call.
+        paths: Saved image paths.
+        backend: Sidecar name (logging).
+        tool_stubbed: If True, skip for max-pass counting.
+        artifact_id: Optional short id recovered from the filename when omitted.
+        trajectory_relpath: Override for the active ContextVar relpath.
+        rollout_id: Override for the active rollout id.
+
+    Returns:
+        None.
+    """
+    relpath = trajectory_relpath or active_trajectory_relpath.get()
     rid = rollout_id or rollout_id_from_relpath(relpath) or get_active_rollout_id()
     png = _first_existing_png(paths)
     aid = (artifact_id or "").strip() or None
@@ -93,9 +106,13 @@ def _entry_belongs_to_active_rollout(entry: dict, rid: str | None, relpath: str 
 
 
 def clear_tool_artifacts_for_active_rollout() -> None:
-    """Drop registry rows and indexes for the active rollout (not other in-flight samples)."""
+    """Drop registry rows and indexes for the active rollout.
+
+    Returns:
+        None.
+    """
     rid = get_active_rollout_id()
-    relpath = get_active_trajectory_relpath()
+    relpath = active_trajectory_relpath.get()
     if not rid and not relpath:
         set_latest_tool_image_path(None)
         return
@@ -120,11 +137,8 @@ def clear_tool_artifacts_for_active_rollout() -> None:
 def count_live_generate_artifacts_for_active_rollout() -> int:
     """Count successful live ``generate_image`` PNGs for the active rollout.
 
-    Used by ``block_generate_after_max_passes`` so the 4th+ generate is
-    refused even when force-reflection is off for RL.
-
-    Returns 0 when no active rollout id is bound — never count every registry
-    row across concurrent rollouts.
+    Returns:
+        Count for the bound ``rollout_id``, or ``0`` if none is bound.
     """
     rid = get_active_rollout_id()
     if not rid:
@@ -145,7 +159,11 @@ def count_live_generate_artifacts_for_active_rollout() -> int:
 
 
 def get_latest_generate_prompt_for_active_rollout() -> str | None:
-    """Full diffusion prompt from the latest live artifact on this rollout."""
+    """Return the diffusion prompt from the latest live artifact on this rollout.
+
+    Returns:
+        Prompt string, or ``None`` if none.
+    """
     rid = get_active_rollout_id()
     with _artifact_registry_lock:
         for entry in reversed(_artifact_registry):
@@ -158,7 +176,14 @@ def get_latest_generate_prompt_for_active_rollout() -> str | None:
 
 
 def set_latest_tool_image_path(path: str | None) -> contextvars.Token:
-    """Remember the most recent generate_image PNG for judge_image (this rollout)."""
+    """Remember the most recent ``generate_image`` PNG for ``judge_image``.
+
+    Args:
+        path: Absolute PNG path, or ``None`` to clear.
+
+    Returns:
+        ContextVar token for the path binding.
+    """
     rid = get_active_rollout_id()
     if rid:
         with _artifact_registry_lock:
@@ -170,6 +195,11 @@ def set_latest_tool_image_path(path: str | None) -> contextvars.Token:
 
 
 def get_latest_tool_image_path() -> str | None:
+    """Return the latest tool image path for the active rollout.
+
+    Returns:
+        PNG path string, or ``None``.
+    """
     rid = get_active_rollout_id()
     if rid:
         with _artifact_registry_lock:
@@ -183,7 +213,11 @@ def get_latest_tool_image_path() -> str | None:
 
 
 def clear_latest_tool_image_for_active_rollout() -> None:
-    """Drop this rollout's latest-image pointer, artifact registry rows, and id index."""
+    """Drop this rollout's latest-image pointer and related registry rows.
+
+    Returns:
+        None.
+    """
     clear_tool_artifacts_for_active_rollout()
 
 
@@ -217,14 +251,12 @@ def resolve_tool_image_path(
 ) -> str | None:
     """Resolve the PNG that ``judge_image`` should score.
 
-    Strictly scoped to the **active rollout**. Order:
-      1. Explicit ``artifact_id`` (from tool args / prior obs) if registered
-      2. Latest PNG registered for this ``rollout_id``
-      3. Same-rollout registry row with fuzzy-matching ``image_prompt``
-      4. Same-rollout registry row (most recent)
+    Args:
+        prompt: Optional diffusion prompt used to match a registry entry.
+        artifact_id: Optional short artifact id.
 
-    Never falls back to another rollout/thread/step via prompt match alone —
-    that path corrupted live C/A rewards under concurrent overfit GRPO.
+    Returns:
+        Absolute PNG path, or ``None`` if unresolved.
     """
     aid = (artifact_id or "").strip()
     if aid:
@@ -238,7 +270,7 @@ def resolve_tool_image_path(
     if direct and Path(direct).is_file():
         # If we have a rollout_id, only accept the direct hit when it belongs
         # to this rollout (path contains the active trajectory folder).
-        relpath = get_active_trajectory_relpath()
+        relpath = active_trajectory_relpath.get()
         if not rid or not relpath or relpath in direct.replace("\\", "/"):
             return direct
 

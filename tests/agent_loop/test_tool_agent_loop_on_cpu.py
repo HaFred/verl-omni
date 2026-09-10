@@ -43,13 +43,14 @@ def _gen_obs(prompt="a poster", backend="qwen_image"):
 
 
 @pytest.mark.parametrize("value", [False, "0", "false", "off", "no"])
-def test_force_enabled_hydra_gate(value):
-    u = utils
+def test_force_reflection_after_judge_hydra_gate(value):
+    from verl_omni.tools.trajectory.hydra_env import agentic_get_bool
+
     clear_agentic_image_gen()
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"force_reflection_after_judge": value}}))
-    assert u.force_enabled() is False
+    assert agentic_get_bool("force_reflection_after_judge") is False
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
-    assert u.force_enabled() is True  # yaml default on
+    assert agentic_get_bool("force_reflection_after_judge") is True  # yaml default on
     clear_agentic_image_gen()
 
 
@@ -111,12 +112,13 @@ def test_force_first_generate_probability_schedule():
 
 
 def test_rewrite_judge_before_generate_hydra():
-    u = utils
+    from verl_omni.tools.trajectory.hydra_env import agentic_get_bool
+
     clear_agentic_image_gen()
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
-    assert u.rewrite_judge_before_generate() is True  # yaml default on
+    assert agentic_get_bool("rewrite_judge_before_generate") is True  # yaml default on
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"rewrite_judge_before_generate": False}}))
-    assert u.rewrite_judge_before_generate() is False
+    assert agentic_get_bool("rewrite_judge_before_generate") is False
     clear_agentic_image_gen()
 
 

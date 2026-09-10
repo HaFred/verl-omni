@@ -4,11 +4,9 @@
 # 3. Inline comments (after a field on the same line) are not allowed.
 # 4. Indentation level is respected for nested fields.
 
-# Mode (2a) frozen image-gen / judge tool knobs.
+# Frozen image-gen / judge tool knobs.
 # Composed as top-level ``agentic_image_gen`` on omni_trainer.
-# OmniAgentLoopWorker / Manager bind this node into a process-local store
-# (``bind_agentic_image_gen``) so FunctionTool bodies and agent-loop helpers
-# read Hydra knobs without AGENTIC_* env vars.
+# OmniAgentLoopWorker / Manager bind this node (``bind_agentic_image_gen``).
 
 # vLLM-Omni OpenAI image generations base URL (``/v1/images/generations``).
 vllm_omni_url: ""

@@ -29,19 +29,23 @@ __all__ = [
     "build_artifact_id",
     "build_trajectory_relpath",
     "clear_run_artifacts",
-    "get_run_name",
     "resolve_rollout_images_root",
+    "run_name",
     "resolve_run_dir",
     "rollout_id_from_relpath",
 ]
 
-_run_name: str = "agentic_run"
+run_name: str = "agentic_run"
 _e2e_root: Path | None = None
 _diffusion_image_dir: Path | None = None
 
 
 def default_e2e_root() -> Path:
-    """Repo ``outputs/e2e`` (absolute). Prefer ``VERLOMNI_ROOT`` when set."""
+    """Return the default e2e artifact root.
+
+    Returns:
+        Absolute ``outputs/e2e`` path (honours ``VERLOMNI_ROOT`` when set).
+    """
     verlomni = os.getenv("VERLOMNI_ROOT", "").strip()
     if verlomni:
         return Path(verlomni).expanduser().resolve() / "outputs" / "e2e"
@@ -50,48 +54,61 @@ def default_e2e_root() -> Path:
 
 
 def clear_run_artifacts() -> None:
-    """Reset process-local run-dir bindings (tests)."""
-    global _run_name, _e2e_root, _diffusion_image_dir
-    _run_name = "agentic_run"
+    """Reset process-local run-dir bindings (tests).
+
+    Returns:
+        None.
+    """
+    global run_name, _e2e_root, _diffusion_image_dir
+    run_name = "agentic_run"
     _e2e_root = None
     _diffusion_image_dir = None
 
 
-def get_run_name() -> str:
-    """Bound experiment / run name (from ``trainer.experiment_name``)."""
-    return _run_name or "agentic_run"
-
-
 def resolve_e2e_root() -> Path:
-    """Shared e2e artifact root for traj / images / hermes_actions."""
+    """Return the shared e2e artifact root.
+
+    Returns:
+        Absolute path for traj / images / hermes dumps.
+    """
     if _e2e_root is not None:
         return _e2e_root
     return default_e2e_root()
 
 
 def resolve_run_dir() -> Path:
-    """Per-run dir: ``<e2e_root>/<experiment_name>/``."""
+    """Return the per-run directory.
+
+    Returns:
+        ``<e2e_root>/<experiment_name>/``.
+    """
     if _diffusion_image_dir is not None:
         return _diffusion_image_dir.parent
-    return resolve_e2e_root() / get_run_name()
+    return resolve_e2e_root() / (run_name or "agentic_run")
 
 
 def resolve_rollout_images_root() -> Path:
-    """``<run_dir>/rollout_images`` (or explicit diffusion image dir override)."""
+    """Return the rollout images directory.
+
+    Returns:
+        ``<run_dir>/rollout_images`` (or an explicit diffusion override).
+    """
     if _diffusion_image_dir is not None:
         return _diffusion_image_dir
     return resolve_run_dir() / "rollout_images"
 
 
 def bind_run_artifacts(config: Any) -> None:
-    """Bind run-dir knobs from Hydra so driver + Ray workers share one layout.
+    """Bind run-dir knobs from Hydra so driver and Ray workers share one layout.
 
-    ``RUN_NAME`` comes from ``trainer.experiment_name``. ``ROOT`` comes from
-    Hydra ``agentic_image_gen.e2e_root`` when set, else ``outputs/e2e``.
+    Args:
+        config: Hydra config. ``trainer.experiment_name`` sets the run name;
+            ``agentic_image_gen.e2e_root`` overrides the default ``outputs/e2e``.
 
-    Must run on each AgentLoop worker before ``generate_image``.
+    Returns:
+        None.
     """
-    global _run_name, _e2e_root, _diffusion_image_dir
+    global run_name, _e2e_root, _diffusion_image_dir
     # Drop stale explicit image-dir overrides from a previous bind/test.
     _diffusion_image_dir = None
     if config is None:
@@ -103,7 +120,7 @@ def bind_run_artifacts(config: Any) -> None:
     except Exception:  # noqa: BLE001
         experiment_name = None
     if experiment_name:
-        _run_name = str(experiment_name)
+        run_name = str(experiment_name)
 
     e2e_root = None
     try:
@@ -124,7 +141,14 @@ def bind_run_artifacts(config: Any) -> None:
 
 
 def rollout_id_from_relpath(relpath: str | None) -> str | None:
-    """Short stable id for a trajectory folder (``sha256(relpath)[:16]``)."""
+    """Derive a short stable id for a trajectory folder.
+
+    Args:
+        relpath: Trajectory relative path.
+
+    Returns:
+        ``sha256(relpath)[:16]``, or ``None`` if empty.
+    """
     text = (relpath or "").strip()
     if not text:
         return None
@@ -132,7 +156,16 @@ def rollout_id_from_relpath(relpath: str | None) -> str | None:
 
 
 def build_artifact_id(*, relpath: str, index: int, prompt: str) -> str:
-    """Identity hash for one generate_image save (not a pixel content hash)."""
+    """Build an identity hash for one ``generate_image`` save.
+
+    Args:
+        relpath: Trajectory relative path.
+        index: Image index within the trajectory.
+        prompt: Diffusion prompt.
+
+    Returns:
+        12-char hex id (not a pixel content hash).
+    """
     blob = f"{relpath}\0{int(index)}\0{(prompt or '').strip()}"
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
@@ -148,7 +181,16 @@ def _sanitize_sample_index(sample_index: object | None) -> str:
 
 
 def build_trajectory_relpath(*, step: int | None, sample_index: object | None, rollout_n: int) -> str:
-    """Build ``step_XXXXXX/sample_{index}.{rollout_n:02d}``."""
+    """Build a trajectory relative path for one sample/rollout.
+
+    Args:
+        step: Global step (``None`` → ``step_unknown``).
+        sample_index: Dataset sample index.
+        rollout_n: Rollout index within the sample.
+
+    Returns:
+        Path like ``step_XXXXXX/sample_{index}.{rollout_n:02d}``.
+    """
     try:
         step_i = int(step) if step is not None else -1
     except (TypeError, ValueError):

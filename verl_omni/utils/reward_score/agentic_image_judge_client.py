@@ -11,14 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""HTTP client for the frozen agentic image-judge sidecar (reward C/A fallback).
+"""HTTP client for the frozen image-judge sidecar (reward C/A fallback).
 
-Primary reward C/A comes from ``agentic_judge ok=1`` observations already in the
-trajectory. This client is the fallback when those markers are missing.
-
-Scorer knobs come from ``extra_info`` (same channel as ``w_*``), not process-local
-``hydra_env`` — reward workers never call ``bind_agentic_image_gen``. Shared HTTP
-POST lives in ``verl_omni.utils.agentic.vllm_chat``.
+Primary C/A comes from trajectory ``agentic_judge`` observations. Knobs come
+from ``extra_info``; HTTP POST lives in ``verl_omni.utils.agentic.vllm_chat``.
 """
 
 from __future__ import annotations
@@ -140,13 +136,20 @@ def call_reflect_vlm(
     image_path: str | None = None,
     extra_info: dict | None = None,
 ) -> dict | None:
-    """Score an image via frozen VL; ``None`` on transport/parse failure.
+    """Score a PNG via the frozen VL sidecar (reward fallback).
 
-    Knobs (``vllm_url``, ``vllm_model``, reflect/judge timeouts & tokens) come from
-    ``extra_info`` — the same channel as ``w_*``. Does not read process-local
-    ``hydra_env`` (reward workers never bind it). ``good_enough_threshold`` must
-    be present on ``extra_info`` (raise if missing). Empty ``vllm_url`` logs a
-    warning and returns ``None`` (no silent 0.80 default).
+    Args:
+        user_request: Original user task.
+        image_prompt: Diffusion prompt for the image.
+        notes: Extra judge notes.
+        image_path: Path to an existing PNG; missing file returns ``None``.
+        extra_info: Scorer knobs. Must include ``good_enough_threshold``.
+
+    Returns:
+        Parsed judge dict, or ``None`` on missing image, empty URL, or HTTP/parse failure.
+
+    Raises:
+        KeyError: If ``good_enough_threshold`` is missing from ``extra_info``.
     """
     info = dict(extra_info or {})
     # Threshold must be explicit on extra_info (driver merge / compute_score).

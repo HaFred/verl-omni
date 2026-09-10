@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 # Discrete facet grid. Continuous VLM scores are snapped to nearest level
@@ -38,37 +39,39 @@ _AESTHETICS_KEYS = (
     "appeal",
 )
 
-_CORRECTNESS_QUESTIONS = {
-    "subject_entities": "Are the requested primary subjects/entities visibly present and recognizable? If the "
-    "subject is a person, is their gender, age, and ethnicity correct? Is he/she facially recognizable?",
-    "attributes": "Are non-text attributes (color, count, material, identity) correct? When the request "
-    "specifies any text/typography (headlines, slogans, labels, numbers, logo lettering), OCR the "
-    "pixels: are the exact requested strings fully legible and spelled correctly — no gibberish, "
-    "substitutions, missing/extra words, or wrong script? Scene beauty alone does not pass this facet.",
-    "relations_layout": "Are requested actions, spatial relations, and layout/composition constraints correct "
-    "(including poster hierarchy when requested: e.g. headline at top, main subject center, "
-    "footer/tagline at bottom)?",
-    "scene_context": "Does the environment, setting, style, and overall scene match the request?",
-    "completeness": "Is the request fully satisfied without missing requested details or contradictory extras? "
-    "If text was requested, treat missing, truncated, illegible, or wrong strings as incompleteness "
-    "even when the rest of the scene looks right.",
-}
-_AESTHETICS_QUESTIONS = {
-    "composition": "Is the composition balanced with a clear focal hierarchy and intentional framing?",
-    "lighting": "Are lighting, exposure, contrast, and depth visually effective?",
-    "color": "Are color harmony, saturation, and tonal relationships pleasing and coherent?",
-    "fidelity": "Is the image sharp and spatially coherent, without obvious generation artifacts or distortions?",
-    "appeal": "Does the image have strong overall visual appeal and professional finish?",
-}
+_AGENTIC_DATA_DIR = Path(__file__).resolve().parent / "agentic"
+
+
+def _load_judge_questions() -> tuple[dict[str, str], dict[str, str]]:
+    payload = json.loads((_AGENTIC_DATA_DIR / "image_judge_questions.json").read_text(encoding="utf-8"))
+    correctness = dict(payload["correctness"])
+    aesthetics = dict(payload["aesthetics"])
+    if tuple(correctness) != _CORRECTNESS_KEYS:
+        raise ValueError(f"image_judge_questions.json correctness keys mismatch: {tuple(correctness)}")
+    if tuple(aesthetics) != _AESTHETICS_KEYS:
+        raise ValueError(f"image_judge_questions.json aesthetics keys mismatch: {tuple(aesthetics)}")
+    return correctness, aesthetics
+
+
+def _load_judge_calibration() -> str:
+    payload = json.loads((_AGENTIC_DATA_DIR / "image_judge_calibration.json").read_text(encoding="utf-8"))
+    body = str(payload.get("text") or "").strip()
+    if not body:
+        raise ValueError("image_judge_calibration.json missing non-empty 'text'")
+    return body + "\n"
 
 
 def good_enough_threshold(raw: object | None = None) -> float:
-    """Min C and A for good_enough=YES (client-side vLLM judge path).
+    """Minimum C and A for ``good_enough=YES``.
 
-    When ``raw`` is omitted, reads Hydra ``agentic_image_gen.good_enough_threshold``
-    (yaml default 0.80 when bound). Reward workers should pass ``raw`` from
-    ``extra_info`` instead of relying on process-local bind. Garbage or
-    out-of-range values raise; they do not silently fall back to 0.80.
+    Args:
+        raw: Explicit threshold. If omitted, reads the bound Hydra knob.
+
+    Returns:
+        Float in ``[0, 1]``.
+
+    Raises:
+        ValueError: If the value is not a float in ``[0, 1]``.
     """
     if raw is None:
         from verl_omni.tools.trajectory.hydra_env import agentic_get
@@ -91,11 +94,14 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 def snap_score(value: Any, default: float = 0.0) -> float:
-    """Snap a score to ``_SCORE_GRID``.
+    """Snap a continuous score onto the discrete judge grid.
 
-    Values in ``[0.9, 1.0)`` map to ``0.8`` so mid-high continuous scores cannot
-    become max. Only an exact ``1.0`` stays ``1.0``. Other values use nearest
-    grid point (ties → lower).
+    Args:
+        value: Raw score.
+        default: Fallback when ``value`` is not numeric.
+
+    Returns:
+        Grid value in ``{0.0, 0.2, ..., 1.0}``.
     """
     v = _safe_float(value, default)
     if v >= 1.0:
@@ -157,20 +163,12 @@ def normalize_judge_payload(
 ) -> dict[str, Any] | None:
     """Normalize a parsed judge dict into the canonical scored shape.
 
-    Facet scores are snapped onto ``_SCORE_GRID``. Rubber-stamps (flat identical
-    near-max facets on the *raw* pre-snap values, default ≥0.9) are handled
-    model-agnostically:
+    Args:
+        data: Parsed judge JSON/object.
+        backend: Backend label stored on the result.
 
-    - ``good_enough`` is forced ``False`` (blocks Done on undifferentiated maxing),
-    - C and A facets share a soft symmetric cap at 0.8 (keeps reward signal),
-    - ``findings`` gains an explicit ``[client]`` note so obs match the scores.
-
-    A uniform discrete ``0.8`` grid is *not* a stamp — that path must remain able
-    to return YES so the agent can learn NO→rewrite→YES without max-pass stops.
-    Detection uses raw facets so ``snap_score``'s ``[0.9, 1.0)→0.8`` path does
-    not itself create a flat group that then gets double-penalized. Model-emitted
-    ``good_enough`` flags are ignored; YES requires snapped C/A ≥ env threshold
-    and no rubber-stamp.
+    Returns:
+        Canonical scored dict, or ``None`` if required fields are missing.
     """
     if not isinstance(data, dict):
         return None
@@ -237,7 +235,15 @@ def normalize_judge_payload(
 
 
 def parse_judge_json(text: str, *, good_enough_threshold_value: object | None = None) -> dict[str, Any] | None:
-    """Extract C/A judge scores from VLM text (think blocks / fences / truncation)."""
+    """Extract C/A judge scores from VLM text.
+
+    Args:
+        text: Raw VLM response (may include fences / think blocks).
+        backend: Backend label for the normalized payload.
+
+    Returns:
+        Canonical scored dict, or ``None`` on parse failure.
+    """
     blob = (text or "").strip()
     blob = re.sub(r"<think>[\s\S]*?</think>", " ", blob, flags=re.IGNORECASE)
     blob = re.sub(r"```(?:json)?\s*", "", blob, flags=re.IGNORECASE).replace("```", "")
@@ -282,15 +288,25 @@ def parse_judge_json(text: str, *, good_enough_threshold_value: object | None = 
 
 
 def build_judge_prompt(user_request: str, image_prompt: str, notes: str = "", *, strict_json: bool = False) -> str:
-    """Build the VL judge prompt. ``strict_json`` is used on parse-failure retry."""
+    """Build the VL judge prompt.
+
+    Args:
+        user_request: Original user task.
+        image_prompt: Diffusion prompt for the image.
+        notes: Optional extra notes.
+        strict_json: If True, use the parse-failure retry prompt.
+
+    Returns:
+        Prompt string.
+    """
     c_schema = ",\n".join(f'    "{key}": 0.0' for key in _CORRECTNESS_KEYS)
     a_schema = ",\n".join(f'    "{key}": 0.0' for key in _AESTHETICS_KEYS)
     rubric = "\n".join(
         [
             "CORRECTNESS QUESTIONS:",
-            *[f"- {key}: {q}" for key, q in _CORRECTNESS_QUESTIONS.items()],
+            *[f"- {key}: {q}" for key, q in _load_judge_questions()[0].items()],
             "AESTHETICS QUESTIONS:",
-            *[f"- {key}: {q}" for key, q in _AESTHETICS_QUESTIONS.items()],
+            *[f"- {key}: {q}" for key, q in _load_judge_questions()[1].items()],
         ]
     )
     header = (
@@ -301,38 +317,7 @@ def build_judge_prompt(user_request: str, image_prompt: str, notes: str = "", *,
         f"Notes: {notes or '(none)'}\n\n"
         f"{rubric}\n\n"
     )
-    calibration = (
-        "SCORE GRID (REQUIRED — each facet MUST be exactly one of these):\n"
-        "  {0.0, 0.2, 0.4, 0.6, 0.8, 1.0}\n"
-        "Do NOT emit continuous mid values (e.g. 0.55, 0.84, 0.95). Pick the closest grid level.\n\n"
-        "CORRECTNESS LEVEL ANCHORS (apply per facet independently):\n"
-        "  0.0 = requested content absent, unrecognizable, or completely wrong\n"
-        "  0.2 = severely deficient; majority missing or wrong\n"
-        "  0.4 = partial; several elements present but many wrong/blurry/misplaced\n"
-        "  0.6 = subjects/entities mostly present BUT attributes (incl. OCR text), relations, or "
-        "details weak (presence alone → max 0.6 for subject_entities / completeness)\n"
-        "  0.8 = key attributes and relations clearly correct; only minor missing detail\n"
-        "  1.0 = no missing requested detail and no contradictory extras (RARE)\n"
-        "TEXT/OCR RULE (when the user request quotes or requires specific wording):\n"
-        "  - Illegible, gibberish, or wrong strings → attributes ≤ 0.4 and completeness ≤ 0.6 "
-        "(do NOT inflate from cozy lighting / nice cup / matching style).\n"
-        "  - findings MUST quote the glyphs actually visible vs the requested strings.\n"
-        "  - suggested_fixes MUST give concrete typography/legibility rewrite hints "
-        "(e.g. exact quoted text, 'highly legible poster typography', placement).\n\n"
-        "AESTHETICS LEVEL ANCHORS (apply per facet independently):\n"
-        "  0.0 = unusable (severe artifacts, collapse, or illegible)\n"
-        "  0.2 = major artifacts / broken anatomy / harsh clutter\n"
-        "  0.4 = typical rough sketch / flat fantasy render — acceptable but weak finish\n"
-        "  0.6 = readable composition and color, still soft lighting or mild artifacts\n"
-        "  0.8 = clear composition + effective lighting + low artifact (reserve for this)\n"
-        "  1.0 = near-professional finish (VERY RARE for diffusion sketches)\n"
-        "Default typical Qwen-Image / fantasy sketch renders to 0.4–0.6 on aesthetics facets.\n\n"
-        "INDEPENDENCE RULES:\n"
-        "- Score each facet from its own pixel evidence; do NOT copy the same number across "
-        "all five correctness facets unless each facet independently earns it.\n"
-        "- For any facet ≥ 0.8, findings MUST include one short sentence of concrete pixel evidence.\n"
-        "- Prefer under-scoring over generosity; mid-high saturation (all ~0.9) is a failure mode.\n"
-    )
+    calibration = _load_judge_calibration()
     if strict_json:
         return (
             header + "CRITICAL RETRY: Your previous reply was not valid JSON.\n"
@@ -372,7 +357,15 @@ def format_judge_observation(
     backend: str,
     parse_retries: int = 0,
 ) -> tuple[str, dict[str, Any]]:
-    """Format a successful judge obs (``agentic_judge ok=1 parse_ok=1``)."""
+    """Format a successful judge observation for the trajectory.
+
+    Args:
+        scored: Canonical scored judge dict.
+        image_path: Path recorded in the observation.
+
+    Returns:
+        Tool observation text with ``agentic_judge ok=1``.
+    """
     correctness = float(parsed["correctness"])
     aesthetics = float(parsed["aesthetics"])
     good = bool(parsed.get("good_enough", False))
@@ -417,7 +410,17 @@ def format_judge_parse_error(
     backend: str = "vllm",
     parse_retries: int = 0,
 ) -> tuple[str, dict[str, Any]]:
-    """Format a failed judge obs (``agentic_judge ok=0 parse_ok=0``) — no fake C/A."""
+    """Format a failed judge observation (no fake C/A).
+
+    Args:
+        image_path: Path recorded in the observation.
+        raw_text: Raw VLM text that failed to parse.
+        backend: Backend label.
+        parse_retries: Number of parse retries already attempted.
+
+    Returns:
+        Tool observation text with ``agentic_judge ok=0 parse_ok=0``.
+    """
     text = (
         "[judge error] VLM returned unparseable response — do not invent scores. "
         "Retry judge_image or rewrite the diffusion prompt and generate again.\n"

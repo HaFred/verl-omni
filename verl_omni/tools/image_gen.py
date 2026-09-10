@@ -61,20 +61,20 @@ from verl.tools.function_tool import function_tool
 from verl.tools.schemas import ToolResponse
 
 from verl_omni.tools.trajectory import (
+    active_trajectory_relpath,
+    active_user_prompt,
     build_artifact_id,
     count_live_generate_artifacts_for_active_rollout,
     get_active_rollout_id,
-    get_active_trajectory_relpath,
-    get_active_user_prompt,
     get_good_enough_yes_reached,
     get_latest_generate_prompt_for_active_rollout,
-    get_run_name,
     register_tool_artifact,
     resolve_rollout_images_root,
     resolve_tool_image_path,
     set_good_enough_yes_reached,
     set_latest_tool_image_path,
 )
+from verl_omni.tools.trajectory import paths as traj_paths
 from verl_omni.tools.trajectory.hydra_env import (
     agentic_get,
     agentic_get_bool,
@@ -92,28 +92,6 @@ from verl_omni.utils.agentic_image_judge_parse import (
 )
 
 logger = logging.getLogger(__file__)
-
-
-DIFFUSION_TOOL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "generate_image",
-        "description": (
-            "Generate an image with the frozen diffusion model. After each generation, "
-            "call `judge_image` on that image before deciding Done. or rewrite."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "The complete prompt to send to the diffusion model.",
-                }
-            },
-            "required": ["prompt"],
-        },
-    },
-}
 
 
 def _decode_images(payload: dict) -> list[Image.Image]:
@@ -192,8 +170,8 @@ def _update_traj_meta(traj_dir: Path, entry: dict) -> None:
     else:
         meta = {}
     meta.setdefault("trajectory", traj_dir.name)
-    meta.setdefault("experiment", get_run_name())
-    user_prompt = entry.get("user_prompt") or get_active_user_prompt() or ""
+    meta.setdefault("experiment", traj_paths.run_name or "agentic_run")
+    user_prompt = entry.get("user_prompt") or active_user_prompt.get() or ""
     if user_prompt:
         meta["user_prompt"] = user_prompt
         entry.setdefault("user_prompt", user_prompt)
@@ -236,8 +214,8 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
     """
     root = resolve_rollout_images_root()
     root.mkdir(parents=True, exist_ok=True)
-    relpath = get_active_trajectory_relpath()
-    user_prompt = get_active_user_prompt() or ""
+    relpath = active_trajectory_relpath.get()
+    user_prompt = active_user_prompt.get() or ""
     provenance = _call_meta_fields(prompt, user_prompt=user_prompt)
     paths: list[str] = []
 
@@ -307,7 +285,7 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
         "backend": backend,
         "tool_stubbed": tool_stubbed,
         "num_images": len(images),
-        "experiment": get_run_name(),
+        "experiment": traj_paths.run_name or "agentic_run",
         "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     for i, img in enumerate(images):
@@ -430,18 +408,6 @@ def _call_generic_http(
     return _pack_response(prompt, text, images, reward, backend=backend, tool_stubbed=False)
 
 
-def _block_generate_after_yes_enabled() -> bool:
-    return agentic_get_bool("block_generate_after_yes", True)
-
-
-def _max_generate_passes() -> int:
-    return max_generate_passes()
-
-
-def _block_generate_after_max_passes_enabled() -> bool:
-    return agentic_get_bool("block_generate_after_max_passes", True)
-
-
 def _blocked_generate_after_yes(prompt: str) -> tuple[ToolResponse, float, dict]:
     """Hydra hard-stop: refuse generate_image after good_enough=YES (no diffusion call)."""
     prompt_snip = (prompt or "").replace("\n", " ")[:240]
@@ -492,18 +458,24 @@ def _blocked_generate_after_max_passes(prompt: str, *, n_gen: int, max_passes: i
     return ToolResponse(text=text), 0.0, metrics
 
 
-@function_tool("generate_image", schema=DIFFUSION_TOOL_SCHEMA)
+@function_tool("generate_image")
 def generate_image(prompt: str) -> tuple[ToolResponse, float, dict]:
-    """Generate an image with a frozen external Qwen-Image service.
+    """Generate an image with the frozen diffusion model.
+
+    After each generation, call ``judge_image`` on that image before deciding
+    Done. or rewrite.
 
     Args:
-        prompt: Complete text prompt for the diffusion model.
+        prompt: The complete prompt to send to the diffusion model.
+
+    Returns:
+        ``(ToolResponse, reward, metrics)``. Reward is unused (frozen tool).
     """
-    if _block_generate_after_yes_enabled() and get_good_enough_yes_reached():
+    if agentic_get_bool("block_generate_after_yes", True) and get_good_enough_yes_reached():
         return _blocked_generate_after_yes(prompt)
 
-    if _block_generate_after_max_passes_enabled():
-        max_passes = _max_generate_passes()
+    if agentic_get_bool("block_generate_after_max_passes", True):
+        max_passes = max_generate_passes()
         n_gen = count_live_generate_artifacts_for_active_rollout()
         if n_gen >= max_passes:
             return _blocked_generate_after_max_passes(prompt, n_gen=n_gen, max_passes=max_passes)
@@ -550,7 +522,7 @@ def _qwen_image_seed(prompt: str) -> int | None:
         base_seed = int(str(raw).strip())
     except (TypeError, ValueError) as exc:
         raise ValueError(f"agentic_image_gen.qwen_image_seed must be an integer or null, got {raw!r}") from exc
-    relpath = get_active_trajectory_relpath() or get_active_rollout_id()
+    relpath = active_trajectory_relpath.get() or get_active_rollout_id()
     if not relpath or not agentic_get_bool("qwen_image_diversify_seed", True):
         return base_seed
     generate_pass = count_live_generate_artifacts_for_active_rollout()
@@ -620,45 +592,6 @@ def _call_vllm_omni(
     return _pack_response(prompt, text, images, 0.0, backend="vllm_omni", tool_stubbed=False)
 
 
-JUDGE_TOOL_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "judge_image",
-        "description": (
-            "Call a frozen vision model to judge the LAST generated image. "
-            "Returns structured feedback: correctness/aesthetics scores per dimension, "
-            "specific findings, suggested prompt fixes, and a good_enough verdict. "
-            "Call this AFTER every generate_image — the VL feedback tells you whether "
-            "to finish (Done.) or rewrite and generate again. "
-            "Keep arguments SHORT: prefer user_request='same as user message' and "
-            "image_prompt='last' (the tool expands from the live task + latest image)."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "user_request": {
-                    "type": "string",
-                    "description": (
-                        "Compact task tag only. Prefer exactly 'same as user message' — "
-                        "do NOT paste the full multi-paragraph user task. The server "
-                        "expands this to the bound user request for the VL judge."
-                    ),
-                },
-                "image_prompt": {
-                    "type": "string",
-                    "description": (
-                        "Prefer exactly 'last', or a short echo of the diffusion prompt. "
-                        "Do NOT re-paste long prompts; the server resolves the latest "
-                        "generated image and full prompt for this rollout."
-                    ),
-                },
-            },
-            "required": ["user_request", "image_prompt"],
-        },
-    },
-}
-
-
 def _expand_judge_user_request(user_request: str) -> str:
     """Expand compact / truncated judge args to the bound live user task."""
     potential_bound_holders = {
@@ -676,7 +609,7 @@ def _expand_judge_user_request(user_request: str) -> str:
         "previous",
     }
     raw = (user_request or "").strip()
-    bound = (get_active_user_prompt() or "").strip()
+    bound = (active_user_prompt.get() or "").strip()
     if not bound:
         return raw
     low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
@@ -808,13 +741,24 @@ def _call_judge_vllm(
     )
 
 
-@function_tool("judge_image", schema=JUDGE_TOOL_SCHEMA)
+@function_tool("judge_image")
 def judge_image(user_request: str, image_prompt: str) -> tuple[ToolResponse, float, dict]:
-    """Call frozen image-judge sidecar to judge the last generated image in-turn.
+    """Judge the last generated image with a frozen vision model.
+
+    Returns structured feedback: correctness/aesthetics scores, findings,
+    suggested prompt fixes, and a good_enough verdict. Call this after every
+    ``generate_image``. Keep arguments short: prefer
+    ``user_request='same as user message'`` and ``image_prompt='last'``.
 
     Args:
-        user_request: Original user task for the vision model to compare against.
-        image_prompt: The diffusion prompt used to generate the image being judged.
+        user_request: Compact task tag only. Prefer exactly ``same as user
+            message``; do not paste the full user task. The server expands this
+            to the bound user request.
+        image_prompt: Prefer exactly ``last``, or a short echo of the diffusion
+            prompt. Do not re-paste long prompts.
+
+    Returns:
+        ``(ToolResponse, reward, metrics)``. Reward is unused (frozen tool).
     """
     text, meta = _call_judge_vlm(user_request, image_prompt)
     # Env hard-stop latch: after YES, later generate_image calls are refused.

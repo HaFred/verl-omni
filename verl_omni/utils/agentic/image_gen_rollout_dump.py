@@ -54,7 +54,17 @@ def materialize_rollout_images(
     relpath: str,
     user_prompt: str,
 ) -> list[str]:
-    """Index images already written by the live tool; never create empty folders."""
+    """Index images already written by the live tool; never create empty folders.
+
+    Args:
+        decoded_response: Decoded assistant text (for tool prompts).
+        run_dir: Artifact run directory.
+        relpath: Trajectory-relative image folder.
+        user_prompt: Dataset user request stored in ``meta.json``.
+
+    Returns:
+        Existing image paths under that folder, or ``[]`` if none.
+    """
     target_dir = run_dir / "rollout_images" / relpath
     # ``agentic_tool._save_images`` creates this directory only after a real
     # generate_image execution. A rollout with no generated artifact must not
@@ -92,13 +102,13 @@ def materialize_rollout_images(
 
 
 def discard_invalid_rollouts(output: Any) -> None:
-    """Drop no-``generate_image`` rollouts from the policy update.
+    """Zero ``response_mask`` for rows that never produced ``generate_image``.
 
-    Prefers rollout-time stamps (``rollout_valid`` / ``rollout_has_generate`` /
-    ``num_generate_image_prompts`` on ``non_tensor_batch`` from the agent loop).
-    Reward-manager keys arrive later and must not be required here.
+    Args:
+        output: Rollout ``DataProto``. Prefers stamps on ``non_tensor_batch``.
 
-    Sets ``response_mask`` to 0 so GRPO/PPO give them no gradient.
+    Returns:
+        None.
     """
     valid = output.non_tensor_batch.get("rollout_valid")
     has_gen = output.non_tensor_batch.get("rollout_has_generate")
@@ -299,7 +309,16 @@ def _format_turn_text_block(turn: dict[str, Any]) -> list[str]:
 
 
 def dump_raw_rollouts(*, tokenizer: Any, output: Any, step: Any) -> None:
-    """Write user prompt + raw assistant turns only."""
+    """Write hermes_actions JSONL and per-step trajectory dumps.
+
+    Args:
+        tokenizer: Tokenizer used to decode responses.
+        output: Rollout ``DataProto``.
+        step: Global step, or ``None`` for ``step_unknown``.
+
+    Returns:
+        None.
+    """
     try:
         responses = output.batch["responses"]
         response_masks = output.batch["response_mask"]

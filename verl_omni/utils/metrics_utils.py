@@ -106,9 +106,8 @@ class GroupedMetricMean:
 class AgenticRewardMetrics:
     """Read-only views of agentic reward extras on a rollout batch.
 
-    ``MIX_KEYS`` are the scalar terms mixed into ``compute_score`` (logged as
-    ``agentic_reward/<name>/{mean,min,max}``). ``ARTIFACT_KEYS`` are copied
-    into compact ``hermes_actions`` JSONL rows; ``INTEGER_KEYS`` stay ints.
+    ``MIX_KEYS`` feed ``agentic_reward/<name>/{mean,min,max}``. ``ROLLOUT_KEYS``
+    are available at ``generate_sequences``. ``ARTIFACT_KEYS`` copy into dump rows.
     """
 
     MIX_KEYS: tuple[str, ...] = (
@@ -157,7 +156,14 @@ class AgenticRewardMetrics:
 
     @classmethod
     def aggregate(cls, non_tensor_batch: dict[str, Any]) -> dict[str, float]:
-        """Batch mean/min/max for mix terms and rollout-time counters."""
+        """Batch mean/min/max for mix terms and rollout-time counters.
+
+        Args:
+            non_tensor_batch: ``DataProto.non_tensor_batch`` mapping.
+
+        Returns:
+            Flat dict of ``agentic_reward/*`` and ``agentic_rollout/*/mean`` keys.
+        """
         metrics: dict[str, float] = {}
         for key in cls.MIX_KEYS:
             if key not in non_tensor_batch:
@@ -183,7 +189,15 @@ class AgenticRewardMetrics:
 
     @classmethod
     def for_rollout(cls, output: Any, index: int) -> dict[str, float | int]:
-        """Per-row scorer outputs for one ``hermes_actions`` JSONL record."""
+        """Per-row scorer outputs for one ``hermes_actions`` JSONL record.
+
+        Args:
+            output: Rollout ``DataProto``.
+            index: Row index in the batch.
+
+        Returns:
+            Compact dict of score and ``ARTIFACT_KEYS`` present on that row.
+        """
         if not isinstance(index, int) or index < 0:
             raise IndexError(f"rollout index must be a non-negative int, got {index!r}")
         metrics: dict[str, float | int] = {}

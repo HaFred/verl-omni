@@ -26,12 +26,10 @@ import verl_omni  # noqa: F401
 from verl_omni.agent_loop import omni_agent_loop
 from verl_omni.agent_loop.omni_agent_loop import OmniAgentLoopManager, OmniAgentLoopWorker
 from verl_omni.tools.trajectory import (
-    get_active_trajectory_relpath,
-    get_active_user_prompt,
+    active_trajectory_relpath,
+    active_user_prompt,
     reset_active_trajectory_relpath,
-    reset_active_user_prompt,
     set_active_trajectory_relpath,
-    set_active_user_prompt,
 )
 from verl_omni.utils.agentic.image_gen_rollout_dump import discard_invalid_rollouts
 from verl_omni.utils.agentic.image_gen_rollout_parse import (
@@ -48,8 +46,8 @@ def test_worker_stamps_rollout_kwargs_and_resets_context(monkeypatch):
     async def _parent_run(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
         del sampling_params, trajectory, agent_name, trace
         captured["kwargs"] = dict(kwargs)
-        captured["relpath_during_run"] = get_active_trajectory_relpath()
-        captured["user_prompt_during_run"] = get_active_user_prompt()
+        captured["relpath_during_run"] = active_trajectory_relpath.get()
+        captured["user_prompt_during_run"] = active_user_prompt.get()
         return "ok"
 
     monkeypatch.setattr(AgentLoopWorker, "_run_agent_loop", _parent_run)
@@ -57,7 +55,7 @@ def test_worker_stamps_rollout_kwargs_and_resets_context(monkeypatch):
     assert OmniAgentLoopWorker._AGENTIC_FUNCTION_TOOLS.is_file()
 
     prior_path = set_active_trajectory_relpath("prior/path")
-    prior_prompt = set_active_user_prompt("prior prompt")
+    prior_prompt = active_user_prompt.set("prior prompt")
 
     async def _run_then_read_context():
         result = await OmniAgentLoopWorker._run_agent_loop(
@@ -67,12 +65,12 @@ def test_worker_stamps_rollout_kwargs_and_resets_context(monkeypatch):
             agent_name="image_gen_tool_agent",
             raw_prompt=[{"role": "user", "content": "draw a cafe poster"}],
         )
-        return result, get_active_trajectory_relpath(), get_active_user_prompt()
+        return result, active_trajectory_relpath.get(), active_user_prompt.get()
 
     try:
         result, path_after, prompt_after = asyncio.run(_run_then_read_context())
     finally:
-        reset_active_user_prompt(prior_prompt)
+        active_user_prompt.reset(prior_prompt)
         reset_active_trajectory_relpath(prior_path)
 
     assert result == "ok"
