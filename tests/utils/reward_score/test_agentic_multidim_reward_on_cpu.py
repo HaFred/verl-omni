@@ -11,511 +11,472 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the RPCO multi-dimensional reward scorer."""
+"""CPU tests for the self-contained RPCO multi-dimensional reward."""
 
 import json
 
 import pytest
 
-from verl_omni.utils.reward_score.agentic_multidim_reward import compute_score
+from verl_omni.utils.reward_score.agentic_multidim_reward import (
+    DIMS,
+    REWARD_COMPONENTS,
+    compute_score,
+)
 
 
-@pytest.fixture(autouse=True)
-def _clear_rpco_weight_env(monkeypatch):
-    for dim in ("REFLECT", "PLAN", "FORMAT", "TOOL_CALL", "RESULT", "TOOL"):
-        monkeypatch.delenv(f"RPCO_W_{dim}", raising=False)
+def _call(name: str, **arguments: str) -> str:
+    return f"<tool_call>\n{json.dumps({'name': name, 'arguments': arguments})}\n</tool_call>"
 
 
-def _gen_call(prompt: str) -> str:
-    payload = json.dumps({"name": "generate_image", "arguments": {"prompt": prompt}})
-    return f"<tool_call>\n{payload}\n</tool_call>"
-
-
-def _gen_obs(path: str, prompt: str, *, ok: bool = True) -> str:
-    return (
-        f"vLLM-Omni generated the requested image. path={path} "
-        f"agentic_tool ok={1 if ok else 0} stub=0 images={1 if ok else 0} backend=vllm_omni prompt={prompt[:60]!r}"
-    )
-
-
-def _judge_call() -> str:
-    return (
-        '<tool_call>\n{"name": "judge_image", "arguments": '
-        '{"user_request": "same as user message", "image_prompt": "last"}}\n</tool_call>'
-    )
-
-
-def _judge_obs(path: str, *, correctness: float, aesthetics: float, good_enough: bool, findings: str) -> str:
-    return (
-        "VL judge on the last generated image:\n"
-        f"  path={path}\n"
-        f"  correctness={correctness:.2f}\n"
-        f"  aesthetics ={aesthetics:.2f}\n"
-        f"  good_enough ={'YES' if good_enough else 'NO'}\n"
-        f"  findings: {findings}\n"
-        "  suggested_fixes: none\n"
-        "  agentic_judge ok=1 parse_ok=1 stub=0 backend=vllm parse_retries=0"
-    )
-
-
-def _closed_reflect_trajectory(
-    *, correctness: float = 0.80, aesthetics: float = 0.76, good_enough: bool = True, extra_gens: int = 0
-) -> str:
-    prompt = "A vertical cafe poster with bold headline text."
-    parts = [
-        _gen_call(prompt),
-        _gen_obs("/tmp/x/image_00_a.png", prompt),
-    ]
-    for i in range(extra_gens):
-        parts.append(_gen_call(f"rewritten prompt {i}"))
-        parts.append(_gen_obs(f"/tmp/x/image_0{i + 1}_b.png", f"rewritten prompt {i}"))
-    parts.append(_judge_call())
-    parts.append(
-        _judge_obs(
-            "/tmp/x/image_00_a.png",
-            correctness=correctness,
-            aesthetics=aesthetics,
-            good_enough=good_enough,
-            findings="headline legible high contrast footer present",
+def _generate(prompt: str, path: str, *, ok: bool = True) -> str:
+    return "\n".join(
+        (
+            _call("generate_image", prompt=prompt),
+            f"agentic_tool ok={int(ok)} images={int(ok)} path={path}",
         )
     )
-    parts.append("Reflection: The image renders the headline and footer correctly with high contrast. Done.")
-    return "\n".join(parts)
 
 
-def _gt(task_type: str = "reflect", expected: int = 1, **extra) -> dict:
-    ground_truth = {
-        "user_request": "A vertical cafe poster with bold headline text.",
+def _judge(
+    path: str,
+    *,
+    correctness: float = 0.8,
+    aesthetics: float = 0.8,
+    accepted: bool = True,
+    findings: str = "headline legible and composition balanced",
+) -> str:
+    return "\n".join(
+        (
+            _call("judge_image", user_request="same as user message", image_prompt="last"),
+            "VL judge on the last generated image:",
+            f"path={path}",
+            f"correctness={correctness}",
+            f"aesthetics={aesthetics}",
+            f"good_enough={'YES' if accepted else 'NO'}",
+            f"findings: {findings}",
+            "suggested_fixes: none",
+            "agentic_judge ok=1 parse_ok=1 stub=0",
+        )
+    )
+
+
+def _reflect_trajectory(
+    *,
+    correctness: float = 0.8,
+    aesthetics: float = 0.8,
+    accepted: bool = True,
+) -> str:
+    return "\n".join(
+        (
+            _generate("A vertical cafe poster with a bold headline.", "/tmp/image_00.png"),
+            _judge(
+                "/tmp/image_00.png",
+                correctness=correctness,
+                aesthetics=aesthetics,
+                accepted=accepted,
+            ),
+            "Reflection: The headline is legible and the composition is balanced. Done.",
+        )
+    )
+
+
+def _ground_truth(task_type: str = "reflect", expected: int = 1, **extra) -> dict:
+    result = {
+        "user_request": "A vertical cafe poster with a bold headline.",
         "task_type": task_type,
         "expected_num_images": expected,
     }
-    ground_truth.update(extra)
-    return ground_truth
+    result.update(extra)
+    return result
 
 
-def test_closed_reflect_trajectory_scores_near_full():
-    blob = _closed_reflect_trajectory()
-    gt = _gt(
-        reference_steps=[
-            {
-                "reflection": "The image renders the headline and footer correctly with high contrast.",
-                "action": "stop",
-                "edit": "",
-            },
-        ]
+def _plan_trajectory(lines: list[str], generated: int | None = None) -> str:
+    count = len(lines) if generated is None else generated
+    parts = ["Plan:", *(f"{index}. {line}" for index, line in enumerate(lines, start=1))]
+    for index, line in enumerate(lines[:count]):
+        parts.append(_generate(line, f"/tmp/image_{index:02d}.png"))
+    parts.extend(
+        (
+            _judge(f"/tmp/image_{max(0, count - 1):02d}.png"),
+            "Reflection: The planned subtask images satisfy the request. Done.",
+        )
     )
-    out = compute_score(solution_str=blob, ground_truth=gt)
-
-    assert out["rollout_valid"] == 1
-    assert out["reward_format"] == 1.0
-    assert out["reward_tool_call"] == 1.0
-    assert "reward_tool" not in out
-    assert out["reward_result"] == 1.0
-    assert out["reward_done"] == 1.0
-    assert 0.5 < out["reward_reflect"] <= 1.0
-    assert out["reward_correctness"] == pytest.approx(0.80)
-    assert out["reward_aesthetics"] == pytest.approx(0.76)
-    assert out["first_correctness"] == pytest.approx(0.80)
-    assert out["first_aesthetics"] == pytest.approx(0.76)
-    assert out["reward_reflect_delta"] == pytest.approx(0.0)
-    assert out["reward_plan"] == 0.0
-    assert out["score"] > 0.9
-    assert out["n_successful_generates"] == 1
+    return "\n".join(parts)
 
 
-def test_plan_trajectory_exact_count_and_coverage():
-    plan_lines = [
-        "1. A snowy winter market with wooden stalls and string lights.",
-        "2. The same market adding a decorated carousel in the center.",
-        "3. The same scene adding a hot cocoa stand with steaming mugs.",
+def test_reflect_reward_blends_judge_quality_and_reference_coverage():
+    reference = "The headline is legible and the composition is balanced."
+    output = compute_score(
+        solution_str=_reflect_trajectory(correctness=0.8, aesthetics=0.6),
+        ground_truth=_ground_truth(reference_steps=[{"reflection": reference, "action": "stop"}]),
+    )
+
+    assert output["rollout_valid"] == 1
+    assert output["reward_reflect"] == pytest.approx(0.85)
+    assert output["reward_plan"] == 0.0
+    assert output["reward_done"] == 1.0
+
+
+def test_reflect_reward_falls_back_to_live_judge_findings():
+    output = compute_score(
+        solution_str=_reflect_trajectory(correctness=0.8, aesthetics=0.6),
+        ground_truth=_ground_truth(),
+    )
+
+    # Quality is 0.7; findings tokens are a subset of the longer policy reflection
+    # so F1 coverage is 5/6, not 1.0 (recall-only used to report 0.85).
+    assert output["reward_reflect"] == pytest.approx(0.5 * 0.7 + 0.5 * (10 / 12))
+
+
+def test_plan_reward_covers_each_reference_subtask():
+    subtasks = [
+        "A snowy market with wooden stalls and warm string lights.",
+        "A decorated carousel centered in the same winter market.",
+        "A cocoa stand with steaming mugs beside the carousel.",
     ]
-    blob = "\n".join(
-        ["Plan:"]
-        + plan_lines
-        + [
-            _gen_call(plan_lines[0]),
-            _gen_obs("/tmp/x/image_00.png", plan_lines[0]),
-            _gen_call(plan_lines[1]),
-            _gen_obs("/tmp/x/image_01.png", plan_lines[1]),
-            _gen_call(plan_lines[2]),
-            _gen_obs("/tmp/x/image_02.png", plan_lines[2]),
-            _judge_call(),
-            _judge_obs(
-                "/tmp/x/image_02.png",
-                correctness=0.82,
-                aesthetics=0.80,
-                good_enough=True,
-                findings="market stalls carousel and cocoa stand all present",
-            ),
-            "Reflection: All three subtask images compose the requested market scene. Done.",
-        ]
+    output = compute_score(
+        solution_str=_plan_trajectory(subtasks),
+        ground_truth=_ground_truth(task_type="plan", expected=3, reference_subtasks=subtasks),
     )
-    gt = _gt(task_type="plan", expected=3, reference_subtasks=plan_lines)
-    out = compute_score(solution_str=blob, ground_truth=gt)
 
-    assert out["reward_plan"] > 0.5
-    assert out["reward_result"] == 1.0
-    assert out["reward_format"] == 1.0
-    assert out["reward_tool_call"] == 1.0
-    assert out["score"] > 0.8
+    assert output["reward_plan"] == pytest.approx(1.0)
+    assert output["reward_result"] == 1.0
+    assert output["reward_format"] == 1.0
 
 
-def test_plan_result_exact_count_mismatch():
-    plan_lines = [
-        "1. A snowy winter market with wooden stalls and string lights.",
-        "2. The same market adding a decorated carousel in the center.",
+def test_plan_forced_reflection_counts_toward_format():
+    subtasks = ["A snowy market with wooden stalls and warm string lights."]
+    parts = ["Plan:", f"1. {subtasks[0]}", _generate(subtasks[0], "/tmp/image_00.png"), _judge("/tmp/image_00.png")]
+    parts.extend(("Reflection: injected stop cue agentic_forced_reflection=1", "Done."))
+    output = compute_score(
+        solution_str="\n".join(parts),
+        ground_truth=_ground_truth(task_type="plan", expected=1, reference_subtasks=subtasks),
+    )
+    assert output["forced_reflection_context"] == 1
+    assert output["terminal_policy_reflection"] == 0
+    assert output["reward_format"] == 1.0
+    assert output["protocol_ok"] == 1
+
+
+def test_format_reward_is_structural_check_ratio():
+    complete = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth())
+    open_loop = compute_score(
+        solution_str="\n".join(
+            (
+                _generate("A cafe poster.", "/tmp/image.png"),
+                _judge("/tmp/image.png"),
+            )
+        ),
+        ground_truth=_ground_truth(),
+    )
+
+    assert complete["reward_format"] == 1.0
+    assert 0.0 < open_loop["reward_format"] < 1.0
+    assert open_loop["protocol_ok"] == 0
+
+
+def test_tool_reward_requires_successful_generate_and_trusted_judge():
+    output = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth())
+
+    assert output["reward_tool"] == 1.0
+    assert output["reward_tool_call"] == 1.0
+
+    open_loop = compute_score(
+        solution_str=_generate("A poster.", "/tmp/image.png"),
+        ground_truth=_ground_truth(),
+    )
+    assert open_loop["rollout_valid"] == 1
+    assert open_loop["reward_tool"] == 0.0
+    assert open_loop["reward_tool_call"] == 1.0
+    assert open_loop["judge_parse_ok_rate"] == 0.0
+
+    malformed = compute_score(
+        solution_str="<tool_call>{bad json}</tool_call>\nagentic_tool ok=1 path=/tmp/image.png",
+        ground_truth=_ground_truth(),
+    )
+    assert malformed["reward_tool"] == 0.0
+    assert malformed["reward_tool_call"] == 0.0
+    assert malformed["rollout_valid"] == 0
+
+
+def test_plan_result_requires_exact_successful_image_count():
+    subtasks = [
+        "A snowy market with wooden stalls and warm lights.",
+        "A decorated carousel in the same winter market.",
     ]
-    blob = "\n".join(
-        ["Plan:"]
-        + plan_lines
-        + [
-            _gen_call(plan_lines[0]),
-            _gen_obs("/tmp/x/image_00.png", plan_lines[0]),
-            _judge_call(),
-            _judge_obs(
-                "/tmp/x/image_00.png",
-                correctness=0.80,
-                aesthetics=0.76,
-                good_enough=True,
-                findings="market stalls present",
-            ),
-            "Reflection: The market is rendered. Done.",
-        ]
+    exact = compute_score(
+        solution_str=_plan_trajectory(subtasks),
+        ground_truth=_ground_truth(task_type="plan", expected=2, reference_subtasks=subtasks),
     )
-    out = compute_score(
-        solution_str=blob, ground_truth=_gt(task_type="plan", expected=2, reference_subtasks=plan_lines)
+    short = compute_score(
+        solution_str=_plan_trajectory(subtasks, generated=1),
+        ground_truth=_ground_truth(task_type="plan", expected=2, reference_subtasks=subtasks),
     )
 
-    assert out["reward_result"] == 0.0  # 1 generated image vs expected 2
+    assert exact["reward_result"] == 1.0
+    assert short["reward_result"] == 0.0
 
 
-def test_reflect_result_is_lenient_stop_validity():
-    # Early YES stop with one image on a 3-state reference row is valid.
-    blob = _closed_reflect_trajectory()
-    out = compute_score(solution_str=blob, ground_truth=_gt(expected=3))
-    assert out["reward_result"] == 1.0
-
-    # Count within reference is valid even when the judge said NO
-    # (lenient stop-validity: R_result only guards over-generation).
-    blob_no = _closed_reflect_trajectory(good_enough=False)
-    out = compute_score(solution_str=blob_no, ground_truth=_gt(expected=3))
-    assert out["reward_result"] == 1.0
-
-    # Over-generating past the reference count is only rescued by a final YES.
-    blob_over = _closed_reflect_trajectory(extra_gens=2, good_enough=False)
-    out = compute_score(solution_str=blob_over, ground_truth=_gt(expected=1))
-    assert out["reward_result"] == 0.0
-    blob_over_yes = _closed_reflect_trajectory(extra_gens=2, good_enough=True)
-    out = compute_score(solution_str=blob_over_yes, ground_truth=_gt(expected=1))
-    assert out["reward_result"] == 1.0
-
-
-def test_terminal_no_is_negative_candidate_despite_positive_components():
-    """Final NO cannot retain positive scalar reward from C/A or protocol dims."""
-    failed = compute_score(
-        solution_str=_closed_reflect_trajectory(
-            correctness=0.80,
-            aesthetics=0.80,
-            good_enough=False,
-        ),
-        ground_truth=_gt(expected=3),
+def test_reflect_result_requires_terminal_yes_and_rejects_over_generation():
+    early_yes = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(expected=3))
+    early_no = compute_score(
+        solution_str=_reflect_trajectory(accepted=False),
+        ground_truth=_ground_truth(expected=3),
     )
-    passed = compute_score(
-        solution_str=_closed_reflect_trajectory(
-            correctness=0.80,
-            aesthetics=0.80,
-            good_enough=True,
-        ),
-        ground_truth=_gt(expected=3),
+    over = "\n".join(
+        (
+            _generate("version one", "/tmp/one.png"),
+            _generate("version two", "/tmp/two.png"),
+            _judge("/tmp/two.png", accepted=False),
+            "Reflection: The second version is still weak. Done.",
+        )
     )
+    over_output = compute_score(solution_str=over, ground_truth=_ground_truth(expected=1))
 
-    # Preserve diagnostics/shaping, then apply an unweighted terminal penalty.
-    assert failed["reward_reflect"] > 0.0
-    assert failed["reward_format"] == 1.0
-    assert failed["reward_result"] == 1.0
-    assert failed["score_before_terminal_penalty"] > 0.0
-    assert failed["reward_terminal_no_penalty"] == -1.0
-    assert failed["final_good_enough"] == 0
-    assert -1.0 <= failed["score"] <= 0.0
-
-    assert passed["reward_terminal_no_penalty"] == 0.0
-    assert passed["reward_missing_tools_penalty"] == 0.0
-    assert passed["reward_good_enough_floor_lift"] == 0.0
-    assert passed["final_good_enough"] == 1
-    assert passed["score"] == pytest.approx(passed["score_before_terminal_penalty"])
-    assert passed["score"] > failed["score"]
+    assert early_yes["reward_result"] == 1.0
+    assert early_no["reward_result"] == 0.0
+    assert over_output["reward_result"] == 0.0
 
 
-def test_skip_judge_cannot_beat_judge_terminal_no():
-    """Generate-only must not outscore an honest judge+NO (reward-hack floor)."""
-    prompt = "A vertical cafe poster with bold headline text."
-    skip_judge = "\n".join(
-        [
-            _gen_call(prompt),
-            _gen_obs("/tmp/x/image_00_a.png", prompt),
-            "Reflection: Looks fine, stopping without judge. Done.",
-        ]
+def test_weighted_total_uses_only_the_task_active_set():
+    text = _reflect_trajectory(correctness=0.8, aesthetics=0.6)
+    ground_truth = _ground_truth(
+        reference_steps=[{"reflection": "unrelated reference tokens", "action": "stop"}],
+        w_reflect=2.0,
+        w_plan=99.0,
+        w_format=1.0,
+        w_tool=1.0,
+        w_result=1.0,
     )
-    skip = compute_score(solution_str=skip_judge, ground_truth=_gt(expected=3))
-    failed = compute_score(
-        solution_str=_closed_reflect_trajectory(
-            correctness=0.80,
-            aesthetics=0.80,
-            good_enough=False,
-        ),
-        ground_truth=_gt(expected=3),
+    output = compute_score(solution_str=text, ground_truth=ground_truth)
+    expected = (
+        2 * output["reward_reflect"] + output["reward_format"] + output["reward_tool"] + output["reward_result"]
+    ) / 5
+
+    assert output["score"] == pytest.approx(expected)
+    without_plan_weight = compute_score(
+        solution_str=text,
+        ground_truth={**ground_truth, "w_plan": 0.0},
     )
-
-    assert skip["rollout_valid"] == 1
-    assert skip["num_judge_image_calls"] == 0
-    assert skip["reward_missing_tools_penalty"] == -1.0
-    assert skip["score_before_terminal_penalty"] > 0.0
-    assert -1.0 <= skip["score"] <= 0.0
-    # Skip-judge must not be the higher-reward escape hatch vs terminal NO.
-    assert skip["score"] <= failed["score"]
+    assert without_plan_weight["score"] == pytest.approx(output["score"])
 
 
-def test_good_enough_at_turn_cap_keeps_high_success_reward():
-    """A live YES remains a strong signal even without budget for Done."""
-    prompt = "A vertical cafe poster with bold headline text."
-    reached_yes_at_cap = "\n".join(
-        [
-            _gen_call(prompt),
-            _gen_obs("/tmp/x/image_00_a.png", prompt),
-            _judge_call(),
-            _judge_obs(
-                "/tmp/x/image_00_a.png",
-                correctness=0.82,
-                aesthetics=0.80,
-                good_enough=True,
-                findings="all requested elements are clear",
-            ),
-        ]
+def test_zero_weights_keep_valid_rollout_but_zero_score():
+    ground_truth = _ground_truth(**{f"w_{dim}": 0.0 for dim in DIMS})
+    output = compute_score(solution_str=_reflect_trajectory(), ground_truth=ground_truth)
+
+    assert output["rollout_valid"] == 1
+    assert output["score"] == 0.0
+
+
+def test_garbage_weights_fail_closed():
+    garbage = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(w_reflect="not-a-float"))
+    assert garbage["method"] == "agentic_multidim_bad_weights"
+    assert garbage["rollout_valid"] == 0
+    assert garbage["score"] == 0.0
+
+    negative = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(w_format=-1.0))
+    assert negative["method"] == "agentic_multidim_bad_weights"
+
+
+def test_done_indicator_requires_successful_judge_and_terminal_decision():
+    open_output = compute_score(
+        solution_str="\n".join((_generate("A poster.", "/tmp/image.png"), _judge("/tmp/image.png"))),
+        ground_truth=_ground_truth(),
     )
-    out = compute_score(solution_str=reached_yes_at_cap, ground_truth=_gt(expected=3))
+    closed_output = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth())
 
-    assert out["rollout_valid"] == 1
-    assert out["final_good_enough"] == 1
-    assert out["terminal_done"] == 0
-    assert out["score_before_terminal_penalty"] < 0.8
-    assert out["reward_good_enough_floor_lift"] > 0.0
-    assert out["score"] == pytest.approx(0.8)
+    assert open_output["reward_done"] == 0.0
+    assert closed_output["reward_done"] == 1.0
 
 
-def test_tool_reward_is_presence_based():
-    prompt = "A poster."
-    # No successful image → rollout invalid, score 0.
-    blob = "\n".join(
-        [
-            _gen_call(prompt),
-            _gen_obs("/tmp/x/none.png", prompt, ok=False),
-            _judge_call(),
-            _judge_obs("/tmp/x/none.png", correctness=0.1, aesthetics=0.1, good_enough=False, findings="no image"),
-            "Reflection: Failed. Done.",
-        ]
+def test_rewrite_after_first_yes_breaks_done_indicator():
+    text = "\n".join(
+        (
+            _generate("version one", "/tmp/one.png"),
+            _judge("/tmp/one.png", accepted=True),
+            _generate("version two", "/tmp/two.png"),
+            _judge("/tmp/two.png", accepted=False),
+            "Reflection: The unnecessary rewrite is worse. Done.",
+        )
     )
-    out = compute_score(solution_str=blob, ground_truth=_gt())
-    assert out["rollout_valid"] == 0
-    assert out["score"] == 0.0
+    output = compute_score(solution_str=text, ground_truth=_ground_truth())
 
-    # Tool calls present but no terminal Done → f_tool_call=1, f_done=0.
-    blob = "\n".join(
-        [
-            _gen_call(prompt),
-            _gen_obs("/tmp/x/image_00.png", prompt),
-            _judge_call(),
-            _judge_obs("/tmp/x/image_00.png", correctness=0.8, aesthetics=0.76, good_enough=True, findings="ok"),
-            "Reflection: The image looks good.",
-        ]
-    )
-    out = compute_score(solution_str=blob, ground_truth=_gt())
-    assert out["reward_tool_call"] == 1.0
-    assert out["reward_done"] == 0.0
+    assert output["rewrite_after_yes"] == 1
+    assert output["reward_done"] == 0.0
+    assert output["reward_result"] == 0.0
 
 
-def test_rewrite_after_yes_downgrades_done():
-    prompt = "A poster."
-    blob = "\n".join(
-        [
-            _gen_call(prompt),
-            _gen_obs("/tmp/x/image_00.png", prompt),
-            _judge_call(),
-            _judge_obs("/tmp/x/image_00.png", correctness=0.85, aesthetics=0.80, good_enough=True, findings="ok"),
-            _gen_call("a rewrite after YES"),
-            _gen_obs("/tmp/x/image_01.png", "a rewrite after YES"),
-            _judge_call(),
-            _judge_obs("/tmp/x/image_01.png", correctness=0.5, aesthetics=0.5, good_enough=False, findings="worse"),
-            "Reflection: The rewrite made it worse. Done.",
-        ]
-    )
-    out = compute_score(solution_str=blob, ground_truth=_gt())
-
-    assert out["rewrite_after_yes"] == 1
-    assert out["reward_tool_call"] == 1.0  # calls exist — presence, not the old ladder
-    assert out["reward_done"] == 0.0  # rewrite-after-YES breaks the closed loop
-
-
-def test_injected_forced_reflection_never_earns_credit():
-    prompt = "A poster."
-    blob = "\n".join(
-        [
-            _gen_call(prompt),
-            _gen_obs("/tmp/x/image_00.png", prompt),
-            _judge_call(),
-            _judge_obs("/tmp/x/image_00.png", correctness=0.80, aesthetics=0.76, good_enough=True, findings="ok"),
-            "Reflection: VL judge reports the image is good. agentic_forced_reflection=1",
+def test_forced_reflection_text_does_not_count_as_policy_reflection():
+    text = "\n".join(
+        (
+            _generate("A poster.", "/tmp/image.png"),
+            _judge("/tmp/image.png"),
+            "Reflection: injected stop cue agentic_forced_reflection=1",
             "Done.",
-        ]
+        )
     )
-    out = compute_score(solution_str=blob, ground_truth=_gt())
+    output = compute_score(solution_str=text, ground_truth=_ground_truth())
 
-    assert out["terminal_done"] == 1
-    assert out["forced_reflection_context"] == 1
-    assert out["terminal_policy_reflection"] == 0
-    assert out["reward_tool_call"] == 1.0
-    assert out["reward_done"] == 1.0  # forced stop context still closes the loop
+    assert output["forced_reflection_context"] == 1
+    assert output["terminal_policy_reflection"] == 0
+    assert output["terminal_done"] == 1
+    assert output["reward_done"] == 1.0
+    assert output["reward_format"] == 1.0
+    assert output["protocol_ok"] == 1
 
 
-def test_weighted_total_respects_active_set():
-    blob = _closed_reflect_trajectory()
-    gt = _gt(
-        reference_steps=[
-            {
-                "reflection": "The image renders the headline and footer correctly with high contrast.",
-                "action": "stop",
-                "edit": "",
-            },
-        ]
+def test_forced_reflection_text_does_not_inflate_reference_coverage():
+    injected = "The headline is legible and the composition is balanced."
+    text = "\n".join(
+        (
+            _generate("A poster.", "/tmp/image.png"),
+            _judge("/tmp/image.png", correctness=0.8, aesthetics=0.6),
+            f"Reflection: {injected} agentic_forced_reflection=1",
+            "Done.",
+        )
     )
-    equal = {f"w_{dim}": 1.0 for dim in ("reflect", "format", "tool_call", "result")}
-    base = compute_score(solution_str=blob, ground_truth={**gt, **equal})
+    output = compute_score(
+        solution_str=text,
+        ground_truth=_ground_truth(reference_steps=[{"reflection": injected, "action": "stop"}]),
+    )
 
-    # w_plan is ignored on reflect rows (not in the active set W).
-    gt_plan_heavy = {**gt, **{f"w_{dim}": 1.0 for dim in ("reflect", "plan", "format", "tool_call", "result")}}
-    gt_plan_heavy["w_plan"] = 99.0
-    out = compute_score(solution_str=blob, ground_truth=gt_plan_heavy)
-    assert out["score"] == pytest.approx(base["score"])
-
-    # All dimensions weighted zero → score 0 despite valid rollout.
-    gt_zero = dict(gt, **{f"w_{dim}": 0.0 for dim in ("reflect", "format", "tool_call", "result")})
-    out = compute_score(solution_str=blob, ground_truth=gt_zero)
-    assert out["score"] == 0.0
-    assert out["rollout_valid"] == 1
-
-    # Legacy parquet ``w_tool`` still drives the mix (same as ``w_tool_call``).
-    gt_legacy = dict(gt, **{f"w_{dim}": 0.0 for dim in ("reflect", "format", "result")})
-    gt_legacy["w_tool"] = 1.0
-    out = compute_score(solution_str=blob, ground_truth=gt_legacy)
-    assert out["score"] == pytest.approx(out["reward_tool_call"])
+    # Injected text contributes no coverage: only half of the 0.7 judge quality.
+    assert output["reward_reflect"] == pytest.approx(0.35)
 
 
-def test_empty_and_invalid_rollouts_zero():
-    out = compute_score(solution_str="", ground_truth=_gt())
-    assert out["score"] == 0.0
-    assert out["rollout_valid"] == 0
-    assert out["method"] == "agentic_multidim_empty"
+def test_missing_or_invalid_task_type_fails_closed():
+    missing = compute_score(solution_str=_reflect_trajectory(), ground_truth={"user_request": "x"})
+    assert missing["method"] == "agentic_multidim_missing_task_type"
+    assert missing["rollout_valid"] == 0
+    assert missing["score"] == 0.0
 
-    out = compute_score(solution_str="Reflection: Done.", ground_truth=_gt())
-    assert out["score"] == 0.0
-    assert out["rollout_valid"] == 0
+    bad = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(task_type="other"))
+    assert bad["method"] == "agentic_multidim_missing_task_type"
+    assert bad["score"] == 0.0
+
+    from_extra = compute_score(
+        solution_str=_reflect_trajectory(),
+        ground_truth={"user_request": "x", "expected_num_images": 1},
+        extra_info={"task_type": "reflect"},
+    )
+    assert from_extra["rollout_valid"] == 1
+    assert from_extra["task_type"] == "reflect"
 
 
-def _assert_full_schema(out: dict) -> None:
-    for dim in ("reflect", "plan", "format", "tool_call", "result"):
-        assert f"reward_{dim}" in out
-    assert "reward_tool" not in out
-    for key in (
+def test_solution_image_without_text_raises():
+    with pytest.raises(ValueError, match="solution_str"):
+        compute_score(ground_truth=_ground_truth(), solution_image=object())
+
+
+def test_qwen_xml_tool_calls_are_supported():
+    generate = "<tool_call><function=generate_image><parameter=prompt>A cafe poster</parameter></function></tool_call>"
+    judge = (
+        "<tool_call><function=judge_image>"
+        "<parameter=user_request>same as user message</parameter>"
+        "<parameter=image_prompt>last</parameter></function></tool_call>"
+    )
+    text = "\n".join(
+        (
+            generate,
+            "agentic_tool ok=1 images=1 path=/tmp/image.png",
+            judge,
+            _judge("/tmp/image.png").split("</tool_call>", 1)[1],
+            "Reflection: The poster looks correct. Done.",
+        )
+    )
+    output = compute_score(solution_str=text, ground_truth=_ground_truth())
+
+    assert output["num_hermes_tool_calls"] == 2
+    assert output["reward_tool"] == 1.0
+    assert output["rollout_valid"] == 1
+
+
+def test_empty_and_failed_generate_rollouts_are_hard_zero():
+    empty = compute_score(solution_str="", ground_truth=_ground_truth())
+    failed = compute_score(
+        solution_str=_generate("A poster.", "/tmp/image.png", ok=False),
+        ground_truth=_ground_truth(),
+    )
+
+    assert empty["score"] == failed["score"] == 0.0
+    assert empty["rollout_valid"] == failed["rollout_valid"] == 0
+    assert empty["judge_parse_ok_rate"] == 0.0
+    assert failed["reward_tool_call"] == 1.0
+
+
+def test_all_paths_emit_stable_schema_and_metric_contract():
+    outputs = (
+        compute_score(solution_str="", ground_truth=_ground_truth()),
+        compute_score(solution_str="Reflection: Done.", ground_truth=_ground_truth()),
+        compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth()),
+    )
+    expected_keys = set(outputs[0])
+
+    assert all(set(output) == expected_keys for output in outputs)
+    assert REWARD_COMPONENTS == (
+        "reward_reflect",
+        "reward_plan",
+        "reward_format",
+        "reward_tool",
+        "reward_result",
         "reward_done",
-        "reward_terminal_no_penalty",
-        "reward_missing_tools_penalty",
-        "reward_good_enough_floor_lift",
-        "score_before_terminal_penalty",
-        "final_good_enough",
-        "reward_correctness",
-        "reward_aesthetics",
-        "first_correctness",
-        "first_aesthetics",
-        "reward_reflect_delta",
-        "num_hermes_tool_calls",
-        "num_generate_image_prompts",
-        "num_judge_image_calls",
-        "judge_parse_ok",
-        "protocol_ok",
-        "rollout_valid",
-        "terminal_done",
-        "n_successful_generates",
-        "task_type",
-        "method",
-    ):
-        assert key in out
-
-
-def test_full_schema_is_emitted():
-    _assert_full_schema(compute_score(solution_str=_closed_reflect_trajectory(), ground_truth=_gt()))
-    _assert_full_schema(compute_score(solution_str="", ground_truth=_gt()))
-    _assert_full_schema(compute_score(solution_str="Reflection: Done.", ground_truth=_gt()))
-
-
-def test_multidim_emits_continuous_first_and_last_ca():
-    out = compute_score(solution_str=_closed_reflect_trajectory(), ground_truth=_gt())
-    assert out["reward_correctness"] == pytest.approx(0.80)
-    assert out["reward_aesthetics"] == pytest.approx(0.76)
-    empty = compute_score(solution_str="", ground_truth=_gt())
-    assert empty["reward_correctness"] == 0.0
-    assert empty["reward_aesthetics"] == 0.0
-
-
-def test_reflect_uses_last_image_ca_not_first_yes():
-    prompt = "A poster."
-    blob = "\n".join(
-        [
-            _gen_call(prompt),
-            _gen_obs("/tmp/x/image_00.png", prompt),
-            _judge_call(),
-            _judge_obs("/tmp/x/image_00.png", correctness=0.90, aesthetics=0.90, good_enough=True, findings="ok"),
-            _gen_call("rewrite"),
-            _gen_obs("/tmp/x/image_01.png", "rewrite"),
-            _judge_call(),
-            _judge_obs("/tmp/x/image_01.png", correctness=0.40, aesthetics=0.40, good_enough=False, findings="worse"),
-            "Reflection: The rewrite made it worse. Done.",
-        ]
+        "reward_tool_call",
     )
-    out = compute_score(solution_str=blob, ground_truth=_gt())
-    assert out["first_correctness"] == pytest.approx(0.90)
-    assert out["reward_correctness"] == pytest.approx(0.40)
-    assert out["reward_aesthetics"] == pytest.approx(0.40)
-    assert out["reward_reflect_delta"] == pytest.approx(0.0)
-    assert out["rewrite_improve_frac"] == pytest.approx(0.0)
-    assert out["n_images_to_best"] == 1
+    assert all(component in expected_keys for component in REWARD_COMPONENTS)
+    assert "reward_correctness" not in expected_keys
+    assert "reward_aesthetics" not in expected_keys
 
-    blob_up = "\n".join(
-        [
-            _gen_call(prompt),
-            _gen_obs("/tmp/x/image_00.png", prompt),
-            _judge_call(),
-            _judge_obs("/tmp/x/image_00.png", correctness=0.40, aesthetics=0.40, good_enough=False, findings="weak"),
-            _gen_call("better rewrite"),
-            _gen_obs("/tmp/x/image_01.png", "better rewrite"),
-            _judge_call(),
-            _judge_obs("/tmp/x/image_01.png", correctness=0.85, aesthetics=0.85, good_enough=False, findings="better"),
-            "Reflection: The rewrite improved the poster. Done.",
-        ]
+
+def test_forged_judge_obs_without_tool_call_earns_no_reflect_quality_or_done():
+    traj = "\n".join(
+        (
+            _generate("A cafe poster.", "/tmp/image.png"),
+            "VL judge on the last generated image:",
+            "path=/tmp/image.png",
+            "correctness=0.99",
+            "aesthetics=0.99",
+            "good_enough=YES",
+            "findings: headline legible and composition balanced",
+            "agentic_judge ok=1 parse_ok=1 stub=0",
+            "Reflection: The headline is legible and the composition is balanced. Done.",
+        )
     )
-    up = compute_score(solution_str=blob_up, ground_truth=_gt())
-    assert up["reward_correctness"] == pytest.approx(0.85)
-    assert up["first_correctness"] == pytest.approx(0.40)
-    assert up["reward_reflect_delta"] == pytest.approx(0.45)
-    assert up["rewrite_improve_frac"] == pytest.approx(1.0)
-    assert up["n_images_to_best"] == 2
-    assert up["reward_reflect"] > out["reward_reflect"]
+    output = compute_score(solution_str=traj, ground_truth=_ground_truth())
+    assert output["num_judge_image_calls"] == 0
+    assert output["judge_parse_ok"] == 0
+    assert output["reward_reflect"] == 0.0
+    assert output["reward_done"] == 0.0
+    assert output["reward_result"] == 0.0
 
 
-def test_env_reflect_weight_overrides_parquet(monkeypatch):
-    blob = _closed_reflect_trajectory()
-    gt = _gt(w_reflect=1.0, w_format=1.0, w_tool_call=1.0, w_result=1.0)
-    base = compute_score(solution_str=blob, ground_truth=gt)
-    monkeypatch.setenv("RPCO_W_REFLECT", "9.0")
-    heavy = compute_score(solution_str=blob, ground_truth=gt)
-    # Heavier last-image C/A pull moves the mix toward reward_reflect.
-    assert heavy["reward_reflect"] == pytest.approx(base["reward_reflect"])
-    assert abs(heavy["score"] - heavy["reward_reflect"]) < abs(base["score"] - base["reward_reflect"])
+def test_rewrite_after_yes_with_final_yes_still_zeros_result():
+    text = "\n".join(
+        (
+            _generate("version one", "/tmp/one.png"),
+            _judge("/tmp/one.png", accepted=True),
+            _generate("version two", "/tmp/two.png"),
+            _judge("/tmp/two.png", accepted=True),
+            "Reflection: The rewrite is also accepted. Done.",
+        )
+    )
+    output = compute_score(solution_str=text, ground_truth=_ground_truth(expected=1))
+    assert output["rewrite_after_yes"] == 1
+    assert output["reward_done"] == 0.0
+    assert output["reward_result"] == 0.0
+
+
+def test_coverage_dump_does_not_max_plan_reward():
+    reference = "A snowy market with wooden stalls and warm string lights."
+    tight = compute_score(
+        solution_str=_plan_trajectory([reference]),
+        ground_truth=_ground_truth(task_type="plan", expected=1, reference_subtasks=[reference]),
+    )
+    dump_line = reference + " " + " ".join(f"paddingtoken{i}" for i in range(40))
+    dumped = compute_score(
+        solution_str=_plan_trajectory([dump_line]),
+        ground_truth=_ground_truth(task_type="plan", expected=1, reference_subtasks=[reference]),
+    )
+    assert tight["reward_plan"] == pytest.approx(1.0)
+    assert dumped["reward_plan"] < 0.5
+    assert dumped["reward_plan"] < tight["reward_plan"]

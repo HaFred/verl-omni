@@ -84,3 +84,35 @@ def validate_bagel_corl_config(config: Any) -> None:
     und_model = str(_select(config, "actor_rollout_ref.model.path") or "")
     if "qwen3-vl" in und_model.lower() or "Qwen3-VL" in und_model:
         raise ValueError("bagel_corl_sync forbids Qwen3-VL as the UND policy; use the published Bagel checkpoint")
+
+    # One vLLM-Omni replica is AR xor Diffusion (strategy chosen at server init).
+    # bagel_corl_deploy.yaml → bagel_single_stage → DiffusionStrategy: GEN works;
+    # UND decode with AR sampling params hits "num_inference_steps must be set".
+    # output_mode=ar alone would break GEN traj. Dual-role serving is the spike.
+    output_mode = str(
+        _select(config, "actor_rollout_ref.rollout.engine_kwargs.vllm_omni.output_mode", default="diffusion")
+        or "diffusion"
+    )
+    if output_mode == "ar":
+        raise ValueError(
+            "bagel_corl_sync refuses output_mode=ar alone: GEN FlowGRPO needs DiffusionStrategy. "
+            "Need dual-role UND AR + GEN diffusion on Bagel (not Qwen)."
+        )
+    und_ready = _select(config, "actor_rollout_ref.rollout.agent.und_ar_serving_ready", default=False)
+    if not bool(und_ready):
+        raise ValueError(
+            "bagel_corl_sync: dual-role UND AR serving is not ready. "
+            "bagel_single_stage is GEN-only (DiffusionStrategy); UND _und_decode then fails with "
+            "'num_inference_steps must be set for RL rollouts' and leaves TQ empty. "
+            "Prove Hermes generate_image via spike_und_hermes.py / dual-role replica, then set "
+            "actor_rollout_ref.rollout.agent.und_ar_serving_ready=True. "
+            "Do not fall back to Qwen3-VL for UND."
+        )
+    und_deploy = _select(config, "actor_rollout_ref.rollout.agent.und_deploy_config")
+    if not und_deploy:
+        raise ValueError(
+            "bagel_corl_sync with und_ar_serving_ready=True requires "
+            "actor_rollout_ref.rollout.agent.und_deploy_config "
+            "(AR bagel_think yaml). GEN keeps engine_kwargs.vllm_omni.deploy_config "
+            "(bagel_single_stage)."
+        )

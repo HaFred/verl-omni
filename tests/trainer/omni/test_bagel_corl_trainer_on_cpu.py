@@ -24,6 +24,7 @@ from verl.utils.tensordict_utils import assign_non_tensor_data
 
 import verl_omni.trainer.omni  # noqa: F401  registers bagel_corl_sync
 from verl_omni.trainer.omni.bagel_corl_trainer import OmniBagelCoRLTrainerSync, _normalize_tq_kv_get_result
+from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
 from verl_omni.utils.config import validate_bagel_corl_config, validate_config
 from verl_omni.workers.utils.losses import bagel_composite_loss
 
@@ -39,7 +40,13 @@ def _corl_cfg(**overrides):
                 "model": {"path": "/models/ByteDance-Seed/BAGEL-7B-MoT", "lora_rank": 64},
                 "rollout": {
                     "n": 8,
-                    "agent": {"gen_samples_per_call": 4, "max_generate_passes": 1},
+                    "agent": {
+                        "gen_samples_per_call": 4,
+                        "max_generate_passes": 1,
+                        # Unit tests exercise N/S/LoRA gates; dual-role serving is a separate spike.
+                        "und_ar_serving_ready": True,
+                        "und_deploy_config": "examples/agenticllmgrpo_trainer/bagel/bagel_corl_deploy_ar.yaml",
+                    },
                 },
             },
         }
@@ -58,6 +65,7 @@ def test_rewrite_bagel_corl_configs_strips_omni_model_keys():
     trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
     trainer.config = OmegaConf.create(
         {
+            "data": {"train_files": "/tmp/train.parquet"},
             "actor_rollout_ref": {
                 "model": {
                     "_target_": "verl_omni.workers.config.omni.OmniModelConfig",
@@ -112,6 +120,11 @@ def test_rewrite_bagel_corl_configs_strips_omni_model_keys():
     assert agent._target_.endswith("BagelCorlAgentLoopConfig")
     assert agent.gen_samples_per_call == 4
     assert agent.max_generate_passes == 1
+    assert rollout.calculate_log_probs is True
+    assert float(rollout.algo.noise_level) > 0.0
+    assert int(rollout.algo.sde_window_size) >= 1
+    assert int(rollout.pipeline.num_inference_steps) >= 1
+    assert trainer.config.data.continuous_token.enable is False
 
 
 def test_seeds_s_must_be_at_least_two():
@@ -133,6 +146,37 @@ def test_sibling_n_need_not_equal_two_s():
 
 def test_default_corl_config_validates():
     validate_config(_corl_cfg())
+
+
+def test_und_ar_serving_ready_required():
+    with pytest.raises(ValueError, match="dual-role UND AR serving is not ready"):
+        validate_bagel_corl_config(
+            _corl_cfg(actor_rollout_ref={"rollout": {"agent": {"und_ar_serving_ready": False}}})
+        )
+
+
+def test_und_deploy_config_required_when_ready():
+    with pytest.raises(ValueError, match="und_deploy_config"):
+        validate_bagel_corl_config(
+            _corl_cfg(actor_rollout_ref={"rollout": {"agent": {"und_ar_serving_ready": True, "und_deploy_config": None}}})
+        )
+
+
+def test_output_mode_ar_alone_rejected():
+    with pytest.raises(ValueError, match="output_mode=ar alone"):
+        validate_bagel_corl_config(
+            _corl_cfg(
+                actor_rollout_ref={
+                    "rollout": {
+                        "engine_kwargs": {"vllm_omni": {"output_mode": "ar"}},
+                        "agent": {
+                            "und_ar_serving_ready": True,
+                            "und_deploy_config": "examples/agenticllmgrpo_trainer/bagel/bagel_corl_deploy_ar.yaml",
+                        },
+                    }
+                }
+            )
+        )
 
 
 def test_qwen_und_forbidden():
@@ -169,7 +213,91 @@ def test_composite_loss_never_uses_und_token_adv_for_gen():
     assert float(loss.detach()) == 0.0
 
 
-def test_gen_flowgrpo_advantage_groups_by_gen_group_uid():
+def test_build_gen_proto_packs_traj_for_diffusion_engine():
+    """GEN actor view must carry latents/timesteps so diffusion V1 engine can train under AR outer loop."""
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage, build_gen_flowgrpo_proto
+    from verl_omni.workers.engine.fsdp.bagel_corl_composite import gen_view_has_traj, materialize_gen_train_batch
+
+    rows = []
+    for seed in range(2):
+        rows.append(
+            {
+                "gen_group_uid": "call0",
+                "gen_sample_uid": f"call0:{seed}",
+                "rollout_log_probs": [0.1, 0.2],
+                "rm_score": float(seed),
+                "all_latents": torch.randn(2, 4),
+                "timesteps": torch.tensor([999.0, 500.0]),
+                "prompt_token_ids": [1, 2, 3],
+            }
+        )
+    proto = build_gen_flowgrpo_proto(rows)
+    assert proto is not None
+    assert "all_latents" in proto.batch.keys()
+    assert "all_timesteps" in proto.batch.keys()
+    assert proto.batch["all_latents"].shape[0] == 2
+    assert proto.batch["all_timesteps"].shape == (2, 2)
+
+    adv_proto, metrics = apply_gen_flowgrpo_advantage(rows, adv_estimator="flow_grpo")
+    assert adv_proto is not None
+    assert metrics["gen/has_traj"] == 1.0
+    assert gen_view_has_traj(adv_proto.batch)
+    gen_data = materialize_gen_train_batch(adv_proto.batch, {"num_gen_rows": 2})
+    assert "all_latents" in gen_data.keys()
+    assert "advantages" in gen_data.keys()
+
+
+def test_response_aligned_und_log_probs():
+    from verl_omni.workers.engine.fsdp.bagel_corl_composite import response_aligned_und_log_probs
+
+    token_logp = torch.arange(12, dtype=torch.float32).view(2, 6)
+    out = response_aligned_und_log_probs(token_logp, response_len=3)
+    assert out.shape == (2, 3)
+    assert torch.equal(out[0], token_logp[0, -3:])
+
+
+def test_composite_loss_und_plus_gen_separate_views():
+    """bagel_composite_loss sums UND ppo stub + GEN diffusion when both outputs present."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    und_data = TensorDict(
+        {
+            "response_mask": torch.ones(2, 3),
+            "old_log_probs": torch.zeros(2, 3),
+            "advantages": torch.ones(2, 3),
+        },
+        batch_size=[2],
+    )
+    gen_data = TensorDict(
+        {"advantages": torch.ones(2, 2), "old_log_probs": torch.zeros(2, 2)},
+        batch_size=[2],
+    )
+    data = TensorDict({}, batch_size=[])
+    assign_non_tensor_data(data, "bagel_corl_und", und_data)
+    assign_non_tensor_data(data, "bagel_corl_gen", gen_data)
+    assign_non_tensor_data(data, "has_complete_gen_groups", True)
+    assign_non_tensor_data(data, "skip_gen", False)
+    assign_non_tensor_data(data, "num_gen_rows", 2)
+
+    model_output = {
+        "und": {"log_probs": torch.zeros(2, 3, requires_grad=True)},
+        "gen": {"log_probs": torch.zeros(2, requires_grad=True)},
+    }
+
+    def fake_ppo(config, model_output, data, dp_group=None):
+        return torch.tensor(1.0, requires_grad=True), {}
+
+    def fake_diff(config, model_output, data, dp_group=None):
+        return torch.tensor(2.0, requires_grad=True), {}
+
+    with (
+        patch("verl.workers.utils.losses.ppo_loss", fake_ppo),
+        patch("verl_omni.workers.utils.losses.diffusion_loss", fake_diff),
+    ):
+        loss, metrics = bagel_composite_loss(config=SimpleNamespace(), model_output=model_output, data=data)
+    assert float(loss.detach()) == 3.0
+    assert metrics.get("gen/skipped_no_groups") is not None
     from types import SimpleNamespace
 
     from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage
@@ -184,11 +312,14 @@ def test_gen_flowgrpo_advantage_groups_by_gen_group_uid():
                     "gen_sample_uid": f"{group}:{seed}",
                     "rollout_log_probs": [0.1, 0.2, 0.3],
                     "rm_score": score,
+                    "all_latents": torch.randn(3, 4),
+                    "timesteps": torch.tensor([900.0, 600.0, 300.0]),
                 }
             )
     proto, metrics = apply_gen_flowgrpo_advantage(rows, adv_estimator="flow_grpo")
     assert proto is not None
     assert metrics["has_complete_gen_groups"] == 1.0
+    assert metrics["gen/has_traj"] == 1.0
     assert metrics["gen/skipped_no_groups"] == 0.0
     uids = list(proto.non_tensor_batch["uid"])
     assert uids == ["callA", "callA", "callB", "callB"]
@@ -198,12 +329,16 @@ def test_gen_flowgrpo_advantage_groups_by_gen_group_uid():
     assert abs(adv[2, 0].item()) < 1e-5
     assert abs(adv[3, 0].item()) < 1e-5
 
-    skipped, skip_metrics = apply_gen_flowgrpo_advantage(
-        [{"gen_group_uid": "g", "rm_score": 1.0}],
-        adv_estimator="flow_grpo",
-    )
+    with pytest.raises(RuntimeError, match="lacks all_latents/timesteps"):
+        apply_gen_flowgrpo_advantage(
+            [{"gen_group_uid": "g", "rm_score": 1.0, "rollout_log_probs": [0.1, 0.2]}],
+            adv_estimator="flow_grpo",
+        )
+
+    skipped, skip_metrics = apply_gen_flowgrpo_advantage([], adv_estimator="flow_grpo")
     assert skipped is None
     assert skip_metrics["has_complete_gen_groups"] == 0.0
+    assert skip_metrics["gen/has_traj"] == 0.0
 
     trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
     # UND keeps token grpo; GEN must take model.algorithm=flow_grpo (not algorithm.adv_estimator).
@@ -285,3 +420,111 @@ def test_gen_adv_estimator_rejects_token_grpo_collision():
     )
     with pytest.raises(ValueError, match="collides"):
         trainer._compute_advantage(type("B", (), {"extra_info": {}})(), {})
+
+
+def test_diffusion_v1_gen_lane_binds_v1_hooks():
+    from verl_omni.trainer.omni.bagel_corl_diff_v1 import DiffusionV1GenLane, diffusion_v1_gen_hooks
+
+    try:
+        old, ref, adv = diffusion_v1_gen_hooks()
+    except ImportError:
+        pytest.skip("verl pin missing ReplayBufferAsync; GEN lane binds at runtime on a current pin")
+    owner = type(
+        "Owner",
+        (),
+        {"config": object(), "actor_rollout_wg": object(), "ref_in_actor": True, "ref_policy_wg": None},
+    )()
+    lane = DiffusionV1GenLane(owner)
+    assert lane._compute_old_log_prob.__func__ is old
+    assert lane._compute_advantage.__func__ is adv
+    assert lane.actor_rollout_wg is owner.actor_rollout_wg
+
+
+def test_composite_forward_mode_gen_only_vs_und_infer():
+    from verl.utils.tensordict_utils import assign_non_tensor_data
+    from verl_omni.workers.engine.fsdp.bagel_corl_composite import composite_forward_mode
+
+    gen_only = TensorDict(
+        {"all_latents": torch.zeros(2, 3, 4), "all_timesteps": torch.zeros(2, 3)},
+        batch_size=[2],
+    )
+    assert composite_forward_mode(gen_only, forward_only=True) == "gen_only_diffusion"
+
+    und_infer = TensorDict(
+        {"input_ids": torch.ones(2, 5, dtype=torch.long), "response_mask": torch.ones(2, 2)},
+        batch_size=[2],
+    )
+    assert composite_forward_mode(und_infer, forward_only=True) == "und_infer"
+
+    empty = TensorDict({}, batch_size=[])
+    assign_non_tensor_data(empty, "skip_gen", True)
+    assign_non_tensor_data(empty, "has_complete_gen_groups", False)
+    assert composite_forward_mode(empty, forward_only=False) == "empty"
+
+
+def test_compute_advantage_without_worker_group_uses_helper():
+    """No actor_rollout_wg → stash FlowGRPO helper (CPU), not a second trainer."""
+    from unittest.mock import patch
+
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = OmegaConf.create(
+        {
+            "algorithm": {
+                "adv_estimator": "grpo",
+                "norm_adv_by_std_in_grpo": True,
+                "global_std": True,
+            },
+            "actor_rollout_ref": {
+                "model": {"algorithm": "flow_grpo"},
+                "rollout": {"agent": {"gen_samples_per_call": 2}},
+            },
+        }
+    )
+    extra = {
+        "gen_batch": [
+            {
+                "gen_group_uid": "callA",
+                "rollout_log_probs": [0.1, 0.2],
+                "rm_score": 1.0,
+                "all_latents": torch.randn(2, 4),
+                "timesteps": torch.tensor([900.0, 500.0]),
+            },
+            {
+                "gen_group_uid": "callA",
+                "rollout_log_probs": [0.1, 0.2],
+                "rm_score": 0.0,
+                "all_latents": torch.randn(2, 4),
+                "timesteps": torch.tensor([900.0, 500.0]),
+            },
+        ]
+    }
+    batch = type("B", (), {"extra_info": extra})()
+
+    def fake_super_adv(_batch, _metrics):
+        return _batch
+
+    with patch.object(OmniPPOTrainerSync, "_compute_advantage", lambda self, b, m: fake_super_adv(b, m)):
+        out = OmniBagelCoRLTrainerSync._compute_advantage(trainer, batch, {})
+    assert extra["has_complete_gen_groups"]
+    assert extra["bagel_corl_gen"] is not None
+    assert extra["bagel_corl_gen"]["advantages"][0, 0].item() > 0
+    assert extra["bagel_corl_gen"]["advantages"][1, 0].item() < 0
+    assert out is batch
+
+
+def test_gen_batch_rejects_legacy_nested_meta():
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"agent": {"gen_samples_per_call": 2}}}})
+    extra = {"bagel_corl": {"gen_batch": [{"gen_group_uid": "x"}]}}
+    batch = type("B", (), {"extra_info": extra, "meta_info": {}, "non_tensor_batch": {}})()
+    with pytest.raises(RuntimeError, match="legacy nested path removed"):
+        trainer._gen_batch_from_step(batch)
+
+
+def test_fetch_gen_records_raises_without_partition_id():
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    extra = {}
+    batch = type("B", (), {"extra_info": extra})()
+    und_records = [{"fields": {"child_gen_keys": ["k0::gen::c::0"]}}]
+    with pytest.raises(RuntimeError, match="no partition_id"):
+        trainer._fetch_gen_records_by_keys(batch, und_records)

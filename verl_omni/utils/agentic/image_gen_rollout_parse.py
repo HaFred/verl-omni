@@ -22,55 +22,69 @@ from typing import Any
 
 
 def turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
-    """Label turns so trajectory dumps make protocol stages grep-able."""
+    """Label a turn so trajectory dumps make protocol stages grep-able.
+
+    Args:
+        decode: Decoded assistant text for this turn.
+        turn_prompt: Prompt / observation text feeding the turn.
+        response: Optional response text used for forced-reflection cues.
+
+    Returns:
+        Stage label string (for example ``call_generate_image``).
+    """
     resp = response or ""
-    prompt = turn_prompt or ""
-    text = decode or ""
-    forced_context = f"{prompt}\n{resp}"
-    judge_call = r"<function=judge_image\b|\"name\"\s*:\s*\"judge_image\""
-    generate_call = r"<function=generate_image\b|\"name\"\s*:\s*\"generate_image\""
-    if re.search(judge_call, text, re.IGNORECASE):
+    forced_context = f"{turn_prompt or ''}\n{resp}"
+    if re.search(r"<function=judge_image\b|\"name\"\s*:\s*\"judge_image\"", decode or "", re.IGNORECASE):
         return "call_judge_image"
-    if re.search(generate_call, text, re.IGNORECASE):
+    if re.search(r"<function=generate_image\b|\"name\"\s*:\s*\"generate_image\"", decode or "", re.IGNORECASE):
         if re.search(r"\bagentic_forced_reflection=1\b", resp, re.IGNORECASE) or re.search(
-            r"\bagentic_forced_reflection=1\b", prompt, re.IGNORECASE
+            r"\bagentic_forced_reflection=1\b", turn_prompt or "", re.IGNORECASE
         ):
             return "agent_rewrite_after_forced_reflection"
-        if re.search(r"\bReflection\s*:", text, re.IGNORECASE):
-            return "agent_reflection_rewrite"
         return "call_generate_image"
-    policy_done = bool(
-        text.strip()
-        and not re.search(generate_call, text, re.IGNORECASE)
-        and not re.search(judge_call, text, re.IGNORECASE)
-        and (
-            re.search(r"(?is)^\s*(?:Reflection\s*:.*?)?Done\.\s*(?:<\|im_end\|>)?\s*$", text)
-            or re.search(r"\bReflection\s*:", text, re.IGNORECASE)
-        )
-    )
-    if policy_done:
+    if re.search(
+        r"(?is)^\s*(?:Reflection\s*:.*?)?Done\.\s*(?:<\|im_end\|>)?\s*$",
+        decode or "",
+    ) and re.search(r"\bagentic_stop_decision_required=1\b", forced_context, re.IGNORECASE):
         if re.search(r"\bagentic_force_stop_max_passes=1\b", forced_context):
             return "agent_done_after_max_passes"
-        good_enough = re.search(r"\bgood_enough\s*=\s*(YES|NO)", prompt, re.IGNORECASE)
-        if good_enough and good_enough.group(1).upper() == "YES":
-            return "agent_done_after_forced_reflection"
-        return "agent_reflection_done"
-    cue_src = resp if re.search(r"\bagentic_forced_reflection=1\b", resp, re.IGNORECASE) else prompt
-    if not text.strip() and re.search(r"\bagentic_forced_reflection=1\b", cue_src, re.IGNORECASE):
-        if re.search(r"\bagentic_force_stop_max_passes=1\b", cue_src, re.IGNORECASE):
-            return "forced_reflection_max_passes_stop_cue"
-        if re.search(r"\bagentic_stop_decision_required=1\b", cue_src, re.IGNORECASE):
+        return "agent_done_after_forced_reflection"
+    if re.search(r"\bagentic_force_stop_max_passes=1\b", resp) or (
+        not (decode or "").strip() and re.search(r"\bagentic_force_stop_max_passes=1\b", turn_prompt or "")
+    ):
+        return "forced_reflection_max_passes_stop_cue"
+    if re.search(r"\bagentic_forced_reflection=1\b", resp, re.IGNORECASE):
+        if re.search(r"\bagentic_stop_decision_required=1\b", resp, re.IGNORECASE):
             return "forced_reflection_stop_cue"
         return "forced_reflection_continue"
-    if re.search(r"\b(?:VL judge|agentic_judge)\b", prompt, re.IGNORECASE):
+    if not (decode or "").strip() and re.search(r"\bagentic_forced_reflection=1\b", turn_prompt or "", re.IGNORECASE):
+        if re.search(r"\bagentic_stop_decision_required=1\b", turn_prompt or "", re.IGNORECASE):
+            return "forced_reflection_stop_cue"
+        return "forced_reflection_continue"
+    if re.search(r"\bReflection\s*:", decode or "", re.IGNORECASE):
+        if re.search(
+            r"<function=generate_image\b|\"name\"\s*:\s*\"generate_image\"",
+            decode or "",
+            re.IGNORECASE,
+        ):
+            return "agent_reflection_rewrite"
+        return "agent_reflection_done"
+    if re.search(r"\b(?:VL judge|agentic_judge)\b", turn_prompt or "", re.IGNORECASE):
         return "after_judge_feedback"
-    if "path=" in prompt and "agentic_tool" in prompt:
+    if "path=" in (turn_prompt or "") and "agentic_tool" in (turn_prompt or ""):
         return "after_generate_image"
     return "other"
 
 
 def extract_generate_image_prompts(decoded_response: str) -> list[str]:
-    """Ordered prompts from Hermes JSON or Qwen3.5 XML tool calls."""
+    """Extract ordered ``generate_image`` prompts from decoded trajectory text.
+
+    Args:
+        decoded_response: Decoded assistant / trajectory text.
+
+    Returns:
+        List of prompt strings in call order.
+    """
     found: list[tuple[int, str]] = []
     hermes_pat = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
     for match in re.finditer(hermes_pat, decoded_response or "", re.IGNORECASE | re.DOTALL):
@@ -107,12 +121,13 @@ def extract_generate_image_prompts(decoded_response: str) -> list[str]:
 
 
 def split_env_blob(blob: str) -> tuple[str, str]:
-    """Split mask=0 env text into ``(turn_prompt, response)``.
+    """Split mask=0 env text into turn prompt and response.
 
-    ``turn_prompt`` = tool / user obs the policy reads.
-    ``response`` = injected assistant text (forced ``Reflection:…``), if any.
-    These can diverge from the previous turn's ``decode`` because the agent loop
-    may inject Reflection after ``judge_image`` without sampling it from the policy.
+    Args:
+        blob: Environment / observation text blob.
+
+    Returns:
+        ``(turn_prompt, response)``.
     """
     text = (blob or "").strip()
     if not text:
@@ -146,7 +161,15 @@ def split_env_blob(blob: str) -> tuple[str, str]:
 
 
 def unpad_left_ids(token_ids, pad_token_id: int | None) -> list[int]:
-    """Strip left padding from prompt ids (verl left-pads prompts)."""
+    """Strip left padding from prompt token ids.
+
+    Args:
+        token_ids: Prompt token ids (possibly left-padded).
+        pad_token_id: Pad id, or ``None`` to return as-is.
+
+    Returns:
+        Unpadded token id list.
+    """
     ids = token_ids.tolist() if hasattr(token_ids, "tolist") else list(token_ids)
     pads = {0}
     if pad_token_id is not None:
@@ -165,6 +188,18 @@ def turn_record(
     decode: str,
     turn_input: str = "",
 ) -> dict[str, Any]:
+    """Build one trajectory-dump turn record.
+
+    Args:
+        turn: 1-based turn index.
+        turn_prompt: Prompt / observation text for the turn.
+        response: Assistant response text.
+        decode: Decoded model tokens for the turn.
+        turn_input: Optional raw turn input text.
+
+    Returns:
+        Dict with turn / prompt / response / decode fields.
+    """
     return {
         "turn": turn,
         "turn_prompt": turn_prompt or "",
@@ -257,7 +292,16 @@ class _RolloutTurnSplitter:
 
 
 def split_assistant_rollouts(token_ids, response_mask, tokenizer) -> list[str]:
-    """Decode contiguous model-token spans; tool observations have mask 0."""
+    """Decode contiguous model-token spans from a response.
+
+    Args:
+        token_ids: Response token ids.
+        response_mask: Mask where model tokens are 1 and tool obs are 0.
+        tokenizer: Tokenizer used for decode.
+
+    Returns:
+        List of decoded assistant span strings.
+    """
     return [turn["decode"] for turn in split_rollout_turns(token_ids, response_mask, tokenizer)]
 
 
@@ -267,24 +311,29 @@ def split_rollout_turns(
     tokenizer,
     prompt_ids=None,
 ) -> list[dict[str, Any]]:
-    """Split response into turns with explicit prompt / response / decode fields.
+    """Split a response into turns with prompt / response / decode fields.
 
-    ``response_mask==1`` → model tokens (``decode``).
-    ``response_mask==0`` → env tokens, split into:
-      - ``turn_prompt``: tool obs the policy conditions on (short env delta)
-      - ``response``: forced ``Reflection:…`` (injected, not policy-sampled)
+    Args:
+        token_ids: Response token ids.
+        response_mask: Model-token mask.
+        tokenizer: Tokenizer used for decode.
+        raw_prompt: Optional raw prompt used to seed the first turn.
 
-    When ``prompt_ids`` is provided (unpadded chat-templated prompt tokens), each
-    turn also gets ``turn_input``: the exact decoded prefix the model saw before
-    generating that turn (system + Tools schema + history), including special tokens.
-
-    Keys per turn: ``turn``, ``turn_prompt``, ``turn_input``, ``decode``,
-    ``response``, ``decode_has_tool_call``.
+    Returns:
+        List of turn record dicts.
     """
     return _RolloutTurnSplitter(token_ids, response_mask, tokenizer, prompt_ids=prompt_ids).run()
 
 
 def last_user_prompt(raw_prompt: Any) -> str:
+    """Return the last user prompt from a raw prompt payload.
+
+    Args:
+        raw_prompt: String, message list, or other prompt payload.
+
+    Returns:
+        Last user text, or ``""`` if none.
+    """
     messages = list(raw_prompt) if raw_prompt is not None else []
     for message in reversed(messages):
         if not isinstance(message, dict) or message.get("role") != "user":

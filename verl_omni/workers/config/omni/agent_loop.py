@@ -30,9 +30,18 @@ class BagelCorlAgentLoopConfig(AgentLoopConfig):
     Kept in verl-omni so upstream ``verl.workers.config.AgentLoopConfig`` stays untouched.
     """
 
-    # S seeds per generate_image (FlowGRPO group). Independent of sibling N / in-episode J,K.
+    # S = FlowGRPO seeds per generate_image turn (not episode GEN-turn count K).
     gen_samples_per_call: Optional[int] = None
-    # PR1 fail-closed: must be 1 (bounds in-episode K).
+    # PR1 fail-closed: must be 1 (bounds in-episode K = number of GEN turns).
     max_generate_passes: Optional[int] = None
     # UND turn budget before force-stop (bounds in-episode J).
     max_und_turns: Optional[int] = None
+    # Set True only after Bagel UND AR (Hermes tool-call) is proven on the live
+    # replica — ``bagel_single_stage`` is DiffusionStrategy / GEN-only today.
+    und_ar_serving_ready: bool = False
+    # Deploy yaml for the standalone UND AR replica (``bagel_think`` topology).
+    # Required when ``und_ar_serving_ready=True``; sibling of GEN ``deploy_config``.
+    und_deploy_config: Optional[str] = None
+    # GPUs for the standalone UND AR ``LLMServerManager`` (not colocated with GEN).
+    und_n_gpus: Optional[int] = None
+    und_gpu_memory_utilization: Optional[float] = None

@@ -921,7 +921,68 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
     def forward_backward_batch(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
     ) -> list[TensorDict]:
-        return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="all_timesteps")
+        """Default: diffusion timestep loop. Bagel Co-RL: UND token then GEN diffusion.
+
+        Co-RL composition (RFC): one FSDP module, sequential branch backwards, then the
+        shared ``BaseEngine.train_batch`` issues a single ``optimizer.step``. This is
+        library reuse of the diffusion V1 engine under the AR V1 outer trainer — not
+        ``PolicyGradientDiffusionTrainerV1Sync``.
+        """
+        from verl_omni.workers.engine.fsdp.bagel_corl_composite import (
+            composite_forward_mode,
+            gen_view_has_traj,
+            is_bagel_corl_composite,
+            materialize_gen_train_batch,
+            merge_composite_outputs,
+            run_und_token_forward_backward,
+        )
+
+        if not is_bagel_corl_composite(self.model_config):
+            return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="all_timesteps")
+
+        mode = composite_forward_mode(data, forward_only=forward_only)
+        if mode == "gen_only_diffusion":
+            # Diffusion V1 GEN old-logprob / GEN-only infer on latents.
+            return self._run_forward_backward_batch(data, loss_function, forward_only, timesteps_key="all_timesteps")
+        if mode == "und_infer":
+            return run_und_token_forward_backward(self, data, loss_function, forward_only=True)
+        if mode == "empty":
+            return {"model_output": {}, "loss": [], "metrics": {"gen/skipped_no_groups": [1.0]}}
+
+        parts: list[dict] = []
+        has_und = "input_ids" in data.keys()
+        gen_view = tu.get_non_tensor_data(data, "bagel_corl_gen", default=None)
+        has_complete = bool(tu.get_non_tensor_data(data, "has_complete_gen_groups", default=False))
+        skip_gen = bool(tu.get_non_tensor_data(data, "skip_gen", default=not has_complete))
+        run_gen = (not skip_gen) and has_complete and gen_view_has_traj(gen_view)
+
+        if has_und and (forward_only or ("old_log_probs" in data.keys() and "advantages" in data.keys())):
+            parts.append(run_und_token_forward_backward(self, data, loss_function, forward_only))
+
+        if run_gen:
+            flags = {
+                "has_complete_gen_groups": True,
+                "skip_gen": False,
+                "num_gen_rows": tu.get_non_tensor_data(data, "num_gen_rows", default=None),
+                "gradient_accumulation_steps": tu.get_non_tensor_data(
+                    data, "gradient_accumulation_steps", default=None
+                ),
+            }
+            gen_data = materialize_gen_train_batch(gen_view, flags)
+            parts.append(
+                self._run_forward_backward_batch(
+                    gen_data, loss_function, forward_only, timesteps_key="all_timesteps"
+                )
+            )
+        elif has_complete and not skip_gen and not gen_view_has_traj(gen_view):
+            raise RuntimeError(
+                "bagel_corl: has_complete_gen_groups but bagel_corl_gen lacks all_latents/timesteps; "
+                "refuse soft-skip of GEN diffusion_loss — fix live GEN traj stash from vLLM-Omni."
+            )
+
+        if not parts:
+            return {"model_output": {}, "loss": [], "metrics": {"gen/skipped_no_groups": [1.0]}}
+        return merge_composite_outputs(parts)
 
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
         """

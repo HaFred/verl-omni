@@ -11,39 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""UniCoT → agentic RL parquet builder (PR 2 / RPCO stage 3).
+"""Build UniCoT agentic RL train/validation parquet.
 
 This is the GRPO application of the UniCoT parsers, not a generic dataset
 loader. Invoke as::
 
     python -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl
 
-Builds the mixed single-image + multi-image training set for multi-task RL
-co-optimization (§6.5 stage 3 of RFC #302) from the local UniCoT snapshots:
+The builder combines:
 
-- UniCoT-Self-Reflection-6K → ``task_type=reflect`` rows (single-image,
-  reference states carry the reflection summaries and the continue/stop
-  transition structure).
-- UniCoT-Breakdown-3K → ``task_type=plan`` rows (reference subtasks) and
-  ``task_type=reflect`` rows ("No breakdown needed." → single image).
+- UniCoT-Self-Reflection-6K as ``reflect`` rows carrying reference reflection
+  states and continue/stop transitions; and
+- UniCoT-Breakdown-3K as ``plan`` rows carrying reference subtasks, with
+  ``No breakdown needed.`` records normalized to single-image ``reflect`` rows.
 
-UniCoT fields are reward ground truth only — they are never baked into the
-prompt as fewshot. Prompt rows are system (per task type) + user + brevity
-tail, with the agentic RL row schema (``data_source``, ``prompt`` messages,
-``ability``, ``reward_model.ground_truth``, ``extra_info``).
-
-Without ``--train_size``/``--val_size`` every parsed row is used (full-dataset
-training; hash-based train/val split at ``--val_ratio``). The sizes exist only
-for smoke runs, where ``--mix_ratio`` bounds the reflect/plan sampling.
-
-Image files are not required: validation is structural/text-only. The
-full hash-audited image path (``LocalImageResolver``) remains available for
-evaluation and future image-backed rewards.
+Source annotations are reward ground truth only and never appear in the model
+prompt. Validation is metadata-only; the builder does not require
+``images.zip`` or read image pixels.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -53,14 +43,16 @@ from typing import Any
 import pandas as pd
 
 from verl_omni.utils.dataset.visual_reflection import VisualReflectionDataError
-from verl_omni.utils.dataset.visual_reflection.contracts import derive_prompt_source_dedup_key
+from verl_omni.utils.dataset.visual_reflection.contracts import RejectionReason, derive_prompt_source_dedup_key
 from verl_omni.utils.dataset.visual_reflection.partition import assign_source_splits
 from verl_omni.utils.dataset.visual_reflection.unicot import (
     UNICOT_DATASET_ID,
     parse_unicot_record,
+    unicot_converter_config,
 )
 from verl_omni.utils.dataset.visual_reflection.unicot_breakdown import (
     UNICOT_BREAKDOWN_DATASET_ID,
+    breakdown_converter_config,
     parse_unicot_breakdown_record,
 )
 
@@ -68,334 +60,335 @@ REFLECT_ABILITY = "agentic_generate_self_reflect"
 PLAN_ABILITY = "agentic_plan_generate"
 REFLECT_DATA_SOURCE = "unicot_reflection"
 BREAKDOWN_DATA_SOURCE = "unicot_breakdown"
-DIMS = ("reflect", "plan", "format", "tool_call", "result")
-MANIFEST_ID = "agentic_rpco_stage3"
+# Parquet data_source follows task_type. Hub corpus stays on extra_info.unicot_source.
+PLAN_DATA_SOURCE = BREAKDOWN_DATA_SOURCE
+REWARD_DIMS = ("reflect", "plan", "format", "tool", "result")
+# Public alias retained for reward/dataset consumers.
+DIMS = REWARD_DIMS
+MANIFEST_ID = "agentic_rl_unicot_v1"
 
-# Reflect protocol (self-contained; no dependency on ``examples/``).
 REFLECT_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
 1) generate_image — create an image from a complete diffusion prompt
-2) judge_image — call a frozen VL judge on the LAST generated image to get
-   structured feedback (scores, findings, suggested fixes, good_enough verdict)
+2) judge_image — inspect the last generated image and return structured feedback
 
-Protocol (one logical turn = generate → judge → reflect & decide):
-1. Call generate_image with a complete diffusion prompt.
-2. After the image returns, call judge_image with SHORT args only:
-   user_request="same as user message"
-   image_prompt="last"
-   The tool judges the latest image against the ORIGINAL user request. Rewritten
-   diffusion prompts may improve pixels but never replace the evaluation target.
-3. Read the VL feedback (correctness, aesthetics, good_enough, findings,
-   suggested_fixes). Then write your reflection and decide:
-   - If good_enough=YES → "Reflection: <summary> Done."
-   - If good_enough=NO  → "Reflection: <what's wrong> + rewritten generate_image"
-     call in the SAME assistant turn, using the suggested_fixes.
-   - After at most 3 successful generate_image calls, you MUST stop with
-     "Reflection: <summary> Done." even if good_enough=NO. Do not keep rewriting.
+Protocol:
+1. Call generate_image with a complete prompt for the user's request.
+2. Call judge_image on the last generated image.
+3. Reflect briefly on the feedback. If the image needs improvement, rewrite the
+   diffusion prompt and repeat. If it is good enough, finish with Done.
 
-HARD RULES (non-negotiable):
-- ALWAYS call judge_image after EVERY generate_image before deciding.
-- Never skip judge_image — you need the VL feedback to make an informed decision.
-- Never call tools other than generate_image and judge_image.
-- If you rewrite, the new prompt MUST differ from the previous one.
-- Keep judge_image arguments compact (placeholders above). Long pasted args
-  waste the response budget and truncate the tool call.
+Always generate before judging, judge before deciding, and use no other tools."""
 
-Fewshot demos above/below (if present) are ONLY examples of the tool protocol for
-on-policy GRPO exploration. They are NOT supervised targets: do not continue,
-imitate, or debate the demo trajectory. Always treat the latest user message as
-a fresh task.
-
-Brevity (mandatory):
-- Keep any private thinking to AT MOST one short paragraph (≤4 sentences).
-- Do not debate yourself, repeat the user request, or rehash prior turns.
-- Prefer emitting the <tool_call> immediately; finish with a one-line Done when done.
-- Stop on your own when the task is complete — do not ramble until a length limit.
-"""
-
-_BREVITY_TAIL = " Keep any private thinking to AT MOST one short paragraph (≤4 sentences)."
-
-
-def _with_brevity(user_task: str) -> str:
-    """Append the brevity reminder to a user-facing request."""
-    task = (user_task or "").rstrip()
-    if _BREVITY_TAIL.strip() in task:
-        return task
-    return task + _BREVITY_TAIL
-
-
-# Plan task protocol: decompose, generate per subtask, judge only the final
-# image, then reflect and stop. Mirrors the reflect SYSTEM_PROMPT conventions.
 PLAN_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
 1) generate_image — create an image from a complete diffusion prompt
-2) judge_image — call a frozen VL judge on the LAST generated image to get
-   structured feedback (scores, findings, suggested fixes, good_enough verdict)
+2) judge_image — inspect the last generated image and return structured feedback
 
-Protocol (plan → generate subtasks → judge final → reflect & stop):
-1. Read the user request. If it needs multiple subtask images, write a short
-   plan: a numbered list of subtask prompts, one per image to generate (at
-   most 3). Each subtask prompt must be a complete diffusion prompt.
-2. Call generate_image tool once per subtask, in order. Do NOT call judge_image
-   between subtasks. Overall there may be at most 3 generate_image tool calls.
-3. After the LAST subtask image, call judge_image with SHORT args only:
-   user_request="same as user message"
-   image_prompt="last"
-   The latest image is evaluated against the original complete user request,
-   not only the final subtask/rewrite prompt.
-4. Read the VL feedback, then write your reflection and end with `Done.` — do
-   not generate more images than the plan listed.
+Protocol:
+1. Write a short numbered plan of at most three complete subtask image prompts.
+2. Call generate_image once per planned subtask, in order.
+3. After the final image, call judge_image on that image.
+4. Reflect briefly on the feedback and finish with Done.
 
-HARD RULES (non-negotiable):
-- Call generate_image exactly once per planned subtask, in order.
-- ALWAYS call judge_image after the final image before deciding Done.
-- Never call tools other than generate_image and judge_image.
-- Keep judge_image arguments compact (placeholders above). Long pasted args
-  waste the response budget and truncate the tool call.
+Do not judge between subtasks or generate more images than the plan lists."""
 
-Brevity (mandatory):
-- Keep any private thinking to AT MOST one short paragraph (≤4 sentences).
-- Do not debate yourself, repeat the user request, or rehash prior turns.
-- Prefer emitting the <tool_call> immediately; finish with a one-line Done when done.
-- Stop on your own when the task is complete — do not ramble until a length limit.
-"""
+_BREVITY_SUFFIX = (
+    " Keep any private thinking to one short paragraph; do not repeat the request, "
+    "and keep the final reflection concise (≤4 sentences)."
+)
 
 
 class _TextOnlyImageResolver:
-    """Structural-only image resolver: no pixel reads, no hash auditing.
+    """Validate reflection structure without materializing source image archives."""
 
-    Transition hash checks in ``parse_unicot_record`` compare ``sha256`` of
-    ``output_image[i]`` against ``input_image[i+1]``; an empty digest passes
-    trivially, so structure is validated without materializing ``images.zip``.
-    """
-
-    def __call__(self, value: Any, *, field: str = "", index: int = 0, source_record_id: str | None = None) -> dict:
-        del field, index
+    def __call__(
+        self,
+        value: Any,
+        *,
+        field: str = "",
+        index: int = 0,
+        source_record_id: str | None = None,
+    ) -> dict[str, str]:
         uri = str(value).strip() if value is not None else ""
         if not uri:
-            uri = f"<no-image>:{source_record_id or 'unknown'}"
-        # Well-formed constant digest: transition hash checks pass trivially and
-        # the format validates, without reading pixels from ``images.zip``.
-        return {"uri": uri, "sha256": "0" * 64}
+            raise VisualReflectionDataError(
+                RejectionReason.MISSING_IMAGE,
+                f"{field}[{index}] has an empty image URI",
+                field=f"{field}[{index}]",
+                source_record_id=source_record_id,
+            )
+        # Hash the URI/path only (no pixel IO) so mismatched output→next-input
+        # chains still raise TRANSITION_HASH_MISMATCH.
+        return {"uri": uri, "sha256": hashlib.sha256(uri.encode()).hexdigest()}
+
+
+def _with_brevity(prompt: str) -> str:
+    return f"{prompt.rstrip()}{_BREVITY_SUFFIX}"
 
 
 def _env_weight(dim: str) -> float:
-    """Read RPCO_W_<DIM> (default 1.0 — VisionCreator-R1 sets all weights to 1)."""
-    env_key = f"RPCO_W_{dim.upper()}"
-    raw = os.environ.get(env_key)
-    # Alias kept so existing launchers that export RPCO_W_TOOL still apply.
-    if raw is None and dim == "tool_call":
-        raw = os.environ.get("RPCO_W_TOOL")
-    if raw is None:
-        raw = "1.0"
-    raw = raw.strip()
+    env_name = f"RPCO_W_{dim.upper()}"
+    raw = os.environ.get(env_name, "1.0").strip()
     try:
-        return max(0.0, float(raw))
+        value = float(raw)
     except ValueError:
-        raise ValueError(f"{env_key} must be a float, got {raw!r}") from None
+        raise ValueError(f"{env_name} must be a float, got {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"{env_name} must be non-negative")
+    return value
 
 
 def _weights() -> dict[str, float]:
-    return {f"w_{dim}": _env_weight(dim) for dim in DIMS}
+    return {f"w_{dim}": _env_weight(dim) for dim in REWARD_DIMS}
 
 
-def _load_metadata(dataset_dir: str | None, dataset_id: str) -> list[dict]:
-    if not dataset_dir:
+def _hub_ref_files(refs_dir: Path) -> list[Path]:
+    """Prefer ``refs/main``, then other ref files in name order."""
+    if not refs_dir.is_dir():
         return []
-    snapshots = sorted((Path(dataset_dir).expanduser() / "snapshots").glob("*/"))
-    for snapshot in snapshots:
-        meta = snapshot / "metadata.json"
-        if meta.is_file():
-            with meta.open() as handle:
-                data = json.load(handle)
-            if not isinstance(data, list):
-                raise ValueError(f"{dataset_id}: metadata.json must be a JSON list, got {type(data).__name__}")
-            return data
-    raise FileNotFoundError(f"{dataset_id}: no snapshot with metadata.json under {dataset_dir}")
+    files = [path for path in refs_dir.iterdir() if path.is_file()]
+    main = refs_dir / "main"
+    rest = sorted(path for path in files if path.name != "main")
+    return ([main] if main.is_file() else []) + rest
 
 
-def _parse_reflection_rows(metadata: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Parse Self-Reflection rows into agentic RL rows + rejections."""
-    rows: list[dict] = []
-    rejections: list[dict] = []
-    weights = _weights()
+def _resolve_hub_snapshot(root: Path) -> Path:
+    """Select the Hub snapshot HF points at, not the max SHA string.
+
+    Order: ``refs/main`` → other ``refs/`` files → newest mtime snapshot that
+    contains ``metadata.json``. Fail closed if none resolve.
+    """
+    snapshots_root = root / "snapshots"
+    for ref_file in _hub_ref_files(root / "refs"):
+        sha = ref_file.read_text().strip()
+        if not sha:
+            continue
+        snapshot = snapshots_root / sha
+        if (snapshot / "metadata.json").is_file():
+            return snapshot
+    candidates = [path for path in snapshots_root.glob("*/") if (path / "metadata.json").is_file()]
+    if not candidates:
+        raise FileNotFoundError(f"no snapshot with metadata.json under {root}")
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _load_metadata(dataset_dir: str, dataset_id: str) -> list[dict[str, Any]]:
+    root = Path(dataset_dir).expanduser()
+    snapshot = _resolve_hub_snapshot(root)
+    metadata_path = snapshot / "metadata.json"
+    data = json.loads(metadata_path.read_text())
+    if not isinstance(data, list):
+        raise ValueError(f"{dataset_id}: metadata.json must be a JSON list, got {type(data).__name__}")
+    return data
+
+
+def _rejection(record: dict[str, Any], error: VisualReflectionDataError) -> dict[str, Any]:
+    return {
+        "data_id": str(record.get("data_id") or ""),
+        "reason": error.reason.value,
+        "field": error.field,
+    }
+
+
+def _split_record(*, dataset_id: str, data_id: str, prompt: str) -> dict[str, str]:
+    return {
+        "source_dataset": dataset_id,
+        "source_record_id": data_id,
+        "pipeline_variant": "prompt_k_turn",
+        "prompt": prompt,
+        "dedup_key": derive_prompt_source_dedup_key(prompt),
+    }
+
+
+def _parse_reflection_rows(metadata: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
     resolver = _TextOnlyImageResolver()
-    for record in metadata:
-        data_id = str(record.get("data_id") or "")
+    weights = _weights()
+    for source in metadata:
         try:
             trajectory = parse_unicot_record(
-                record,
+                source,
                 manifest_id=MANIFEST_ID,
                 image_resolver=resolver,
             )
         except VisualReflectionDataError as error:
-            rejections.append({"data_id": data_id, "reason": error.reason.value, "field": error.field})
+            rejections.append(_rejection(source, error))
             continue
-        task = trajectory["prompt"]
-        expected = len(trajectory["steps"])
-        ground_truth = {
-            "user_request": task,
-            "task_type": "reflect",
-            "expected_num_images": expected,
-            "reference_steps": trajectory["steps"],
-            **weights,
-        }
+        data_id = trajectory["source_record_id"]
+        prompt = trajectory["prompt"]
+        expected_num_images = len(trajectory["steps"])
         rows.append(
             {
                 "data_id": data_id,
                 "task_type": "reflect",
-                "prompt_text": task,
-                "expected_num_images": expected,
-                "ground_truth": ground_truth,
-                "source_dataset": UNICOT_DATASET_ID,
-                "split_record": {
-                    "source_dataset": UNICOT_DATASET_ID,
-                    "source_record_id": data_id,
-                    "pipeline_variant": "prompt_k_turn",
-                    "prompt": task,
-                    "dedup_key": derive_prompt_source_dedup_key(task),
+                "prompt_text": prompt,
+                "expected_num_images": expected_num_images,
+                "ground_truth": {
+                    "user_request": prompt,
+                    "task_type": "reflect",
+                    "expected_num_images": expected_num_images,
+                    "reference_steps": trajectory["steps"],
+                    **weights,
                 },
+                "source_dataset": UNICOT_DATASET_ID,
+                "split_record": _split_record(
+                    dataset_id=UNICOT_DATASET_ID,
+                    data_id=data_id,
+                    prompt=prompt,
+                ),
             }
         )
     return rows, rejections
 
 
-def _parse_breakdown_rows(metadata: list[dict]) -> tuple[list[dict], list[dict]]:
-    """Parse Breakdown rows into agentic RL rows + rejections."""
-    rows: list[dict] = []
-    rejections: list[dict] = []
+def _parse_breakdown_rows(metadata: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
     weights = _weights()
-    for record in metadata:
-        data_id = str(record.get("data_id") or "")
+    for source in metadata:
         try:
-            parsed = parse_unicot_breakdown_record(record, manifest_id=MANIFEST_ID)
+            parsed = parse_unicot_breakdown_record(source, manifest_id=MANIFEST_ID)
         except VisualReflectionDataError as error:
-            rejections.append({"data_id": data_id, "reason": error.reason.value, "field": error.field})
+            rejections.append(_rejection(source, error))
             continue
-        task = parsed.prompt
-        if parsed.task_type == "plan":
-            ground_truth = {
-                "user_request": task,
-                "task_type": "plan",
-                "expected_num_images": parsed.expected_num_images,
-                "reference_subtasks": list(parsed.subtasks),
-                "plan_expected": True,
-                **weights,
-            }
-        else:
-            ground_truth = {
-                "user_request": task,
-                "task_type": "reflect",
-                "expected_num_images": parsed.expected_num_images,
-                "plan_expected": False,
-                **weights,
-            }
+        ground_truth: dict[str, Any] = {
+            "user_request": parsed.prompt,
+            "task_type": parsed.task_type,
+            "expected_num_images": parsed.expected_num_images,
+            "plan_expected": parsed.plan_expected,
+            **weights,
+        }
+        if parsed.plan_expected:
+            ground_truth["reference_subtasks"] = list(parsed.subtasks)
         rows.append(
             {
-                "data_id": data_id,
+                "data_id": parsed.data_id,
                 "task_type": parsed.task_type,
-                "prompt_text": task,
+                "prompt_text": parsed.prompt,
                 "expected_num_images": parsed.expected_num_images,
                 "ground_truth": ground_truth,
                 "source_dataset": UNICOT_BREAKDOWN_DATASET_ID,
-                "split_record": {
-                    "source_dataset": UNICOT_BREAKDOWN_DATASET_ID,
-                    "source_record_id": data_id,
-                    "pipeline_variant": "prompt_k_turn",
-                    "prompt": task,
-                    "dedup_key": derive_prompt_source_dedup_key(task),
-                },
+                "split_record": _split_record(
+                    dataset_id=UNICOT_BREAKDOWN_DATASET_ID,
+                    data_id=parsed.data_id,
+                    prompt=parsed.prompt,
+                ),
             }
         )
     return rows, rejections
 
 
-def _system_prompt(task_type: str) -> str:
-    return PLAN_SYSTEM_PROMPT if task_type == "plan" else REFLECT_SYSTEM_PROMPT
+def _assign_splits(
+    rows: list[dict[str, Any]],
+    *,
+    seed: int,
+    val_ratio: float,
+) -> tuple[dict[tuple[str, str], str], str | None]:
+    assignments = assign_source_splits(
+        [row["split_record"] for row in rows],
+        ratios={"train": 1.0 - val_ratio, "validation": val_ratio, "test": 0.0},
+        seed=seed,
+    )
+    split_by_identity = {
+        identity: "val" if assignment["split"] == "validation" else "train"
+        for identity, assignment in assignments.items()
+    }
+    partition_ids = {assignment["partition_id"] for assignment in assignments.values()}
+    partition_id = next(iter(partition_ids)) if partition_ids else None
+    return split_by_identity, partition_id
 
 
-def _build_parquet_row(row: dict, *, split: str, index: int) -> dict:
-    gt = dict(row["ground_truth"])
-    task = row["prompt_text"]
+def _select_rows(
+    rows: list[dict[str, Any]],
+    split_by_identity: dict[tuple[str, str], str],
+    *,
+    split: str,
+    size: int | None,
+    mix_ratio: float,
+    seed: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    split_rows = [row for row in rows if split_by_identity[(row["source_dataset"], row["data_id"])] == split]
+    split_rows.sort(key=lambda row: (row["source_dataset"], row["data_id"]))
+    if size is None:
+        return split_rows, {
+            "requested_size": None,
+            "actual_size": len(split_rows),
+            "shortfall": None,
+        }
+
+    reflect = [row for row in split_rows if row["task_type"] == "reflect"]
+    plan = [row for row in split_rows if row["task_type"] == "plan"]
+    requested_reflect = round(size * mix_ratio)
+    requested_plan = size - requested_reflect
+    pool = len(reflect) + len(plan)
+    if pool < size:
+        raise SystemExit(f"{split}: requested {size} rows but only {pool} available after split")
+    if len(reflect) < requested_reflect or len(plan) < requested_plan:
+        raise SystemExit(
+            f"{split}: cannot meet mix_ratio={mix_ratio} for size={size}: "
+            f"need reflect={requested_reflect} (have {len(reflect)}), "
+            f"plan={requested_plan} (have {len(plan)})"
+        )
+    rng = random.Random(seed)
+    selected = rng.sample(reflect, requested_reflect) + rng.sample(plan, requested_plan)
+    selected.sort(key=lambda row: (row["source_dataset"], row["data_id"]))
+    return selected, {
+        "requested_size": size,
+        "actual_size": len(selected),
+        "shortfall": None,
+        "requested_reflect": requested_reflect,
+        "requested_plan": requested_plan,
+    }
+
+
+def _build_parquet_row(row: dict[str, Any], *, split: str, index: int) -> dict[str, Any]:
+    prompt = row["prompt_text"]
+    is_plan = row["task_type"] == "plan"
     return {
-        "data_source": REFLECT_DATA_SOURCE if row["source_dataset"] == UNICOT_DATASET_ID else BREAKDOWN_DATA_SOURCE,
+        "data_source": (PLAN_DATA_SOURCE if is_plan else REFLECT_DATA_SOURCE),
         "prompt": [
-            {"role": "system", "content": _system_prompt(row["task_type"])},
-            {"role": "user", "content": _with_brevity(task)},
+            {"role": "system", "content": PLAN_SYSTEM_PROMPT if is_plan else REFLECT_SYSTEM_PROMPT},
+            {"role": "user", "content": _with_brevity(prompt)},
         ],
-        "ability": PLAN_ABILITY if row["task_type"] == "plan" else REFLECT_ABILITY,
-        "reward_model": {"style": "rule", "ground_truth": gt},
+        "ability": PLAN_ABILITY if is_plan else REFLECT_ABILITY,
+        "reward_model": {"style": "rule", "ground_truth": dict(row["ground_truth"])},
         "extra_info": {
             "split": split,
             "index": index,
             "data_id": row["data_id"],
             "task_type": row["task_type"],
             "expected_num_images": row["expected_num_images"],
-            "raw_prompt": task,
+            "raw_prompt": prompt,
             "unicot_source": row["source_dataset"],
-            "plan_expected": bool(gt.get("plan_expected", False)),
-            **{key: gt[key] for key in (f"w_{dim}" for dim in DIMS) if key in gt},
+            "plan_expected": bool(row["ground_truth"].get("plan_expected", False)),
         },
     }
 
 
-def _assign_splits(rows: list[dict], *, seed: int, val_ratio: float) -> dict[str, dict[str, str]]:
-    """Hash-based train/validation assignment per source record."""
-    assignments = assign_source_splits(
-        [row["split_record"] for row in rows],
-        ratios={"train": 1.0 - val_ratio, "validation": val_ratio, "test": 0.0},
-        seed=seed,
-    )
-    split_by_id: dict[str, dict[str, str]] = {}
-    for identity, assignment in assignments.items():
-        split = "val" if assignment["split"] == "validation" else "train"
-        split_by_id[f"{identity[0]}\0{identity[1]}"] = {"split": split, "partition_id": assignment["partition_id"]}
-    return split_by_id
-
-
-def _sample_pool(pool: list[dict], *, split: str) -> list[dict]:
-    return [row for row in sorted(pool, key=lambda row: row["data_id"]) if row["_split"] == split]
-
-
-def _mix_pools(
-    reflect: list[dict], plan: list[dict], *, n: int | None, mix_ratio: float, rng: random.Random
-) -> list[dict]:
-    """Select rows for one split.
-
-    ``n=None`` (real training): use the **entire** pool — full dataset
-    utilization, natural reflect:plan ratio (mix_ratio is ignored).
-    ``n`` given (smoke runs): sample ``round(n * mix_ratio)`` reflect rows and
-    the remainder plan rows, capped by availability.
-    """
-    if n is None:
-        return reflect + plan
-    n_reflect = min(len(reflect), round(n * mix_ratio))
-    n_plan = min(len(plan), max(0, n - n_reflect))
-    chosen = rng.sample(reflect, min(n_reflect, len(reflect))) + rng.sample(plan, min(n_plan, len(plan)))
-    return sorted(chosen, key=lambda row: row["data_id"])
-
-
 def build_rows(
-    rows: list[dict],
-    split_by_id: dict[str, dict[str, str]],
+    rows: list[dict[str, Any]],
+    split_by_identity: dict[tuple[str, str], str],
     *,
     split: str,
-    n: int | None,
+    size: int | None,
     mix_ratio: float,
     seed: int,
-) -> tuple[list[dict], dict[str, int]]:
-    reflect_pool, plan_pool = [], []
-    for row in rows:
-        identity = f"{row['source_dataset']}\0{row['data_id']}"
-        row["_split"] = split_by_id[identity]["split"]
-        (reflect_pool if row["task_type"] == "reflect" else plan_pool).append(row)
-    reflect_pool = _sample_pool(reflect_pool, split=split)
-    plan_pool = _sample_pool(plan_pool, split=split)
-    chosen = _mix_pools(reflect_pool, plan_pool, n=n, mix_ratio=mix_ratio, rng=random.Random(seed))
+) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
+    selected, selection = _select_rows(
+        rows,
+        split_by_identity,
+        split=split,
+        size=size,
+        mix_ratio=mix_ratio,
+        seed=seed,
+    )
     counts = {"reflect": 0, "plan": 0}
     parquet_rows = []
-    for index, row in enumerate(chosen):
+    for index, row in enumerate(selected):
         counts[row["task_type"]] += 1
         parquet_rows.append(_build_parquet_row(row, split=split, index=index))
-    return parquet_rows, counts
+    return parquet_rows, counts, selection
 
 
 def main_cli(
@@ -409,65 +402,82 @@ def main_cli(
     seed: int,
     val_ratio: float,
 ) -> None:
-    """Build train/val parquet from UniCoT snapshots (also the test entry point)."""
-    if not breakdown_dir and not reflection_dir:
-        raise SystemExit("provide at least one of breakdown_dir / reflection_dir (or UNICOT_*_DIR)")
-    if not 0.0 < mix_ratio < 1.0:
-        raise SystemExit("mix_ratio must be in (0, 1)")
+    """Build train/validation parquet files; also serves as the test entry point."""
+    if not reflection_dir and not breakdown_dir:
+        raise SystemExit("provide at least one of breakdown_dir / reflection_dir")
+    if not 0.0 <= mix_ratio <= 1.0:
+        raise SystemExit("mix_ratio must be in [0, 1]")
     if not 0.0 < val_ratio < 1.0:
         raise SystemExit("val_ratio must be in (0, 1)")
+    if any(size is not None and size < 0 for size in (train_size, val_size)):
+        raise SystemExit("train_size and val_size must be non-negative")
 
-    all_rows: list[dict] = []
-    rejections: list[dict] = []
+    rows: list[dict[str, Any]] = []
+    rejections: list[dict[str, Any]] = []
     if reflection_dir:
-        metadata = _load_metadata(reflection_dir, UNICOT_DATASET_ID)
-        parsed, rejected = _parse_reflection_rows(metadata)
-        all_rows.extend(parsed)
+        parsed, rejected = _parse_reflection_rows(_load_metadata(reflection_dir, UNICOT_DATASET_ID))
+        rows.extend(parsed)
         rejections.extend(rejected)
     if breakdown_dir:
-        metadata = _load_metadata(breakdown_dir, UNICOT_BREAKDOWN_DATASET_ID)
-        parsed, rejected = _parse_breakdown_rows(metadata)
-        all_rows.extend(parsed)
+        parsed, rejected = _parse_breakdown_rows(_load_metadata(breakdown_dir, UNICOT_BREAKDOWN_DATASET_ID))
+        rows.extend(parsed)
         rejections.extend(rejected)
 
-    split_by_id = _assign_splits(all_rows, seed=seed, val_ratio=val_ratio)
-    save_dir = Path(local_save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    report = {"rejections": rejections, "rejection_count": len(rejections), "splits": {}}
+    split_by_identity, partition_id = _assign_splits(rows, seed=seed, val_ratio=val_ratio)
+    output_dir = Path(local_save_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report: dict[str, Any] = {
+        "manifest_id": MANIFEST_ID,
+        "partition_id": partition_id,
+        "seed": seed,
+        "val_ratio": val_ratio,
+        "source_configs": {
+            "reflection": unicot_converter_config(),
+            "breakdown": breakdown_converter_config(),
+        },
+        "rejections": rejections,
+        "rejection_count": len(rejections),
+        "splits": {},
+    }
     for split, size in (("train", train_size), ("val", val_size)):
-        parquet_rows, counts = build_rows(all_rows, split_by_id, split=split, n=size, mix_ratio=mix_ratio, seed=seed)
-        df = pd.DataFrame(parquet_rows)
-        df.to_parquet(save_dir / f"{split}.parquet")
-        report["splits"][split] = {**counts, "total": len(df)}
-        print(f"[INFO] {split}: wrote {len(df)} rows ({counts}) to {save_dir / f'{split}.parquet'}")
-    (save_dir / "build_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
-    print(f"[INFO] rejected {len(rejections)} source rows; see {save_dir / 'build_report.json'}")
+        parquet_rows, counts, selection = build_rows(
+            rows,
+            split_by_identity,
+            split=split,
+            size=size,
+            mix_ratio=mix_ratio,
+            seed=seed,
+        )
+        dataframe = pd.DataFrame(
+            parquet_rows,
+            columns=["data_source", "prompt", "ability", "reward_model", "extra_info"],
+        )
+        destination = output_dir / f"{split}.parquet"
+        dataframe.to_parquet(destination)
+        report["splits"][split] = {**counts, "total": len(dataframe), **selection}
+        print(f"[INFO] {split}: wrote {len(dataframe)} rows ({counts}) to {destination}")
+    (output_dir / "build_report.json").write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Build UniCoT agentic RL parquet (python -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl)"
-    )
+    parser = argparse.ArgumentParser(description="Build UniCoT agentic RL parquet files")
     parser.add_argument("--breakdown_dir", default=os.environ.get("UNICOT_BREAKDOWN_DIR", ""))
     parser.add_argument("--reflection_dir", default=os.environ.get("UNICOT_REFLECTION_DIR", ""))
     parser.add_argument("--local_save_dir", default=os.path.expanduser("~/data/agentic_unicot"))
-    parser.add_argument(
-        "--train_size", type=int, default=None, help="Total train rows (None = full dataset)"
-    )
-    parser.add_argument(
-        "--val_size", type=int, default=None, help="Total val rows (None = full val split)"
-    )
+    parser.add_argument("--train_size", type=int, default=None, help="None uses the full train split")
+    parser.add_argument("--val_size", type=int, default=None, help="None uses the full validation split")
     parser.add_argument(
         "--mix_ratio",
+        "--reflect_ratio",
+        dest="mix_ratio",
         type=float,
         default=float(os.environ.get("UNICOT_MIX_RATIO", "0.5")),
-        help="Reflect-row fraction, applied only when --train_size/--val_size cap the pools",
+        help="Reflect fraction used only when a split size cap is supplied",
     )
     parser.add_argument(
         "--val_ratio",
         type=float,
         default=float(os.environ.get("UNICOT_VAL_RATIO", "0.05")),
-        help="Hash-based validation split fraction",
     )
     parser.add_argument("--seed", type=int, default=int(os.environ.get("UNICOT_SPLIT_SEED", "42")))
     args = parser.parse_args()

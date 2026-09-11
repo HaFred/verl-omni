@@ -110,10 +110,20 @@ def _count_gen_calls(samples: list[GenSample]) -> int:
     return len(groups)
 
 
+def _sample_has_gen_traj(sample: GenSample) -> bool:
+    """Complete FlowGRPO seed requires latents + timesteps + rollout logprobs."""
+    return (
+        sample.valid
+        and sample.all_latents is not None
+        and sample.timesteps is not None
+        and sample.rollout_log_probs is not None
+    )
+
+
 def _complete_groups(samples: list[GenSample], *, expected_s: int) -> dict[str, list[GenSample]]:
     by_group: dict[str, list[GenSample]] = {}
     for sample in samples:
-        if not sample.valid:
+        if not _sample_has_gen_traj(sample):
             continue
         by_group.setdefault(str(sample.gen_group_uid), []).append(sample)
     complete: dict[str, list[GenSample]] = {}
@@ -291,8 +301,7 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
-            logger.warning("Empty output for prompt %s_%s", uid, session_id)
-            return
+            raise RuntimeError(f"Empty bagel Co-RL agent output for prompt {uid}_{session_id}")
 
         await self._compute_score(outputs, kwargs=kwargs)
 
@@ -312,11 +321,10 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
 
         # Bagel Co-RL: one serial episode per session → single UND index 0.
         if len(outputs) != 1:
-            logger.warning(
-                "Bagel Co-RL expected one AgentLoopOutput per session, got %s; using last",
-                len(outputs),
+            raise RuntimeError(
+                f"Bagel Co-RL expected one AgentLoopOutput per session, got {len(outputs)}"
             )
-        episode_output = outputs[-1]
+        episode_output = outputs[0]
         und_key = und_tq_key(dataset_task_uid=uid, session_id=session_id, episode_index=0)
         episode = episode_from_agent_extra(
             prompt_ids=list(episode_output.prompt_ids),

@@ -23,7 +23,9 @@ from typing import Any
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopBase, AgentLoopMetrics, AgentLoopOutput, register
 from verl.utils.profiler import simple_timer
+from verl.utils.tokenizer import normalize_token_ids
 
+from verl_omni.agent_loop.bagel_corl_gen_serve import build_gen_sampling_params, stash_gen_row_from_diffusion_output
 from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     BagelGenerateImageTool,
     GenSample,
@@ -41,8 +43,8 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
     """Per-episode serial UND→GEN→RM loop. Outer gather stays on the worker."""
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        # Stash for the GEN tool (``_generate_image_k``) so it can build diffusion
-        # sampling params (seed / logprobs / num_inference_steps) per seed.
+        # Stash for the GEN tool (``_generate_image``) so it can build diffusion
+        # sampling params (seed / logprobs / num_inference_steps) per FlowGRPO seed.
         self._sampling_params = sampling_params
         dataset_task_uid = str(
             kwargs.get("dataset_task_uid")
@@ -54,31 +56,72 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         raw_prompt = kwargs.get("raw_prompt")
         if raw_prompt is None:
             raise ValueError("bagel_multiturn_agent requires raw_prompt")
+        # Transformers 4/5: tokenize=True may return BatchEncoding; list(enc) would
+        # iterate keys ('input_ids', ...) and crash normalize_token_ids on the server.
         prompt_ids = kwargs.get("prompt_ids")
         if prompt_ids is None:
             encoded = self.tokenizer.apply_chat_template(raw_prompt, add_generation_prompt=True, tokenize=True)
-            prompt_ids = list(encoded)
+            prompt_ids = normalize_token_ids(encoded)
+        else:
+            prompt_ids = normalize_token_ids(prompt_ids)
 
         agent_cfg = self.config.actor_rollout_ref.rollout.agent
-        k = int(agent_cfg.get("gen_samples_per_call", 4))
+        # S = FlowGRPO seeds under one generate_image turn. Not episode GEN-turn count K.
+        s = int(agent_cfg.get("gen_samples_per_call", 4))
         max_passes = int(agent_cfg.get("max_generate_passes", 1))
         max_und_turns = int(agent_cfg.get("max_und_turns", 8))
 
         async def _und_decode(**_decode_kwargs):
             with simple_timer("und_decode", {}):
-                output = await self.server_manager.generate(
-                    request_id=str(uuid.uuid4()),
-                    prompt_ids=list(_decode_kwargs["prompt_ids"]) + list(_decode_kwargs["response_ids"]),
-                    sampling_params=sampling_params,
+                und_params = dict(sampling_params)
+                und_params["bagel_role"] = "und"
+                # UND must hit the AR replica (BagelDualRoleLLMServerClient routes on role /
+                # absence of diffusion keys). Never send num_inference_steps here.
+                for _k in (
+                    "num_inference_steps",
+                    "noise_level",
+                    "sde_window_size",
+                    "sde_window_range",
+                    "sde_type",
+                    "height",
+                    "width",
+                ):
+                    und_params.pop(_k, None)
+                try:
+                    output = await self.server_manager.generate(
+                        request_id=str(uuid.uuid4()),
+                        prompt_ids=list(_decode_kwargs["prompt_ids"]) + list(_decode_kwargs["response_ids"]),
+                        sampling_params=und_params,
+                    )
+                except Exception as exc:  # noqa: BLE001 — map diffusion-replica errors to UND dual-role failure
+                    err = str(exc)
+                    if "num_inference_steps" in err or "Diffusion" in type(exc).__name__:
+                        raise RuntimeError(
+                            "Bagel Co-RL UND decode hit the GEN diffusion replica "
+                            "(bagel_single_stage / DiffusionStrategy). UND needs AR TokenOutput "
+                            "(Hermes tool-call); refuse soft-empty TQ. "
+                            "Prove dual-role serving, then set agent.und_ar_serving_ready=True. "
+                            f"Underlying error: {err}"
+                        ) from exc
+                    raise
+            if hasattr(output, "diffusion_output"):
+                raise RuntimeError(
+                    "Bagel Co-RL UND decode received DiffusionOutput: rollout is on DiffusionStrategy "
+                    "(bagel_single_stage / output_mode≠ar). UND needs AR token generation; "
+                    "refuse empty token_ids that would leave TQ with no materializable trajectories."
                 )
-            token_ids = list(output.token_ids if hasattr(output, "token_ids") else output.get("token_ids", []))
+            if not hasattr(output, "token_ids"):
+                raise RuntimeError(
+                    f"Bagel Co-RL UND decode expected TokenOutput with token_ids, got {type(output)!r}"
+                )
+            token_ids = list(output.token_ids)
             text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
             return {"token_ids": token_ids, "text": text}
 
         tool = BagelGenerateImageTool(
-            gen_samples_per_call=k,
+            gen_samples_per_call=s,
             max_generate_passes=max_passes,
-            generate_fn=self._generate_image_k,
+            generate_fn=self._generate_image,
         )
         # Non-image UND scalar for pattern-3 (K=0) episodes. The reward model computes
         # the authoritative token-GRPO reward post-hoc (via the worker's ``_compute_score``);
@@ -126,60 +169,46 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             extra_fields=extra,
         )
 
-    async def _generate_image_k(self, **kwargs) -> list[dict[str, Any]]:
-        """Call the GEN vLLM-Omni replica ``S`` times (one per seed) and stash trajectories.
+    async def _generate_image(self, **kwargs) -> list[dict[str, Any]]:
+        """Run **one** GEN turn: S same-conditioning FlowGRPO seeds, then return.
+
+        Episode pattern (RFC): each UND ``generate_image`` verdict enqueues exactly
+        one GEN turn (``K += 1``). This method is that turn — not ``K`` GEN turns
+        attached to one UND decode. The seed loop is ``S = gen_samples_per_call``
+        (group size for FlowGRPO), e.g. ``UND → GEN(S seeds) → UND → Done``.
 
         Each returned row carries ``valid`` / ``all_latents`` / ``timesteps`` /
-        ``rollout_log_probs`` / ``image_path``. Fails closed when the server returns a
-        token (not diffusion) output, i.e. dual-role serving is not yet active — do not
-        fall back to a Qwen image sidecar (RFC stop-gate).
+        ``rollout_log_probs`` / ``image_path``. Fails closed when traj stash is
+        missing (no soft-fallback to logprobs-only / skip GEN loss) and when the
+        server returns a token output — do not fall back to a Qwen image sidecar.
 
         Incomplete / invalid S-groups are dropped at dual-lane ingest (no dummy pads).
-        Pattern 3 (K=0) never calls this.
+        Pattern 3 (``K = 0``) never calls this.
         """
         prompt = str(kwargs.get("prompt", ""))
         seeds = list(kwargs.get("seeds") or [])
         if not prompt:
-            raise ValueError("_generate_image_k requires a non-empty diffusion prompt")
+            raise ValueError("_generate_image requires a non-empty diffusion prompt")
 
-        sampling = dict(getattr(self, "_sampling_params", None) or {})
+        rollout = self.config.actor_rollout_ref.rollout
+        base = dict(getattr(self, "_sampling_params", None) or {})
         rows: list[dict[str, Any]] = []
         for seed in seeds:
-            request_params = dict(sampling)
-            request_params["seed"] = int(seed)
-            request_params["logprobs"] = True
+            request_params = build_gen_sampling_params(rollout, base=base, seed=int(seed))
+            request_params["bagel_role"] = "gen"
             # BagelPipeline reads text from the request prompt; encode the diffusion
             # prompt directly (not the whole UND conversation) so the GEN replica
             # denoises the right conditioning.
-            gen_prompt_ids = list(self.tokenizer.encode(prompt, add_special_tokens=False))
+            gen_prompt_ids = normalize_token_ids(
+                self.tokenizer.encode(prompt, add_special_tokens=False)
+            )
             output = await self.server_manager.generate(
                 request_id=str(uuid.uuid4()),
                 prompt_ids=gen_prompt_ids,
                 sampling_params=request_params,
             )
-            if not self._is_diffusion_output(output):
-                raise RuntimeError(
-                    "Bagel Co-RL generate_image returned a token output: dual-role GEN "
-                    "serving is not wired (bagel_single_stage is GEN-only / the AR replica "
-                    "is not diffusion-capable). Do not fall back to a Qwen sidecar."
-                )
-            extra = dict(getattr(output, "extra_fields", None) or {})
-            rows.append(
-                {
-                    "valid": getattr(output, "stop_reason", None) not in ("aborted", "abort", "error"),
-                    "all_latents": extra.get("all_latents"),
-                    "timesteps": extra.get("all_timesteps"),
-                    "rollout_log_probs": getattr(output, "log_probs", None),
-                    "image_path": extra.get("image_path") or extra.get("path"),
-                }
-            )
+            rows.append(stash_gen_row_from_diffusion_output(output, seed=int(seed)))
         return rows
-
-    @staticmethod
-    def _is_diffusion_output(output: Any) -> bool:
-        """verl_omni ``DiffusionOutput`` carries ``diffusion_output``; ``TokenOutput`` does not."""
-        return hasattr(output, "diffusion_output")
-
     async def _score_gen_samples(self, samples: list[GenSample]) -> list[GenSample]:
         """Score GEN samples via an injected RM hook (C/A, UniCoT similarity, good_enough).
 
@@ -221,17 +250,14 @@ class MultiturnAgentLoopWorker(CompositeAgentLoopWorker):
         extra.update(hist)
         logger.info("bagel_corl turn histogram: %s", hist)
         agent_cfg = getattr(self.config.actor_rollout_ref.rollout, "agent", None)
-        expected_k = int(getattr(agent_cfg, "gen_samples_per_call", None) or 4)
-        try:
-            from verl_omni.agent_loop.bagel_corl_lib import flatten_from_agent_output, strip_pixels_for_actor
+        expected_s = int(getattr(agent_cfg, "gen_samples_per_call", None) or 4)
+        from verl_omni.agent_loop.bagel_corl_lib import flatten_from_agent_output, strip_pixels_for_actor
 
-            flat = flatten_from_agent_output(output, expected_k=expected_k)
-            extra.update(flat.metrics)
-            extra["gen_batch"] = [strip_pixels_for_actor(row) for row in flat.gen_batch]
-            extra["und_batch"] = flat.und_batch
-            extra["gen_episode_map"] = flat.gen_episode_map
-        except (TypeError, KeyError, AttributeError, ValueError) as exc:
-            logger.warning("bagel_corl flatten skipped: %s", exc)
+        flat = flatten_from_agent_output(output, expected_s=expected_s)
+        extra.update(flat.metrics)
+        extra["gen_batch"] = [strip_pixels_for_actor(row) for row in flat.gen_batch]
+        extra["und_batch"] = flat.und_batch
+        extra["gen_episode_map"] = flat.gen_episode_map
         try:
             from verl_omni.utils.agentic.image_gen_rollout_dump import (
                 dump_bagel_corl_episode_images,

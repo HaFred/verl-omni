@@ -24,7 +24,7 @@ from typing import Any
 
 import numpy as np
 
-from verl_omni.agent_loop.image_gen_trajectory_context import (
+from verl_omni.tools.trajectory import (
     build_trajectory_relpath,
     resolve_rollout_images_root,
     resolve_run_dir,
@@ -55,7 +55,17 @@ def materialize_rollout_images(
     relpath: str,
     user_prompt: str,
 ) -> list[str]:
-    """Index images already written by the live tool; never create empty folders."""
+    """Index images already written by the live tool; never create empty folders.
+
+    Args:
+        decoded_response: Decoded assistant text (for tool prompts).
+        run_dir: Artifact run directory.
+        relpath: Trajectory-relative image folder.
+        user_prompt: Dataset user request stored in ``meta.json``.
+
+    Returns:
+        Existing image paths under that folder, or ``[]`` if none.
+    """
     target_dir = run_dir / "rollout_images" / relpath
     # ``agentic_tool._save_images`` creates this directory only after a real
     # generate_image execution. A rollout with no generated artifact must not
@@ -93,14 +103,16 @@ def materialize_rollout_images(
 
 
 def discard_invalid_rollouts(output: Any) -> None:
-    """Drop no-``generate_image`` rollouts from the policy update.
+    """Zero ``response_mask`` for rows that never produced ``generate_image``.
 
-    Sets ``response_mask`` to 0 so GRPO/PPO give them no gradient. Their
-    scalar reward is already 0 with ``rollout_valid=0`` from
-    ``agentic_reward``; they can still slightly affect the GRPO group mean,
-    which is acceptable (penalizes skip-gen relative to siblings).
+    Args:
+        output: Rollout ``DataProto``. Prefers stamps on ``non_tensor_batch``.
+
+    Returns:
+        None.
     """
     valid = output.non_tensor_batch.get("rollout_valid")
+    has_gen = output.non_tensor_batch.get("rollout_has_generate")
     n_gen = output.non_tensor_batch.get("num_generate_image_prompts")
     response_mask = output.batch.get("response_mask")
     if response_mask is None:
@@ -111,17 +123,7 @@ def discard_invalid_rollouts(output: Any) -> None:
     original_mask = response_mask.clone()
     dropped = 0
     for i in range(n):
-        is_valid = True
-        if valid is not None:
-            try:
-                is_valid = int(np.asarray(valid[i]).reshape(-1)[0]) == 1
-            except (TypeError, ValueError, IndexError):
-                is_valid = True
-        elif n_gen is not None:
-            try:
-                is_valid = int(np.asarray(n_gen[i]).reshape(-1)[0]) >= 1
-            except (TypeError, ValueError, IndexError):
-                is_valid = True
+        is_valid = _row_has_generate(valid=valid, has_gen=has_gen, n_gen=n_gen, index=i)
         if is_valid:
             continue
         response_mask[i].zero_()
@@ -142,6 +144,37 @@ def discard_invalid_rollouts(output: Any) -> None:
         )
 
 
+def _row_int(values: Any, index: int) -> int | None:
+    if values is None:
+        return None
+    try:
+        return int(np.asarray(values[index]).reshape(-1)[0])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _row_has_generate(*, valid: Any, has_gen: Any, n_gen: Any, index: int) -> bool:
+    """Fail-closed when a stamp is present but unparsable; True only if generate count >= 1."""
+    for values, predicate in (
+        (valid, lambda v: v == 1),
+        (has_gen, lambda v: v == 1),
+        (n_gen, lambda v: v >= 1),
+    ):
+        parsed = _row_int(values, index)
+        if parsed is None:
+            if values is not None:
+                # Key present for the batch but this row failed to parse → treat as invalid.
+                try:
+                    _ = values[index]
+                except Exception:  # noqa: BLE001
+                    continue
+                return False
+            continue
+        return bool(predicate(parsed))
+    # No validity stamps at all (non-agentic loop) → keep the row.
+    return True
+
+
 def _resolve_sample_relpath(
     *,
     i: int,
@@ -150,7 +183,6 @@ def _resolve_sample_relpath(
     rollout_counts: dict[str, int],
     live_relpaths: Any,
     step_i: int,
-    validate: bool,
 ) -> tuple[str, str, int]:
     """Return ``(relpath, sample_key, rollout_n)`` for one batch row."""
     live_relpath = None
@@ -170,17 +202,13 @@ def _resolve_sample_relpath(
             sample_key = m.group(1)
             rollout_n = int(m.group(2))
         else:
-            match = re.fullmatch(r"sample_(.+)$", name)
-            if match:
-                sample_key = match.group(1)
-            rollout_n = 0 if validate else rollout_counts.get(sample_key, 0)
+            rollout_n = rollout_counts.get(sample_key, 0)
     else:
-        rollout_n = 0 if validate else rollout_counts.get(sample_key, 0)
+        rollout_n = rollout_counts.get(sample_key, 0)
         relpath = build_trajectory_relpath(
             step=step_i,
             sample_index=sample_index,
             rollout_n=rollout_n,
-            validate=validate,
         )
     return relpath, sample_key, rollout_n
 
@@ -281,15 +309,17 @@ def _format_turn_text_block(turn: dict[str, Any]) -> list[str]:
     ]
 
 
-def dump_raw_rollouts(
-    *,
-    tokenizer: Any,
-    output: Any,
-    step: Any,
-    write_monitor: bool = True,
-    validate: bool = False,
-) -> None:
-    """Write per-sample trajectories and optional step monitor files."""
+def dump_raw_rollouts(*, tokenizer: Any, output: Any, step: Any) -> None:
+    """Write hermes_actions JSONL and per-step trajectory dumps.
+
+    Args:
+        tokenizer: Tokenizer used to decode responses.
+        output: Rollout ``DataProto``.
+        step: Global step, or ``None`` for ``step_unknown``.
+
+    Returns:
+        None.
+    """
     try:
         responses = output.batch["responses"]
         response_masks = output.batch["response_mask"]
@@ -300,8 +330,7 @@ def dump_raw_rollouts(
         run_dir = resolve_run_dir()
         monitor_dir = run_dir / "hermes_actions"
         trajectory_dir = run_dir / "rollout_trajectories" / step_tag
-        if write_monitor:
-            monitor_dir.mkdir(parents=True, exist_ok=True)
+        monitor_dir.mkdir(parents=True, exist_ok=True)
         trajectory_dir.mkdir(parents=True, exist_ok=True)
 
         rollout_counts: dict[str, int] = {}
@@ -322,7 +351,6 @@ def dump_raw_rollouts(
                 rollout_counts=rollout_counts,
                 live_relpaths=live_relpaths,
                 step_i=step_i,
-                validate=validate,
             )
             rollout_counts[sample_key] = max(rollout_counts.get(sample_key, 0), int(rollout_n) + 1)
             user_prompt = last_user_prompt(raw_prompts[i]) if raw_prompts is not None else ""
@@ -403,9 +431,8 @@ def dump_raw_rollouts(
             }
             jsonl_rows.append(json.dumps(monitor_payload, ensure_ascii=False))
 
-        if write_monitor:
-            (monitor_dir / f"{step_tag}.txt").write_text("\n".join(step_text) + "\n")
-            (monitor_dir / f"{step_tag}.jsonl").write_text("\n".join(jsonl_rows) + "\n")
+        (monitor_dir / f"{step_tag}.txt").write_text("\n".join(step_text) + "\n")
+        (monitor_dir / f"{step_tag}.jsonl").write_text("\n".join(jsonl_rows) + "\n")
     except Exception as exc:  # noqa: BLE001
         # Monitoring must never fail or alter rollout generation.
         logger.warning("Failed to dump raw agent rollouts: %s", exc)
@@ -418,11 +445,24 @@ def dump_bagel_corl_episode_images(
     sample_index: Any = 0,
     rollout_n: int = 0,
 ) -> list[str]:
-    """Copy Bagel Co-RL gen_sample PNGs into LocalImageResolver layout.
+    """Copy Bagel Co-RL gen_sample PNGs into the rollout image tree.
 
-    Layout: ``<rollout_images_root>/step_XXXXXX/sample_i.n/image_*.png``.
+    Layout: ``<rollout_images_root>/step_XXXXXX/sample_i.nn/image_*.png``.
     Accepts CompositeAgentLoop ``extra_fields`` rows, a list of episodes, or a
     single episode-like object with ``gen_samples``.
+
+    Bagel Co-RL specific: kept even though upstream ``verl_omni.utils.agentic``
+    does not need it, because ``bagel_corl.py`` imports it from this module.
+
+    Args:
+        output_or_episodes: Composite/DataProto-like object, an episode list, or
+            a single episode-like object carrying ``gen_samples``.
+        step: Global step (``None`` → ``step_unknown``).
+        sample_index: Dataset sample index used when there is a single episode.
+        rollout_n: Rollout index within the sample.
+
+    Returns:
+        Written image paths (absolute), in copy order.
     """
     import shutil
 
@@ -455,7 +495,6 @@ def dump_bagel_corl_episode_images(
             step=step,
             sample_index=idx,
             rollout_n=rollout_n,
-            validate=False,
         )
         target_dir = root / relpath
         target_dir.mkdir(parents=True, exist_ok=True)

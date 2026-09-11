@@ -11,10 +11,11 @@
 #   REBUILD_UNICOT=1 python3 examples/agenticllmgrpo_trainer/bagel/stamp_unicot_reference_paths.py \
 #       --input $UNICOT_PARQUET --output $UNICOT_PARQUET
 #
-# GPUs: trainer.n_gpus_per_node follows CUDA_VISIBLE_DEVICES (e.g. 2,3,4,5 → 4).
+# GPUs: trainer.n_gpus_per_node = len(CUDA_VISIBLE_DEVICES) (e.g. 2,3,4,5 → 4).
+# UND AR is colocated on that same actor placement group (not a second Ray pool).
 # Default REWARD_TP=N so one Qwen RM is TP-sharded, not copied per GPU.
 # 1-GPU smoke (CUDA_VISIBLE_DEVICES=3): ENABLE_RM=0 by default — actor+Omni+RM cannot fit.
-# Re-enable with ENABLE_RM=1 once you have ≥2 empty cards.
+# Re-enable with ENABLE_RM=1 once you have headroom.
 set -x
 # Prefer local verl checkout (tokenizer package layout) over site-packages flat tokenizer.py.
 _SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -29,13 +30,34 @@ fi
 export BAGEL_MODEL_PATH=/scratch/fq9hpsac/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b
 WORKSPACE=${WORKSPACE:-$HOME}
 BAGEL_DEPLOY_CONFIG=${BAGEL_DEPLOY_CONFIG:-"$(dirname "$0")/bagel_corl_deploy.yaml"}
+# Prefer Slurm job GPUs 2-5 when the caller did not set CUDA_VISIBLE_DEVICES.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3,4,5}"
 
 model_name=${BAGEL_MODEL_PATH:-$HOME/models/ByteDance-Seed/BAGEL-7B-MoT}
-unicot_train_path=${UNICOT_TRAIN:-"${_REPO_ROOT}/outputs/data/agentic_unicot/train.parquet"}
-unicot_test_path=${UNICOT_TEST:-"${_REPO_ROOT}/outputs/data/agentic_unicot/val.parquet"}
 reward_model_name=${REWARD_MODEL:-/home/fq9hpsac/fq9hpsacuser11/fred/hf_home/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc}
 
+TRAIN_FILE=${UNICOT_TRAIN:-"${_REPO_ROOT}/outputs/data/agentic_unicot/train.parquet"}
+VAL_FILE=${UNICOT_TEST:-"${_REPO_ROOT}/outputs/data/agentic_unicot/val.parquet"}
+# Build the mixed UniCoT train/val parquet (system + user only; UniCoT fields
+# are reward ground truth, never fewshot). Skip when both files already exist
+# unless REBUILD_UNICOT=1 (avoids import-heavy rebuild on resume).
+if [[ "${REBUILD_UNICOT:-1}" == "1" || ! -f "$TRAIN_FILE" || ! -f "$VAL_FILE" ]]; then
+  python3 -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl \
+      --breakdown_dir "$UNICOT_BREAKDOWN_DIR" \
+      --reflection_dir "$UNICOT_REFLECTION_DIR" \
+      --local_save_dir "$(dirname "$TRAIN_FILE")" \
+      --mix_ratio "$UNICOT_MIX_RATIO" \
+      --val_ratio "$UNICOT_VAL_RATIO" \
+      --seed "$UNICOT_SPLIT_SEED" \
+      ${UNICOT_TRAIN_SIZE:+--train_size "$UNICOT_TRAIN_SIZE"} \
+      ${UNICOT_VAL_SIZE:+--val_size "$UNICOT_VAL_SIZE"}
+else
+  echo "[INFO] reusing existing UniCoT parquet: $TRAIN_FILE / $VAL_FILE (set REBUILD_UNICOT=1 to rebuild)"
+fi
+
 # Count cards Ray will actually see (CUDA_VISIBLE_DEVICES=2,3,4,5 → 4).
+# All visible cards go to the actor+GEN hybrid pool. UND AR is colocated on that
+# same placement group (init_colocated) — it does NOT need spare free Ray GPUs.
 _count_visible_gpus() {
   if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
     local n=0 id
@@ -61,6 +83,14 @@ if [[ -z "$N_VISIBLE" || "$N_VISIBLE" -lt 1 ]]; then
   exit 1
 fi
 NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS_ACTOR_ROLLOUT_REWARD:-$N_VISIBLE}
+# Colocated UND AR footprint inside the actor PG (TP=1 smoke → 1 card share).
+UND_N_GPUS=${UND_N_GPUS:-1}
+BAGEL_UND_DEPLOY_CONFIG=${BAGEL_UND_DEPLOY_CONFIG:-"$(dirname "$0")/bagel_corl_deploy_ar.yaml"}
+# Live Hermes proof (optional before long runs):
+#   bash examples/agenticllmgrpo_trainer/bagel/run_bagel_und_ar_serve.sh
+#   BAGEL_UND_URL=http://127.0.0.1:8094 python3 .../spike_und_hermes.py --model-path "$BAGEL_MODEL_PATH"
+BAGEL_UND_AR_SERVING_READY=${BAGEL_UND_AR_SERVING_READY:-1}
+echo "bagel_corl 4-device e2e: actor+GEN=${NUM_GPUS_ACTOR_ROLLOUT_REWARD} UND_AR_colocated=${UND_N_GPUS} visible=${N_VISIBLE} und_ready=${BAGEL_UND_AR_SERVING_READY}"
 ROLLOUT_TP=${ROLLOUT_TP:-1}
 # One colocated RM tensor-parallel across the pool (not N copies of Qwen). Override REWARD_TP=1 for per-GPU workers.
 REWARD_TP=${REWARD_TP:-$NUM_GPUS_ACTOR_ROLLOUT_REWARD}
@@ -74,7 +104,8 @@ if (( NUM_GPUS_ACTOR_ROLLOUT_REWARD % REWARD_TP != 0 )); then
   exit 1
 fi
 # 1-GPU cannot colocate Bagel FSDP + vLLM-Omni + Qwen RM. Default: drop RM, tiny util.
-# 2-GPU: actor + Omni + RM still tight. More GPUs → slightly more KV.
+# 2-GPU: actor + Omni + colocated UND AR is already tight — keep RM off.
+# 4-GPU e2e: still default RM off until Hermes+composite step are green; ENABLE_RM=1 to re-enable.
 if [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -eq 1 ]]; then
   ENABLE_RM=${ENABLE_RM:-0}
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.08}
@@ -86,7 +117,7 @@ if [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -eq 1 ]]; then
   LORA_RANK=${LORA_RANK:-4}
   LORA_ALPHA=${LORA_ALPHA:-8}
 elif [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -le 2 ]]; then
-  ENABLE_RM=${ENABLE_RM:-1}
+  ENABLE_RM=${ENABLE_RM:-0}
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.12}
   ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.30}
   TRAIN_BSZ=${TRAIN_BSZ:-2}
@@ -96,9 +127,9 @@ elif [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -le 2 ]]; then
   LORA_RANK=${LORA_RANK:-8}
   LORA_ALPHA=${LORA_ALPHA:-16}
 else
-  ENABLE_RM=${ENABLE_RM:-1}
+  ENABLE_RM=${ENABLE_RM:-0}
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.15}
-  ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.40}
+  ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.35}
   TRAIN_BSZ=${TRAIN_BSZ:-2}
   MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1024}
   GEN_STEPS=${GEN_STEPS:-10}
@@ -132,8 +163,8 @@ echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runti
 
 python3 -m verl_omni.trainer.main_omni \
     trainer.v1.trainer_mode=bagel_corl_sync \
-    data.train_files=$unicot_train_path \
-    data.val_files=$unicot_test_path \
+    data.train_files=$TRAIN_FILE \
+    data.val_files=$VAL_FILE \
     data.train_batch_size=$TRAIN_BSZ \
     data.max_prompt_length=$MAX_PROMPT_LEN \
     data.max_response_length=$MAX_PROMPT_LEN \
@@ -172,9 +203,16 @@ python3 -m verl_omni.trainer.main_omni \
     +actor_rollout_ref.rollout.pipeline.width=$GEN_HW \
     +actor_rollout_ref.rollout.pipeline.num_inference_steps=$GEN_STEPS \
     +actor_rollout_ref.rollout.pipeline.max_sequence_length=$MAX_PROMPT_LEN \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
+    +actor_rollout_ref.rollout.algo.noise_level=${NOISE_LEVEL:-0.7} \
+    +actor_rollout_ref.rollout.algo.sde_window_size=${SDE_WINDOW_SIZE:-2} \
+    +actor_rollout_ref.rollout.algo.sde_window_range=${SDE_WINDOW_RANGE:-[0,7]} \
     actor_rollout_ref.rollout.agent.default_agent_loop=bagel_multiturn_agent \
     +actor_rollout_ref.rollout.agent.gen_samples_per_call=$S \
     +actor_rollout_ref.rollout.agent.max_generate_passes=1 \
+    +actor_rollout_ref.rollout.agent.und_ar_serving_ready=$BAGEL_UND_AR_SERVING_READY \
+    +actor_rollout_ref.rollout.agent.und_deploy_config=$BAGEL_UND_DEPLOY_CONFIG \
+    +actor_rollout_ref.rollout.agent.und_n_gpus=$UND_N_GPUS \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.deploy_config=$BAGEL_DEPLOY_CONFIG \
     reward.num_workers=$(( ENABLE_RM == 1 ? NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP : 0 )) \
     reward.reward_model.enable=$ENABLE_RM \

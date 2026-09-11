@@ -24,7 +24,8 @@ from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1.trainer_base import register_trainer
 from verl.utils.config import omega_conf_to_dataclass
 
-from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage
+from verl_omni.trainer.omni.bagel_corl_diff_v1 import DiffusionV1GenLane
+from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage, build_gen_flowgrpo_proto
 from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.config.diffusion import DiffusionRolloutConfig
@@ -172,16 +173,21 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     Do **not** only add ``rollout_adapter`` onto omni ``RolloutConfig``: ``init_model``
     instantiates via Hydra ``_target_``, and verl's ``RolloutConfig`` rejects that kwarg.
 
-    Parent is intentional AR V1 (``OmniPPOTrainerSync`` / token GRPO), not diffusion
-    ``PolicyGradientDiffusionTrainerV1Sync`` and not OCR's legacy ``PolicyGradientRayTrainer``.
-    Rewrite + ``ActorRolloutRefWorker`` swap unlock GEN *loss* on ``DiffusersFSDPEngine``.
-    Same training step: UND token GRPO via ``super()._compute_advantage`` (TQ
-    ``advantages``); GEN FlowGRPO via ``apply_gen_flowgrpo_advantage`` into
-    ``extra_info["bagel_corl_gen"]`` only (grouped by ``gen_group_uid``). Estimators
-    are decoupled: UND uses ``algorithm.adv_estimator`` (omni default ``grpo``);
-    GEN uses ``model.algorithm`` / ``flow_grpo``. One ``update_actor`` /
-    ``optimizer.step`` / weight publish. Incomplete or traj-less GEN views skip GEN
-    only; UND still updates.
+    Parent is intentional PPO V1 (``OmniPPOTrainerSync`` / ``TaskRunnerV1`` / token GRPO),
+    not diffusion ``PolicyGradientDiffusionTrainerV1Sync.fit()`` and not OCR's legacy
+    ``PolicyGradientRayTrainer``. GEN lane binds
+    ``PolicyGradientDiffusionTrainerV1._compute_old_log_prob`` /
+    ``_compute_advantage`` onto the same ``actor_rollout_wg``. Rewrite +
+    ``ActorRolloutRefWorker`` unlock GEN *loss* on ``PPODiffusersFSDPEngine``.
+    Composite ``forward_backward_batch`` (``bagel_corl_composite``) runs UND
+    ``BagelForCoRL.compute_und_log_prob`` then GEN timestep FlowGRPO in one
+    ``train_batch`` / one ``optimizer.step``. Same training step: UND token GRPO via
+    ``super()._compute_advantage`` (TQ ``advantages``); GEN FlowGRPO via the bound
+    diffusion V1 ``_compute_advantage`` into ``extra_info["bagel_corl_gen"]`` only
+    (grouped by ``gen_group_uid``), including traj ``all_latents`` when stashed.
+    Estimators are decoupled: UND uses ``algorithm.adv_estimator`` (omni default
+    ``grpo``); GEN uses ``model.algorithm`` / ``flow_grpo``. Incomplete or traj-less
+    GEN views skip GEN only; UND still updates.
     Inherited Omni ``resume_generation_replicas`` is a poor fit for ``bagel_single_stage``
     (diffusion V1 sleeps replicas instead) — revisit after GEN serving is live.
     """
@@ -218,7 +224,19 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             "verl_omni.agent_loop.bagel_corl_tq.BagelCorlAgentLoopManagerTQ",
         )
         agent.setdefault("default_agent_loop", "bagel_multiturn_agent")
+        agent.setdefault("und_ar_serving_ready", False)
         rollout_filtered["agent"] = agent
+        # Live GEN traj stash requires FlowGRPO SDE + logprobs (refuse ODE soft-skip).
+        rollout_filtered["calculate_log_probs"] = True
+        algo = dict(rollout_filtered.get("algo") or {})
+        algo.setdefault("noise_level", 0.7)
+        algo.setdefault("sde_window_size", 2)
+        algo.setdefault("sde_window_range", [0, 7])
+        algo.setdefault("sde_type", "sde")
+        rollout_filtered["algo"] = algo
+        pipeline = dict(rollout_filtered.get("pipeline") or {})
+        pipeline.setdefault("num_inference_steps", 10)
+        rollout_filtered["pipeline"] = pipeline
 
         with open_dict(self.config):
             self.config.actor_rollout_ref.model = OmegaConf.create(filtered)
@@ -233,6 +251,16 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 )
             elif actor.diffusion_loss.get("loss_mode") is None:
                 actor.diffusion_loss.loss_mode = filtered.get("algorithm", "flow_grpo")
+            # verl AgentLoopBase always reads data.continuous_token (struct). Omni data
+            # schemas may omit it; missing key aborts every episode → empty TQ →
+            # "no materializable trajectories".
+            data = self.config.get("data")
+            if data is None:
+                self.config.data = data = OmegaConf.create({})
+            if data.get("continuous_token") is None:
+                data.continuous_token = OmegaConf.create({"enable": False, "model_family": "auto"})
+            elif data.continuous_token.get("enable") is None:
+                data.continuous_token.enable = False
 
     def _init_tokenizer(self):
         self._rewrite_bagel_corl_configs()
@@ -262,7 +290,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             if role in self.role_worker_mapping:
                 self.role_worker_mapping[role] = remote_cls
 
-    def _expected_k(self) -> int:
+    def _expected_s(self) -> int:
         agent = self.config.actor_rollout_ref.rollout.get("agent") or {}
         return int(agent.get("gen_samples_per_call") or 4)
 
@@ -288,8 +316,35 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 batch.extra_info = extra
         return extra
 
+    def _diffusion_v1_gen_lane(self) -> DiffusionV1GenLane:
+        """GEN hooks from ``PolicyGradientDiffusionTrainerV1`` on this job's workers."""
+        lane = getattr(self, "_diff_v1_gen_lane", None)
+        wg = getattr(self, "actor_rollout_wg", None)
+        if lane is None or getattr(lane, "actor_rollout_wg", None) is not wg:
+            self._diff_v1_gen_lane = DiffusionV1GenLane(self)
+        return self._diff_v1_gen_lane
+
+    def _compute_old_log_prob(self, batch, metrics: dict):
+        """UND: PPO V1 token old-logprob. GEN: diffusion V1 ``infer_actor_batch`` (required when K>0)."""
+        extra = self._extra_info(batch)
+        proto = build_gen_flowgrpo_proto(self._gen_batch_from_step(batch))
+        if proto is None:
+            return super()._compute_old_log_prob(batch, metrics)
+        if "all_latents" not in proto.batch.keys():
+            raise RuntimeError(
+                "bagel_corl GEN old_log_prob requires all_latents; refuse rollout_log_probs-only recompute skip."
+            )
+        if getattr(self, "actor_rollout_wg", None) is None:
+            # CPU unit tests: no worker group. Packed traj logprobs stay on proto for GEN advantage.
+            metrics["gen/old_log_prob_recomputed"] = 0.0
+            return super()._compute_old_log_prob(batch, metrics)
+        old = self._diffusion_v1_gen_lane()._compute_old_log_prob(proto)
+        extra["bagel_corl_gen_old"] = old.batch
+        metrics["gen/old_log_prob_recomputed"] = 1.0
+        return super()._compute_old_log_prob(batch, metrics)
+
     def _gen_batch_from_step(self, batch) -> list:
-        """GEN rows for FlowGRPO: dual-lane ``child_gen_keys`` first; nested extras are legacy only."""
+        """GEN rows for FlowGRPO: dual-lane ``child_gen_keys`` or ``extra['gen_batch']`` only."""
         extra = self._extra_info(batch)
         if extra.get("gen_batch") is not None:
             return list(extra["gen_batch"])
@@ -320,16 +375,13 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             return gen_batch
 
         bagel = extra.get("bagel_corl") if isinstance(extra.get("bagel_corl"), dict) else {}
-        if bagel.get("gen_batch"):
-            logger.warning("bagel_corl: using legacy bagel_corl.gen_batch; prefer dual-lane child_gen_keys")
-            return list(bagel["gen_batch"])
         meta = getattr(batch, "meta_info", None) or {}
         bagel_meta = meta.get("bagel_corl") if isinstance(meta, dict) else {}
-        if isinstance(bagel_meta, dict) and bagel_meta.get("gen_batch"):
-            logger.warning("bagel_corl: using legacy meta_info bagel_corl.gen_batch")
-            extra.update({k: v for k, v in bagel_meta.items() if k != "gen_batch"})
-            extra["gen_batch"] = list(bagel_meta["gen_batch"])
-            return extra["gen_batch"]
+        if bagel.get("gen_batch") or (isinstance(bagel_meta, dict) and bagel_meta.get("gen_batch")):
+            raise RuntimeError(
+                "bagel_corl: GEN rows found only on nested bagel_corl.gen_batch / meta_info; "
+                "dual-lane extra['gen_batch'] or child_gen_keys is required (legacy nested path removed)."
+            )
         return []
 
     def _und_records_from_batch(self, batch) -> list[dict]:
@@ -381,34 +433,20 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         if not keys:
             return {}
         if not hasattr(batch, "partition_id"):
-            logger.warning(
-                "bagel_corl: batch has child_gen_keys=%d but no partition_id; cannot fetch GEN TQ rows",
-                len(keys),
+            raise RuntimeError(
+                f"bagel_corl: batch has child_gen_keys={len(keys)} but no partition_id; cannot fetch GEN TQ rows"
             )
-            return {}
 
-        try:
-            import transfer_queue as tq
+        import transfer_queue as tq
 
-            data = tq.kv_batch_get(keys=keys, partition_id=batch.partition_id)
-        except Exception as exc:  # noqa: BLE001 - any fetch failure must be loud, not silent
-            logger.warning("bagel_corl GEN key fetch FAILED for %d keys: %s", len(keys), exc)
-            extra["gen/tq_fetch_failed"] = 1.0
-            return {}
-
+        data = tq.kv_batch_get(keys=keys, partition_id=batch.partition_id)
         out = _normalize_tq_kv_get_result(data, keys)
         missing = [k for k in keys if k not in out]
         if missing:
-            logger.warning(
-                "bagel_corl GEN fetch returned %d/%d rows; missing=%d (first: %s)",
-                len(out),
-                len(keys),
-                len(missing),
-                missing[:3],
+            raise RuntimeError(
+                f"bagel_corl GEN TQ fetch incomplete: {len(out)}/{len(keys)} rows "
+                f"(first missing: {missing[:3]})"
             )
-            extra["gen/tq_fetch_missing"] = float(len(missing)) / max(1, len(keys))
-        if len(out) != len(keys):
-            extra["gen/tq_fetch_incomplete"] = 1.0
         return out
 
     @staticmethod
@@ -424,8 +462,8 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             if isinstance(data, dict) and "extra_fields" in data:
                 return data["extra_fields"]
             return data
-        except (KeyError, AttributeError, RuntimeError, TypeError, ValueError):
-            return None
+        except (KeyError, AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise RuntimeError("bagel_corl UND extra_fields TQ fetch failed") from exc
 
     def _compute_advantage(self, batch, metrics: dict):
         """Same step, separate tensors: GEN FlowGRPO → ``bagel_corl_gen``; UND token GRPO → TQ via ``super``.
@@ -452,13 +490,41 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 f"Bagel Co-RL GEN adv_estimator={gen_estimator!r} collides with UND token estimator; "
                 "set actor_rollout_ref.model.algorithm=flow_grpo (GEN) and leave algorithm.adv_estimator for UND"
             )
-        gen_proto, gen_metrics = apply_gen_flowgrpo_advantage(
-            self._gen_batch_from_step(batch),
-            adv_estimator=gen_estimator,
-            norm_adv_by_std_in_grpo=bool(algo.get("norm_adv_by_std_in_grpo", True)),
-            global_std=bool(algo.get("global_std", True)),
-            algo_config=algo,
-        )
+        proto = build_gen_flowgrpo_proto(self._gen_batch_from_step(batch))
+        gen_proto = None
+        gen_metrics: dict = {
+            "gen/skipped_no_groups": 1.0,
+            "gen/num_rows": 0.0,
+            "has_complete_gen_groups": 0.0,
+        }
+        if proto is not None:
+            old_batch = extra.get("bagel_corl_gen_old")
+            if old_batch is not None and "old_log_probs" in old_batch.keys():
+                proto.batch["old_log_probs"] = old_batch["old_log_probs"]
+                if "old_prev_sample_mean" in old_batch.keys():
+                    proto.batch["old_prev_sample_mean"] = old_batch["old_prev_sample_mean"]
+            if getattr(self, "actor_rollout_wg", None) is not None:
+                gen_proto = self._diffusion_v1_gen_lane()._compute_advantage(proto)
+                if "all_latents" not in gen_proto.batch.keys():
+                    raise RuntimeError(
+                        "bagel_corl GEN V1 advantage returned no all_latents; refuse skip GEN loss."
+                    )
+                gen_metrics = {
+                    "gen/skipped_no_groups": 0.0,
+                    "gen/num_rows": float(len(gen_proto)),
+                    "gen/num_usable_rows": float(len(gen_proto)),
+                    "has_complete_gen_groups": 1.0,
+                    "gen/has_traj": 1.0,
+                }
+            else:
+                # CPU tests without a worker group: same FlowGRPO helper, still requires traj.
+                gen_proto, gen_metrics = apply_gen_flowgrpo_advantage(
+                    self._gen_batch_from_step(batch),
+                    adv_estimator=gen_estimator,
+                    norm_adv_by_std_in_grpo=bool(algo.get("norm_adv_by_std_in_grpo", True)),
+                    global_std=bool(algo.get("global_std", True)),
+                    algo_config=algo,
+                )
         metrics.update(gen_metrics)
         has_complete = bool(gen_metrics.get("has_complete_gen_groups"))
         extra["has_complete_gen_groups"] = has_complete
@@ -494,14 +560,11 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 metrics[key] = extra[key]
         # Ensure GEN FlowGRPO view + skip flags ride on the actor TensorDict / extra_info.
         if hasattr(batch, "keys") and callable(getattr(tu, "assign_non_tensor_data", None)):
-            try:
-                tu.assign_non_tensor_data(batch, "skip_gen", extra["skip_gen"])
-                tu.assign_non_tensor_data(batch, "has_complete_gen_groups", has_complete)
-                tu.assign_non_tensor_data(batch, "num_gen_rows", int(extra.get("num_gen_rows") or 0))
-                if extra.get("bagel_corl_gen") is not None:
-                    tu.assign_non_tensor_data(batch, "bagel_corl_gen", extra["bagel_corl_gen"])
-            except (TypeError, AttributeError, ValueError) as exc:
-                logger.debug("bagel_corl actor non-tensor attach skipped: %s", exc)
+            tu.assign_non_tensor_data(batch, "skip_gen", extra["skip_gen"])
+            tu.assign_non_tensor_data(batch, "has_complete_gen_groups", has_complete)
+            tu.assign_non_tensor_data(batch, "num_gen_rows", int(extra.get("num_gen_rows") or 0))
+            if extra.get("bagel_corl_gen") is not None:
+                tu.assign_non_tensor_data(batch, "bagel_corl_gen", extra["bagel_corl_gen"])
         logger.info(
             "bagel_corl_sync update_actor skip_gen=%s policy_version=%s J=%s K=%s",
             extra.get("skip_gen"),
@@ -510,3 +573,186 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             metrics.get("episode/K"),
         )
         return super()._update_actor(batch, metrics)
+
+    def _und_deploy_config_path(self) -> str | None:
+        agent = self.config.actor_rollout_ref.rollout.get("agent") or {}
+        path = agent.get("und_deploy_config")
+        if path:
+            return str(path)
+        ek = self.config.actor_rollout_ref.rollout.get("engine_kwargs") or {}
+        vo = (ek.get("vllm_omni") or {}) if hasattr(ek, "get") else {}
+        path = vo.get("und_deploy_config") if hasattr(vo, "get") else None
+        return str(path) if path else None
+
+    def _build_und_ar_entrypoint_config(self):
+        """Clone entry config for a standalone UND AR ``LLMServerManager``.
+
+        GEN keeps the rewritten diffusion hybrid stack. UND needs Omni model +
+        ``output_mode=ar`` + bagel_think deploy — never ``bagel_single_stage``.
+        """
+        from omegaconf import OmegaConf, open_dict
+
+        und_deploy = self._und_deploy_config_path()
+        if not und_deploy:
+            raise ValueError("bagel_corl_sync dual-role requires agent.und_deploy_config")
+
+        model = self.config.actor_rollout_ref.model
+        rollout = self.config.actor_rollout_ref.rollout
+        agent = rollout.get("agent") or {}
+        und_n_gpus = int(agent.get("und_n_gpus") or 1)
+        und_util = float(agent.get("und_gpu_memory_utilization") or 0.40)
+        max_prompt = int(self.config.data.get("max_prompt_length") or rollout.get("prompt_length") or 1024)
+        max_resp = int(self.config.data.get("max_response_length") or rollout.get("response_length") or max_prompt)
+
+        und_cfg = OmegaConf.create(OmegaConf.to_container(self.config, resolve=True))
+        with open_dict(und_cfg):
+            und_cfg.actor_rollout_ref.model = OmegaConf.create(
+                {
+                    "_target_": "verl_omni.workers.config.omni.OmniModelConfig",
+                    "path": model.get("path"),
+                    "tokenizer_path": model.get("tokenizer_path") or model.get("path"),
+                    "model_type": "omni_model",
+                    "architecture": model.get("architecture") or "OmniBagelForConditionalGeneration",
+                    "trust_remote_code": bool(model.get("trust_remote_code", True)),
+                    "composite_mode": "bagel_corl",
+                    "lora_rank": int(model.get("lora_rank") or 0),
+                    "lora_alpha": int(model.get("lora_alpha") or 0),
+                }
+            )
+            ckpt_engine = OmegaConf.to_container(rollout.get("checkpoint_engine"), resolve=True) or {
+                "backend": "naive"
+            }
+            und_cfg.actor_rollout_ref.rollout = OmegaConf.create(
+                {
+                    "_target_": "verl.workers.config.RolloutConfig",
+                    "name": "vllm_omni",
+                    "tensor_model_parallel_size": 1,
+                    "data_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                    "n_gpus_per_node": und_n_gpus,
+                    "nnodes": 1,
+                    "prompt_length": max_prompt,
+                    "response_length": max_resp,
+                    "max_model_len": max_prompt + max_resp,
+                    "gpu_memory_utilization": und_util,
+                    "enforce_eager": True,
+                    "free_cache_engine": True,
+                    "enable_sleep_mode": True,
+                    "disable_log_stats": True,
+                    "checkpoint_engine": ckpt_engine,
+                    "disaggregation": {"enabled": False},
+                    "prometheus": {"enable": False},
+                    "engine_kwargs": {
+                        "vllm_omni": {
+                            "output_mode": "ar",
+                            "deploy_config": und_deploy,
+                        }
+                    },
+                    "agent": OmegaConf.to_container(agent, resolve=True) or {},
+                }
+            )
+        return und_cfg
+
+    def _ensure_dual_role_rollout(self) -> None:
+        """Start UND AR colocated on the actor GPU pool; wrap GEN+UND behind one client.
+
+        Standalone UND fails when ``trainer.n_gpus_per_node`` already claims every
+        visible card (``Total available GPUs 0``). Reward/teacher use the same
+        ``init_colocated`` pattern on the actor placement group.
+        """
+        from verl.checkpoint_engine.base import CheckpointEngineManager
+        from verl.single_controller.ray.base import split_resource_pool
+        from verl.trainer.ppo.utils import Role
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.utils.ray_utils import auto_await
+        from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer, LLMServerClient
+        from verl.workers.rollout.replica import get_rollout_replica_class
+
+        from verl_omni.workers.rollout.bagel_dual_role_llm_server import BagelDualRoleLLMServerClient
+
+        if getattr(self, "_bagel_dual_role_ready", False):
+            return
+        if not bool((self.config.actor_rollout_ref.rollout.get("agent") or {}).get("und_ar_serving_ready")):
+            raise RuntimeError(
+                "bagel_corl_sync dual-role init requires agent.und_ar_serving_ready=True "
+                "(prove spike_und_hermes.py first)"
+            )
+
+        gen_manager = self.llm_server_manager
+        und_cfg = self._build_und_ar_entrypoint_config()
+        und_rollout = und_cfg.actor_rollout_ref.rollout
+        und_model = und_cfg.actor_rollout_ref.model
+        agent = self.config.actor_rollout_ref.rollout.get("agent") or {}
+        und_n_gpus = int(agent.get("und_n_gpus") or 1)
+        if und_n_gpus < 1:
+            raise ValueError(f"agent.und_n_gpus must be >= 1, got {und_n_gpus}")
+
+        actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+        actor_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+        # One UND AR replica (TP=1): take the first ``und_n_gpus``-wide slice of the actor PG.
+        split_pools = split_resource_pool(actor_pool, split_size=und_n_gpus)
+        if not split_pools:
+            raise RuntimeError("bagel_corl_sync: actor resource pool is empty; cannot colocate UND AR")
+        und_pool = split_pools[0]
+
+        hybrid_n = len(gen_manager.rollout_replicas)
+        replica_cls = get_rollout_replica_class(str(und_rollout.get("name") or "vllm_omni"))
+        und_replica = replica_cls(
+            replica_rank=hybrid_n,
+            config=und_rollout,
+            model_config=und_model,
+            gpus_per_node=int(und_rollout.get("n_gpus_per_node") or und_n_gpus),
+            name_suffix="bagel_und_ar",
+        )
+        logger.info(
+            "bagel_corl_sync colocating UND AR on actor pool start_rank=%s und_n_gpus=%s und_deploy=%s",
+            hybrid_n,
+            und_n_gpus,
+            self._und_deploy_config_path(),
+        )
+
+        @auto_await
+        async def _init_und():
+            await und_replica.init_colocated(und_pool)
+
+        _init_und()
+
+        und_replicas = [und_replica]
+        self.und_rollout_replicas = und_replicas
+        self.checkpoint_manager.add_replicas(und_replicas)
+
+        und_ckpt_config = omega_conf_to_dataclass(und_rollout.checkpoint_engine)
+        und_ckpt_config.backend = "naive"
+        self.und_checkpoint_manager = CheckpointEngineManager(
+            config=und_ckpt_config,
+            actor_wg=self.actor_rollout_wg,
+            replicas=und_replicas,
+        )
+
+        und_lb = GlobalRequestLoadBalancer.remote(
+            servers={und_replica.server_address: und_replica.server_handle},
+            max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
+            full_determinism=bool(getattr(und_rollout, "full_determinism", False)),
+        )
+        und_client = LLMServerClient(config=und_cfg, load_balancer_handle=und_lb)
+        self._bagel_dual_client = BagelDualRoleLLMServerClient(
+            config=self.config,
+            und_client=und_client,
+            gen_client=gen_manager.get_client(),
+        )
+        self._bagel_dual_role_ready = True
+
+    def get_llm_client(self):
+        """Return the dual-role client (UND AR + GEN diffusion)."""
+        self._ensure_dual_role_rollout()
+        return self._bagel_dual_client
+
+    def on_init_end(self):
+        # Build UND AR before the first weight publish so both pools see step-0 weights.
+        self._ensure_dual_role_rollout()
+        super().on_init_end()
+
+    def on_step_end(self):
+        # Parent updates weights for every replica registered on checkpoint_manager
+        # (GEN hybrid + UND standalone via add_replicas).
+        super().on_step_end()

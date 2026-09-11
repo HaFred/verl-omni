@@ -11,343 +11,482 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Multi-dimensional reward for RPCO agentic RL.
+"""RPCO multi-dimensional reward for agentic image-generation trajectories.
 
-Reward set (VisionCreator-R1, arXiv:2603.08812, §4.1/§4.3):
+The scorer is intentionally self-contained so the reward PR can be reviewed
+and merged independently of RFC #302's rollout and data PRs. It accepts the
+trajectory text emitted by those PRs once they are present, but does not import
+their agent-loop or dataset modules.
 
-  R_reflect — continuous last-image quality from live ``judge_image`` C/A
-      (mean of the **final** successful judge, not the first ``good_enough=YES``).
-      Optionally mixed with a light lexical regularizer and a rewrite-delta
-      term: ``0.70 * last_CA + 0.20 * coverage + 0.10 * max(0, last_CA - first_CA)``.
-      ``good_enough`` is not used as a binary gate on this dim. Also emitted as
-      ``reward_correctness`` / ``reward_aesthetics`` (last image) and
-      ``first_correctness`` / ``first_aesthetics``.
-  R_plan    — requirement coverage of the agent's plan lines against the
-      reference subtasks (per-subtask best token overlap, then mean). Applied
-      only on plan rows (``gt.reference_subtasks``). Zero when no plan text.
-  R_format  — rule-based ratio over structural checks: well-formed tool calls,
-      judge after the last generate, terminal policy-sampled Done, and the
-      task-type tags (Plan + Reflection on plan rows; Reflection on reflect rows).
-  R_tool_call — tool-call presence, the same ``f_tool_call`` as PR 1
-      (``agentic_reward.py``): 1.0 iff any tool call was parsed, else 0.
-      Emitted as ``reward_tool_call`` so PR 1 and RPCO share one WandB series.
-  R_result  — output count/type match against ``expected_num_images``.
-      Plan rows: exact count match. Reflect rows (lenient stop-validity):
-      terminal Done + ≥1 image + (count ≤ expected OR last judge YES).
-  R_done    — logged-only (not in W): PR 1's ``f_done`` closed-loop indicator
-      (valid terminal context + policy-sampled ``Done.`` or forced stop cue),
-      emitted as ``reward_done`` for the ``agentic_reward/done`` WandB series.
-  R_terminal_no_penalty — an additive -1.0 scalar penalty when the final
-      successful judge verdict is ``good_enough=NO``. Component rewards remain
-      visible for diagnosis, but a failed terminal verdict cannot have positive
-      total reward. The penalty is placed on the final response token by verl's
-      reward manager, so it trains the sampled terminal decision.
-  R_missing_tools_penalty — an additive -1.0 scalar penalty when the trajectory
-      omits a ``generate_image`` call or a ``judge_image`` call. Without this,
-      generate-only rollouts still earn ~0.3–0.4 from format/tool_call/result
-      while judge+NO is floored at ≤0, so the policy learns to skip the judge.
-      Same magnitude as ``R_terminal_no_penalty`` so skip-judge cannot beat
-      an honest failed verdict.
-  R_good_enough_floor_lift — raises a valid trajectory whose final successful
-      sidecar verdict is ``good_enough=YES`` to at least 0.80. This protects the
-      sparse success signal when the rollout reaches a good image near the
-      generate/turn cap but lacks budget for a perfect Reflection/Done suffix.
-      Cleanly closed YES trajectories retain their naturally higher score.
+Wire with ``reward.reward_manager.name=naive`` so verl passes ``solution_str``.
+``VisualRewardManager``'s ``solution_image`` is the wrong modality and raises.
 
-Base: ``base_score = (1/|W|) * sum(w_i * R_i)`` over the active set W (dims
-with ``w_* > 0`` that apply to the row's task type). Final:
-``score = base_score + R_terminal_no_penalty + R_missing_tools_penalty``,
-clipped to [-1, 1]. Default weights are 1.0 except ``w_reflect=1.5`` so
-last-image C/A outranks format/tool presence. ``RPCO_W_*`` env vars override
-parquet-baked ``w_*`` without a rebuild.
+The active reward set is ``{reflect, plan, format, tool, result}``. ``plan`` is
+active only for plan rows. ``done`` and ``tool_call`` reproduce the PR1
+closed-loop indicators for metrics, but are not additional score dimensions.
+Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
+receive score zero and ``rollout_valid=0``. ``task_type`` is required.
 
-Gating kept from PR 1: no ``generate_image`` / no successful PNG → score 0 and
-``rollout_valid=0`` (rollout is discarded from the GRPO update). Env-injected
-``Reflection`` (``agentic_forced_reflection=1``) never earns credit.
+Judge C/A is trusted only after a parsed ``judge_image`` ``<tool_call>`` and the
+tool observation header. Coverage is token F1 (not recall-only), so dumping
+reference words into a long blob does not max ``R_reflect`` / ``R_plan``.
+Rewrite-after-YES zeros ``R_result`` as well as the Done indicator. Reflect
+``R_result`` requires a terminal trusted YES. ``R_tool`` needs a successful
+PNG generate plus a trusted judge (not merely a parsed tool call).
 """
 
 from __future__ import annotations
 
-import os
+import json
 import re
 from typing import Any
 
-from verl_omni.utils.reward_score.agentic_reward import (
-    _BLOCKED_GENERATE_RE,
-    _PATH_RE,
-    _TOOL_CALL_RE,
-    _TOOL_OK,
-    _as_dict,
-    _assistant_prose,
-    _extract_tool_calls,
-    _gen_image_prompts,
-    _has_agent_reflection_prose,
-    _has_successful_generated_image,
-    _iter_successful_judge_scores,
-    _judge_parse_stats,
-    _num_generate_after_first_yes,
-    _ordered_tool_names,
-    _policy_terminal_decision,
-)
-from verl_omni.utils.reward_score.agentic_reward import (
-    _zero_result as _ca_zero_result,
-)
+DIMS = ("reflect", "plan", "format", "tool", "result")
+# Names consumed by AgenticMetricsAgentLoopManager when PR1 and PR3 are
+# composed. Keeping them here lets this independent PR specify that contract.
+REWARD_COMPONENTS = tuple(f"reward_{name}" for name in (*DIMS, "done", "tool_call"))
 
-DIMS = ("reflect", "plan", "format", "tool_call", "result")
-GOOD_ENOUGH_SCORE_FLOOR = 0.80
-# Slightly overweight last-image C/A so GRPO prefers better generate_image
-# prompts / useful rewrites over protocol-only dims.
-DEFAULT_WEIGHTS: dict[str, float] = {
-    "reflect": 1.5,
-    "plan": 1.0,
-    "format": 1.0,
-    "tool_call": 1.0,
-    "result": 1.0,
-}
-# Always emit these so Ray `_postprocess` (keys taken from sample 0) cannot
-# KeyError when one rollout is valid and another hits an early-zero path.
-_SCHEMA_EXTRAS: dict[str, float | str | int | None] = {
-    **{f"reward_{dim}": 0.0 for dim in DIMS},
-    "reward_done": 0.0,
-    "reward_terminal_no_penalty": 0.0,
-    "reward_missing_tools_penalty": 0.0,
-    "reward_good_enough_floor_lift": 0.0,
-    "score_before_terminal_penalty": 0.0,
-    "final_good_enough": -1,
-    "reward_correctness": 0.0,
-    "reward_aesthetics": 0.0,
-    "first_correctness": 0.0,
-    "first_aesthetics": 0.0,
-    "reward_reflect_delta": 0.0,
-    "rewrite_improve_frac": 0.0,
-    "n_images_to_best": 0,
-    "terminal_done": 0,
-    "terminal_policy_reflection": 0,
-    "forced_reflection_context": 0,
-    "n_successful_generates": 0,
-    "expected_num_images": 0,
-    "task_type": "",
-}
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+_JUDGE_OK_RE = re.compile(r"\bagentic_judge\s+ok=1\b", re.IGNORECASE)
+_TOOL_OBS_LINE_RE = re.compile(
+    r"(?im)^(?!.*\bReflection\s*:).*\b("
+    r"agentic_tool|agentic_reflect|agentic_judge|"
+    r"VL judge on the last generated image|"
+    r"image_vis=|Frozen (?:diffusion|Qwen)|Image reflection vs user request"
+    r")\b.*$"
+)
+_REFLECTION_RE = re.compile(r"\bReflection\s*:", re.IGNORECASE)
 
 
 def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
-    out = _ca_zero_result(method=method)
-    out.update(_SCHEMA_EXTRAS)
-    # Keep last-image C/A (and first-image / delta) so WandB can plot continuous
-    # quality. Facet breakdowns from PR 1 remain unused here.
-    for key in list(out):
-        if key.startswith("reward_correctness_") or key.startswith("reward_aesthetics_"):
-            out.pop(key, None)
-    return out
+    return {
+        "score": 0.0,
+        **{f"reward_{dim}": 0.0 for dim in DIMS},
+        "reward_done": 0.0,
+        "reward_tool_call": 0.0,
+        "num_hermes_tool_calls": 0,
+        "num_generate_image_prompts": 0,
+        "num_judge_image_calls": 0,
+        "judge_parse_ok": 0,
+        "judge_parse_fail": 0,
+        "judge_parse_ok_rate": 0.0,
+        "protocol_ok": 0,
+        "rewrite_after_yes": 0,
+        "rollout_valid": 0,
+        "terminal_done": 0,
+        "terminal_policy_reflection": 0,
+        "forced_reflection_context": 0,
+        "n_successful_generates": 0,
+        "expected_num_images": 0,
+        "task_type": "",
+        "method": method,
+    }
 
 
-_PLAN_HEADER_RE = re.compile(r"\bPlan\s*:", re.IGNORECASE)
-_PLAN_ITEM_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+(.+)$")
-_FINDINGS_RE = re.compile(r"(?im)^\s*(?:findings|suggested_fixes)\s*:\s*(.*)$")
-_TOKEN_RE = re.compile(r"[a-z0-9_']+")
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if raw.startswith("{"):
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+            if isinstance(parsed, dict):
+                return parsed
+        return {"user_request": raw}
+    return {}
+
+
+def _parse_tool_call_body(body: str) -> dict[str, Any] | None:
+    if not body:
+        return None
+    if body.lstrip().startswith("{"):
+        try:
+            call = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return call if isinstance(call, dict) and call.get("name") else None
+
+    function = re.search(r"<function=([^>\s]+)\s*>(.*?)</function>", body, re.IGNORECASE | re.DOTALL)
+    if function is None:
+        return None
+    name = (function.group(1) or "").strip()
+    if not name:
+        return None
+    arguments = {
+        match.group(1).strip(): (match.group(2) or "").strip()
+        for match in re.finditer(
+            r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>",
+            function.group(2) or "",
+            re.IGNORECASE | re.DOTALL,
+        )
+        if match.group(1).strip()
+    }
+    return {"name": name, "arguments": arguments}
+
+
+def _extract_tool_calls(text: str) -> list[tuple[int, int, dict[str, Any]]]:
+    calls = []
+    for match in _TOOL_CALL_RE.finditer(text or ""):
+        call = _parse_tool_call_body((match.group(1) or "").strip())
+        if call is not None:
+            calls.append((match.start(), match.end(), call))
+    return calls
+
+
+def _call_arguments(call: dict[str, Any]) -> dict[str, Any]:
+    arguments = call.get("arguments") or {}
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+    return arguments if isinstance(arguments, dict) else {}
+
+
+def _tool_name(call: dict[str, Any]) -> str:
+    return str(call.get("name") or "").strip().lower()
+
+
+def _follows_judge_image_call(pos: int, calls: list[tuple[int, int, dict[str, Any]]]) -> bool:
+    """True when ``pos`` is after at least one parsed ``judge_image`` ``<tool_call>``."""
+    return any(end <= pos for _, end, call in calls if _tool_name(call) == "judge_image")
+
+
+def _generate_prompts(calls: list[tuple[int, int, dict[str, Any]]]) -> list[str]:
+    prompts = []
+    for _, _, call in calls:
+        if _tool_name(call) != "generate_image":
+            continue
+        prompt = str(_call_arguments(call).get("prompt") or "").strip()
+        if prompt:
+            prompts.append(prompt)
+    return prompts
+
+
+def _assistant_prose(text: str) -> str:
+    prose = _TOOL_CALL_RE.sub(" ", text or "")
+    prose = _TOOL_OBS_LINE_RE.sub(" ", prose)
+    prose = re.sub(r"</?think>", " ", prose, flags=re.IGNORECASE)
+    # Masked, environment-injected reflection text cannot earn policy credit.
+    prose = re.sub(
+        r"(?is)\bReflection\s*:.*?(?:agentic_forced_reflection=1|agentic_force_stop_max_passes=1)\S*",
+        " ",
+        prose,
+    )
+    return re.sub(r"\s+", " ", prose).strip()
+
+
+def _assistant_prose_lines(text: str) -> str:
+    """Strip protocol payloads while preserving plan-item line boundaries."""
+    prose = _TOOL_CALL_RE.sub("\n", text or "")
+    prose = _TOOL_OBS_LINE_RE.sub("", prose)
+    prose = re.sub(r"</?think>", "", prose, flags=re.IGNORECASE)
+    return prose
 
 
 def _tokens(text: str) -> set[str]:
-    return set(_TOKEN_RE.findall((text or "").lower()))
+    return set(re.findall(r"[a-z0-9_']+", (text or "").lower()))
 
 
 def _coverage(candidate: str, reference: str) -> float:
-    """Fraction of the reference tokens covered by the candidate."""
-    ref_tokens = _tokens(reference)
-    if not ref_tokens:
-        return 0.0
-    return len(_tokens(candidate) & ref_tokens) / len(ref_tokens)
+    """Token F1 of candidate vs reference (recall-only bag-of-words is not enough).
 
-
-def _best_coverage(candidates: list[str], reference: str) -> float:
-    if not candidates:
+    Precision penalizes dumping the reference tokens into a long unrelated blob;
+    recall still rewards covering the reference. Exact copy scores 1.0.
+    """
+    reference_tokens = _tokens(reference)
+    candidate_tokens = _tokens(candidate)
+    if not reference_tokens or not candidate_tokens:
         return 0.0
-    return max(_coverage(candidate, reference) for candidate in candidates)
+    overlap = len(reference_tokens & candidate_tokens)
+    if overlap == 0:
+        return 0.0
+    recall = overlap / len(reference_tokens)
+    precision = overlap / len(candidate_tokens)
+    return 2.0 * precision * recall / (precision + recall)
 
 
 def _count_successful_generates(text: str) -> int:
-    """Count successful live ``generate_image`` PNGs (``agentic_tool ok=1``)."""
-    n = 0
-    for line in (text or "").splitlines():
-        if _TOOL_OK.search(line) and any(path.lower().endswith(".png") for path in _PATH_RE.findall(line)):
-            n += 1
-    return n
+    return sum(
+        1
+        for line in (text or "").splitlines()
+        if re.search(r"\bagentic_tool\s+ok=1\b", line, re.IGNORECASE)
+        and any(path.lower().endswith(".png") for path in re.findall(r"\bpath=([^\s'\"]+)", line, re.IGNORECASE))
+    )
 
 
-def _judge_feedback_text(text: str) -> str:
-    """Concatenated findings/suggested_fixes from judge observations."""
-    return " ".join(match.group(1) for match in _FINDINGS_RE.finditer(text or "")).strip()
+def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] | None = None) -> tuple[int, int, float]:
+    blob = text or ""
+    parsed_calls = calls if calls is not None else _extract_tool_calls(blob)
+    ok = 0
+    for marker in _JUDGE_OK_RE.finditer(blob):
+        if _follows_judge_image_call(marker.start(), parsed_calls):
+            ok += 1
+    failed = 0
+    for marker in re.finditer(r"\bagentic_judge\s+ok=0\b", blob, flags=re.IGNORECASE):
+        if _follows_judge_image_call(marker.start(), parsed_calls):
+            failed += 1
+    if failed == 0:
+        for marker in re.finditer(r"\bagentic_judge\s+ok=0\b|\bparse_ok\s*=\s*0\b", blob, re.IGNORECASE):
+            if _follows_judge_image_call(marker.start(), parsed_calls):
+                failed += 1
+    total = ok + failed
+    return ok, failed, (ok / total) if total else 0.0
+
+
+def _good_enough(window: str) -> bool | None:
+    matches = list(re.finditer(r"\bgood_enough\s*=\s*(YES|NO|1|0|true|false)\b", window or "", re.IGNORECASE))
+    if not matches:
+        return None
+    value = matches[-1].group(1).lower()
+    return value in {"yes", "1", "true"}
+
+
+def _successful_judges(text: str) -> list[tuple[float, float, bool | None, int]]:
+    """Return trusted ``(correctness, aesthetics, good_enough, end)`` values.
+
+    Hits must follow a parsed ``judge_image`` ``<tool_call>`` and the tool's
+    ``VL judge on the last generated image`` header.
+    """
+    blob = text or ""
+    calls = _extract_tool_calls(blob)
+    hits = []
+    for marker in _JUDGE_OK_RE.finditer(blob):
+        if not _follows_judge_image_call(marker.start(), calls):
+            continue
+        window = blob[max(0, marker.start() - 1400) : marker.end()]
+        if "VL judge on the last generated image" not in window:
+            continue
+        if re.search(r"\bparse_ok\s*=\s*0\b", window, re.IGNORECASE):
+            continue
+        correctness = list(re.finditer(r"\bcorrectness\s*=\s*([0-9]*\.?[0-9]+)", window, re.IGNORECASE))
+        aesthetics = list(re.finditer(r"\baesthetics\s*=\s*([0-9]*\.?[0-9]+)", window, re.IGNORECASE))
+        if not correctness or not aesthetics:
+            continue
+        try:
+            c = min(1.0, max(0.0, float(correctness[-1].group(1))))
+            a = min(1.0, max(0.0, float(aesthetics[-1].group(1))))
+        except ValueError:
+            continue
+        hits.append((c, a, _good_enough(window), marker.end()))
+    return hits
+
+
+def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
+    judges = _successful_judges(text)
+    if not judges:
+        return False, False, False
+
+    judge_end = judges[-1][3]
+    line_end = text.find("\n", judge_end)
+    anchor = len(text) if line_end < 0 else line_end + 1
+    forced_context = False
+    for marker in re.finditer(r"\bagentic_forced_reflection=1\b", text, re.IGNORECASE):
+        if marker.start() < anchor:
+            continue
+        anchor = marker.end()
+        forced_context = True
+
+    suffix = _assistant_prose(text[anchor:])
+    suffix = re.sub(r"<\|[^>]+\|>|</?tool_response>|</?assistant>", " ", suffix, flags=re.IGNORECASE)
+    suffix = re.sub(r"^\s*(?:assistant|user)\s+", "", suffix, flags=re.IGNORECASE)
+    suffix = re.sub(r"\s+", " ", suffix).strip()
+    policy_reflection = bool(_REFLECTION_RE.search(suffix))
+    if policy_reflection:
+        terminal_done = bool(re.search(r"\bDone\.\s*$", suffix, re.IGNORECASE))
+    else:
+        terminal_done = bool(re.fullmatch(r"Done\.", suffix, re.IGNORECASE))
+    return terminal_done, policy_reflection, forced_context
+
+
+def _generates_after_first_yes(text: str, calls: list[tuple[int, int, dict[str, Any]]]) -> int:
+    yes_position = next((end for _, _, accepted, end in _successful_judges(text) if accepted is True), None)
+    if yes_position is None:
+        return 0
+    return sum(1 for start, _, call in calls if start > yes_position and _tool_name(call) == "generate_image")
 
 
 def _extract_plan_lines(text: str) -> list[str]:
-    """Numbered/bulleted plan items from the agent's prose (tool blocks stripped)."""
-    prose = _assistant_prose(text)
-    header = _PLAN_HEADER_RE.search(prose)
+    prose = _assistant_prose_lines(text)
+    header = re.search(r"\bPlan\s*:", prose, re.IGNORECASE)
     body = prose[header.end() :] if header else prose
-    lines = [match.group(1).strip() for match in _PLAN_ITEM_RE.finditer(body)]
-    return [line for line in lines if len(_tokens(line)) >= 4]
+    return [
+        line
+        for match in re.finditer(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+(.+)$", body)
+        if len(_tokens(line := match.group(1).strip())) >= 4
+    ]
 
 
-def _reflection_text(blob: str) -> str:
-    """Policy-sampled ``Reflection:`` prose (injected cues already stripped)."""
-    prose = _assistant_prose(blob)
+def _reflection_text(text: str) -> str:
+    prose = _assistant_prose(text)
     match = re.search(r"\bReflection\s*:(.*?)(?:\bDone\.\s*$|$)", prose, re.IGNORECASE | re.DOTALL)
     return match.group(1).strip() if match else ""
 
 
-def _reference_reflection_text(gt: dict[str, Any]) -> str:
-    steps = gt.get("reference_steps") or []
-    return " ".join(str(step.get("reflection") or "") for step in steps if isinstance(step, dict)).strip()
+def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
+    judges = _successful_judges(text)
+    quality = 0.0
+    if judges:
+        preferred = next((hit for hit in judges if hit[2] is True), judges[-1])
+        quality = 0.5 * (preferred[0] + preferred[1])
+
+    steps = ground_truth.get("reference_steps") or []
+    reference = " ".join(str(step.get("reflection") or "") for step in steps if isinstance(step, dict)).strip()
+    if not reference and judges:
+        feedback = []
+        for _, _, _, end in judges:
+            window = text[max(0, end - 1400) : end]
+            feedback.extend(
+                match.group(1).strip()
+                for match in re.finditer(r"(?im)^\s*(?:findings|suggested_fixes)\s*:\s*(.*)$", window)
+            )
+        reference = " ".join(item for item in feedback if item.lower() not in {"", "none", "n/a"}).strip()
+    if not reference:
+        return quality
+    return 0.5 * quality + 0.5 * _coverage(_reflection_text(text), reference)
 
 
-def _judge_ca_series(blob: str) -> list[tuple[float, float]]:
-    """Successful ``judge_image`` C/A pairs in order. ``good_enough`` is ignored."""
-    return [(float(c), float(a)) for c, a, _, _ in _iter_successful_judge_scores(blob)]
-
-
-def _first_last_judge_ca(blob: str) -> tuple[float, float, float, float]:
-    """Continuous first/last-image C/A. Zeros when no successful judge."""
-    series = _judge_ca_series(blob)
-    if not series:
-        return 0.0, 0.0, 0.0, 0.0
-    first_c, first_a = series[0]
-    last_c, last_a = series[-1]
-    return first_c, first_a, last_c, last_a
-
-
-def _rewrite_improve_stats(blob: str) -> tuple[float, int]:
-    """``(frac of judge-to-judge C/A lifts, 1-indexed judge of max C/A)``."""
-    series = _judge_ca_series(blob)
-    if not series:
-        return 0.0, 0
-    cas = [0.5 * (c + a) for c, a in series]
-    if len(cas) >= 2:
-        n_up = sum(1 for i in range(1, len(cas)) if cas[i] > cas[i - 1])
-        frac = n_up / float(len(cas) - 1)
-    else:
-        frac = 0.0
-    best_i = max(range(len(cas)), key=lambda i: (cas[i], -i))
-    return float(frac), int(best_i + 1)
-
-
-def _reflection_reward(blob: str, *, gt: dict[str, Any]) -> tuple[float, float, float, float, float]:
-    """``(R_reflect, last_c, last_a, first_c, first_a)``.
-
-    Last-image quality is the mean of the **final** successful judge's C/A
-    (continuous in [0, 1]). Lexical coverage of GT / judge feedback is a light
-    regularizer, not a 50/50 mix. Rewrite delta ``max(0, last_CA - first_CA)``
-    credits improvements without punishing a strong first image.
-    """
-    first_c, first_a, last_c, last_a = _first_last_judge_ca(blob)
-    last_ca = 0.5 * (last_c + last_a)
-    first_ca = 0.5 * (first_c + first_a)
-    delta = max(0.0, last_ca - first_ca)
-
-    coverage = 0.0
-    reference = _reference_reflection_text(gt)
-    if reference:
-        coverage = _coverage(_reflection_text(blob), reference)
-    else:
-        feedback = _judge_feedback_text(blob)
-        if feedback:
-            coverage = _coverage(_reflection_text(blob), feedback)
-
-    if last_ca <= 0.0 and coverage <= 0.0:
-        return 0.0, last_c, last_a, first_c, first_a
-    r_reflect = 0.70 * last_ca + 0.20 * coverage + 0.10 * delta
-    return float(r_reflect), last_c, last_a, first_c, first_a
-
-
-def _plan_reward(blob: str, *, gt: dict[str, Any]) -> float:
-    """R_plan"""
-    subtasks = [str(s).strip() for s in (gt.get("reference_subtasks") or []) if str(s).strip()]
-    if not subtasks:
+def _plan_reward(text: str, ground_truth: dict[str, Any]) -> float:
+    references = [str(item).strip() for item in ground_truth.get("reference_subtasks") or [] if str(item).strip()]
+    candidates = _extract_plan_lines(text)
+    if not references or not candidates:
         return 0.0
-    plan_lines = _extract_plan_lines(blob)
-    if not plan_lines:
-        return 0.0
-    return sum(_best_coverage(plan_lines, subtask) for subtask in subtasks) / len(subtasks)
+    return sum(max(_coverage(candidate, reference) for candidate in candidates) for reference in references) / len(
+        references
+    )
 
 
-def _format_reward(blob: str, *, task_type: str, n_successful_gens: int) -> float:
-    checks: list[bool] = []
-    raw_blocks = len(_TOOL_CALL_RE.findall(blob))
-    calls = _extract_tool_calls(blob)
-    checks.append(raw_blocks > 0 and len(calls) == raw_blocks)  # well-formed tool calls
-    names = _ordered_tool_names(calls)
-    gen_idxs = [i for i, name in enumerate(names) if name == "generate_image"]
-    judge_idxs = [i for i, name in enumerate(names) if name == "judge_image"]
-    checks.append(n_successful_gens >= 1)
-    checks.append(bool(judge_idxs) and (not gen_idxs or max(judge_idxs) > max(gen_idxs)))
-    terminal_done, policy_reflection, _ = _policy_terminal_decision(blob)
-    checks.append(terminal_done)
+def _format_reward(
+    text: str,
+    *,
+    task_type: str,
+    successful_generates: int,
+    forced_context: bool = False,
+) -> float:
+    raw_blocks = len(_TOOL_CALL_RE.findall(text))
+    calls = _extract_tool_calls(text)
+    names = [_tool_name(call) for _, _, call in calls]
+    generates = [index for index, name in enumerate(names) if name == "generate_image"]
+    judges = [index for index, name in enumerate(names) if name == "judge_image"]
+    terminal_done, policy_reflection, _ = _terminal_decision(text)
+    checks = [
+        raw_blocks > 0 and len(calls) == raw_blocks,
+        successful_generates >= 1,
+        bool(judges) and (not generates or max(judges) > max(generates)),
+        terminal_done,
+    ]
     if task_type == "plan":
-        checks.append(bool(_extract_plan_lines(blob)))
-        checks.append(policy_reflection)
+        checks.extend((bool(_extract_plan_lines(text)), policy_reflection or forced_context))
     else:
-        checks.append(_has_agent_reflection_prose(_assistant_prose(blob)))
+        # #409 force-injects Reflection (stripped from prose) then policy Done.
+        # Count forced_context so the default curriculum can still saturate format.
+        checks.append(bool(_REFLECTION_RE.search(_assistant_prose(text))) or forced_context)
     return sum(checks) / len(checks)
 
 
 def _result_reward(
-    blob: str,
+    text: str,
     *,
     task_type: str,
     expected: int,
-    n_successful_gens: int,
+    successful_generates: int,
     terminal_done: bool,
     blocked: bool,
+    rewrite_after_yes: int,
 ) -> float:
-    if blocked or not terminal_done or n_successful_gens < 1:
+    if blocked or not terminal_done or successful_generates < 1 or rewrite_after_yes > 0:
         return 0.0
     if task_type == "plan":
-        return 1.0 if n_successful_gens == expected else 0.0
-    # Reflect rows (lenient stop-validity): stop is valid when the final judge
-    # said YES (early stop) or the generated count stays within the reference.
-    hits = _iter_successful_judge_scores(blob)
-    last_yes = bool(hits) and hits[-1][2] is True
-    return 1.0 if (n_successful_gens <= expected or last_yes) else 0.0
+        return 1.0 if successful_generates == expected else 0.0
+    judges = _successful_judges(text)
+    final_yes = bool(judges) and judges[-1][2] is True
+    # Fail closed on a terminal NO: early-stop alone is not a free result point.
+    return 1.0 if final_yes and successful_generates <= expected else 0.0
 
 
-def _env_weight_override(dim: str) -> float | None:
-    """``RPCO_W_REFLECT`` / ``RPCO_W_PLAN`` / … beat parquet-baked ``w_*``."""
-    raw = os.environ.get(f"RPCO_W_{dim.upper()}")
-    if raw is None or str(raw).strip() == "":
-        return None
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return None
+def _resolve_solution_text(
+    solution_str: str,
+    *,
+    kwargs: dict[str, Any],
+    extra_info: dict[str, Any],
+) -> str:
+    """Resolve trajectory text for NaiveRewardManager (and optional decode).
+
+    ``solution_image`` from VisualRewardManager is the wrong modality — raise
+    instead of scoring an empty blob as zeros.
+    """
+    blob = (solution_str or "").strip()
+    if not blob:
+        alt = kwargs.get("solution_str")
+        if isinstance(alt, str):
+            blob = alt.strip()
+    if blob:
+        return blob
+
+    responses = kwargs.get("responses")
+    tokenizer = kwargs.get("tokenizer") or extra_info.get("tokenizer")
+    if responses is not None and tokenizer is not None:
+        try:
+            if hasattr(responses, "tolist"):
+                ids = responses.tolist()
+            else:
+                ids = list(responses)
+            if ids and isinstance(ids[0], list | tuple):
+                ids = list(ids[0])
+            decoded = tokenizer.decode(ids, skip_special_tokens=False)
+            if isinstance(decoded, str) and decoded.strip():
+                return decoded.strip()
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                "agentic_multidim_reward.compute_score failed to decode responses into solution_str"
+            ) from exc
+
+    if "solution_image" in kwargs:
+        raise ValueError(
+            "agentic_multidim_reward.compute_score requires solution_str (text trajectory). "
+            "Got solution_image from VisualRewardManager — set "
+            "reward.reward_manager.name=naive for Mode (2a)."
+        )
+    return ""
 
 
-def _weight_raw(gt: dict[str, Any], extra_info: dict[str, Any], dim: str) -> Any:
-    env_w = _env_weight_override(dim)
-    if env_w is not None:
-        return env_w
-    raw = extra_info.get(f"w_{dim}")
+def _require_task_type(ground_truth: dict[str, Any], extra_info: dict[str, Any]) -> str | None:
+    raw = ground_truth.get("task_type")
     if raw is None:
-        raw = gt.get(f"w_{dim}")
-    # Existing UniCoT parquet baked ``w_tool`` before the dim was renamed.
-    if dim == "tool_call" and raw is None:
-        raw = extra_info.get("w_tool")
-        if raw is None:
-            raw = gt.get("w_tool")
-    return raw
+        raw = extra_info.get("task_type")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return None
+    task_type = str(raw).strip()
+    if task_type not in {"reflect", "plan"}:
+        return None
+    return task_type
 
 
-def _active_weights(gt: dict[str, Any], extra_info: dict[str, Any], *, task_type: str) -> dict[str, float]:
+def _active_weights(
+    ground_truth: dict[str, Any], extra_info: dict[str, Any], *, task_type: str
+) -> dict[str, float] | None:
+    """Return positive active-set weights, or None if a ``w_*`` value is garbage."""
     weights = {}
     for dim in DIMS:
         if dim == "plan" and task_type != "plan":
             continue
-        raw = _weight_raw(gt, extra_info, dim)
-        default = DEFAULT_WEIGHTS.get(dim, 1.0)
-        try:
-            weight = float(raw if raw is not None else default)
-        except (TypeError, ValueError):
-            weight = default
-        if weight > 0.0:
-            weights[dim] = weight
+        raw = ground_truth.get(f"w_{dim}")
+        if raw is None:
+            raw = extra_info.get(f"w_{dim}")
+        if raw is None:
+            value = 1.0
+        else:
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if value < 0:
+                return None
+        if value > 0:
+            weights[dim] = value
     return weights
 
 
@@ -358,142 +497,109 @@ def compute_score(
     extra_info: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, float | str | int | None]:
-    """Score an agentic trajectory with the RPCO multi-dimensional reward set."""
-    del data_source, kwargs
-    extra_info = dict(extra_info or {})
-    gt = _as_dict(ground_truth)
-    blob = solution_str or ""
+    """Compute the RFC #302 stage-3 reward and its complete metric schema.
 
-    task_type = str(gt.get("task_type") or extra_info.get("task_type") or "reflect")
-    if task_type not in {"reflect", "plan"}:
-        task_type = "reflect"
+    Args:
+        data_source: Unused; kept for the verl ``compute_score`` signature.
+        solution_str: Decoded trajectory text (NaiveRewardManager).
+        ground_truth: Must include ``task_type`` (``reflect`` / ``plan``) plus
+            optional references and ``w_*`` weights.
+        extra_info: Fallback for ``task_type`` / weights; optional tokenizer.
+        **kwargs: May include ``responses`` + tokenizer, or ``solution_image``
+            (rejected).
+
+    Returns:
+        Dict with ``score``, per-dim ``reward_*``, and metric schema fields.
+    """
+    del data_source
+    gt = _as_dict(ground_truth)
+    metadata = dict(extra_info or {})
+    task_type = _require_task_type(gt, metadata)
+    if task_type is None:
+        return _zero_result(method="agentic_multidim_missing_task_type")
+    weights = _active_weights(gt, metadata, task_type=task_type)
+    if weights is None:
+        return _zero_result(method="agentic_multidim_bad_weights")
+
     try:
-        expected = int(gt.get("expected_num_images", extra_info.get("expected_num_images", 1)))
+        expected = max(1, int(gt.get("expected_num_images", metadata.get("expected_num_images", 1))))
     except (TypeError, ValueError):
         expected = 1
 
-    if not blob.strip():
-        out = _zero_result(method="agentic_multidim_empty")
-        out["task_type"] = task_type
-        out["expected_num_images"] = int(expected)
-        return out
+    text = _resolve_solution_text(solution_str, kwargs=kwargs, extra_info=metadata)
+    kwargs.pop("solution_image", None)
+    if not text.strip():
+        result = _zero_result(method="agentic_multidim_empty")
+        result.update(task_type=task_type, expected_num_images=expected)
+        return result
 
-    calls = _extract_tool_calls(blob)
-    prompts = _gen_image_prompts(calls)
-    names = _ordered_tool_names(calls)
-    n_reflect = sum(1 for n in names if n == "judge_image")
-    n_judge_ok, n_judge_fail, judge_parse_rate = _judge_parse_stats(blob)
-    terminal_done, terminal_policy_reflection, forced_context = _policy_terminal_decision(blob)
-    n_successful_gens = _count_successful_generates(blob)
-    blocked = bool(_BLOCKED_GENERATE_RE.search(blob))
+    calls = _extract_tool_calls(text)
+    prompts = _generate_prompts(calls)
+    names = [_tool_name(call) for _, _, call in calls]
+    judge_ok, judge_failed, judge_rate = _judge_parse_stats(text, calls)
+    successful_generates = _count_successful_generates(text)
+    terminal_done, policy_reflection, forced_context = _terminal_decision(text)
+    blocked = bool(
+        re.search(
+            r"\b(?:blocked_after_yes|blocked_after_max_passes)=1\b|generate_image blocked:",
+            text,
+            re.IGNORECASE,
+        )
+    )
+    rewrites_after_yes = _generates_after_first_yes(text, calls)
+    tool_reward = float(successful_generates >= 1 and judge_ok >= 1)
 
-    out = _zero_result(method="agentic_multidim")
-    out["num_hermes_tool_calls"] = int(len(calls))
-    out["num_generate_image_prompts"] = int(len(prompts))
-    out["num_judge_image_calls"] = int(n_reflect)
-    out["judge_parse_ok"] = int(n_judge_ok)
-    out["judge_parse_fail"] = int(n_judge_fail)
-    out["judge_parse_ok_rate"] = float(judge_parse_rate)
-    if not prompts:
-        out["rollout_valid"] = 0
-        out["score"] = 0.0
-        out["task_type"] = task_type
-        out["expected_num_images"] = int(expected)
-        return out
-    if not _has_successful_generated_image(blob):
-        out["rollout_valid"] = 0
-        out["score"] = 0.0
-        out["task_type"] = task_type
-        out["expected_num_images"] = int(expected)
-        return out
+    result = _zero_result(method="agentic_multidim")
+    result.update(
+        num_hermes_tool_calls=len(calls),
+        num_generate_image_prompts=len(prompts),
+        num_judge_image_calls=sum(name == "judge_image" for name in names),
+        judge_parse_ok=judge_ok,
+        judge_parse_fail=judge_failed,
+        judge_parse_ok_rate=float(judge_rate),
+        terminal_done=int(terminal_done),
+        terminal_policy_reflection=int(policy_reflection),
+        forced_reflection_context=int(forced_context),
+        n_successful_generates=successful_generates,
+        expected_num_images=expected,
+        task_type=task_type,
+        rewrite_after_yes=rewrites_after_yes,
+        reward_tool_call=float(bool(calls)),
+        reward_tool=tool_reward,
+    )
+    if not prompts or successful_generates == 0:
+        return result
 
-    n_rewrite_after_yes = _num_generate_after_first_yes(blob, calls)
-    # PR 1's closed-loop indicator (agentic_reward.py ``f_done``): logged to
-    # WandB as ``reward_done``; the count-match R_result keeps its own logic.
-    valid_terminal_context = bool(n_judge_ok > 0 and not blocked and n_rewrite_after_yes == 0)
-    closed = bool(valid_terminal_context and terminal_done and (terminal_policy_reflection or forced_context))
-    f_tool_call = 1.0 if calls else 0.0
-    f_done = 1.0 if closed else 0.0
-
-    r_reflect, last_c, last_a, first_c, first_a = _reflection_reward(blob, gt=gt)
-    rewrite_improve_frac, n_images_to_best = _rewrite_improve_stats(blob)
+    valid_terminal_context = judge_ok > 0 and not blocked and rewrites_after_yes == 0
+    closed = valid_terminal_context and terminal_done and (policy_reflection or forced_context)
     rewards = {
-        "reflect": r_reflect,
-        "plan": _plan_reward(blob, gt=gt),
-        "format": _format_reward(blob, task_type=task_type, n_successful_gens=n_successful_gens),
-        "tool_call": f_tool_call,
+        "reflect": _reflection_reward(text, gt),
+        "plan": _plan_reward(text, gt),
+        "format": _format_reward(
+            text,
+            task_type=task_type,
+            successful_generates=successful_generates,
+            forced_context=forced_context,
+        ),
+        "tool": tool_reward,
         "result": _result_reward(
-            blob,
+            text,
             task_type=task_type,
             expected=expected,
-            n_successful_gens=n_successful_gens,
+            successful_generates=successful_generates,
             terminal_done=terminal_done,
             blocked=blocked,
+            rewrite_after_yes=rewrites_after_yes,
         ),
     }
-    weights = _active_weights(gt, extra_info, task_type=task_type)
-    w_sum = sum(weights.values())
-    base_score = sum(weights[dim] * rewards[dim] for dim in weights) / w_sum if w_sum > 0 else 0.0
-    judge_hits = _iter_successful_judge_scores(blob)
-    final_good_enough = judge_hits[-1][2] if judge_hits else None
-    # This is deliberately outside the weighted average. A terminal NO is task
-    # failure regardless of high C/A or protocol-component rewards. Subtracting
-    # one keeps continuous ordering among failed samples while ensuring every
-    # failed sample scores <= 0 and every successful sample remains unchanged.
-    terminal_no_penalty = -1.0 if final_good_enough is False else 0.0
-    # Hard protocol gate: both tools must appear as parsed Hermes calls.
-    # Format/result soft-miss alone left generate-only trajectories at ~+0.35,
-    # which beat judge+NO (~-0.4) and collapsed the closed loop after force-first.
-    called_generate = any(name == "generate_image" for name in names)
-    called_judge = any(name == "judge_image" for name in names)
-    missing_tools_penalty = 0.0 if (called_generate and called_judge) else -1.0
-    penalized_score = base_score + terminal_no_penalty + missing_tools_penalty
-    # A parsed live YES is the scarce task-success event. Preserve that signal
-    # even when it arrives at the turn cap before a perfect terminal suffix.
-    # Require both parsed calls and a successful image so prose cannot fake it.
-    valid_good_enough = bool(
-        final_good_enough is True
-        and called_generate
-        and called_judge
-        and n_successful_gens >= 1
-        and n_judge_ok > 0
-        and not blocked
+    weight_sum = sum(weights.values())
+    score = sum(weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
+    result.update(
+        score=float(min(1.0, score)),
+        **{f"reward_{dim}": float(rewards[dim]) for dim in DIMS},
+        reward_done=float(closed),
+        reward_tool_call=float(bool(calls)),
+        protocol_ok=int(rewards["format"] == 1.0),
+        rollout_valid=1,
     )
-    good_enough_floor_lift = max(0.0, GOOD_ENOUGH_SCORE_FLOOR - penalized_score) if valid_good_enough else 0.0
-    score = max(-1.0, min(1.0, penalized_score + good_enough_floor_lift))
-
-    out.update(
-        {
-            "score": float(score),
-            "score_before_terminal_penalty": float(base_score),
-            "reward_terminal_no_penalty": float(terminal_no_penalty),
-            "reward_missing_tools_penalty": float(missing_tools_penalty),
-            "reward_good_enough_floor_lift": float(good_enough_floor_lift),
-            "final_good_enough": (
-                1 if final_good_enough is True else 0 if final_good_enough is False else -1
-            ),
-            **{f"reward_{dim}": float(rewards[dim]) for dim in DIMS},
-            "reward_done": float(f_done),
-            "reward_correctness": float(last_c),
-            "reward_aesthetics": float(last_a),
-            "first_correctness": float(first_c),
-            "first_aesthetics": float(first_a),
-            "reward_reflect_delta": float(max(0.0, 0.5 * (last_c + last_a) - 0.5 * (first_c + first_a))),
-            "rewrite_improve_frac": float(rewrite_improve_frac),
-            "n_images_to_best": int(n_images_to_best),
-            "protocol_ok": int(rewards["format"] == 1.0),
-            "rewrite_after_yes": int(n_rewrite_after_yes),
-            "rollout_valid": 1,
-            "terminal_done": int(terminal_done),
-            "terminal_policy_reflection": int(terminal_policy_reflection),
-            "forced_reflection_context": int(forced_context),
-            "n_successful_generates": int(n_successful_gens),
-            "expected_num_images": int(expected),
-            "task_type": task_type,
-            "method": "agentic_multidim",
-        }
-    )
-    # Full schema merge so Ray reward workers never KeyError on missing keys.
-    schema = _zero_result(method=str(out.get("method") or "agentic_multidim"))
-    schema.update(out)
-    return schema
+    return result

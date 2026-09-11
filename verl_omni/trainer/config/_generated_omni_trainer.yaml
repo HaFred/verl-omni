@@ -550,6 +550,9 @@ data:
     path: null
     name: null
   apply_chat_template_kwargs: {}
+  continuous_token:
+    enable: false
+    model_family: auto
 critic:
   optim:
     _target_: verl.workers.config.FSDPOptimizerConfig

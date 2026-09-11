@@ -117,7 +117,7 @@ def _episode(*, uid: str, gens, used_image: bool):
 
 def test_flatten_reflection_only_has_zero_gen_rows():
     ep = _episode(uid="t0", gens=[], used_image=False)
-    result = lib.flatten_multiturn_rollouts([ep], expected_k=2)
+    result = lib.flatten_multiturn_rollouts([ep], expected_s=2)
     assert len(result.und_batch) == 1
     assert result.gen_batch == []
     assert result.metrics["und/no_image_credit"] == 1.0
@@ -136,7 +136,7 @@ def test_flatten_drops_incomplete_k_groups():
             rm_score=1.0,
         )
     ]
-    result = lib.flatten_multiturn_rollouts([_episode(uid="t0", gens=samples, used_image=True)], expected_k=2)
+    result = lib.flatten_multiturn_rollouts([_episode(uid="t0", gens=samples, used_image=True)], expected_s=2)
     assert result.gen_batch == []
     assert result.metrics["gen/dropped_incomplete_groups"] == 1.0
 
@@ -155,7 +155,7 @@ def test_flatten_complete_k_group_keeps_prompt_token_ids():
         )
         for i in range(2)
     ]
-    result = lib.flatten_multiturn_rollouts([_episode(uid="t0", gens=samples, used_image=True)], expected_k=2)
+    result = lib.flatten_multiturn_rollouts([_episode(uid="t0", gens=samples, used_image=True)], expected_s=2)
     assert len(result.gen_batch) == 2
     assert result.gen_batch[0]["prompt_token_ids"] == [9, 8]
     assert result.und_batch[0]["token_level_scores"] == pytest.approx(1.5)
@@ -193,7 +193,7 @@ def test_flatten_from_agent_output_reads_extra_fields():
             ]
         }
     )
-    result = lib.flatten_from_agent_output(output, expected_k=2)
+    result = lib.flatten_from_agent_output(output, expected_s=2)
     assert len(result.gen_batch) == 2
     assert result.gen_batch[0]["gen_group_uid"] == "g1"
     assert result.metrics["gen/skipped_no_groups"] == 0.0
@@ -297,7 +297,7 @@ def test_forced_reflection_masks_and_observation_encoding():
     assert episode.response_mask[-len(done_ids) :] == [1] * len(done_ids)
     assert episode.response_mask[-len(done_ids) - 1] == 0
     assert episode.und_reward == pytest.approx(0.9)
-    flat = lib.flatten_multiturn_rollouts([episode], expected_k=2)
+    flat = lib.flatten_multiturn_rollouts([episode], expected_s=2)
     assert flat.und_batch[0]["token_level_scores"] == pytest.approx(0.9)
 
 
@@ -426,7 +426,7 @@ def test_pattern3_non_image_reward_replaces_zero():
     assert episode.gen_samples == []
     assert episode.und_reward == pytest.approx(0.42)
 
-    flat = lib.flatten_multiturn_rollouts([episode], expected_k=2)
+    flat = lib.flatten_multiturn_rollouts([episode], expected_s=2)
     assert flat.und_batch[0]["token_level_scores"] == pytest.approx(0.42)
     assert flat.metrics["und/no_image_credit"] == 1.0
 
@@ -459,5 +459,5 @@ def test_flatten_propagates_episode_und_reward_for_no_image():
         used_image_credit=False,
         und_reward=0.73,
     )
-    result = lib.flatten_multiturn_rollouts([episode], expected_k=2)
+    result = lib.flatten_multiturn_rollouts([episode], expected_s=2)
     assert result.und_batch[0]["token_level_scores"] == pytest.approx(0.73)

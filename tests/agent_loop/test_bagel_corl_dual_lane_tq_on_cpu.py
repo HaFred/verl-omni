@@ -172,7 +172,7 @@ def test_retire_n_eq_two_s_config_gate():
             "trainer": {"v1": {"trainer_mode": "bagel_corl_sync"}},
             "actor_rollout_ref": {
                 "model": {"path": "/models/ByteDance-Seed/BAGEL-7B-MoT", "lora_rank": 64},
-                "rollout": {"n": 3, "agent": {"gen_samples_per_call": 2, "max_generate_passes": 1}},
+                "rollout": {"n": 3, "agent": {"gen_samples_per_call": 2, "max_generate_passes": 1, "und_ar_serving_ready": True, "und_deploy_config": "examples/agenticllmgrpo_trainer/bagel/bagel_corl_deploy_ar.yaml"}},
             },
         }
     )

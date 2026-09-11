@@ -24,8 +24,11 @@ Frozen Qwen3-VL judge serves dual role: (1) in-turn ``judge_image`` agent tool
 scores from the first ``good_enough=YES`` ``agentic_judge ok=1`` observation
 (protocol: YES → Done); otherwise the last successful judge. This blocks
 rewrite-after-YES roulette from replacing a good C/A with a failed last image.
-If absent, it falls back to ``call_reflect_vlm`` via ``AGENTIC_VLLM_URL``
-(OpenAI chat). There is no legacy ``/reflect`` path.
+If absent, it falls back to ``call_reflect_vlm`` via ``agentic_image_gen.vllm_url``
+(OpenAI chat) **only** for a PNG under the rollout images root (never an
+arbitrary ``path=`` the policy wrote). There is no legacy ``/reflect`` path.
+C/A and closed-protocol credit require a real ``judge_image`` ``<tool_call>``;
+forged ``agentic_judge ok=1`` prose without that call does not count.
 
 Scalar mix terms (enter ``score`` via weighted mix):
   ``reward_tool_call``, ``reward_correctness`` (gated), ``reward_aesthetics``
@@ -62,6 +65,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 from verl_omni.utils.reward_score.agentic_image_judge_client import call_reflect_vlm
@@ -76,7 +80,7 @@ _BLOCKED_GENERATE_RE = re.compile(
     r"\b(?:blocked_after_yes|blocked_after_max_passes)=1\b|generate_image blocked:",
     re.IGNORECASE,
 )
-# Tool observations only — do NOT match agent prose that merely quotes "VL judge".
+_JUDGE_OBS_HEADER = "VL judge on the last generated image"
 _TOOL_OBS_LINE = re.compile(
     r"(?im)^(?!.*\bReflection\s*:).*\b("
     r"agentic_tool|agentic_reflect|agentic_judge|"
@@ -184,6 +188,15 @@ def _ordered_tool_names(calls: list[tuple[int, int, dict[str, Any]]]) -> list[st
     return [str(c.get("name", "")).lower() for _, _, c in calls]
 
 
+def _judge_image_call_ends(calls: list[tuple[int, int, dict[str, Any]]]) -> list[int]:
+    return [end for _, end, call in calls if str(call.get("name", "")).lower() == "judge_image"]
+
+
+def _follows_judge_image_call(pos: int, calls: list[tuple[int, int, dict[str, Any]]]) -> bool:
+    """True when ``pos`` is after at least one parsed ``judge_image`` ``<tool_call>``."""
+    return any(end <= pos for end in _judge_image_call_ends(calls))
+
+
 def _assistant_prose(text: str) -> str:
     """Strip tool_calls and tool-obs lines; keep private thinking as scored prose."""
     prose = _TOOL_CALL_RE.sub(" ", text or "")
@@ -226,6 +239,67 @@ def _last_successful_generate_image_path(text: str) -> str | None:
     return last_ok or last_png
 
 
+def _rollout_image_roots(extra_info: dict[str, Any]) -> list[Path]:
+    """Directories the VL fallback is allowed to read.
+
+    Roots must arrive on ``extra_info`` (``rollout_images_root`` /
+    ``agentic_images_root`` + optional ``trajectory_relpath``). Reward workers
+    never bind tools.trajectory — do not import it here. The driver stamps
+    ``rollout_images_root`` in ``OmniAgentLoopManager.generate_sequences`` via
+    ``_stamp_reward_context``; if the reward process cannot read that path
+    (remote node, different mount) ``call_reflect_vlm`` fail-closes to
+    ``(None, None, ...)`` and C/A stay 0.0.
+    """
+    roots: list[Path] = []
+    explicit = str(extra_info.get("rollout_images_root") or extra_info.get("agentic_images_root") or "").strip()
+    relpath = str(extra_info.get("trajectory_relpath") or "").strip()
+    if explicit:
+        base = Path(explicit).expanduser()
+        roots.append(base)
+        if relpath:
+            roots.append(base / relpath)
+    return roots
+
+
+def _path_if_under_rollout_root(path: str, extra_info: dict[str, Any]) -> str | None:
+    """Return the resolved PNG path if it lives under a known rollout images root."""
+    if not path or not str(path).lower().endswith(".png"):
+        return None
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return None
+    for root in _rollout_image_roots(extra_info):
+        try:
+            root_resolved = root.expanduser().resolve()
+            resolved.relative_to(root_resolved)
+        except (OSError, ValueError):
+            continue
+        return str(resolved)
+    return None
+
+
+def _confined_generate_image_path(text: str, extra_info: dict[str, Any]) -> str | None:
+    """Last successful generate PNG that is inside the rollout dump root."""
+    candidates: list[str] = []
+    for line in (text or "").splitlines():
+        if not _TOOL_OK.search(line):
+            continue
+        for raw in _PATH_RE.findall(line):
+            path = raw.strip()
+            if path.lower().endswith(".png"):
+                candidates.append(path)
+    if not candidates:
+        fallback = _last_successful_generate_image_path(text)
+        if fallback:
+            candidates.append(fallback)
+    for path in reversed(candidates):
+        confined = _path_if_under_rollout_root(path, extra_info)
+        if confined:
+            return confined
+    return None
+
+
 def _has_successful_generated_image(text: str) -> bool:
     """Accept live tool lines regardless of whether ``path`` precedes ``ok=1``."""
     for line in (text or "").splitlines():
@@ -249,17 +323,33 @@ _AGENTIC_JUDGE_OK_RE = re.compile(r"\bagentic_judge\s+ok=1\b", re.IGNORECASE)
 _AGENTIC_JUDGE_PARSE_FAIL_RE = re.compile(r"\bagentic_judge\s+ok=0\b|\bparse_ok\s*=\s*0\b", re.IGNORECASE)
 
 
-def _judge_parse_stats(text: str) -> tuple[int, int, float]:
-    """Return ``(n_ok, n_fail, parse_ok_rate)`` from trajectory judge observations."""
+def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] | None = None) -> tuple[int, int]:
+    """Return ``(n_ok, n_fail)`` from trajectory judge observations.
+
+    Markers that are not after a parsed ``judge_image`` ``<tool_call>`` are ignored
+    so assistant prose cannot mint parse-ok counts.
+
+    Only the integer counts travel in the reward dict. The trainer reduces every
+    reward-extra key with ``np.mean`` (``process_validation_metrics``), which
+    raises on ``None``, so the rate is *derived* in ``AgenticRewardMetrics``
+    instead — there a zero-judge rollout can honestly report ``null`` without
+    poisoning a numeric reduction.
+    """
     blob = text or ""
-    n_ok = len(_AGENTIC_JUDGE_OK_RE.findall(blob))
-    # Prefer explicit ok=0 marker (one per failed judge obs).
-    n_fail = len(re.findall(r"\bagentic_judge\s+ok=0\b", blob, flags=re.IGNORECASE))
+    parsed_calls = calls if calls is not None else _extract_tool_calls(blob)
+    n_ok = 0
+    for match in _AGENTIC_JUDGE_OK_RE.finditer(blob):
+        if _follows_judge_image_call(match.start(), parsed_calls):
+            n_ok += 1
+    n_fail = 0
+    for match in re.finditer(r"\bagentic_judge\s+ok=0\b", blob, flags=re.IGNORECASE):
+        if _follows_judge_image_call(match.start(), parsed_calls):
+            n_fail += 1
     if n_fail == 0:
-        n_fail = len(_AGENTIC_JUDGE_PARSE_FAIL_RE.findall(blob))
-    n_attempts = n_ok + n_fail
-    rate = float(n_ok) / float(n_attempts) if n_attempts else 1.0
-    return n_ok, n_fail, rate
+        for match in _AGENTIC_JUDGE_PARSE_FAIL_RE.finditer(blob):
+            if _follows_judge_image_call(match.start(), parsed_calls):
+                n_fail += 1
+    return n_ok, n_fail
 
 
 def _good_enough_from_window(window: str) -> bool | None:
@@ -280,12 +370,19 @@ def _good_enough_from_window(window: str) -> bool | None:
 
 
 def _iter_successful_judge_scores(text: str) -> list[tuple[float, float, bool | None, int]]:
-    """Yield ``(c, a, good_enough, end_pos)`` for each successful judge obs."""
+    """Yield ``(c, a, good_enough, end_pos)`` for each successful judge obs.
+
+    A hit must follow a parsed ``judge_image`` ``<tool_call>`` and the tool's
+    ``VL judge on the last generated image`` header so policy prose cannot mint C/A.
+    """
     blob = text or ""
+    calls = _extract_tool_calls(blob)
     out: list[tuple[float, float, bool | None, int]] = []
     for match in _AGENTIC_JUDGE_OK_RE.finditer(blob):
+        if not _follows_judge_image_call(match.start(), calls):
+            continue
         window = blob[max(0, match.start() - 1400) : match.end()]
-        if "VL judge" not in window and "correctness" not in window.lower():
+        if _JUDGE_OBS_HEADER not in window:
             continue
         if re.search(r"\bparse_ok\s*=\s*0\b", window, re.IGNORECASE):
             continue
@@ -342,9 +439,10 @@ def _parse_last_agentic_judge_scores(
 ) -> tuple[float | None, float | None, dict[str, float], dict[str, float]]:
     """Reuse C/A from judge obs: first ``good_enough=YES``, else last ok=1.
 
-    Only trusts windows ending in ``agentic_judge ok=1`` (written by our tool),
-    not bare ``correctness=`` markers the policy might hallucinate. Parse
-    failures (``parse_ok=0`` / unparseable) never contribute C/A.
+    Only trusts windows that follow a ``judge_image`` ``<tool_call>`` and end in
+    ``agentic_judge ok=1`` (written by our tool). Bare ``correctness=`` markers
+    the policy might hallucinate never contribute C/A. Parse failures
+    (``parse_ok=0`` / unparseable) also never contribute.
     """
     hits = _iter_successful_judge_scores(text)
     if not hits:
@@ -415,17 +513,19 @@ def _vl_judge_correctness_aesthetics(
     *,
     user_request: str,
     image_prompt: str,
+    extra_info: dict[str, Any] | None = None,
 ) -> tuple[float | None, float | None, dict[str, float], dict[str, float]]:
     """Resolve C/A from trajectory judge obs, else re-call frozen VL on last PNG.
 
-    Returns ``(None, None, {}, {})`` when neither source works — callers must
-    treat C/A as 0.0 (no heuristic fallback for reward).
+    Fallback only reads a PNG under the rollout images root. Returns
+    ``(None, None, {}, {})`` when neither source works — callers must treat C/A
+    as 0.0 (no heuristic fallback for reward).
     """
     parsed = _parse_last_agentic_judge_scores(text)
     if parsed[0] is not None and parsed[1] is not None:
         return parsed
 
-    image_path = _last_successful_generate_image_path(text)
+    image_path = _confined_generate_image_path(text, extra_info or {})
     if not image_path:
         return None, None, {}, {}
     scored = call_reflect_vlm(
@@ -433,6 +533,7 @@ def _vl_judge_correctness_aesthetics(
         image_prompt=image_prompt or "",
         notes="",
         image_path=image_path,
+        extra_info=extra_info or {},
     )
     if scored is None:
         return None, None, {}, {}
@@ -456,7 +557,7 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
         "num_judge_image_calls": 0,
         "judge_parse_ok": 0,
         "judge_parse_fail": 0,
-        "judge_parse_ok_rate": 1.0,
+        # No rate key: see ``_judge_parse_stats`` — ``AgenticRewardMetrics`` derives it.
         "protocol_ok": 0,
         "rewrite_after_yes": 0,
         "reward_delta_c": 0.0,
@@ -471,6 +572,52 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
     return result
 
 
+def _resolve_solution_text(
+    solution_str: str,
+    *,
+    kwargs: dict[str, Any],
+    extra_info: dict[str, Any],
+) -> str:
+    """Resolve trajectory text.
+
+    Prefer ``solution_str`` (NaiveRewardManager). Optionally decode ``responses``
+    when a tokenizer is available. ``solution_image`` from VisualRewardManager is
+    the wrong modality — raise instead of scoring an empty blob as zeros.
+    """
+    blob = (solution_str or "").strip()
+    if not blob:
+        alt = kwargs.get("solution_str")
+        if isinstance(alt, str):
+            blob = alt.strip()
+    if blob:
+        return blob
+
+    responses = kwargs.get("responses")
+    tokenizer = kwargs.get("tokenizer") or extra_info.get("tokenizer")
+    if responses is not None and tokenizer is not None:
+        try:
+            if hasattr(responses, "tolist"):
+                ids = responses.tolist()
+            else:
+                ids = list(responses)
+            # Batched row: take first sequence if nested.
+            if ids and isinstance(ids[0], list | tuple):
+                ids = list(ids[0])
+            decoded = tokenizer.decode(ids, skip_special_tokens=False)
+            if isinstance(decoded, str) and decoded.strip():
+                return decoded.strip()
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("agentic_reward.compute_score failed to decode responses into solution_str") from exc
+
+    if "solution_image" in kwargs:
+        raise ValueError(
+            "agentic_reward.compute_score requires solution_str (text trajectory). "
+            "Got solution_image from VisualRewardManager — set "
+            "reward.reward_manager.name=naive for agent llm."
+        )
+    return ""
+
+
 def compute_score(
     data_source: str = "",
     solution_str: str = "",
@@ -478,14 +625,33 @@ def compute_score(
     extra_info: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, float | str | int | None]:
-    """Score an agentic image-generation trajectory for GRPO."""
-    del data_source, kwargs
-    extra_info = dict(extra_info or {})
+    """Score an image-generation tool trajectory for GRPO.
+
+    Args:
+        data_source: Unused; kept for the verl ``compute_score`` signature.
+        solution_str: Decoded trajectory text (tool calls + observations).
+        ground_truth: Optional dict of mix weights / user request.
+        extra_info: Mix weights and VL scorer knobs (same channel as ``w_*``).
+            ``SCORER_KNOB_KEYS`` must already be stamped, or pass ``config``.
+        **kwargs: Optional ``config`` for ``merge_agentic_scorer_knobs``.
+
+    Returns:
+        Dict with ``score`` and per-term ``reward_*`` fields for the reward manager.
+    """
+    del data_source
+    from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
+
+    # Reward actors never bind hydra_env or receive Hydra ``config``.
+    # Driver stamps SCORER_KNOB_KEYS onto inbound prompts (then output);
+    # merge fails loud if those keys are missing when config is None.
+    extra_info = merge_agentic_scorer_knobs(extra_info, kwargs.get("config"))
     gt = _as_dict(ground_truth)
 
-    blob = solution_str or ""
-    if not blob.strip():
-        return _zero_result(method="agentic_hermes_tool_calls")
+    blob = _resolve_solution_text(solution_str, kwargs=kwargs, extra_info=extra_info)
+    # Ignore visual payloads explicitly; do not let them leak into scoring.
+    kwargs.pop("solution_image", None)
+    if not blob:
+        return _zero_result(method="agentic_missing_solution_str")
 
     calls = _extract_tool_calls(blob)
     prompts = _gen_image_prompts(calls)
@@ -518,11 +684,10 @@ def compute_score(
     last_c, last_a, correctness_scores, aesthetics_scores = _vl_judge_correctness_aesthetics(
         blob,
         user_request=user_request,
-        # Keep the reward target anchored to the business request. A rewritten
-        # diffusion prompt is an action, not permission to redefine success.
-        image_prompt=user_request,
+        image_prompt=prompts[-1] if prompts else "",
+        extra_info=extra_info,
     )
-    n_judge_ok, n_judge_fail, judge_parse_rate = _judge_parse_stats(blob)
+    n_judge_ok, n_judge_fail = _judge_parse_stats(blob, calls)
     # No successful parse anywhere → keep C/A at 0 (do not invent scores).
     if last_c is None and last_a is None and n_judge_fail > 0 and n_judge_ok == 0:
         last_c, last_a = 0.0, 0.0
@@ -539,13 +704,15 @@ def compute_score(
     w_rewrite_yes = float(extra_info.get("w_rewrite_yes", gt.get("w_rewrite_yes", 0.12)))
     w_sum = w_tool_call + w_correctness + w_aesthetics + w_done
     if w_sum <= 0:
-        w_tool_call, w_correctness, w_aesthetics, w_done, w_sum = 0.10, 0.35, 0.35, 0.20, 1.0
+        return _zero_result(method="agentic_bad_weights")
 
     prose = _assistant_prose(blob)
     has_refl = _has_agent_reflection_prose(prose)
     terminal_done, terminal_policy_reflection, forced_reflection_context = _policy_terminal_decision(blob)
     n_rewrite_after_yes = _num_generate_after_first_yes(blob, calls)
-    valid_terminal_context = bool(n_judge_ok > 0 and not _BLOCKED_GENERATE_RE.search(blob) and n_rewrite_after_yes == 0)
+    valid_terminal_context = bool(
+        n_reflect > 0 and n_judge_ok > 0 and not _BLOCKED_GENERATE_RE.search(blob) and n_rewrite_after_yes == 0
+    )
     closed = bool(
         valid_terminal_context and terminal_done and (terminal_policy_reflection or forced_reflection_context)
     )
@@ -628,7 +795,8 @@ def compute_score(
         "num_judge_image_calls": int(n_reflect),
         "judge_parse_ok": int(n_judge_ok),
         "judge_parse_fail": int(n_judge_fail),
-        "judge_parse_ok_rate": float(judge_parse_rate),
+        # No rate key here: the trainer np.means every reward-extra key and raises
+        # on None. ``AgenticRewardMetrics`` derives the rate (None when zero judges).
         "protocol_ok": int(protocol_ok),
         "rewrite_after_yes": int(n_rewrite_after_yes),
         "rollout_valid": 1,

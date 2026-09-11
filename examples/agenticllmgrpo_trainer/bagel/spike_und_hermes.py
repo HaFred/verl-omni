@@ -20,6 +20,9 @@ Environment:
   BAGEL_MODEL_PATH   local Bagel checkpoint (tokenizer + specials)
   BAGEL_UND_URL      optional OpenAI-compatible chat URL for a live replica
   BAGEL_SPIKE_OFFLINE_SCHEMA=1  tokenizer/schema only (CI); does not prove serving
+
+Serve AR (bagel_think) first:
+  bash examples/agenticllmgrpo_trainer/bagel/run_bagel_und_ar_serve.sh
 """
 
 from __future__ import annotations
@@ -27,18 +30,58 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 
-from verl_omni.agent_loop.bagel_corl_lib import (
-    GENERATE_IMAGE_TOOL_SCHEMA,
-    HERMES_SPECIAL_TOKENS,
-    parse_hermes_tool_call,
-    und_turn_kind,
+# Keep schema/token constants local so offline mode does not import verl_omni
+# pipelines (those pull vllm-omni diffusion → CUDA init).
+GENERATE_IMAGE_TOOL_SCHEMA: dict = {
+    "type": "function",
+    "function": {
+        "name": "generate_image",
+        "description": "Generate an image from a text prompt using the Bagel GEN pathway.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "prompt": {"type": "string", "description": "Text prompt for image generation."},
+            },
+            "required": ["prompt"],
+        },
+    },
+}
+HERMES_SPECIAL_TOKENS: tuple[str, ...] = (
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>",
 )
 
-TOOLS = [GENERATE_IMAGE_TOOL_SCHEMA]
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
+_DONE_RE = re.compile(r"\bDone\.\s*$", re.IGNORECASE)
+
+
+def _parse_hermes_tool_call(text: str) -> dict | None:
+    match = _TOOL_CALL_RE.search(text)
+    if match is None:
+        return None
+    payload = json.loads(match.group(1))
+    if "name" not in payload and "function" in payload:
+        payload = payload["function"]
+    return payload
+
+
+def _und_turn_kind(text: str) -> str:
+    call = _parse_hermes_tool_call(text)
+    if call is not None:
+        name = str(call.get("name", ""))
+        if name == "generate_image":
+            return "generate_image"
+        raise ValueError(f"Bagel CoRL UND emitted unsupported tool {name!r}; Qwen/other tools are fail-closed")
+    if _DONE_RE.search(text.strip()):
+        return "done"
+    return "continue"
 
 
 def inspect_tokenizer(model_path: str) -> dict[str, bool]:
@@ -59,7 +102,7 @@ def query_und_replica(url: str, prompt: str, timeout_s: float = 120.0) -> str:
     payload = {
         "model": "bagel",
         "messages": [{"role": "user", "content": prompt}],
-        "tools": TOOLS,
+        "tools": [GENERATE_IMAGE_TOOL_SCHEMA],
         "temperature": 0.7,
         "max_tokens": 256,
     }
@@ -82,7 +125,11 @@ def main(argv: list[str] | None = None) -> int:
         "--prompt",
         default="Draw a red circle on a white background. Use generate_image if you can render it.",
     )
-    parser.add_argument("--offline-schema", action="store_true", default=os.environ.get("BAGEL_SPIKE_OFFLINE_SCHEMA") == "1")
+    parser.add_argument(
+        "--offline-schema",
+        action="store_true",
+        default=os.environ.get("BAGEL_SPIKE_OFFLINE_SCHEMA") == "1",
+    )
     args = parser.parse_args(argv)
 
     print("tool_schema:", json.dumps(GENERATE_IMAGE_TOOL_SCHEMA))
@@ -91,6 +138,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.model_path:
         specials = inspect_tokenizer(args.model_path)
         print("tokenizer_hermes_specials:", json.dumps(specials))
+        if not specials.get("<tool_call>") or not specials.get("</tool_call>"):
+            print("FAIL-CLOSED: Bagel tokenizer missing Hermes <tool_call> specials", file=sys.stderr)
+            return 1
 
     if args.offline_schema and not args.und_url:
         print("offline schema check only; this is NOT UND serving proof")
@@ -99,7 +149,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.und_url:
         print(
             "FAIL-CLOSED: set BAGEL_UND_URL to a Bagel AR replica. "
-            "Do not substitute Qwen3-VL. bagel_single_stage is GEN-only.",
+            "Do not substitute Qwen3-VL. bagel_single_stage is GEN-only. "
+            "Start: bash examples/agenticllmgrpo_trainer/bagel/run_bagel_und_ar_serve.sh",
             file=sys.stderr,
         )
         return 2
@@ -111,8 +162,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     print("und_text:", text)
-    kind = und_turn_kind(text)
-    call = parse_hermes_tool_call(text)
+    kind = _und_turn_kind(text)
+    call = _parse_hermes_tool_call(text)
     if kind != "generate_image" or call is None or call.get("name") != "generate_image":
         print("FAIL-CLOSED: Bagel UND did not emit Hermes <tool_call> generate_image", file=sys.stderr)
         return 1

@@ -127,7 +127,7 @@ def gen_sample_uid(gen_call_id: str, seed_index: int) -> str:
 
 @dataclass
 class GenSample:
-    """One of K GEN seeds from a single ``generate_image`` call."""
+    """One of S FlowGRPO seeds for a single ``generate_image`` turn."""
 
     gen_sample_uid: str
     gen_group_uid: str
@@ -168,7 +168,13 @@ class EpisodeRollout:
 
 
 class BagelGenerateImageTool:
-    """K-seed GEN tool. Refuses a second call when ``max_generate_passes=1``."""
+    """One GEN turn per call (RFC ``K`` += 1).
+
+    ``gen_samples_per_call`` is **S** (FlowGRPO seeds under the same conditioning),
+    not the episode GEN-turn count **K**. One UND ``generate_image`` tool verdict
+    invokes this once → one GEN turn; the seed fan-out is group sampling for FlowGRPO.
+    ``max_generate_passes`` bounds how many such GEN turns an episode may enqueue.
+    """
 
     def __init__(
         self,
@@ -181,7 +187,7 @@ class BagelGenerateImageTool:
             raise ValueError("gen_samples_per_call must be >= 1")
         if max_generate_passes < 1:
             raise ValueError("max_generate_passes must be >= 1")
-        self.k = int(gen_samples_per_call)
+        self.s = int(gen_samples_per_call)
         self.max_generate_passes = int(max_generate_passes)
         self._passes = 0
         self._generate_fn = generate_fn
@@ -203,9 +209,9 @@ class BagelGenerateImageTool:
             )
         self._passes += 1
         if seeds is None:
-            seeds = list(range(self.k))
-        if len(seeds) != self.k:
-            raise ValueError(f"expected K={self.k} seeds, got {len(seeds)}")
+            seeds = list(range(self.s))
+        if len(seeds) != self.s:
+            raise ValueError(f"expected S={self.s} FlowGRPO seeds for one GEN turn, got {len(seeds)}")
         raw_rows: list[dict[str, Any]]
         if self._generate_fn is None:
             raw_rows = [{"valid": True} for _ in seeds]
@@ -239,7 +245,7 @@ class BagelGenerateImageTool:
 
 
 def compact_image_observation(path: str) -> str:
-    """UND-facing observation: path only; K trajectories stay on the GEN batch."""
+    """UND-facing observation: path only; S seed trajectories stay on the GEN batch."""
     return f"path={path}"
 
 
@@ -313,7 +319,11 @@ async def run_serial_episode(
     episode_uid: str | None = None,
     non_image_reward: float | None = None,
 ) -> EpisodeRollout:
-    """Serial UND decode → optional GEN (K seeds) → RM → forced reflection / Done.
+    """Serial UND turn(s) → optional one GEN turn (S FlowGRPO seeds) → RM → reflection / Done.
+
+    Episode shape follows the RFC: ``UND (+ GEN) (+ UND…)* + Done``, where each
+    ``generate_image`` verdict enqueues exactly one GEN turn (``K += 1``). ``S`` is
+    seed fan-out inside that turn for FlowGRPO — not additional GEN turns.
 
     ``non_image_reward`` is the RFC "non-image UND scalar" used when the episode
     makes zero ``generate_image`` calls (pattern 3, ``K = 0``). When it is ``None``
@@ -509,14 +519,16 @@ class FlattenResult:
 def flatten_multiturn_rollouts(
     episodes: list[EpisodeRollout],
     *,
-    expected_k: int,
+    expected_s: int,
 ) -> FlattenResult:
     """Split token UND rows from latent GEN rows. Never concatenate the two.
 
-    Incomplete K-groups are dropped. Reflection-only episodes contribute zero GEN rows.
+    Incomplete S-seed groups are dropped. Reflection-only episodes contribute zero GEN rows.
+    One finished ``generate_image`` tool call is one GEN turn (RFC K); ``expected_s`` is
+    FlowGRPO seeds under that single turn.
     """
-    if expected_k < 1:
-        raise ValueError("expected_k must be >= 1")
+    if expected_s < 1:
+        raise ValueError("expected_s must be >= 1")
     und_batch: list[dict[str, Any]] = []
     gen_batch: list[dict[str, Any]] = []
     gen_episode_map: list[dict[str, Any]] = []
@@ -547,7 +559,7 @@ def flatten_multiturn_rollouts(
         valid = [s for s in episode.gen_samples if s.valid]
         if not valid:
             continue
-        if len(valid) != expected_k:
+        if len(valid) != expected_s:
             dropped_incomplete += 1
             continue
         for sample in valid:
@@ -634,14 +646,14 @@ def _ntb_from_extra_fields(extras: Any) -> dict[str, list[Any]]:
     return ntb
 
 
-def flatten_from_agent_output(output: Any, *, expected_k: int) -> FlattenResult:
+def flatten_from_agent_output(output: Any, *, expected_s: int) -> FlattenResult:
     """RFC Flatten after ``generate_sequences``: UND vs GEN rows from extra_fields."""
     ntb = dict(getattr(output, "non_tensor_batch", None) or {})
     if ntb.get("gen_samples") is None and ntb.get("extra_fields") is not None:
         ntb.update(_ntb_from_extra_fields(ntb["extra_fields"]))
     gen_col = ntb.get("gen_samples")
     if gen_col is None:
-        return flatten_multiturn_rollouts([], expected_k=expected_k)
+        return flatten_multiturn_rollouts([], expected_s=expected_s)
 
     length = len(gen_col)
 
@@ -683,7 +695,7 @@ def flatten_from_agent_output(output: Any, *, expected_k: int) -> FlattenResult:
                 num_gen_calls=len({str(s.gen_group_uid) for s in samples if s.valid}),
             )
         )
-    return flatten_multiturn_rollouts(episodes, expected_k=expected_k)
+    return flatten_multiturn_rollouts(episodes, expected_s=expected_s)
 
 
 def strip_pixels_for_actor(row: dict[str, Any]) -> dict[str, Any]:

@@ -1,0 +1,50 @@
+# Co-RL UND AR deploy (Thinker). Sibling of bagel_corl_deploy.yaml (GEN / bagel_single_stage).
+#
+# Uses registered ``bagel_think`` so stage-0 LLM_AR decodes planning / tool tokens
+# (Hermes ``<tool_call>``) before any KV transfer. Do NOT use bagel_single_stage here —
+# that is DiffusionStrategy / GEN-only.
+#
+# Passed from run_agentic_bagel_rpco_lora.sh as BAGEL_UND_DEPLOY_CONFIG and from
+# run_bagel_und_ar_serve.sh for the spike_und_hermes.py gate.
+#
+# Layout note: stock bagel_think pins both stages to devices:"0". The serve helper
+# overrides stage devices (Thinker on logical 0, DiT on logical 1) when two GPUs
+# are visible. For 1-GPU smoke, leave both on "0" and lower util.
+
+pipeline: bagel_think
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_model_len: 2048
+    max_num_batched_tokens: 2048
+    max_num_seqs: 1
+    gpu_memory_utilization: 0.45
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 50
+      max_tokens: 512
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    max_num_batched_tokens: 2048
+    max_num_seqs: 1
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    input_connectors:
+      from_stage_0: shared_memory_connector
+    default_sampling_params:
+      seed: 42
+
+connectors:
+  shared_memory_connector:
+    name: SharedMemoryConnector
