@@ -96,13 +96,62 @@ def test_manager_dumps_before_discarding_invalid_rollouts(monkeypatch):
     manager._monitor_tokenizer = object()
     manager.config = OmegaConf.create({"agentic_image_gen": {"vllm_url": "http://cli", "good_enough_threshold": 0.55}})
     output = SimpleNamespace(non_tensor_batch={"extra_info": np.array([{"w_tool_call": 0.1}], dtype=object)})
-    prompts = SimpleNamespace(meta_info={"global_steps": 4}, output=output)
+    prompts = SimpleNamespace(
+        meta_info={"global_steps": 4},
+        non_tensor_batch={"extra_info": np.array([{"w_tool_call": 0.1}], dtype=object)},
+        output=output,
+    )
     assert OmniAgentLoopManager.generate_sequences(manager, prompts) is output
     assert order == ["dump", "discard"]
     extra = output.non_tensor_batch["extra_info"][0]
     assert extra["vllm_url"] == "http://cli"
     assert extra["good_enough_threshold"] == 0.55
     assert extra["w_tool_call"] == 0.1
+
+
+def test_inbound_stamp_reaches_compute_score_kwargs(monkeypatch):
+    """Pinned ``AgentLoopWorker._compute_score`` reads extra_info from inbound kwargs.
+
+    Default RayPPOTrainer enables ``agent_reward_loop`` with no RM, so scoring
+    runs during worker generate — not on the concatenated manager output.
+    Streaming ``_postprocess`` does not copy ``input_non_tensor_batch``.
+    """
+    from omegaconf import OmegaConf
+
+    captured: dict = {}
+
+    def _parent_generate(self, prompts):
+        del self
+        # Same construction as pinned AgentLoopWorker.generate_sequences (fefb0802).
+        kwargs = {k: v[0] for k, v in prompts.non_tensor_batch.items() if k != "__do_sample__"}
+        captured["kwargs"] = kwargs
+        captured["remote_extra"] = np.array([kwargs["extra_info"]])[0]
+        # Simulate streaming postprocess: no copy of input extra_info.
+        return SimpleNamespace(non_tensor_batch={"__num_turns__": np.array([1])}, meta_info={})
+
+    monkeypatch.setattr(AgentLoopManager, "generate_sequences", _parent_generate)
+    monkeypatch.setattr(omni_agent_loop, "dump_raw_rollouts", lambda **kwargs: None)
+    monkeypatch.setattr(omni_agent_loop, "discard_invalid_rollouts", lambda output: output)
+    monkeypatch.setattr(omni_agent_loop, "AgenticRewardMetrics", SimpleNamespace(aggregate=lambda batch: {}))
+
+    manager = OmniAgentLoopManager.__new__(OmniAgentLoopManager)
+    manager._monitor_tokenizer = object()
+    manager.config = OmegaConf.create({"agentic_image_gen": {"vllm_url": "http://cli", "good_enough_threshold": 0.55}})
+    prompts = SimpleNamespace(
+        meta_info={"global_steps": 4},
+        non_tensor_batch={"extra_info": np.array([{"w_tool_call": 0.1}], dtype=object)},
+    )
+    output = OmniAgentLoopManager.generate_sequences(manager, prompts)
+    extra = captured["kwargs"]["extra_info"]
+    assert extra["vllm_url"] == "http://cli"
+    assert extra["good_enough_threshold"] == 0.55
+    assert extra["w_tool_call"] == 0.1
+    assert captured["remote_extra"]["vllm_url"] == "http://cli"
+    assert captured["remote_extra"]["good_enough_threshold"] == 0.55
+    # Output stamp still fills knobs after streaming postprocess dropped extra_info.
+    out_extra = output.non_tensor_batch["extra_info"][0]
+    assert out_extra["vllm_url"] == "http://cli"
+    assert out_extra["good_enough_threshold"] == 0.55
 
 
 def test_stamp_scorer_knobs_does_not_override_row_values():

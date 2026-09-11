@@ -15,9 +15,10 @@
 """Process-local store for Hydra ``agentic_image_gen`` knobs.
 
 Yaml ``image_gen_tools.yaml`` is the default source of truth. Bind on the
-rollout worker; stamp scorer knobs onto row ``extra_info`` in
-``generate_sequences``. Reward scorers call ``merge_agentic_scorer_knobs``
-and fail loud if those keys are missing when Hydra ``config`` is absent.
+rollout worker; stamp scorer knobs onto inbound ``prompts`` extra_info
+before worker dispatch (and again on concatenated output). Reward scorers
+call ``merge_agentic_scorer_knobs`` and fail loud if those keys are missing
+when Hydra ``config`` is absent.
 """
 
 from __future__ import annotations
@@ -275,7 +276,7 @@ def agentic_scorer_knobs_from_config(config: Any) -> dict[str, Any]:
         raise ValueError(
             "agentic_scorer_knobs_from_config requires composed Hydra config; "
             "OmniAgentLoopManager.generate_sequences stamps SCORER_KNOB_KEYS onto "
-            "extra_info so reward actors do not yaml-fill"
+            "inbound prompts (and output) so reward actors do not yaml-fill"
         )
     defaults = yaml_agentic_image_gen_defaults()
     try:
@@ -314,6 +315,7 @@ def merge_agentic_scorer_knobs(extra_info: dict[str, Any] | None, config: Any = 
         raise ValueError(
             f"agentic scorer knobs missing from extra_info: {missing}; "
             "OmniAgentLoopManager.generate_sequences must stamp SCORER_KNOB_KEYS "
+            "onto inbound prompts before AgentLoopWorker._compute_score "
             "(NaiveRewardManager / compute_score.remote never pass Hydra config)"
         )
     return merged

@@ -634,7 +634,7 @@ def compute_score(
     from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
 
     # Reward actors never bind hydra_env or receive Hydra ``config``.
-    # Driver stamps SCORER_KNOB_KEYS onto extra_info in generate_sequences;
+    # Driver stamps SCORER_KNOB_KEYS onto inbound prompts (then output);
     # merge fails loud if those keys are missing when config is None.
     extra_info = merge_agentic_scorer_knobs(extra_info, kwargs.get("config"))
     gt = _as_dict(ground_truth)
