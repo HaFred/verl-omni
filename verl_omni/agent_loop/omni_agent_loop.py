@@ -22,6 +22,7 @@ from pathlib import Path
 import ray
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
+from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
 from verl.utils import hf_tokenizer
 
 from verl_omni.tools.trajectory import (
@@ -48,10 +49,30 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "OmniAgentLoopWorker",
+    "OmniAgentLoopWorkerTQ",
     "OmniAgentLoopManager",
     "split_assistant_rollouts",
     "split_rollout_turns",
 ]
+
+
+def _transfer_queue_enabled(config) -> bool:
+    """Return whether V1 TaskRunner has flipped TransferQueue on for this run."""
+    if config is None:
+        return False
+    try:
+        return bool(config.transfer_queue.enable)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _unwrap_ray_actor(cls):
+    """Return the implementation class behind a ``@ray.remote`` actor wrapper."""
+    meta = getattr(cls, "__ray_metadata__", None)
+    inner = getattr(meta, "modified_class", None) if meta is not None else None
+    if inner is None:
+        raise TypeError(f"cannot unwrap Ray actor class: {cls!r}")
+    return inner
 
 
 def _stamp_scorer_knobs(batch, config) -> None:
@@ -101,23 +122,26 @@ def _stamp_scorer_knobs(batch, config) -> None:
     ntb["extra_info"] = stamped
 
 
-class OmniAgentLoopWorker(AgentLoopWorker):
-    """Bind trajectory Hydra knobs and pass step kwargs into the agent loop.
+class OmniAgentLoopMixin:
+    """Bind Hydra knobs and stamp trajectory kwargs shared by DataProto and TQ workers.
 
-    Overrides must live here: ``AgentLoopManager.generate_sequences`` dispatches
-    to Ray workers. Hermes / ``image_gen.py`` bind is gated on
+    Overrides must live on the Ray worker: ``generate_sequences`` dispatches
+    remotely. Hermes / ``image_gen.py`` bind is gated on
     ``default_agent_loop == image_gen_tool_agent`` and only fills unset keys.
     """
 
     _AGENTIC_TOOL_FORMAT = "hermes"
     _AGENTIC_FUNCTION_TOOLS = Path(__file__).resolve().parents[1] / "tools" / "image_gen.py"
 
-    def __init__(self, config, *args, **kwargs):
+    def _bind_agentic_rollout_config(self, config) -> None:
         from omegaconf import open_dict
+
+        from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
 
         # Bind by path string only — importing image_gen.py would double-register tools.
         bind_run_artifacts(config)
         bind_agentic_image_gen(config)
+        self._agentic_scorer_bind = merge_agentic_scorer_knobs
         default_loop = None
         try:
             default_loop = config.actor_rollout_ref.rollout.agent.get("default_agent_loop")
@@ -136,7 +160,6 @@ class OmniAgentLoopWorker(AgentLoopWorker):
                     mt.function_tool_path = str(tool_path)
                 if not mt.get("format"):
                     mt.format = self._AGENTIC_TOOL_FORMAT
-        super().__init__(config, *args, **kwargs)
 
     async def _run_agent_loop(
         self,
@@ -160,6 +183,10 @@ class OmniAgentLoopWorker(AgentLoopWorker):
         kwargs["_agentic_step"] = trajectory["step"]
         kwargs["_agentic_validate"] = trajectory["validate"]
         kwargs["_agentic_trajectory_relpath"] = relpath
+        extra = kwargs.get("extra_info")
+        stamp = getattr(self, "_agentic_scorer_bind", None)
+        if stamp is not None:
+            kwargs["extra_info"] = stamp(extra if isinstance(extra, dict) else {}, self.config)
         try:
             return await super()._run_agent_loop(
                 sampling_params,
@@ -173,15 +200,42 @@ class OmniAgentLoopWorker(AgentLoopWorker):
             reset_active_trajectory_relpath(path_token)
 
 
+class OmniAgentLoopWorker(OmniAgentLoopMixin, AgentLoopWorker):
+    """DataProto / legacy worker used by L2 GPU smoke and ``trainer.use_v1=false``."""
+
+    def __init__(self, config, *args, **kwargs):
+        self._bind_agentic_rollout_config(config)
+        super().__init__(config, *args, **kwargs)
+
+
+_AgentLoopWorkerTQImpl = _unwrap_ray_actor(AgentLoopWorkerTQ)
+
+
+class OmniAgentLoopWorkerTQImpl(OmniAgentLoopMixin, _AgentLoopWorkerTQImpl):
+    """V1 TransferQueue worker: bind tools, then put outputs into the queue."""
+
+    def __init__(self, config, *args, **kwargs):
+        self._bind_agentic_rollout_config(config)
+        super().__init__(config, *args, **kwargs)
+
+
+OmniAgentLoopWorkerTQ = ray.remote(OmniAgentLoopWorkerTQImpl)
+
+
 class OmniAgentLoopManager(AgentLoopManager):
     """Use stock rollout management, dump outputs, and mask invalid rollouts."""
 
     def __init__(self, *args, **kwargs):
         # Must set before AgentLoopManager.__init__ creates Ray workers.
-        self.agent_loop_workers_class = ray.remote(OmniAgentLoopWorker)
         config = kwargs.get("config")
         if config is None and args:
             config = args[0]
+        # V1 TaskRunner sets transfer_queue.enable=True and passes TensorDict.
+        # DataProto GPU smoke / v0 keep OmniAgentLoopWorker.
+        if _transfer_queue_enabled(config):
+            self.agent_loop_workers_class = OmniAgentLoopWorkerTQ
+        else:
+            self.agent_loop_workers_class = ray.remote(OmniAgentLoopWorker)
         if config is not None:
             bind_run_artifacts(config)
             bind_agentic_image_gen(config)
@@ -194,13 +248,25 @@ class OmniAgentLoopManager(AgentLoopManager):
         """Run stock generate, dump, discard invalid rows, and emit rollout metrics.
 
         Args:
-            prompts: ``DataProto`` batch from the trainer.
+            prompts: ``DataProto`` (legacy / GPU smoke) or V1 ``TensorDict``.
+                V1 workers put results into TransferQueue and this method
+                returns ``None``.
 
         Returns:
             ``DataProto`` with invalid rollouts masked and metrics on
-            ``meta_info["agentic_metrics"]`` and ``meta_info["timing"]``.
-            Each row ``extra_info`` also carries ``SCORER_KNOB_KEYS``.
+            ``meta_info["agentic_metrics"]`` and ``meta_info["timing"]``, or
+            ``None`` on the V1 TensorDict path.
+            Each DataProto row ``extra_info`` also carries ``SCORER_KNOB_KEYS``.
         """
+        if not hasattr(prompts, "meta_info"):
+            chunks = prompts.chunk(len(self.agent_loop_workers))
+            ray.get(
+                [
+                    worker.generate_sequences.remote(chunk)
+                    for worker, chunk in zip(self.agent_loop_workers, chunks, strict=False)
+                ]
+            )
+            return None
         step = prompts.meta_info.get("global_steps")
         # Stamp inbound rows first: default RayPPOTrainer enables agent_reward_loop
         # (no RM), so AgentLoopWorker._compute_score.remote runs during generate

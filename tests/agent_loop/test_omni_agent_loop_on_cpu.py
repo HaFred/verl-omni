@@ -152,6 +152,27 @@ def test_inbound_stamp_reaches_compute_score_kwargs(monkeypatch):
     out_extra = output.non_tensor_batch["extra_info"][0]
     assert out_extra["vllm_url"] == "http://cli"
     assert out_extra["good_enough_threshold"] == 0.55
+def test_manager_v1_tensordict_dispatches_without_meta_info(monkeypatch):
+    import torch
+    from tensordict import TensorDict
+
+    chunks = []
+
+    class _Remote:
+        def remote(self, chunk):
+            chunks.append(chunk)
+            return "ref"
+
+    class _Worker:
+        generate_sequences = _Remote()
+
+    monkeypatch.setattr(omni_agent_loop.ray, "get", lambda refs: refs)
+    manager = OmniAgentLoopManager.__new__(OmniAgentLoopManager)
+    manager.agent_loop_workers = [_Worker()]
+    batch = TensorDict({"input_ids": torch.zeros(2, 1, dtype=torch.int64)}, batch_size=[2])
+    assert OmniAgentLoopManager.generate_sequences(manager, batch) is None
+    assert len(chunks) == 1
+    assert chunks[0].batch_size == torch.Size([2])
 
 
 def test_stamp_scorer_knobs_does_not_override_row_values():
