@@ -110,6 +110,33 @@ def test_generate_image_blocked_after_yes(tmp_path):
     assert metrics["blocked_after_yes"] == 1
 
 
+def test_good_enough_yes_latch_does_not_key_on_recycled_thread_ident():
+    """No rollout/task scope → the shared latch dict must stay untouched.
+
+    Thread-pool idents are recycled; keying the cross-context latch on
+    ``threading.get_ident()`` let a YES set from an executor thread survive the
+    loop's ``clear`` (different ident) and bleed into the next sample.
+    """
+    import threading
+
+    from verl_omni.tools.trajectory import judge_latch
+
+    tokens = trajectory.set_active_trajectory_relpath(None)
+    try:
+        before = dict(judge_latch._good_enough_yes_by_scope)
+        worker = threading.Thread(target=judge_latch.set_good_enough_yes_reached, args=(True,))
+        worker.start()
+        worker.join()
+        # Executor-thread set must not mint a recycled-ident scope entry.
+        assert not any(isinstance(k, tuple) and k and k[0] == "thread" for k in judge_latch._good_enough_yes_by_scope)
+        assert judge_latch._good_enough_yes_by_scope == before
+        # And the parent context does not inherit the executor thread's YES.
+        assert judge_latch.get_good_enough_yes_reached() is False
+    finally:
+        judge_latch.clear_good_enough_yes_reached()
+        trajectory.reset_active_trajectory_relpath(tokens)
+
+
 def test_generate_image_blocked_after_max_passes(tmp_path):
     _bind_tool_cfg(e2e_root=tmp_path, run_name="cpu_test", max_generate_image_passes=1)
     png = tmp_path / "image.png"

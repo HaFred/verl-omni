@@ -54,8 +54,15 @@ __all__ = [
 ]
 
 
-def _stamp_scorer_knobs(batch, config) -> None:
-    """Copy composed ``SCORER_KNOB_KEYS`` onto each sample ``extra_info``.
+def _stamp_reward_context(batch, config) -> None:
+    """Stamp reward-side inputs onto each sample ``extra_info``.
+
+    Copies composed ``SCORER_KNOB_KEYS`` (judge knobs) plus the resolved
+    ``rollout_images_root``. Reward actors run in Ray processes that never bind
+    Hydra ``config`` or ``tools.trajectory``, so both must travel on the row:
+    the knobs let ``compute_score`` avoid yaml-filling, and the images root lets
+    its ``call_reflect_vlm`` fallback resolve the last generated PNG when the
+    trajectory has no parseable ``judge_image`` observation.
 
     Args:
         batch: ``DataProto`` (or test stub) with ``non_tensor_batch``. Used for
@@ -69,9 +76,13 @@ def _stamp_scorer_knobs(batch, config) -> None:
     """
     import numpy as np
 
+    from verl_omni.tools.trajectory import resolve_rollout_images_root
     from verl_omni.tools.trajectory.hydra_env import agentic_scorer_knobs_from_config
 
     knobs = agentic_scorer_knobs_from_config(config)
+    # Same root the frozen tool writes under; reward fallback only accepts PNGs
+    # confined to it. Harmless when the reward process cannot read the path.
+    knobs["rollout_images_root"] = str(resolve_rollout_images_root())
     ntb = getattr(batch, "non_tensor_batch", None)
     if ntb is None:
         batch.non_tensor_batch = {}
@@ -199,17 +210,18 @@ class OmniAgentLoopManager(AgentLoopManager):
         Returns:
             ``DataProto`` with invalid rollouts masked and metrics on
             ``meta_info["agentic_metrics"]`` and ``meta_info["timing"]``.
-            Each row ``extra_info`` also carries ``SCORER_KNOB_KEYS``.
+            Each row ``extra_info`` also carries ``SCORER_KNOB_KEYS`` and
+            ``rollout_images_root``.
         """
         step = prompts.meta_info.get("global_steps")
         # Stamp inbound rows first: default RayPPOTrainer enables agent_reward_loop
         # (no RM), so AgentLoopWorker._compute_score.remote runs during generate
         # on kwargs built from this extra_info. Post-hoc output stamp is too late.
-        _stamp_scorer_knobs(prompts, self.config)
+        _stamp_reward_context(prompts, self.config)
         output = super().generate_sequences(prompts)
         # Streaming _postprocess does not copy input extra_info; stamp output too
         # so NaiveRewardManager / dumps still see composed knobs.
-        _stamp_scorer_knobs(output, self.config)
+        _stamp_reward_context(output, self.config)
         # Dump before discard: discard zeros response_mask and hides tool-less prose.
         dump_raw_rollouts(tokenizer=self._monitor_tokenizer, output=output, step=step)
         discard_invalid_rollouts(output)

@@ -244,7 +244,11 @@ def _rollout_image_roots(extra_info: dict[str, Any]) -> list[Path]:
 
     Roots must arrive on ``extra_info`` (``rollout_images_root`` /
     ``agentic_images_root`` + optional ``trajectory_relpath``). Reward workers
-    never bind tools.trajectory — do not import it here.
+    never bind tools.trajectory — do not import it here. The driver stamps
+    ``rollout_images_root`` in ``OmniAgentLoopManager.generate_sequences`` via
+    ``_stamp_reward_context``; if the reward process cannot read that path
+    (remote node, different mount) ``call_reflect_vlm`` fail-closes to
+    ``(None, None, ...)`` and C/A stay 0.0.
     """
     roots: list[Path] = []
     explicit = str(extra_info.get("rollout_images_root") or extra_info.get("agentic_images_root") or "").strip()
@@ -319,11 +323,17 @@ _AGENTIC_JUDGE_OK_RE = re.compile(r"\bagentic_judge\s+ok=1\b", re.IGNORECASE)
 _AGENTIC_JUDGE_PARSE_FAIL_RE = re.compile(r"\bagentic_judge\s+ok=0\b|\bparse_ok\s*=\s*0\b", re.IGNORECASE)
 
 
-def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] | None = None) -> tuple[int, int, float]:
-    """Return ``(n_ok, n_fail, parse_ok_rate)`` from trajectory judge observations.
+def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] | None = None) -> tuple[int, int]:
+    """Return ``(n_ok, n_fail)`` from trajectory judge observations.
 
     Markers that are not after a parsed ``judge_image`` ``<tool_call>`` are ignored
     so assistant prose cannot mint parse-ok counts.
+
+    Only the integer counts travel in the reward dict. The trainer reduces every
+    reward-extra key with ``np.mean`` (``process_validation_metrics``), which
+    raises on ``None``, so the rate is *derived* in ``AgenticRewardMetrics``
+    instead — there a zero-judge rollout can honestly report ``null`` without
+    poisoning a numeric reduction.
     """
     blob = text or ""
     parsed_calls = calls if calls is not None else _extract_tool_calls(blob)
@@ -339,9 +349,7 @@ def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] |
         for match in _AGENTIC_JUDGE_PARSE_FAIL_RE.finditer(blob):
             if _follows_judge_image_call(match.start(), parsed_calls):
                 n_fail += 1
-    n_attempts = n_ok + n_fail
-    rate = float(n_ok) / float(n_attempts) if n_attempts else 1.0
-    return n_ok, n_fail, rate
+    return n_ok, n_fail
 
 
 def _good_enough_from_window(window: str) -> bool | None:
@@ -549,7 +557,7 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
         "num_judge_image_calls": 0,
         "judge_parse_ok": 0,
         "judge_parse_fail": 0,
-        "judge_parse_ok_rate": 1.0,
+        # No rate key: see ``_judge_parse_stats`` — ``AgenticRewardMetrics`` derives it.
         "protocol_ok": 0,
         "rewrite_after_yes": 0,
         "reward_delta_c": 0.0,
@@ -679,7 +687,7 @@ def compute_score(
         image_prompt=prompts[-1] if prompts else "",
         extra_info=extra_info,
     )
-    n_judge_ok, n_judge_fail, judge_parse_rate = _judge_parse_stats(blob, calls)
+    n_judge_ok, n_judge_fail = _judge_parse_stats(blob, calls)
     # No successful parse anywhere → keep C/A at 0 (do not invent scores).
     if last_c is None and last_a is None and n_judge_fail > 0 and n_judge_ok == 0:
         last_c, last_a = 0.0, 0.0
@@ -787,7 +795,8 @@ def compute_score(
         "num_judge_image_calls": int(n_reflect),
         "judge_parse_ok": int(n_judge_ok),
         "judge_parse_fail": int(n_judge_fail),
-        "judge_parse_ok_rate": float(judge_parse_rate),
+        # No rate key here: the trainer np.means every reward-extra key and raises
+        # on None. ``AgenticRewardMetrics`` derives the rate (None when zero judges).
         "protocol_ok": int(protocol_ok),
         "rewrite_after_yes": int(n_rewrite_after_yes),
         "rollout_valid": 1,

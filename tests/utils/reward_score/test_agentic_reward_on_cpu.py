@@ -22,6 +22,7 @@ score ∝ w_tool_call * f_tool_call
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -469,3 +470,117 @@ def test_compute_score_merges_scorer_knobs_into_extra_info(monkeypatch):
     agentic_reward.compute_score(solution_str=text, extra_info={"w_tool_call": 0.1})
     assert captured["merged"]["good_enough_threshold"] == 0.80
     assert captured["merged"]["w_tool_call"] == 0.1
+
+
+def test_judge_parse_ok_rate_is_derived_and_trainer_safe():
+    """Zero judge attempts must not report a perfect rate — and must not crash training.
+
+    Locks two hazards at once (audit modules D + A one-hop):
+      * a rollout that never calls ``judge_image`` has no parse health, so ``1.0``
+        would make the aggregate look perfect exactly when judge calls are missing;
+      * the trainer reduces *every* reward-extra key with ``np.mean``
+        (``verl.trainer.ppo.metric_utils.process_validation_metrics``), which
+        raises ``TypeError`` on ``None`` — so the honest "no measurement" value
+        must live on the dump path only, never inside the reward dict.
+    """
+    from types import SimpleNamespace
+
+    from verl.trainer.ppo.metric_utils import process_validation_metrics
+
+    from verl_omni.utils.metrics_utils import AgenticRewardMetrics, judge_parse_ok_rate
+
+    no_judge = compute_score("smoke", solution_str=_gen())
+    judged = compute_score("smoke", solution_str=_closed())
+    zero = compute_score("smoke", solution_str="")
+    no_gen = compute_score("smoke", solution_str=_judge())
+
+    # 1) The reward dict must stay numeric/str: a single None crashes validation.
+    for result in (no_judge, judged, zero, no_gen):
+        assert all(value is not None for value in result.values()), "None leaked into the reward dict"
+        assert "judge_parse_ok_rate" not in result
+        assert isinstance(result["judge_parse_ok"], int)
+        assert isinstance(result["judge_parse_fail"], int)
+    assert no_judge["judge_parse_ok"] == 0
+    assert no_judge["judge_parse_fail"] == 0
+    assert no_judge["num_judge_image_calls"] == 0
+    assert set(no_judge) == set(judged), "same code path must emit the same keys"
+
+    # 2) Counts are the SoT; the derived rate is None only when nothing was attempted.
+    assert judge_parse_ok_rate(0, 0) is None
+    assert judge_parse_ok_rate(0, 3) == pytest.approx(0.0)
+    assert judge_parse_ok_rate(2, 0) == pytest.approx(1.0)
+    assert judged["judge_parse_ok"] >= 1
+
+    # 3) Per-row dump keeps the honest value (JSON null), never a fake 1.0.
+    output = SimpleNamespace(
+        batch=None,
+        non_tensor_batch={
+            "judge_parse_ok": [no_judge["judge_parse_ok"], judged["judge_parse_ok"]],
+            "judge_parse_fail": [no_judge["judge_parse_fail"], judged["judge_parse_fail"]],
+        },
+    )
+    row0 = AgenticRewardMetrics.for_rollout(output, 0)
+    row1 = AgenticRewardMetrics.for_rollout(output, 1)
+    assert row0["judge_parse_ok_rate"] is None
+    assert json.loads(json.dumps(row0))["judge_parse_ok_rate"] is None
+    assert row1["judge_parse_ok_rate"] == pytest.approx(1.0)
+
+    # 4) Real-path lock: the pinned validation reduction must not raise on these rows.
+    # ``data_sources``/``sample_uids`` are per-sample; two rollouts of one prompt
+    # share a uid, as GRPO groups them, so the reduction sees n_resps == 2.
+    infos_dict = {key: [no_judge[key], judged[key]] for key in no_judge}
+    reduced = process_validation_metrics(["src", "src"], ["uid1", "uid1"], infos_dict)
+    assert reduced["src"]["judge_parse_ok"]["mean@2"] == pytest.approx(
+        (no_judge["judge_parse_ok"] + judged["judge_parse_ok"]) / 2.0
+    )
+
+    # 5) Pooled parse health is still emitted for loggers (zero-attempt rows skipped).
+    pooled = AgenticRewardMetrics.aggregate(output.non_tensor_batch)
+    attempts = judged["judge_parse_ok"] + judged["judge_parse_fail"]
+    assert pooled["agentic_rollout/judge_parse_ok_rate/mean"] == pytest.approx(judged["judge_parse_ok"] / attempts)
+
+
+def test_stamped_rollout_images_root_enables_vl_fallback(tmp_path, monkeypatch):
+    """Driver-stamped ``rollout_images_root`` reaches the reward VL fallback.
+
+    ``OmniAgentLoopManager.generate_sequences`` stamps this key before worker
+    dispatch; without it ``_confined_generate_image_path`` never resolves and
+    ``call_reflect_vlm`` is dead code on the default trainer path.
+    """
+    from types import SimpleNamespace
+
+    import numpy as np
+    from omegaconf import OmegaConf
+
+    import verl_omni.tools.trajectory as trajectory_pkg
+    from verl_omni.agent_loop.omni_agent_loop import _stamp_reward_context
+
+    Image = pytest.importorskip("PIL.Image")
+    root = tmp_path / "rollout_images"
+    rel = "step_000001/sample_0.00"
+    (root / rel).mkdir(parents=True)
+    png = root / rel / "image_00_deadbeef.png"
+    Image.new("RGB", (1, 1), (1, 2, 3)).save(png)
+    monkeypatch.setattr(trajectory_pkg, "resolve_rollout_images_root", lambda: root)
+
+    called: list[str] = []
+
+    def _capture(**kwargs):
+        called.append(str(kwargs.get("image_path") or ""))
+        return {"correctness": 0.80, "aesthetics": 0.70}
+
+    monkeypatch.setattr(agentic_reward, "call_reflect_vlm", _capture)
+
+    batch = SimpleNamespace(non_tensor_batch={"extra_info": np.array([{}], dtype=object)})
+    _stamp_reward_context(
+        batch,
+        OmegaConf.create({"agentic_image_gen": {"vllm_url": "http://cli", "good_enough_threshold": 0.55}}),
+    )
+    stamped = batch.non_tensor_batch["extra_info"][0]
+    assert stamped["rollout_images_root"] == str(root)
+
+    traj = _gen(path=str(png)) + "Reflection: judge obs missing, use fallback. Done.\n"
+    out = agentic_reward.compute_score(solution_str=traj, extra_info=dict(stamped))
+    assert called and Path(called[0]).resolve() == png.resolve()
+    assert out["reward_correctness"] == pytest.approx(0.80)
+    assert out["reward_aesthetics"] == pytest.approx(0.70)

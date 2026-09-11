@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -146,21 +147,32 @@ def test_inbound_stamp_reaches_compute_score_kwargs(monkeypatch):
     assert extra["vllm_url"] == "http://cli"
     assert extra["good_enough_threshold"] == 0.55
     assert extra["w_tool_call"] == 0.1
+    # Images root travels with the knobs so the reward VL fallback can fire.
+    assert isinstance(extra["rollout_images_root"], str) and extra["rollout_images_root"]
     assert captured["remote_extra"]["vllm_url"] == "http://cli"
     assert captured["remote_extra"]["good_enough_threshold"] == 0.55
+    assert captured["remote_extra"]["rollout_images_root"] == extra["rollout_images_root"]
     # Output stamp still fills knobs after streaming postprocess dropped extra_info.
     out_extra = output.non_tensor_batch["extra_info"][0]
     assert out_extra["vllm_url"] == "http://cli"
     assert out_extra["good_enough_threshold"] == 0.55
+    assert out_extra["rollout_images_root"] == extra["rollout_images_root"]
 
 
-def test_stamp_scorer_knobs_does_not_override_row_values():
+def test_stamp_reward_context_does_not_override_row_values(monkeypatch):
     from omegaconf import OmegaConf
 
+    import verl_omni.tools.trajectory as trajectory_pkg
+
+    monkeypatch.setattr(trajectory_pkg, "resolve_rollout_images_root", lambda: Path("/run/root/rollout_images"))
     output = SimpleNamespace(
-        non_tensor_batch={"extra_info": np.array([{"vllm_url": "http://row", "w_done": 0.2}], dtype=object)}
+        non_tensor_batch={
+            "extra_info": np.array(
+                [{"vllm_url": "http://row", "rollout_images_root": "/row/root", "w_done": 0.2}], dtype=object
+            )
+        }
     )
-    omni_agent_loop._stamp_scorer_knobs(
+    omni_agent_loop._stamp_reward_context(
         output,
         OmegaConf.create({"agentic_image_gen": {"vllm_url": "http://cli", "good_enough_threshold": 0.55}}),
     )
@@ -168,6 +180,35 @@ def test_stamp_scorer_knobs_does_not_override_row_values():
     assert extra["vllm_url"] == "http://row"
     assert extra["good_enough_threshold"] == 0.55
     assert extra["w_done"] == 0.2
+    # Driver fills the images root when the row has none; a row value wins.
+    assert extra["rollout_images_root"] == "/row/root"
+
+    fresh = SimpleNamespace(non_tensor_batch={"extra_info": np.array([{}], dtype=object)})
+    omni_agent_loop._stamp_reward_context(
+        fresh,
+        OmegaConf.create({"agentic_image_gen": {"vllm_url": "http://cli", "good_enough_threshold": 0.55}}),
+    )
+    assert fresh.non_tensor_batch["extra_info"][0]["rollout_images_root"] == "/run/root/rollout_images"
+
+
+def test_materialize_rollout_images_ignores_stub_no_image_txt(tmp_path):
+    """A live failure stub must not be indexed as a generated rollout image."""
+    from verl_omni.utils.agentic.image_gen_rollout_dump import materialize_rollout_images
+
+    relpath = "step_000001/sample_0.00"
+    target = tmp_path / "rollout_images" / relpath
+    target.mkdir(parents=True)
+    # Matches the tool's stub name/extension in ``image_gen._save_images``.
+    (target / "STUB_NO_IMAGE_00_deadbeef.txt").write_text("No PNG produced.\n")
+
+    images = materialize_rollout_images(
+        decoded_response="",
+        run_dir=tmp_path,
+        relpath=relpath,
+        user_prompt="draw a cafe poster",
+    )
+    assert images == []
+    assert not (target / "meta.json").exists()
 
 
 def test_turn_kind_stop_rewrite_and_continue():

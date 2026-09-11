@@ -36,8 +36,18 @@ _good_enough_yes_lock = threading.Lock()
 _good_enough_yes_by_scope: dict[object, bool] = {}
 
 
-def _rollout_scope_key() -> object:
-    """Stable key for the active agent rollout (prefer rollout_id)."""
+def _rollout_scope_key() -> object | None:
+    """Stable cross-context key for the active agent rollout, or ``None``.
+
+    Prefers ``rollout_id`` (bound per rollout by the worker/loop) and falls back
+    to the running asyncio task. There is deliberately **no** OS-thread fallback:
+    ``threading.get_ident()`` is recycled once a pool thread exits, and a tool
+    that sets the latch from an executor thread would key it on a *different*
+    ident than the loop's ``clear`` — leaking YES into the next sample scheduled
+    onto that ident. Without a rollout/task scope the shared dict is unused and
+    the ``ContextVar`` alone governs the current context (sync tests / legacy
+    standalone calls).
+    """
     rid = get_active_rollout_id()
     if rid:
         return ("rollout", rid)
@@ -49,8 +59,7 @@ def _rollout_scope_key() -> object:
             return ("task", id(task))
     except RuntimeError:
         pass
-    # Sync unit tests with no task / rollout_id: isolate by OS thread.
-    return ("thread", threading.get_ident())
+    return None
 
 
 def set_good_enough_yes_reached(reached: bool) -> contextvars.Token:
@@ -64,11 +73,12 @@ def set_good_enough_yes_reached(reached: bool) -> contextvars.Token:
     """
     flag = bool(reached)
     key = _rollout_scope_key()
-    with _good_enough_yes_lock:
-        if flag:
-            _good_enough_yes_by_scope[key] = True
-        else:
-            _good_enough_yes_by_scope.pop(key, None)
+    if key is not None:
+        with _good_enough_yes_lock:
+            if flag:
+                _good_enough_yes_by_scope[key] = True
+            else:
+                _good_enough_yes_by_scope.pop(key, None)
     return _good_enough_yes_reached.set(flag)
 
 
@@ -81,6 +91,8 @@ def get_good_enough_yes_reached() -> bool:
     if _good_enough_yes_reached.get():
         return True
     key = _rollout_scope_key()
+    if key is None:
+        return False
     with _good_enough_yes_lock:
         return bool(_good_enough_yes_by_scope.get(key, False))
 
@@ -92,6 +104,7 @@ def clear_good_enough_yes_reached() -> None:
         None.
     """
     key = _rollout_scope_key()
-    with _good_enough_yes_lock:
-        _good_enough_yes_by_scope.pop(key, None)
+    if key is not None:
+        with _good_enough_yes_lock:
+            _good_enough_yes_by_scope.pop(key, None)
     _good_enough_yes_reached.set(False)

@@ -24,7 +24,30 @@ import torch
 __all__ = [
     "AgenticRewardMetrics",
     "GroupedMetricMean",
+    "judge_parse_ok_rate",
 ]
+
+
+def judge_parse_ok_rate(n_ok: int, n_fail: int) -> float | None:
+    """Parse-health rate for one rollout, or ``None`` when no judge was attempted.
+
+    Single source of truth for the derived metric. It is computed here rather
+    than in ``compute_score`` because the trainer reduces every reward-extra key
+    with ``np.mean`` (``verl.trainer.ppo.metric_utils.process_validation_metrics``),
+    which raises ``TypeError`` on ``None`` — so the honest "absent measurement"
+    value can only live on the per-row dump path, never in the reward dict.
+
+    Args:
+        n_ok: Judge observations that parsed to a real ``judge_image`` call.
+        n_fail: Judge observations that failed to parse.
+
+    Returns:
+        ``n_ok / (n_ok + n_fail)``, or ``None`` when ``n_ok + n_fail == 0``.
+    """
+    attempts = int(n_ok) + int(n_fail)
+    if attempts <= 0:
+        return None
+    return float(n_ok) / float(attempts)
 
 
 class _MetricMeanStats:
@@ -135,7 +158,6 @@ class AgenticRewardMetrics:
         "num_judge_image_calls",
         "judge_parse_ok",
         "judge_parse_fail",
-        "judge_parse_ok_rate",
         "protocol_ok",
         "rewrite_after_yes",
         "reward_delta_c",
@@ -185,10 +207,22 @@ class AgenticRewardMetrics:
             if values.size == 0:
                 continue
             metrics[f"agentic_rollout/{key}/mean"] = float(np.mean(values))
+        # Derived parse health, pooled over rows that actually attempted a judge.
+        # Zero-attempt rows contribute nothing (they are not "0% healthy" either),
+        # and no None ever enters the pinned np.mean reduction.
+        if "judge_parse_ok" in non_tensor_batch and "judge_parse_fail" in non_tensor_batch:
+            try:
+                ok = np.asarray(non_tensor_batch["judge_parse_ok"], dtype=np.float64)
+                fail = np.asarray(non_tensor_batch["judge_parse_fail"], dtype=np.float64)
+            except (TypeError, ValueError):
+                ok = fail = np.zeros(0, dtype=np.float64)
+            attempts = float(ok.sum() + fail.sum())
+            if attempts > 0:
+                metrics["agentic_rollout/judge_parse_ok_rate/mean"] = float(ok.sum()) / attempts
         return metrics
 
     @classmethod
-    def for_rollout(cls, output: Any, index: int) -> dict[str, float | int]:
+    def for_rollout(cls, output: Any, index: int) -> dict[str, float | int | None]:
         """Per-row scorer outputs for one ``hermes_actions`` JSONL record.
 
         Args:
@@ -196,11 +230,14 @@ class AgenticRewardMetrics:
             index: Row index in the batch.
 
         Returns:
-            Compact dict of score and ``ARTIFACT_KEYS`` present on that row.
+            Compact dict of score and ``ARTIFACT_KEYS`` present on that row, plus
+            the derived ``judge_parse_ok_rate``. A derived key is ``None`` when
+            the row carries no measurement for it (zero judge attempts), which
+            JSONL encodes as ``null``.
         """
         if not isinstance(index, int) or index < 0:
             raise IndexError(f"rollout index must be a non-negative int, got {index!r}")
-        metrics: dict[str, float | int] = {}
+        metrics: dict[str, float | int | None] = {}
         batch = getattr(output, "batch", None)
         rm_scores = batch.get("rm_scores") if batch is not None else None
         if rm_scores is not None:
@@ -219,7 +256,18 @@ class AgenticRewardMetrics:
             if row is None:
                 continue
             value = np.asarray(row).reshape(-1)[0]
-            metrics[key] = int(value) if key in cls.INTEGER_KEYS else float(value)
+            if value is None:
+                # Defensive: a None row value stays None so JSONL dumps null
+                # rather than raising in float().
+                metrics[key] = None
+            elif key in cls.INTEGER_KEYS:
+                metrics[key] = int(value)
+            else:
+                metrics[key] = float(value)
+        # Derived, not stored on the row: counts are the SoT (see
+        # ``judge_parse_ok_rate`` for why this must not live in the reward dict).
+        if "judge_parse_ok" in metrics and "judge_parse_fail" in metrics:
+            metrics["judge_parse_ok_rate"] = judge_parse_ok_rate(metrics["judge_parse_ok"], metrics["judge_parse_fail"])
         return metrics
 
     @staticmethod
