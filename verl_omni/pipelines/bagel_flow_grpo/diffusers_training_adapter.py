@@ -31,16 +31,16 @@ from tensordict.tensorclass import NonTensorStack
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_name
 
-from verl_omni.pipelines.model_base import DiffusionModelBase
-from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
-from verl_omni.workers.config import DiffusionModelConfig
-
 from verl_omni.pipelines.bagel_flow_grpo.bagel_corl import (
     BagelForCoRL,
     dual_lora_param_groups,
     validate_disjoint_lora_targets,
 )
 from verl_omni.pipelines.bagel_flow_grpo.bagel_model import BagelForTraining, get_flattened_position_ids
+from verl_omni.pipelines.model_base import DiffusionModelBase
+from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
+from verl_omni.workers.config import DiffusionModelConfig
+
 from .common import BAGEL_FLOWGRPO_CFG_DEFAULTS, setup_bagel_sigmas
 
 logger = logging.getLogger(__name__)
@@ -59,10 +59,15 @@ class BagelDiffusion(DiffusionModelBase):
 
     @classmethod
     def get_optimizer_param_groups(cls, module, model_config: DiffusionModelConfig):
-        """Two optimizer param groups (UND LoRA vs GEN LoRA) when Co-RL dual LoRA is enabled."""
+        """Two optimizer param groups (UND LoRA vs GEN LoRA) when Co-RL dual LoRA is enabled.
+
+        ``lr_gen`` (model config) overrides the GEN group's LR — the UniGRPO
+        per-expert pattern (text 1e-6 vs denoise 3e-5); ``None`` keeps the base
+        ``actor.optim.lr`` for both groups.
+        """
         if model_config.get("composite_mode") != "bagel_corl":
             return None
-        return dual_lora_param_groups(module)
+        return dual_lora_param_groups(module, lr_gen=model_config.get("lr_gen"))
 
     @classmethod
     def configure_train_mode(cls, module):

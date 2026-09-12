@@ -26,20 +26,23 @@ from typing import Any, Callable
 
 import numpy as np
 
-from verl_omni.agent_loop.image_gen_trajectory_context import (
-    build_generate_call_meta,
-    clear_good_enough_yes_reached,
-    get_active_user_prompt,
-    get_good_enough_yes_reached,
-    register_tool_artifact,
-    set_good_enough_yes_reached,
-)
 from verl_omni.agent_loop.rpco_turn_protocol import (
     build_forced_reflection,
     derive_good_enough_from_scores,
     format_rm_scores_as_judge_text,
 )
 
+# Single trajectory-state layer (audit T1.6): the bagel lane shares the Mode-2a
+# tool loop's registry/latch/context under tools.trajectory. The legacy
+# agent_loop/image_gen_trajectory_context module remains only for its own
+# deprecated consumers and must not be imported here.
+from verl_omni.tools.trajectory.artifacts import build_generate_call_meta, register_tool_artifact
+from verl_omni.tools.trajectory.context import get_active_user_prompt
+from verl_omni.tools.trajectory.judge_latch import (
+    clear_good_enough_yes_reached,
+    get_good_enough_yes_reached,
+    set_good_enough_yes_reached,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -249,20 +252,42 @@ def compact_image_observation(path: str) -> str:
     return f"path={path}"
 
 
-def judge_text_from_gen_samples(samples: list[GenSample]) -> str | None:
-    """Average RM scores into Mode-2a judge text for ``build_forced_reflection``."""
+def judge_text_from_gen_samples(
+    samples: list[GenSample],
+    *,
+    reduction: str = "any",
+    threshold: float | None = None,
+) -> str | None:
+    """Reduce RM scores into Mode-2a judge text for ``build_forced_reflection``.
+
+    Args:
+        samples: GEN samples of one ``generate_image`` call (up to ``S`` seeds).
+        reduction: episode-level stop bit over per-seed explicit flags —
+            ``"any"`` (default, best-of-S), ``"all"``, or ``"mean"``
+            (fraction of YES flags >= ``threshold``).
+        threshold: ``good_enough_threshold`` from the single SoT
+            (``agentic_image_gen.good_enough_threshold``); ``None`` keeps the
+            turn-protocol default for callers that did not wire the knob.
+    """
     scores = [float(s.rm_score) for s in samples if s.valid and s.rm_score is not None]
     if not scores:
         return None
     mean = float(sum(scores) / len(scores))
     explicit = [bool(s.good_enough) for s in samples if s.good_enough is not None]
     if explicit:
-        good_enough = any(explicit)
+        if reduction == "all":
+            good_enough = all(explicit)
+        elif reduction == "mean":
+            effective_threshold = float(threshold) if threshold is not None else 0.7
+            good_enough = (sum(1.0 for flag in explicit if flag) / len(explicit)) >= effective_threshold
+        else:
+            good_enough = any(explicit)
     else:
         good_enough = derive_good_enough_from_scores(
             correctness=mean,
             aesthetics=mean,
             similarity=None,
+            **({"threshold": float(threshold)} if threshold is not None else {}),
         )
     for sample in samples:
         if sample.good_enough is None:
@@ -293,7 +318,7 @@ def turn_histogram(turns: list[int]) -> dict[str, float]:
     arr = np.asarray(turns, dtype=np.float64)
     p95 = float(np.percentile(arr, 95))
     max_t = float(arr.max())
-    tail = float(np.mean(arr >= max(p95, 1.0))) if max_t > 0 else 0.0
+    tail = float(np.mean(arr > p95)) if max_t > 0 else 0.0
     return {
         "turns_per_episode/mean": float(arr.mean()),
         "turns_per_episode/p50": float(np.percentile(arr, 50)),
@@ -318,6 +343,8 @@ async def run_serial_episode(
     forced_reflection_text: str = "Done.",
     episode_uid: str | None = None,
     non_image_reward: float | None = None,
+    good_enough_threshold: float | None = None,
+    good_enough_reduction: str = "any",
 ) -> EpisodeRollout:
     """Serial UND turn(s) → optional one GEN turn (S FlowGRPO seeds) → RM → reflection / Done.
 
@@ -392,7 +419,10 @@ async def run_serial_episode(
                 scored = await scored
             call_samples = scored
 
-        gen_samples = call_samples
+        # Accumulate — every generate_image call contributes its S seeds to the
+        # episode (RFC: all K calls survive to gen_batch). Replacing the list here
+        # silently dropped all but the last call's trajectories for K > 1.
+        gen_samples.extend(call_samples)
 
         if valid_paths:
             used_image_credit = True
@@ -413,7 +443,11 @@ async def run_serial_episode(
                 maybe_text = await maybe_text
             judge_text = maybe_text
         if not judge_text:
-            judge_text = judge_text_from_gen_samples(call_samples)
+            judge_text = judge_text_from_gen_samples(
+                call_samples,
+                reduction=good_enough_reduction,
+                threshold=good_enough_threshold,
+            )
 
         if judge_text:
             remaining = generate_tool.remaining_passes()
@@ -559,31 +593,39 @@ def flatten_multiturn_rollouts(
         valid = [s for s in episode.gen_samples if s.valid]
         if not valid:
             continue
-        if len(valid) != expected_s:
-            dropped_incomplete += 1
-            continue
+        # Group by gen_group_uid — every complete call (exactly S valid seeds)
+        # contributes its rows; a K>1 episode keeps ALL of its calls. Demanding
+        # len(valid) == expected_s for the whole episode was a K=1 assumption that
+        # silently dropped every multi-call episode.
+        groups: dict[str, list[GenSample]] = {}
         for sample in valid:
-            gen_batch.append(
-                {
-                    "gen_group_uid": sample.gen_group_uid,
-                    "gen_sample_uid": sample.gen_sample_uid,
-                    "seed_index": sample.seed_index,
-                    "prompt_token_ids": list(sample.prompt_token_ids),
-                    "all_latents": sample.all_latents,
-                    "timesteps": sample.timesteps,
-                    "rollout_log_probs": sample.rollout_log_probs,
-                    "rm_score": sample.rm_score,
-                    "call_role": sample.call_role,
-                }
-            )
-            gen_episode_map.append(
-                {
-                    "und_index": und_index,
-                    "episode_uid": episode.episode_uid,
-                    "gen_sample_uid": sample.gen_sample_uid,
-                    "gen_group_uid": sample.gen_group_uid,
-                }
-            )
+            groups.setdefault(str(sample.gen_group_uid), []).append(sample)
+        for rows in groups.values():
+            if len(rows) != expected_s:
+                dropped_incomplete += 1
+                continue
+            for sample in sorted(rows, key=lambda s: int(s.seed_index)):
+                gen_batch.append(
+                    {
+                        "gen_group_uid": sample.gen_group_uid,
+                        "gen_sample_uid": sample.gen_sample_uid,
+                        "seed_index": sample.seed_index,
+                        "prompt_token_ids": list(sample.prompt_token_ids),
+                        "all_latents": sample.all_latents,
+                        "timesteps": sample.timesteps,
+                        "rollout_log_probs": sample.rollout_log_probs,
+                        "rm_score": sample.rm_score,
+                        "call_role": sample.call_role,
+                    }
+                )
+                gen_episode_map.append(
+                    {
+                        "und_index": und_index,
+                        "episode_uid": episode.episode_uid,
+                        "gen_sample_uid": sample.gen_sample_uid,
+                        "gen_group_uid": sample.gen_group_uid,
+                    }
+                )
 
     metrics = {
         "gen/dropped_incomplete_groups": float(dropped_incomplete),
@@ -598,6 +640,51 @@ def flatten_multiturn_rollouts(
         gen_episode_map=gen_episode_map,
         metrics=metrics,
     )
+
+
+def aggregate_episode_metrics(records: list[Any]) -> dict[str, float]:
+    """Batch-aggregate per-episode metrics into step-level logging values.
+
+    Per-episode ``J``/``K`` must be **averaged over the sibling batch**, and
+    ``gen/dropped_incomplete_groups`` summed — first-row-wins collapse hides every
+    episode but one (audit module A). Records are the UND TQ rows (``{"fields": …}``
+    or plain field dicts) carrying ``episode_J`` / ``episode_K`` and the
+    ``bagel_corl_metrics`` blob written by ``pack_dual_lane_episode``.
+    """
+    j_values: list[float] = []
+    k_values: list[float] = []
+    dropped = 0.0
+    no_credit_flags: list[float] = []
+    skipped_flags: list[float] = []
+    for rec in records:
+        fields = rec.get("fields") if isinstance(rec, dict) else rec
+        if not isinstance(fields, dict):
+            fields = {}
+        metrics = fields.get("bagel_corl_metrics")
+        if not isinstance(metrics, dict):
+            metrics = {}
+        j = fields.get("episode_J", metrics.get("episode/J"))
+        k = fields.get("episode_K", metrics.get("episode/K"))
+        if j is not None:
+            j_values.append(float(j))
+        if k is not None:
+            k_values.append(float(k))
+        dropped += float(metrics.get("gen/dropped_incomplete_groups", 0.0) or 0.0)
+        if "und/no_image_credit" in metrics:
+            no_credit_flags.append(float(metrics["und/no_image_credit"] or 0.0))
+        if "gen/skipped_no_groups" in metrics:
+            skipped_flags.append(float(metrics["gen/skipped_no_groups"] or 0.0))
+    aggregated: dict[str, float] = {}
+    if j_values:
+        aggregated["episode/J"] = float(sum(j_values) / len(j_values))
+    if k_values:
+        aggregated["episode/K"] = float(sum(k_values) / len(k_values))
+    aggregated["gen/dropped_incomplete_groups"] = float(dropped)
+    if no_credit_flags:
+        aggregated["und/no_image_credit"] = float(sum(no_credit_flags) / len(no_credit_flags))
+    if skipped_flags:
+        aggregated["gen/skipped_no_groups"] = float(sum(skipped_flags) / len(skipped_flags))
+    return aggregated
 
 
 def _as_gen_sample(item: Any) -> GenSample | None:

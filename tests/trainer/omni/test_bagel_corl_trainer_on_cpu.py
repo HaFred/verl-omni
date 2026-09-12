@@ -528,3 +528,267 @@ def test_fetch_gen_records_raises_without_partition_id():
     und_records = [{"fields": {"child_gen_keys": ["k0::gen::c::0"]}}]
     with pytest.raises(RuntimeError, match="no partition_id"):
         trainer._fetch_gen_records_by_keys(batch, und_records)
+
+
+# ---------------------------------------------------------------------------
+# PR2 (M2): lane weights, per-group LRs, real-shape TQ normalize, ragged edges.
+# ---------------------------------------------------------------------------
+
+
+def test_composite_loss_applies_lane_weights():
+    """loss_weight_und / loss_weight_gen scale their branches (RFC §4.4)."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    und_data = TensorDict(
+        {
+            "response_mask": torch.ones(2, 3),
+            "old_log_probs": torch.zeros(2, 3),
+            "advantages": torch.ones(2, 3),
+        },
+        batch_size=[2],
+    )
+    gen_data = TensorDict(
+        {"advantages": torch.ones(2, 2), "old_log_probs": torch.zeros(2, 2)},
+        batch_size=[2],
+    )
+    data = TensorDict({}, batch_size=[])
+    assign_non_tensor_data(data, "bagel_corl_und", und_data)
+    assign_non_tensor_data(data, "bagel_corl_gen", gen_data)
+    assign_non_tensor_data(data, "has_complete_gen_groups", True)
+    assign_non_tensor_data(data, "skip_gen", False)
+    assign_non_tensor_data(data, "num_gen_rows", 2)
+
+    model_output = {
+        "und": {"log_probs": torch.zeros(2, 3, requires_grad=True)},
+        "gen": {"log_probs": torch.zeros(2, requires_grad=True)},
+    }
+    config = SimpleNamespace(
+        diffusion_loss=OmegaConf.create({"loss_weight_und": 2.0, "loss_weight_gen": 3.0})
+    )
+
+    def fake_ppo(config, model_output, data, dp_group=None):
+        return torch.tensor(1.0, requires_grad=True), {}
+
+    def fake_diff(config, model_output, data, dp_group=None):
+        return torch.tensor(2.0, requires_grad=True), {}
+
+    with (
+        patch("verl.workers.utils.losses.ppo_loss", fake_ppo),
+        patch("verl_omni.workers.utils.losses.diffusion_loss", fake_diff),
+    ):
+        loss, _metrics = bagel_composite_loss(config=config, model_output=model_output, data=data)
+    # 1.0 (und stub) * 2.0 + 2.0 (gen stub) * 3.0
+    assert float(loss.detach()) == pytest.approx(8.0)
+
+
+def test_gen_regularizer_velocity_mse_fails_loud():
+    """velocity_mse (UniGRPO Eq. 8) lands in Phase 2 — selecting it must fail loud."""
+    from types import SimpleNamespace
+
+    gen_data = TensorDict(
+        {"advantages": torch.ones(2, 2), "old_log_probs": torch.zeros(2, 2)},
+        batch_size=[2],
+    )
+    data = TensorDict({}, batch_size=[])
+    assign_non_tensor_data(data, "bagel_corl_gen", gen_data)
+    assign_non_tensor_data(data, "has_complete_gen_groups", True)
+    assign_non_tensor_data(data, "skip_gen", False)
+    assign_non_tensor_data(data, "num_gen_rows", 2)
+    config = SimpleNamespace(diffusion_loss=OmegaConf.create({"gen_regularizer": "velocity_mse"}))
+    model_output = {"gen": {"log_probs": torch.zeros(2, requires_grad=True)}}
+    with pytest.raises(NotImplementedError, match="velocity_mse"):
+        bagel_composite_loss(config=config, model_output=model_output, data=data)
+
+
+def test_dual_lora_param_groups_lr_override():
+    import torch.nn as nn
+
+    from verl_omni.pipelines.bagel_flow_grpo.bagel_corl import dual_lora_param_groups
+
+    class _Tiny(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora_A = nn.Parameter(torch.zeros(2))
+            self.mlp_moe_gen = nn.Parameter(torch.zeros(2))
+            self.frozen = nn.Parameter(torch.zeros(2), requires_grad=False)
+
+    module = _Tiny()
+    groups = dual_lora_param_groups(module)
+    by_name = {g["name"]: g for g in groups}
+    assert set(by_name) == {"und_lora", "gen_lora"}
+    assert "lr" not in by_name["und_lora"]
+    assert "lr" not in by_name["gen_lora"]
+
+    groups = dual_lora_param_groups(module, lr_gen=3e-5)
+    by_name = {g["name"]: g for g in groups}
+    assert by_name["gen_lora"]["lr"] == pytest.approx(3e-5)
+    assert "lr" not in by_name["und_lora"]  # UND keeps the base actor.optim.lr
+
+
+def test_rewrite_sets_lr_gen_and_cfg_free_pipeline():
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = OmegaConf.create(
+        {
+            "data": {"train_files": "/tmp/train.parquet"},
+            "actor_rollout_ref": {
+                "model": {"path": "/tmp/bagel", "lora_rank": 64},
+                "actor": {},
+                "rollout": {
+                    "name": "vllm_omni",
+                    "response_length": 512,
+                    "agent": {"default_agent_loop": "bagel_multiturn_agent"},
+                },
+            },
+        }
+    )
+    trainer._rewrite_bagel_corl_configs()
+    model = trainer.config.actor_rollout_ref.model
+    assert model.lr_gen == pytest.approx(3e-5)
+    pipeline = trainer.config.actor_rollout_ref.rollout.pipeline
+    assert pipeline.cfg_text_scale == pytest.approx(1.0)  # UniGRPO CFG-free training
+
+
+def _non_tensor_stack(values):
+    """Version-robust NonTensorStack construction (API moved across tensordict pins)."""
+    from tensordict import NonTensorData, NonTensorStack
+
+    if hasattr(NonTensorStack, "from_list_positional_stack"):
+        return NonTensorStack.from_list_positional_stack(values)
+    return NonTensorStack([NonTensorData(v) for v in values])
+
+
+def test_normalize_tq_kv_get_result_with_non_tensor_stack():
+    """Real kv_batch_get shape: NonTensorStack columns must unwrap to plain values."""
+    keys = ["und_k::gen::call0::0", "und_k::gen::call0::1"]
+    td = TensorDict({}, batch_size=[2])
+    td["gen_group_uid"] = _non_tensor_stack(["call0", "call0"])
+    td["seed_index"] = _non_tensor_stack([0, 1])
+    td["rm_score"] = _non_tensor_stack([0.5, 0.7])
+    out = _normalize_tq_kv_get_result(td, keys)
+    assert set(out.keys()) == set(keys)
+    row0 = out[keys[0]]["fields"]
+    assert row0["gen_group_uid"] == "call0"
+    assert row0["rm_score"] == pytest.approx(0.5)
+    row1 = out[keys[1]]["fields"]
+    assert row1["seed_index"] == 1
+
+
+def test_fetch_gen_records_by_keys_with_mocked_tq(monkeypatch):
+    """The child_gen_keys → kv_batch_get gather must survive the real columnar shape."""
+    import transfer_queue as tq_module
+
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    batch = type("B", (), {"extra_info": {}, "partition_id": "train"})()
+    und_records = [{"fields": {"child_gen_keys": ["k0", "k1"]}}]
+
+    td = TensorDict({}, batch_size=[2])
+    td["gen_group_uid"] = _non_tensor_stack(["call0", "call0"])
+    td["seed_index"] = _non_tensor_stack([0, 1])
+    monkeypatch.setattr(tq_module, "kv_batch_get", lambda keys, partition_id: td)
+
+    out = trainer._fetch_gen_records_by_keys(batch, und_records)
+    assert set(out.keys()) == {"k0", "k1"}
+    assert out["k0"]["fields"]["gen_group_uid"] == "call0"
+    assert out["k1"]["fields"]["seed_index"] == 1
+
+
+def test_gen_batch_from_step_aggregates_metrics_over_siblings(monkeypatch):
+    """child_gen_keys path: GEN rows survive the gather and J/K are batch means."""
+    import transfer_queue as tq_module
+
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"agent": {"gen_samples_per_call": 2}}}})
+    extra: dict = {}
+    batch = type(
+        "B",
+        (),
+        {
+            "extra_info": extra,
+            "partition_id": "train",
+            "non_tensor_batch": {
+                "child_gen_keys": [["k0"], ["k1"]],
+                "episode_J": [2, 4],
+                "episode_K": [1, 0],
+                "bagel_corl_metrics": [
+                    {
+                        "episode/J": 2.0,
+                        "episode/K": 1.0,
+                        "gen/dropped_incomplete_groups": 0.0,
+                        "und/no_image_credit": 0.0,
+                        "gen/skipped_no_groups": 0.0,
+                    },
+                    {
+                        "episode/J": 4.0,
+                        "episode/K": 0.0,
+                        "gen/dropped_incomplete_groups": 1.0,
+                        "und/no_image_credit": 1.0,
+                        "gen/skipped_no_groups": 1.0,
+                    },
+                ],
+            },
+        },
+    )()
+    monkeypatch.setattr(
+        tq_module,
+        "kv_batch_get",
+        lambda keys, partition_id: {
+            "k0": {"fields": {"gen_group_uid": "call0", "rm_score": 0.5, "rollout_log_probs": [0.1]}},
+            "k1": {"fields": {"gen_group_uid": "call1", "rm_score": 0.6, "rollout_log_probs": [0.2]}},
+        },
+    )
+    gen_batch = trainer._gen_batch_from_step(batch)
+    assert [row["gen_group_uid"] for row in gen_batch] == ["call0", "call1"]
+    assert extra["episode/J"] == pytest.approx(3.0)  # mean, not first-row-wins
+    assert extra["episode/K"] == pytest.approx(0.5)
+    assert extra["gen/dropped_incomplete_groups"] == pytest.approx(1.0)
+    assert extra["und/no_image_credit"] == pytest.approx(0.5)
+
+
+def test_stack_padded_ragged_timesteps():
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import _stack_padded
+
+    out = _stack_padded([torch.tensor([1.0, 2.0, 3.0]), torch.tensor([9.0])])
+    assert out.shape == (2, 3)
+    assert torch.equal(out[1], torch.tensor([9.0, 0.0, 0.0]))
+
+
+def test_build_gen_flowgrpo_proto_resizes_log_probs_to_timesteps():
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import build_gen_flowgrpo_proto
+
+    rows = [
+        {
+            "gen_group_uid": "g0",
+            "rm_score": 1.0,
+            "rollout_log_probs": [0.1, 0.2, 0.3],
+            "all_latents": torch.randn(3, 4),
+            "timesteps": [999.0, 500.0, 100.0],
+        },
+        {
+            "gen_group_uid": "g1",
+            "rm_score": 0.5,
+            "rollout_log_probs": [0.4, 0.5],
+            "all_latents": torch.randn(5, 4),
+            "timesteps": [999.0, 700.0, 500.0, 300.0, 100.0],
+        },
+    ]
+    proto = build_gen_flowgrpo_proto(rows)
+    assert proto.batch["all_timesteps"].shape == (2, 5)
+    # old_log_probs zero-padded from 3 → 5 timesteps to stay aligned.
+    assert proto.batch["old_log_probs"].shape == (2, 5)
+    assert torch.equal(proto.batch["old_log_probs"][0, 3:], torch.zeros(2))
+
+
+def test_build_gen_flowgrpo_proto_empty_and_missing_traj():
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import build_gen_flowgrpo_proto
+
+    assert build_gen_flowgrpo_proto([]) is None
+    with pytest.raises(RuntimeError, match="lacks all_latents"):
+        build_gen_flowgrpo_proto([{"gen_group_uid": "g", "rm_score": 1.0, "rollout_log_probs": [0.1]}])
+
+
+def test_split_und_gen_empty_records():
+    from verl_omni.agent_loop.bagel_corl_tq import split_und_gen_metas
+
+    und_batch, gen_batch = split_und_gen_metas([], None)
+    assert und_batch == [] and gen_batch == []

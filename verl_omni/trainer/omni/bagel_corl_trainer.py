@@ -24,6 +24,7 @@ from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1.trainer_base import register_trainer
 from verl.utils.config import omega_conf_to_dataclass
 
+from verl_omni.agent_loop.bagel_corl_lib import aggregate_episode_metrics
 from verl_omni.trainer.omni.bagel_corl_diff_v1 import DiffusionV1GenLane
 from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage, build_gen_flowgrpo_proto
 from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
@@ -59,6 +60,7 @@ _DIFFUSION_MODEL_KEYS = {
     "lora_rank",
     "lora_alpha",
     "lora_init_weights",
+    "lr_gen",
     "target_modules",
     "target_parameters",
     "exclude_modules",
@@ -148,13 +150,26 @@ def _normalize_tq_kv_get_result(data, keys: list[str]) -> dict[str, dict]:
 
 
 def _index_column(col, i: int):
-    """Index a stacked TQ column (Tensor / NonTensorStack / list) at position ``i``."""
+    """Index a stacked TQ column (Tensor / NonTensorStack / list) at position ``i``.
+
+    ``NonTensorStack.__getitem__`` yields a ``NonTensorData`` wrapper — unwrap it so
+    field dicts carry plain values (a wrapper would silently break
+    ``split_und_gen_metas`` iteration and ``build_gen_flowgrpo_proto``). Tensors are
+    returned as-is (never touch ``Tensor.data``).
+    """
     if col is None:
         return None
     try:
-        return col[i]
+        value = col[i]
     except (TypeError, IndexError, KeyError):
         return None
+    try:
+        from tensordict import NonTensorData
+    except ImportError:  # pragma: no cover - tensordict is a hard dependency here
+        return value
+    if isinstance(value, NonTensorData):
+        return value.data
+    return value
 
 
 @register_trainer("bagel_corl_sync")
@@ -201,6 +216,9 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         filtered["model_type"] = "diffusion_model"
         filtered.setdefault("architecture", "OmniBagelForConditionalGeneration")
         filtered.setdefault("composite_mode", "bagel_corl")
+        # UniGRPO per-expert LRs: the GEN (*_moe_gen) optimizer group runs at its
+        # own LR; UND keeps the base actor.optim.lr. Recipe-visible, configurable.
+        filtered.setdefault("lr_gen", 3e-5)
         filtered.setdefault("trust_remote_code", True)
 
         # Strip omni-only rollout keys (do_sample, over_sample_rate, …) before Hydra instantiate.
@@ -236,6 +254,10 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         rollout_filtered["algo"] = algo
         pipeline = dict(rollout_filtered.get("pipeline") or {})
         pipeline.setdefault("num_inference_steps", 10)
+        # UniGRPO (arXiv:2603.23500): CFG doubles per-step evaluations and branches
+        # the rollout graph — prohibitive for multi-turn episodes. Training runs
+        # CFG-free; the recipe's eval block re-enables CFG if desired.
+        pipeline["cfg_text_scale"] = 1.0
         rollout_filtered["pipeline"] = pipeline
 
         with open_dict(self.config):
@@ -355,22 +377,13 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         if und_records and any("child_gen_keys" in (r.get("fields") or r) for r in und_records):
             gen_by_key = self._fetch_gen_records_by_keys(batch, und_records)
             _, gen_batch = split_und_gen_metas(und_records, gen_by_key)
-            for rec in und_records:
-                fields = rec.get("fields") or rec
-                metrics = fields.get("bagel_corl_metrics") or {}
-                for key in (
-                    "episode/J",
-                    "episode/K",
-                    "und/no_image_credit",
-                    "gen/skipped_no_groups",
-                    "gen/dropped_incomplete_groups",
-                ):
-                    if key in metrics and extra.get(key) is None:
-                        extra[key] = metrics[key]
-                if fields.get("episode_J") is not None and extra.get("episode/J") is None:
-                    extra["episode/J"] = float(fields["episode_J"])
-                if fields.get("episode_K") is not None and extra.get("episode/K") is None:
-                    extra["episode/K"] = float(fields["episode_K"])
+            # Batch aggregation (mean J/K over siblings, summed dropped groups,
+            # fraction without image credit) — first-row-wins collapse hid every
+            # episode but one (audit module A).
+            aggregated = aggregate_episode_metrics(und_records)
+            for key, value in aggregated.items():
+                if extra.get(key) is None:
+                    extra[key] = value
             extra["gen_batch"] = gen_batch
             return gen_batch
 
@@ -665,7 +678,11 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         from verl.trainer.ppo.utils import Role
         from verl.utils.config import omega_conf_to_dataclass
         from verl.utils.ray_utils import auto_await
-        from verl.workers.rollout.llm_server import DEFAULT_ROUTING_CACHE_SIZE, GlobalRequestLoadBalancer, LLMServerClient
+        from verl.workers.rollout.llm_server import (
+            DEFAULT_ROUTING_CACHE_SIZE,
+            GlobalRequestLoadBalancer,
+            LLMServerClient,
+        )
         from verl.workers.rollout.replica import get_rollout_replica_class
 
         from verl_omni.workers.rollout.bagel_dual_role_llm_server import BagelDualRoleLLMServerClient
@@ -747,9 +764,53 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         self._ensure_dual_role_rollout()
         return self._bagel_dual_client
 
+    def _bagel_rm_enabled(self) -> bool:
+        reward_cfg = getattr(self.config, "reward", None)
+        if reward_cfg is None:
+            return False
+        try:
+            return bool(reward_cfg.get("reward_model", {}).get("enable", False))
+        except (AttributeError, TypeError):
+            return False
+
+    def _ensure_reward_loop_manager(self):
+        """Create the colocated ``OmniRewardLoopManager`` (RFC §4.2).
+
+        Its worker handles serve both consumers: the inherited episode-reward
+        ``_compute_score`` and the mid-loop GEN scoring adapter
+        (``bagel_corl_rm``). Creation mirrors the diffusion V1 trainer.
+        """
+        if getattr(self, "reward_loop_manager", None) is not None:
+            return self.reward_loop_manager
+        from verl.trainer.ppo.utils import Role
+
+        from verl_omni.reward_loop import OmniRewardLoopManager
+
+        resource_pool = None
+        if getattr(self, "use_rm", False) and getattr(self, "resource_pool_manager", None) is not None:
+            resource_pool = self.resource_pool_manager.get_resource_pool(Role.RewardModel)
+        self.reward_loop_manager = OmniRewardLoopManager(config=self.config, rm_resource_pool=resource_pool)
+        return self.reward_loop_manager
+
+    def get_reward_handles(self):
+        """Handles the pinned ``TaskRunnerV1`` forwards into the agent-loop manager.
+
+        The manager passes them to every ``BagelCorlAgentLoopWorkerTQ``, which
+        binds the DiT-side handle for in-loop GEN scoring.
+        """
+        manager = getattr(self, "reward_loop_manager", None)
+        if manager is not None:
+            workers = getattr(manager, "reward_loop_workers", None)
+            if workers:
+                return workers
+        getter = getattr(super(), "get_reward_handles", None)
+        return getter() if callable(getter) else None
+
     def on_init_end(self):
         # Build UND AR before the first weight publish so both pools see step-0 weights.
         self._ensure_dual_role_rollout()
+        if self._bagel_rm_enabled():
+            self._ensure_reward_loop_manager()
         super().on_init_end()
 
     def on_step_end(self):

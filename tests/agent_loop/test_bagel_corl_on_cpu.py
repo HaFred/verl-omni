@@ -48,13 +48,17 @@ def _load_lib():
     omni = root / "verl_omni"
     _ensure_pkg("verl_omni", omni)
     _ensure_pkg("verl_omni.agent_loop", omni / "agent_loop")
+    # Bagel lib now shares the tools.trajectory layer (audit T1.6).
+    _ensure_pkg("verl_omni.tools", omni / "tools")
+    _ensure_pkg("verl_omni.tools.trajectory", omni / "tools" / "trajectory")
+    _load_by_path("verl_omni.tools.trajectory.hydra_env", omni / "tools" / "trajectory" / "hydra_env.py")
+    _load_by_path("verl_omni.tools.trajectory.paths", omni / "tools" / "trajectory" / "paths.py")
+    _load_by_path("verl_omni.tools.trajectory.context", omni / "tools" / "trajectory" / "context.py")
+    _load_by_path("verl_omni.tools.trajectory.artifacts", omni / "tools" / "trajectory" / "artifacts.py")
+    _load_by_path("verl_omni.tools.trajectory.judge_latch", omni / "tools" / "trajectory" / "judge_latch.py")
     _load_by_path(
         "verl_omni.agent_loop.rpco_turn_protocol",
         omni / "agent_loop" / "rpco_turn_protocol.py",
-    )
-    _load_by_path(
-        "verl_omni.agent_loop.image_gen_trajectory_context",
-        omni / "agent_loop" / "image_gen_trajectory_context.py",
     )
     return _load_by_path(
         "bagel_corl_lib_isolated",
@@ -63,7 +67,7 @@ def _load_lib():
 
 
 lib = _load_lib()
-ctx = sys.modules["verl_omni.agent_loop.image_gen_trajectory_context"]
+ctx = sys.modules["verl_omni.tools.trajectory.judge_latch"]
 
 
 class _FakeTokenizer:
@@ -325,7 +329,7 @@ def test_good_enough_latch_blocks_second_generate():
 
     async def _run():
         tool = lib.BagelGenerateImageTool(gen_samples_per_call=2, max_generate_passes=2, generate_fn=gen_fn)
-        return await lib.run_serial_episode(
+        episode = await lib.run_serial_episode(
             dataset_task_uid="task",
             policy_version=1,
             prompt_ids=[1],
@@ -335,10 +339,14 @@ def test_good_enough_latch_blocks_second_generate():
             tokenizer=tok,
             max_und_turns=6,
         )
+        # Latch visibility is task-scoped (the unified layer deliberately dropped
+        # the thread fallback): read it inside the episode's own context.
+        latch_after = ctx.get_good_enough_yes_reached()
+        return episode, latch_after
 
-    episode = asyncio.run(_run())
+    episode, latch_after = asyncio.run(_run())
     assert gen_calls["n"] == 1
-    assert ctx.get_good_enough_yes_reached() is True
+    assert latch_after is True
     assert episode.stop_required is True
 
     # Explicit latch-skip: with latch pre-set and clear disabled, GEN must not run.
@@ -461,3 +469,159 @@ def test_flatten_propagates_episode_und_reward_for_no_image():
     )
     result = lib.flatten_multiturn_rollouts([episode], expected_s=2)
     assert result.und_batch[0]["token_level_scores"] == pytest.approx(0.73)
+
+
+def test_k2_episode_keeps_both_calls():
+    """RFC: every generate_image call contributes its S seeds — K=2 must yield 2xS
+    GEN rows (the old code replaced gen_samples per call and silently dropped the
+    first call's trajectories)."""
+    ctx.clear_good_enough_yes_reached()
+    tok = _FakeTokenizer()
+    gen_calls = {"n": 0}
+
+    async def und_decode(**kwargs):
+        decoded = tok.decode(kwargs["response_ids"])
+        rewrite_count = decoded.count("Reflection:")
+        if rewrite_count == 0:
+            text = '<tool_call>{"name": "generate_image", "arguments": {"prompt": "v1"}}</tool_call>'
+        elif rewrite_count == 1:
+            text = '<tool_call>{"name": "generate_image", "arguments": {"prompt": "v2"}}</tool_call>'
+        else:
+            text = "Done."
+        return {"token_ids": tok.encode(text), "text": text}
+
+    async def gen_fn(**kwargs):
+        gen_calls["n"] += 1
+        return [{"valid": True, "image_path": f"/tmp/k2_{gen_calls['n']}.png"} for _ in kwargs["seeds"]]
+
+    call_index = {"n": 0}
+
+    def score_fn(samples):
+        call_index["n"] += 1
+        for s in samples:
+            s.rm_score = 0.2 if call_index["n"] == 1 else 0.9
+            s.good_enough = call_index["n"] != 1
+        return samples
+
+    async def _run():
+        tool = lib.BagelGenerateImageTool(gen_samples_per_call=2, max_generate_passes=2, generate_fn=gen_fn)
+        return await lib.run_serial_episode(
+            dataset_task_uid="task",
+            policy_version=1,
+            prompt_ids=[1],
+            und_decode=und_decode,
+            generate_tool=tool,
+            score_fn=score_fn,
+            tokenizer=tok,
+        )
+
+    episode = asyncio.run(_run())
+    assert gen_calls["n"] == 2
+    assert episode.num_gen_calls == 2
+    assert len(episode.gen_samples) == 4
+    groups = {s.gen_group_uid for s in episode.gen_samples}
+    assert len(groups) == 2
+
+    flat = lib.flatten_multiturn_rollouts([episode], expected_s=2)
+    assert len(flat.gen_batch) == 4
+    assert len({row["gen_group_uid"] for row in flat.gen_batch}) == 2
+    assert flat.metrics["gen/dropped_incomplete_groups"] == 0.0
+    assert flat.metrics["und/no_image_credit"] == 0.0
+    # Episode scalar averages over both calls' seeds: (0.2*2 + 0.9*2) / 4.
+    assert episode.und_reward == pytest.approx(0.55)
+
+
+def test_judge_text_reduction_modes():
+    """Episode-level stop bit: any (default best-of-S), all, and mean vs threshold."""
+    from verl_omni.agent_loop import rpco_turn_protocol as protocol
+
+    def _samples(flags):
+        return [
+            lib.GenSample(
+                gen_sample_uid=f"g:{i}",
+                gen_group_uid="g",
+                seed_index=i,
+                valid=True,
+                prompt_token_ids=[1],
+                rm_score=0.5,
+                good_enough=flag,
+            )
+            for i, flag in enumerate(flags)
+        ]
+
+    assert "good_enough=YES" in lib.judge_text_from_gen_samples(_samples([True, False]))
+    text = lib.judge_text_from_gen_samples(_samples([True, False]), reduction="all")
+    assert "good_enough=NO" in text
+    assert "good_enough=NO" in lib.judge_text_from_gen_samples(_samples([True, False]), reduction="mean", threshold=1.0)
+    assert (
+        "good_enough=YES"
+        in lib.judge_text_from_gen_samples(_samples([True, False]), reduction="mean", threshold=0.5)
+    )
+    # Derived branch (no explicit flags) honours the threshold pass-through.
+    # Fresh lists per assertion: judge_text_from_gen_samples writes the derived
+    # stop bit back onto samples (episode latch input), so reuse would couple calls.
+    def _unscored():
+        return [
+            lib.GenSample(
+                gen_sample_uid=f"g:{i}",
+                gen_group_uid="g",
+                seed_index=i,
+                valid=True,
+                prompt_token_ids=[1],
+                rm_score=0.75,
+            )
+            for i in range(2)
+        ]
+
+    assert "good_enough=YES" in lib.judge_text_from_gen_samples(_unscored(), threshold=0.7)
+    assert "good_enough=NO" in lib.judge_text_from_gen_samples(_unscored(), threshold=0.9)
+    assert protocol.derive_good_enough_from_scores(correctness=0.75, aesthetics=0.75, threshold=0.7) is True
+
+
+def test_aggregate_episode_metrics_averages_over_siblings():
+    """Step-level J/K metrics are batch means; first-row-wins collapse is gone."""
+    records = [
+        {
+            "fields": {
+                "episode_J": 2,
+                "episode_K": 1,
+                "bagel_corl_metrics": {
+                    "episode/J": 2.0,
+                    "episode/K": 1.0,
+                    "gen/dropped_incomplete_groups": 1.0,
+                    "und/no_image_credit": 0.0,
+                    "gen/skipped_no_groups": 0.0,
+                },
+            }
+        },
+        {
+            "fields": {
+                "episode_J": 4,
+                "episode_K": 0,
+                "bagel_corl_metrics": {
+                    "episode/J": 4.0,
+                    "episode/K": 0.0,
+                    "gen/dropped_incomplete_groups": 0.0,
+                    "und/no_image_credit": 1.0,
+                    "gen/skipped_no_groups": 1.0,
+                },
+            }
+        },
+    ]
+    out = lib.aggregate_episode_metrics(records)
+    assert out["episode/J"] == pytest.approx(3.0)
+    assert out["episode/K"] == pytest.approx(0.5)
+    assert out["gen/dropped_incomplete_groups"] == pytest.approx(1.0)
+    assert out["und/no_image_credit"] == pytest.approx(0.5)
+    assert out["gen/skipped_no_groups"] == pytest.approx(0.5)
+    # Empty batch: no episode-derived keys, dropped stays a real 0 sum.
+    empty = lib.aggregate_episode_metrics([])
+    assert empty == {"gen/dropped_incomplete_groups": 0.0}
+
+
+def test_turn_histogram_tail_frac_is_zero_without_a_tail():
+    """Constant turn counts have no tail; the old >= p95 rule reported 1.0."""
+    assert lib.turn_histogram([1, 1, 1, 1])["tail_frac"] == 0.0
+    assert lib.turn_histogram([1])["tail_frac"] == 0.0
+    hist = lib.turn_histogram([1, 1, 1, 1, 9])
+    assert hist["tail_frac"] == pytest.approx(0.2)

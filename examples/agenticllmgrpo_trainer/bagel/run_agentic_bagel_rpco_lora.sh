@@ -192,7 +192,11 @@ if [[ "$N" -lt 1 ]]; then
 fi
 echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runtime)"
 
-"${_PY}" -m verl_omni.trainer.main_omni \
+# UniGRPO-aligned knobs (RFC 453 §2/§4.4): per-expert LRs (UND base vs GEN
+# lr_gen=3e-5), lane weights, and GRPO-Guard ratio normalization via
+# +actor_rollout_ref.actor.diffusion_loss.loss_mode=grpo_guard as an ablation.
+# NOTE: keep comment lines OUTSIDE the backslash-continued launch command below.
+python3 -m verl_omni.trainer.main_omni \
     trainer.v1.trainer_mode=bagel_corl_sync \
     data.train_files=$TRAIN_FILE \
     data.val_files=$VAL_FILE \
@@ -221,6 +225,9 @@ echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runti
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     +actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_grpo \
+    +actor_rollout_ref.model.lr_gen=3e-5 \
+    +actor_rollout_ref.actor.diffusion_loss.loss_weight_und=1.0 \
+    +actor_rollout_ref.actor.diffusion_loss.loss_weight_gen=1.0 \
     actor_rollout_ref.rollout.name=vllm_omni \
     actor_rollout_ref.rollout.n=$N \
     actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEM_UTIL \
@@ -249,6 +256,8 @@ echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runti
     reward.reward_model.enable=$ENABLE_RM \
     reward.reward_model.model_path=$reward_model_name \
     reward.reward_model.rollout.name=$REWARD_ENGINE \
+    reward.custom_reward_function.path=pkg://verl_omni.utils.reward_score.bagel_rm_image_scorer \
+    reward.custom_reward_function.name=compute_score \
     reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_TP \
     reward.reward_model.rollout.gpu_memory_utilization=$REWARD_GPU_MEM_UTIL \
     reward.reward_model.rollout.enforce_eager=True \

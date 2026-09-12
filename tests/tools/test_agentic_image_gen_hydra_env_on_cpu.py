@@ -126,7 +126,9 @@ def test_bind_clears_stale_cfg_when_agentic_image_gen_missing():
     bind_agentic_image_gen(OmegaConf.create({"trainer": {}}))
     assert agentic_get_str("diffusion_tool_url") == ""
     assert agentic_get_bool("force_first_generate") is False
-    bind_agentic_image_gen(None)
+    # bind(None) fails loud (audit knob-SoT): reset via clear instead.
+    with pytest.raises(ValueError, match="silently serve yaml"):
+        bind_agentic_image_gen(None)
     assert agentic_get_str("diffusion_tool_url") == ""
     clear_agentic_image_gen()
 

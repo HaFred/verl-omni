@@ -37,9 +37,10 @@ from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 from verl_omni.agent_loop.bagel_corl_lib import (
     EpisodeRollout,
     GenSample,
-    strip_pixels_for_actor,
     _as_gen_sample,
+    strip_pixels_for_actor,
 )
+from verl_omni.agent_loop.bagel_corl_rm import bind_bagel_rm_handles
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -289,6 +290,20 @@ def episode_from_agent_extra(
 @ray.remote
 class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
     """TransferQueue worker that writes dual-lane UND + GEN keys for Bagel Co-RL."""
+
+    def __init__(self, *args, reward_loop_worker_handles=None, **kwargs):
+        """Accept the handles the pinned ``TaskRunnerV1`` forwards via the manager
+        (``main_ppo`` passes ``trainer.get_reward_handles()`` unconditionally).
+
+        ``[0]`` is the DiT/GEN pool (composite contract) and is bound for the
+        in-loop RM adapter; the full list stays on ``self`` for the inherited
+        episode-reward ``_compute_score`` when the base supports it.
+        """
+        super().__init__(*args, reward_loop_worker_handles=reward_loop_worker_handles, **kwargs)
+        handles = list(reward_loop_worker_handles) if reward_loop_worker_handles else None
+        if handles is not None and not hasattr(self, "reward_loop_worker_handles"):
+            self.reward_loop_worker_handles = handles
+        bind_bagel_rm_handles(handles)
 
     def _expected_s(self) -> int:
         agent = self.config.actor_rollout_ref.rollout.agent
