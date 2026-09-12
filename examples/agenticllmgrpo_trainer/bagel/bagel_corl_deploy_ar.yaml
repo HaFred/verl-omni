@@ -16,8 +16,16 @@ async_chunk: false
 
 stages:
   - stage_id: 0
-    max_model_len: 2048
-    max_num_batched_tokens: 2048
+    # Bagel registers as encoder-decoder in vLLM-Omni, which forces
+    # disable_chunked_mm_input=True and pins the MM encoder budget to
+    # max_num_batched_tokens. The Bagel image processor emits ~8625 tokens per
+    # image, so 2048 aborts engine init with:
+    #   ValueError: Chunked MM input disabled but max_tokens_per_mm_item (8625)
+    #   is larger than max_num_batched_tokens (2048).
+    # 16384 keeps max_num_batched_tokens == max_num_seqs * max_model_len, so the
+    # scheduler's seq*len warning stays silent, and leaves prompt headroom.
+    max_model_len: 16384
+    max_num_batched_tokens: 16384
     max_num_seqs: 1
     gpu_memory_utilization: 0.45
     enforce_eager: true

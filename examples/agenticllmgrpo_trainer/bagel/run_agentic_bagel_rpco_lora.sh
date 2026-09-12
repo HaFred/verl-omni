@@ -11,7 +11,7 @@
 #   REBUILD_UNICOT=1 python3 examples/agenticllmgrpo_trainer/bagel/stamp_unicot_reference_paths.py \
 #       --input $UNICOT_PARQUET --output $UNICOT_PARQUET
 #
-# GPUs: trainer.n_gpus_per_node = len(CUDA_VISIBLE_DEVICES) (e.g. 2,3,4,5 → 4).
+# GPUs: trainer.n_gpus_per_node = len(CUDA_VISIBLE_DEVICES) (e.g. 0,1,2,3 → 4).
 # UND AR is colocated on that same actor placement group (not a second Ray pool).
 # Default REWARD_TP=N so one Qwen RM is TP-sharded, not copied per GPU.
 # 1-GPU smoke (CUDA_VISIBLE_DEVICES=3): ENABLE_RM=0 by default — actor+Omni+RM cannot fit.
@@ -26,12 +26,40 @@ if [[ -d "${_LOCAL_VERL}/verl" ]]; then
 else
   export PYTHONPATH="${_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 fi
+# Same interpreter convention as run_bagel_und_ar_serve.sh: prefer this repo's
+# venv (its editable install points here) and fall back to PATH. Without this,
+# bare `python3` picks up whichever verlomni-* venv is active and the trainer can
+# load another checkout's vllm_omni while PYTHONPATH points at this tree.
+_PY="${_REPO_ROOT}/.venv/bin/python3"
+if [[ ! -x "${_PY}" ]]; then
+  _PY="$(command -v python3)"
+fi
 
 export BAGEL_MODEL_PATH=/scratch/fq9hpsac/huggingface/hub/models--ByteDance-Seed--BAGEL-7B-MoT/snapshots/5019f57d168e5816e8f3f701b17cc816bb7cf24b
 WORKSPACE=${WORKSPACE:-$HOME}
 BAGEL_DEPLOY_CONFIG=${BAGEL_DEPLOY_CONFIG:-"$(dirname "$0")/bagel_corl_deploy.yaml"}
-# Prefer Slurm job GPUs 2-5 when the caller did not set CUDA_VISIBLE_DEVICES.
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-2,3,4,5}"
+# 4 cards are free on this box (0-3); 4-7 are occupied by other jobs.
+# Honour the caller and default to 0,1,2,3 — the same default as
+# run_bagel_und_ar_serve.sh, so the optional Hermes proof and the trainer see
+# the same cards. Never hard-assign here: an unconditional export clobbers a
+# caller/job allocation and makes the default dead code.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+
+# flashinfer JIT-compiles MM/attention kernels and needs nvcc. The CUDA
+# toolkits on this box live under /cm/shared, not the /usr/local/cuda default,
+# so without this the vllm_omni engine dies with:
+#   RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda'
+if [[ -z "${CUDA_HOME:-}" ]]; then
+  for _cand in /cm/shared/apps/cuda-latest/toolkit/current /usr/local/cuda; do
+    if [[ -x "${_cand}/bin/nvcc" ]]; then
+      export CUDA_HOME="${_cand}"
+      break
+    fi
+  done
+fi
+if [[ -n "${CUDA_HOME:-}" && ":${PATH}:" != *":${CUDA_HOME}/bin:"* ]]; then
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+fi
 
 model_name=${BAGEL_MODEL_PATH:-$HOME/models/ByteDance-Seed/BAGEL-7B-MoT}
 reward_model_name=${REWARD_MODEL:-/home/fq9hpsac/fq9hpsacuser11/fred/hf_home/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc}
@@ -42,7 +70,7 @@ VAL_FILE=${UNICOT_TEST:-"${_REPO_ROOT}/outputs/data/agentic_unicot/val.parquet"}
 # are reward ground truth, never fewshot). Skip when both files already exist
 # unless REBUILD_UNICOT=1 (avoids import-heavy rebuild on resume).
 if [[ "${REBUILD_UNICOT:-1}" == "1" || ! -f "$TRAIN_FILE" || ! -f "$VAL_FILE" ]]; then
-  python3 -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl \
+  "${_PY}" -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl \
       --breakdown_dir "$UNICOT_BREAKDOWN_DIR" \
       --reflection_dir "$UNICOT_REFLECTION_DIR" \
       --local_save_dir "$(dirname "$TRAIN_FILE")" \
@@ -55,7 +83,7 @@ else
   echo "[INFO] reusing existing UniCoT parquet: $TRAIN_FILE / $VAL_FILE (set REBUILD_UNICOT=1 to rebuild)"
 fi
 
-# Count cards Ray will actually see (CUDA_VISIBLE_DEVICES=2,3,4,5 → 4).
+# Count cards Ray will actually see (CUDA_VISIBLE_DEVICES=0,1,2,3 → 4).
 # All visible cards go to the actor+GEN hybrid pool. UND AR is colocated on that
 # same placement group (init_colocated) — it does NOT need spare free Ray GPUs.
 _count_visible_gpus() {
@@ -86,9 +114,12 @@ NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS_ACTOR_ROLLOUT_REWARD:-$N_VISIBLE}
 # Colocated UND AR footprint inside the actor PG (TP=1 smoke → 1 card share).
 UND_N_GPUS=${UND_N_GPUS:-1}
 BAGEL_UND_DEPLOY_CONFIG=${BAGEL_UND_DEPLOY_CONFIG:-"$(dirname "$0")/bagel_corl_deploy_ar.yaml"}
-# Live Hermes proof (optional before long runs):
+# Live Hermes proof (optional before long runs). STOP IT BEFORE THIS SCRIPT:
+# its AR engine pins GPU 0, and the colocated UND AR below needs that card too,
+# which shows up as the trainer OOMing during vllm-omni engine init.
 #   bash examples/agenticllmgrpo_trainer/bagel/run_bagel_und_ar_serve.sh
 #   BAGEL_UND_URL=http://127.0.0.1:8094 python3 .../spike_und_hermes.py --model-path "$BAGEL_MODEL_PATH"
+#   pkill -f 'vllm-omni serve'   # free the cards again before training
 BAGEL_UND_AR_SERVING_READY=${BAGEL_UND_AR_SERVING_READY:-1}
 echo "bagel_corl 4-device e2e: actor+GEN=${NUM_GPUS_ACTOR_ROLLOUT_REWARD} UND_AR_colocated=${UND_N_GPUS} visible=${N_VISIBLE} und_ready=${BAGEL_UND_AR_SERVING_READY}"
 ROLLOUT_TP=${ROLLOUT_TP:-1}
@@ -161,7 +192,7 @@ if [[ "$N" -lt 1 ]]; then
 fi
 echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runtime)"
 
-python3 -m verl_omni.trainer.main_omni \
+"${_PY}" -m verl_omni.trainer.main_omni \
     trainer.v1.trainer_mode=bagel_corl_sync \
     data.train_files=$TRAIN_FILE \
     data.val_files=$VAL_FILE \
