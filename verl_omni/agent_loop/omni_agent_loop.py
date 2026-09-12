@@ -127,8 +127,10 @@ class OmniAgentLoopWorker(AgentLoopWorker):
         from omegaconf import open_dict
 
         # Bind by path string only — importing image_gen.py would double-register tools.
-        bind_run_artifacts(config)
+        # agentic bind first: bind_run_artifacts reads agentic_get when the yaml
+        # e2e_root is null, and agentic_get raises while unbound.
         bind_agentic_image_gen(config)
+        bind_run_artifacts(config)
         default_loop = None
         try:
             default_loop = config.actor_rollout_ref.rollout.agent.get("default_agent_loop")
@@ -194,8 +196,8 @@ class OmniAgentLoopManager(AgentLoopManager):
         if config is None and args:
             config = args[0]
         if config is not None:
-            bind_run_artifacts(config)
             bind_agentic_image_gen(config)
+            bind_run_artifacts(config)
         super().__init__(*args, **kwargs)
         model_path = self.model_config.get("tokenizer_path") or self.model_config.get("path")
         trust_remote_code = bool(self.model_config.get("trust_remote_code", False))

@@ -137,8 +137,24 @@ def _env_weight(dim: str) -> float:
     return value
 
 
+# CLI overrides (--w_reflect / --w_plan / ...) win over the RPCO_W_* env fallback
+# so one knob source (the build invocation) is enough — env stays as the documented
+# override for wrapper scripts. Audit knob-SoT module C.
+_CLI_WEIGHTS: dict[str, float] | None = None
+
+
 def _weights() -> dict[str, float]:
-    return {f"w_{dim}": _env_weight(dim) for dim in REWARD_DIMS}
+    weights: dict[str, float] = {}
+    for dim in REWARD_DIMS:
+        key = f"w_{dim}"
+        if _CLI_WEIGHTS and key in _CLI_WEIGHTS:
+            value = float(_CLI_WEIGHTS[key])
+            if value < 0:
+                raise ValueError(f"--{key} must be non-negative, got {value}")
+        else:
+            value = _env_weight(dim)
+        weights[key] = value
+    return weights
 
 
 def _hub_ref_files(refs_dir: Path) -> list[Path]:
@@ -480,7 +496,20 @@ def main() -> None:
         default=float(os.environ.get("UNICOT_VAL_RATIO", "0.05")),
     )
     parser.add_argument("--seed", type=int, default=int(os.environ.get("UNICOT_SPLIT_SEED", "42")))
+    for dim in REWARD_DIMS:
+        parser.add_argument(
+            f"--w_{dim}",
+            type=float,
+            default=None,
+            help=f"RPCO weight for the {dim} dimension (overrides RPCO_W_{dim.upper()})",
+        )
     args = parser.parse_args()
+    global _CLI_WEIGHTS
+    _CLI_WEIGHTS = {
+        f"w_{dim}": getattr(args, f"w_{dim}")
+        for dim in REWARD_DIMS
+        if getattr(args, f"w_{dim}") is not None
+    }
     main_cli(
         reflection_dir=args.reflection_dir,
         breakdown_dir=args.breakdown_dir,

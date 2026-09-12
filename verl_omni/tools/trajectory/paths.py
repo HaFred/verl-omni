@@ -133,7 +133,13 @@ def bind_run_artifacts(config: Any) -> None:
         except Exception:  # noqa: BLE001
             e2e_root = getattr(node, "e2e_root", None)
     if e2e_root is None:
-        e2e_root = agentic_get("e2e_root")
+        try:
+            e2e_root = agentic_get("e2e_root")
+        except RuntimeError:
+            # bind_agentic_image_gen has not run in this process yet (a caller bound
+            # run artifacts first). Fall back to the documented default root instead
+            # of crashing worker/manager init (audit blocker: bind-order crash).
+            e2e_root = None
     if e2e_root:
         _e2e_root = Path(str(e2e_root)).expanduser().resolve()
     else:

@@ -12,7 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Artifact path helpers and optional per-task diffusion-tool bindings.
+"""DEPRECATED — legacy trajectory-context layer (Mode-2a tool loop only).
+
+The Bagel Co-RL lane now shares the unified registry/latch/context under
+``verl_omni.tools.trajectory`` (audit T1.6); this module remains only for the
+legacy ``image_gen_tool_agent_loop`` / ``image_gen_metrics_manager`` consumers
+and their tests. New code must import from ``verl_omni.tools.trajectory`` —
+do not add functionality here.
+
+Artifact path helpers and optional per-task diffusion-tool bindings.
 
 Kept in a tiny module with no ``@function_tool`` registration so path helpers
 can be shared by the stock-loop manager and diffusion tool safely.

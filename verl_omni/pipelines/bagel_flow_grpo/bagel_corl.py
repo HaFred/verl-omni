@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Iterable
+from typing import Any, Iterable
 
 import torch
 import torch.nn as nn
@@ -87,8 +87,14 @@ def validate_disjoint_lora_targets(target_modules: Iterable[str]) -> tuple[set[s
     return und_sel, gen_sel
 
 
-def dual_lora_param_groups(module: nn.Module) -> list[dict]:
-    """Split trainable parameters into UND (text-path) and GEN (``moe_gen``) groups."""
+def dual_lora_param_groups(module: nn.Module, *, lr_gen: float | None = None) -> list[dict]:
+    """Split trainable parameters into UND (text-path) and GEN (``moe_gen``) groups.
+
+    Args:
+        module: The Bagel Co-RL model (FSDP-wrapped or bare).
+        lr_gen: Per-group LR override for the GEN group (UniGRPO per-expert LRs,
+            text 1e-6 vs denoise 3e-5). ``None`` keeps the optimizer's base LR.
+    """
     und_params: list[nn.Parameter] = []
     gen_params: list[nn.Parameter] = []
     other: list[nn.Parameter] = []
@@ -105,7 +111,10 @@ def dual_lora_param_groups(module: nn.Module) -> list[dict]:
     if und_params:
         groups.append({"params": und_params, "name": "und_lora"})
     if gen_params:
-        groups.append({"params": gen_params, "name": "gen_lora"})
+        gen_group: dict[str, Any] = {"params": gen_params, "name": "gen_lora"}
+        if lr_gen is not None:
+            gen_group["lr"] = float(lr_gen)
+        groups.append(gen_group)
     if other:
         groups.append({"params": other, "name": "other_trainable"})
     if not groups:

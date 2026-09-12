@@ -139,17 +139,24 @@ def bind_agentic_image_gen(config: Any) -> None:
     """Store ``config.agentic_image_gen`` for process-local readers.
 
     Args:
-        config: Hydra config (or ``None``). Missing node still marks bound and
-            clears overrides so readers see yaml defaults.
+        config: Hydra config. Missing node still marks bound and clears overrides
+            so readers see yaml defaults. ``None`` fails loud — a worker that
+            cannot produce its config must not silently run on file defaults and
+            hide CLI overrides (audit knob-SoT module C).
 
     Returns:
         None.
+
+    Raises:
+        ValueError: If ``config`` is ``None``.
     """
     global _cfg, _bound
-    _bound = True
     if config is None:
-        _cfg = {}
-        return
+        raise ValueError(
+            "bind_agentic_image_gen requires a composed Hydra config; "
+            "bind(None) would silently serve yaml file defaults"
+        )
+    _bound = True
     try:
         node = config.get("agentic_image_gen")
     except (AttributeError, TypeError, KeyError):

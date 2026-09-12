@@ -96,6 +96,9 @@ class DiffusionModelConfig(BaseConfig):
     lora_init_weights: str = "gaussian"
     target_modules: Optional[Any] = "all-linear"  # allow both "all-linear" and ["q_proj","k_proj"]
     target_parameters: Optional[list[str]] = None  # for lora adapter on nn.Parameter
+    # Bagel Co-RL per-group LR (RFC §4.4 / UniGRPO per-expert LRs): GEN (*_moe_gen)
+    # optimizer group LR override; None keeps the base actor.optim.lr for both groups.
+    lr_gen: Optional[float] = None
 
     exclude_modules: Optional[str] = None
 

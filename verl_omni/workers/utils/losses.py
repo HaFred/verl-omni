@@ -134,6 +134,19 @@ def _bagel_corl_view(data: TensorDict, key: str):
     return tu.get_non_tensor_data(data, key, default=None)
 
 
+def _bagel_lane_weight(config, key: str, *, default: float | str = 1.0, cast=float):
+    """Read a Bagel Co-RL lane knob from ``config.diffusion_loss`` (SoT: DiffusionLossConfig).
+
+    Older configs without the field keep the default; never invent a fallback for
+    garbage values — cast errors fail loud.
+    """
+    try:
+        raw = config.diffusion_loss.get(key, default)
+    except (AttributeError, TypeError):
+        raw = default
+    return cast(raw)
+
+
 def bagel_composite_loss(config, model_output, data, dp_group=None):
     """Composite Co-RL loss: UND token PPO + GEN FlowGRPO on *separate* advantage views.
 
@@ -166,7 +179,7 @@ def bagel_composite_loss(config, model_output, data, dp_group=None):
 
     if und_output is not None and und_data is not None and "log_probs" in und_output:
         und_loss, und_metrics = ppo_loss(config, und_output, und_data, dp_group=dp_group)
-        loss_value = und_loss
+        loss_value = und_loss * _bagel_lane_weight(config, "loss_weight_und")
         metrics.update(und_metrics)
 
     gen_data = _bagel_corl_view(data, "bagel_corl_gen")
@@ -194,13 +207,20 @@ def bagel_composite_loss(config, model_output, data, dp_group=None):
     elif not hasattr(gen_data, "keys") or "advantages" not in gen_data:
         raise ValueError("bagel_corl_gen must carry FlowGRPO advantages for MoT GEN")
 
+    gen_regularizer = _bagel_lane_weight(config, "gen_regularizer", default="latent_kl", cast=str)
+    if gen_regularizer == "velocity_mse":
+        raise NotImplementedError(
+            "gen_regularizer='velocity_mse' (UniGRPO Eq. 8) lands in Phase 2; "
+            "use 'latent_kl' for now"
+        )
+
     gen_loss, gen_metrics = diffusion_loss(config, gen_output, gen_data, dp_group=dp_group)
     metrics.update(gen_metrics)
     metrics["gen/skipped_no_groups"] = Metric(value=0.0, aggregation=AggregationType.MEAN)
     if loss_value is None:
-        loss_value = gen_loss
+        loss_value = gen_loss * _bagel_lane_weight(config, "loss_weight_gen")
     else:
-        loss_value = loss_value + gen_loss
+        loss_value = loss_value + gen_loss * _bagel_lane_weight(config, "loss_weight_gen")
     return loss_value, metrics
 
 
