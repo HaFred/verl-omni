@@ -143,7 +143,7 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     # chunk of the batch, so a chunk-local position would reuse
                     # the same seed offsets in every worker and roll out
                     # duplicated noise.
-                    run_sampling_params["seed"] = _derive_rollout_seed(rollout_base_seed, prompt_index * n + session_id)
+                    run_sampling_params["seed"] = derive_rollout_seed(rollout_base_seed, prompt_index * n + session_id)
                 task = asyncio.create_task(
                     self._run_agent_loop(
                         run_sampling_params,
