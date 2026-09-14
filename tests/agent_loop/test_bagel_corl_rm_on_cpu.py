@@ -92,16 +92,16 @@ class _FakeAsyncHandle:
 
 def test_bind_get_roundtrip_and_fail_loud():
     rm.bind_bagel_rm_handles(None)
-    assert rm.get_bagel_rm_dit_handle() is None
+    assert rm.get_bagel_rm_gen_handle() is None
     h1, h2 = object(), object()
     rm.bind_bagel_rm_handles([h1, h2])
-    assert rm.get_bagel_rm_dit_handle() is h1  # [0] is the DiT pool
+    assert rm.get_bagel_rm_gen_handle() is h1  # [0] is the GEN pool
     with pytest.raises(rm.RMScoringError, match="at least 1"):
         rm.bind_bagel_rm_handles([])
     with pytest.raises(rm.RMScoringError, match="must be a list"):
         rm.bind_bagel_rm_handles(h1)
     rm.bind_bagel_rm_handles(None)
-    assert rm.get_bagel_rm_dit_handle() is None
+    assert rm.get_bagel_rm_gen_handle() is None
 
 
 def test_build_payload_requires_image_paths():

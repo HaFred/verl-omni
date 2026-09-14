@@ -295,7 +295,8 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
         """Accept the handles the pinned ``TaskRunnerV1`` forwards via the manager
         (``main_ppo`` passes ``trainer.get_reward_handles()`` unconditionally).
 
-        ``[0]`` is the DiT/GEN pool (composite contract) and is bound for the
+        ``[0]`` is the GEN pool (the composite contract's first slot, which it
+        generically calls "dit"; Bagel is a MoT model with no DiT) and is bound for the
         in-loop RM adapter; the full list stays on ``self`` for the inherited
         episode-reward ``_compute_score`` when the base supports it.
         """

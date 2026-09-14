@@ -14,8 +14,11 @@
 """Mid-episode RM scoring adapter for Bagel Co-RL (RFC §4.2).
 
 The rollout worker holds the dual reward handles (``reward_loop_worker_handles``,
-``[0]`` = DiT/GEN pool, ``[1]`` = LLM/AR pool — the ``CompositeAgentLoopWorker``
-contract). ``bind_bagel_rm_handles`` stashes the DiT-side handle process-locally
+``[0]`` = GEN pool, ``[1]`` = LLM/AR pool — the ``CompositeAgentLoopWorker``
+contract, whose generic slot name for ``[0]`` is "dit"). Note that **Bagel has no
+DiT** — it is a Mixture-of-Tokens model whose text and VAE (denoising) experts
+share one set of transformer layers — so this module says GEN throughout.
+``bind_bagel_rm_handles`` stashes the GEN-side handle process-locally
 and ``make_rm_score_fn`` turns it into the ``score_fn`` that
 ``bagel_corl_lib.run_serial_episode`` already consumes — GEN call samples get
 ``rm_score`` / ``good_enough`` **inside the episode**, which is what drives the
@@ -47,14 +50,15 @@ __all__ = [
     "RMScoringError",
     "bind_bagel_rm_handles",
     "build_rm_score_payload",
-    "get_bagel_rm_dit_handle",
+    "get_bagel_rm_gen_handle",
     "make_rm_score_fn",
     "parse_rm_result",
 ]
 
 _RM_HANDLES_KEY = "_bagel_corl_rm_handles"
-# [0] is the DiT/GEN pool under the CompositeAgentLoopWorker handle order.
-_RM_DIT_HANDLE_INDEX = 0
+# [0] is the GEN pool. The composite worker's generic name for this slot is "dit",
+# but Bagel is a MoT model (no DiT), so this module calls it GEN.
+_RM_GEN_HANDLE_INDEX = 0
 
 
 class RMScoringError(RuntimeError):
@@ -65,7 +69,7 @@ def bind_bagel_rm_handles(handles: list[Any] | None) -> None:
     """Stash the reward-loop handles process-locally (worker ``__init__`` time).
 
     Args:
-        handles: ``[dit_handle, ar_handle]`` per the composite contract, or
+        handles: ``[gen_handle, ar_handle]`` per the composite contract, or
             ``None`` when no RM pool is wired for this worker.
     """
     import sys
@@ -76,21 +80,21 @@ def bind_bagel_rm_handles(handles: list[Any] | None) -> None:
         return
     if not isinstance(handles, (list, tuple)):
         raise RMScoringError(f"bagel RM handles must be a list, got {type(handles)!r}")
-    if len(handles) < _RM_DIT_HANDLE_INDEX + 1:
+    if len(handles) < _RM_GEN_HANDLE_INDEX + 1:
         raise RMScoringError(
-            f"bagel RM handles need at least {_RM_DIT_HANDLE_INDEX + 1} entries (DiT pool first), got {len(handles)}"
+            f"bagel RM handles need at least {_RM_GEN_HANDLE_INDEX + 1} entries (GEN pool first), got {len(handles)}"
         )
     setattr(module, _RM_HANDLES_KEY, list(handles))
 
 
-def get_bagel_rm_dit_handle() -> Any | None:
-    """Return the DiT-side RM handle bound in this process, or ``None``."""
+def get_bagel_rm_gen_handle() -> Any | None:
+    """Return the GEN-side RM handle bound in this process, or ``None``."""
     import sys
 
     handles = getattr(sys.modules[__name__], _RM_HANDLES_KEY, None)
     if not handles:
         return None
-    return handles[_RM_DIT_HANDLE_INDEX]
+    return handles[_RM_GEN_HANDLE_INDEX]
 
 
 def build_rm_score_payload(

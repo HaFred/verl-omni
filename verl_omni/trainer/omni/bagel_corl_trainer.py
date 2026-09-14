@@ -630,6 +630,20 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     "composite_mode": "bagel_corl",
                     "lora_rank": int(model.get("lora_rank") or 0),
                     "lora_alpha": int(model.get("lora_alpha") or 0),
+                    # OmniModelConfig.__post_init__ runs AutoConfig.from_pretrained on
+                    # hf_config_path (falling back to ``path``). Bagel publishes weights
+                    # only: its config.json is model_type "bagel" with no auto_map and no
+                    # modeling code, so transformers cannot resolve it. Point the UND
+                    # (Thinker) replica at the LLM sub-config via
+                    # agent.und_hf_config_path when the checkpoint is Bagel.
+                    "hf_config_path": agent.get("und_hf_config_path"),
+                    # No OmniModelBase adapter is registered for
+                    # ("OmniBagelForConditionalGeneration", "thinker") — the registry only
+                    # knows Qwen3-Omni — and OmniModelConfig.__post_init__ only consults it
+                    # when load_tokenizer=True. The UND AR replica is served over HTTP by
+                    # vllm-omni (tokenisation happens server-side) and never goes through a
+                    # training engine, so skip client-side tokenizer/processor loading.
+                    "load_tokenizer": False,
                 }
             )
             ckpt_engine = OmegaConf.to_container(rollout.get("checkpoint_engine"), resolve=True) or {
@@ -647,6 +661,13 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     "prompt_length": max_prompt,
                     "response_length": max_resp,
                     "max_model_len": max_prompt + max_resp,
+                    # Bagel registers as encoder-decoder in vLLM-Omni, which disables
+                    # chunked MM input and pins the MM encoder budget to
+                    # max_num_batched_tokens. One image is ~8625 tokens, so the
+                    # RolloutConfig default (8192) aborts AR engine init with
+                    # "max_tokens_per_mm_item (8625) is larger than max_num_batched_tokens".
+                    # Mirror bagel_corl_deploy_ar.yaml stage 0.
+                    "max_num_batched_tokens": int(agent.get("und_max_num_batched_tokens") or 16384),
                     "gpu_memory_utilization": und_util,
                     "enforce_eager": True,
                     "free_cache_engine": True,
@@ -654,7 +675,12 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     "disable_log_stats": True,
                     "checkpoint_engine": ckpt_engine,
                     "disaggregation": {"enabled": False},
-                    "prometheus": {"enable": False},
+                    # Nested rollout sub-configs are only instantiated into their dataclass
+                    # when the node carries ``_target_`` (``omega_conf_to_dataclass`` uses
+                    # ``_convert_="partial"``). Without it the AR server dies on
+                    # ``self.config.prometheus.enable`` in vllm_async_server.launch_server.
+                    # Keep it disabled: the AR replica must not bind a second exporter.
+                    "prometheus": {"_target_": "verl.workers.config.PrometheusConfig", "enable": False},
                     "engine_kwargs": {
                         "vllm_omni": {
                             "output_mode": "ar",
@@ -796,7 +822,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         """Handles the pinned ``TaskRunnerV1`` forwards into the agent-loop manager.
 
         The manager passes them to every ``BagelCorlAgentLoopWorkerTQ``, which
-        binds the DiT-side handle for in-loop GEN scoring.
+        binds the GEN-side handle for in-loop GEN scoring.
         """
         manager = getattr(self, "reward_loop_manager", None)
         if manager is not None:

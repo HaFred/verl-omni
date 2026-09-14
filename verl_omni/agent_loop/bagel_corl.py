@@ -32,7 +32,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     run_serial_episode,
     turn_histogram,
 )
-from verl_omni.agent_loop.bagel_corl_rm import get_bagel_rm_dit_handle, make_rm_score_fn
+from verl_omni.agent_loop.bagel_corl_rm import get_bagel_rm_gen_handle, make_rm_score_fn
 from verl_omni.agent_loop.composite_agent_loop import CompositeAgentLoopWorker
 from verl_omni.agent_loop.rpco_turn_protocol import derive_good_enough_from_scores
 from verl_omni.tools.trajectory.artifacts import get_latest_generate_prompt_for_active_rollout
@@ -89,9 +89,9 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         timing = {"und_decode_s": 0.0, "gen_s": 0.0, "rm_s": 0.0}
         self._bagel_timing = timing
         # In-loop RM (RFC §4.2): score each generate_image call mid-episode via the
-        # DiT-side reward handle bound by the worker. UniCoT reference paths ride on
+        # GEN-side reward handle bound by the worker. UniCoT reference paths ride on
         # the row's extra_info (stamped by the dataset builder / driver).
-        rm_handle = get_bagel_rm_dit_handle()
+        rm_handle = get_bagel_rm_gen_handle()
         if rm_handle is not None:
             extra_info = kwargs.get("extra_info") if isinstance(kwargs.get("extra_info"), dict) else {}
             ref_paths = extra_info.get("reference_image_path")

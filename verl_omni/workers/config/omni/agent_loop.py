@@ -44,4 +44,10 @@ class BagelCorlAgentLoopConfig(AgentLoopConfig):
     und_deploy_config: Optional[str] = None
     # GPUs for the standalone UND AR ``LLMServerManager`` (not colocated with GEN).
     und_n_gpus: Optional[int] = None
+    # HF config used to build the UND AR (Thinker) ``OmniModelConfig``.
+    # ``OmniModelConfig`` runs ``AutoConfig.from_pretrained`` on this path, falling
+    # back to the model path. Bagel checkpoints are weights-only (``model_type:
+    # bagel``, no ``auto_map``/modeling code), so ``transformers`` cannot resolve
+    # them; set this to the checkpoint's ``llm_config.json`` instead.
+    und_hf_config_path: Optional[str] = None
     und_gpu_memory_utilization: Optional[float] = None
