@@ -1,6 +1,6 @@
-# Bagel Co-RL (RFC 453) — GPU run guide for agents
+# Bagel Co-RL (Joint-Training) (RFC 453) — GPU run guide for agents
 
-Multi-turn agentic Co-RL on one Bagel-7B-MoT actor: the UND text path is the
+Multi-turn agentic Co-RL (Joint-Training) on one Bagel-7B-MoT actor: the UND text path is the
 Hermes tool-calling agent, the GEN path (`*_moe_gen`) is its own `generate_image`
 tool, both trained in one composite optimizer step (UND token GRPO + GEN
 FlowGRPO). Design: RFC [#453](https://github.com/verl-project/verl-omni/issues/453)
@@ -79,14 +79,14 @@ guess.
 bash tests/gpu_smoke/run_gpu_smoke_core.sh
 ```
 
-Entry 9 ("bagel corl tiny composite") is the Co-RL gate: builds a tiny random
+Entry 9 ("bagel corl tiny composite") is the Co-RL (Joint-Training) gate: builds a tiny random
 Bagel checkpoint, checks UND log-probs, dual-LoRA param groups (UND group without
 `lr`, GEN group with `lr=3e-5`), and the UND backward path on CUDA. Entry 7
 covers the Mode-2a tool loop and must keep passing. All 9 entries green → proceed.
 
 ## 3. M0 spike — prove dual-role serving (the go/no-go gate)
 
-The trainer refuses to start Co-RL training without
+The trainer refuses to start Co-RL (Joint-Training) training without
 `agent.und_ar_serving_ready=True` (fail-closed; no Qwen fallback).
 
 ```bash
@@ -142,7 +142,7 @@ re-hear the fail-closed gate after any serving change.
 | Symptom | Cause | Action |
 | --- | --- | --- |
 | `UND decode hit the GEN diffusion replica ... refuse soft-empty TQ` | Rollout served by the diffusion strategy, not the AR replica | Run the M0 spike; only then `BAGEL_UND_AR_SERVING_READY=1` |
-| `Bagel Co-RL GEN traj stash incomplete` | `calculate_log_probs` / `algo.noise_level` / SDE window missing | Keep the rewrite defaults; do not disable FlowGRPO SDE to "make it run" |
+| `Bagel Co-RL (Joint-Training) GEN traj stash incomplete` | `calculate_log_probs` / `algo.noise_level` / SDE window missing | Keep the rewrite defaults; do not disable FlowGRPO SDE to "make it run" |
 | `TypeError ... reward_loop_worker_handles` in worker `__init__` | Pinned verl base class signature drift | Report the traceback — this is a pin-compat break, not something to silently swallow |
 | `bagel RM result missing 'reward_score'` / `failed to score N/M image(s)` | Judge URL unreachable or image missing; scorer refuses zero-fill by design | Check `agentic_image_gen.vllm_url` (colocated RM) and that payload images exist on the RM worker's FS |
 | `good_enough_threshold missing from payload` | Scorer knobs not stamped | Loop stamps via `agentic_scorer_knobs_from_config`; verify `agentic_image_gen` node exists in the composed config |

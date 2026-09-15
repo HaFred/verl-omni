@@ -14,7 +14,7 @@
 
 """DEPRECATED — legacy trajectory-context layer (Mode-2a tool loop only).
 
-The Bagel Co-RL lane now shares the unified registry/latch/context under
+The Bagel Co-RL (Joint-Training) lane now shares the unified registry/latch/context under
 ``verl_omni.tools.trajectory`` (audit T1.6); this module remains only for the
 legacy ``image_gen_tool_agent_loop`` / ``image_gen_metrics_manager`` consumers
 and their tests. New code must import from ``verl_omni.tools.trajectory`` —

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for Bagel Co-RL live GEN traj stash helpers (path-loaded, no CUDA init)."""
+"""CPU tests for Bagel Co-RL (Joint-Training) live GEN traj stash helpers (path-loaded, no CUDA init)."""
 
 from __future__ import annotations
 

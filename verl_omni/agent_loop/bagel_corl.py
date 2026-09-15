@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Serial Bagel UND→GEN Co-RL agent loop (RFC phase A / PR1)."""
+"""Serial Bagel UND→GEN Co-RL (Joint-Training) agent loop (RFC phase A / PR1)."""
 
 from __future__ import annotations
 
@@ -48,6 +48,46 @@ from verl_omni.utils.agentic.image_gen_rollout_parse import last_user_prompt
 
 logger = logging.getLogger(__name__)
 
+# Episode-level reduction over the S per-seed ``good_enough`` flags. SoT is
+# ``actor_rollout_ref.rollout.agent.good_enough_reduction``; unknown values fail
+# loud rather than silently degrading to best-of-S (see ``bagel_corl_lib``).
+_GOOD_ENOUGH_REDUCTIONS = frozenset({"any", "all", "mean"})
+
+# RFC §5: knobs the agent loop must see but must NOT invent a value for.
+_BAGEL_AGENT_REQUIRED_KNOBS = ("gen_samples_per_call", "max_generate_passes", "max_und_turns")
+
+
+def resolve_bagel_agent_knobs(agent_cfg: Any) -> dict[str, Any]:
+    """Resolve the ``bagel_multiturn_agent`` knobs, failing loud on missing ones.
+
+    RFC §5: ``actor_rollout_ref.rollout.agent.*`` is the single source of truth for
+    ``gen_samples_per_call`` (S) / ``max_generate_passes`` / ``max_und_turns`` and
+    there is **no code default** — a silent fallback would let an episode run with
+    a group size or turn budget nobody configured, bypassing the launch-time
+    validation in ``verl_omni/utils/config.py``. ``good_enough_reduction`` is read
+    from the same struct and validated against the reductions ``bagel_corl_lib``
+    implements; unknown values previously degraded silently to best-of-S.
+    """
+    missing = [key for key in _BAGEL_AGENT_REQUIRED_KNOBS if agent_cfg.get(key) is None]
+    if missing:
+        raise ValueError(
+            "bagel_multiturn_agent requires actor_rollout_ref.rollout.agent."
+            f"{', '.join(missing)} (RFC §5 knob SoT, no code default)"
+        )
+    reduction = str(agent_cfg.get("good_enough_reduction", "any"))
+    if reduction not in _GOOD_ENOUGH_REDUCTIONS:
+        raise ValueError(
+            "bagel_multiturn_agent actor_rollout_ref.rollout.agent.good_enough_reduction "
+            f"must be one of {sorted(_GOOD_ENOUGH_REDUCTIONS)}, got {reduction!r}"
+        )
+    return {
+        # S = FlowGRPO seeds under one generate_image turn. Not episode GEN-turn count K.
+        "gen_samples_per_call": int(agent_cfg.get("gen_samples_per_call")),
+        "max_generate_passes": int(agent_cfg.get("max_generate_passes")),
+        "max_und_turns": int(agent_cfg.get("max_und_turns")),
+        "good_enough_reduction": reduction,
+    }
+
 
 @register("bagel_multiturn_agent")
 class BagelMultiturnAgentLoop(AgentLoopBase):
@@ -77,14 +117,19 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             prompt_ids = normalize_token_ids(prompt_ids)
 
         agent_cfg = self.config.actor_rollout_ref.rollout.agent
-        # S = FlowGRPO seeds under one generate_image turn. Not episode GEN-turn count K.
-        s = int(agent_cfg.get("gen_samples_per_call", 4))
-        max_passes = int(agent_cfg.get("max_generate_passes", 1))
-        max_und_turns = int(agent_cfg.get("max_und_turns", 8))
+        # Response kind the RM worker's reward manager will dtype-check the in-loop
+        # payload row against. ``output_type`` is a real ``DiffusionPipelineConfig``
+        # field, so ``get`` + a literal fallback is only defensive; the fallback
+        # matches the field's own default.
+        rollout_pipeline = self.config.actor_rollout_ref.rollout.get("pipeline") or {}
+        knobs = resolve_bagel_agent_knobs(agent_cfg)
+        s = knobs["gen_samples_per_call"]
+        max_passes = knobs["max_generate_passes"]
+        max_und_turns = knobs["max_und_turns"]
         # good_enough SoT: agentic_image_gen.good_enough_threshold (yaml, bound at
         # worker init). Reduction over per-seed flags defaults to best-of-S ("any").
         good_enough_threshold = float(agentic_get("good_enough_threshold"))
-        good_enough_reduction = str(agent_cfg.get("good_enough_reduction", "any"))
+        good_enough_reduction = knobs["good_enough_reduction"]
         # Role timing (RFC §8 KPIs): per-episode wall-clock split by lane.
         timing = {"und_decode_s": 0.0, "gen_s": 0.0, "rm_s": 0.0}
         self._bagel_timing = timing
@@ -107,6 +152,10 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                 get_extra_info=lambda: dict(self._rm_extra_info),
                 get_scorer_knobs=lambda: dict(agentic_scorer_knobs_from_config(self.config)),
                 get_image_prompt=lambda: get_latest_generate_prompt_for_active_rollout() or "",
+                # The RM worker's reward manager validates the row's ``responses``
+                # against the rollout pipeline's response kind, so the un-used
+                # placeholder must match it (image → uint8, latent → float).
+                output_type=str(rollout_pipeline.get("output_type", "image")),
             )
         else:
             self._rm_score_fn = None
@@ -138,7 +187,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                     err = str(exc)
                     if "num_inference_steps" in err or "Diffusion" in type(exc).__name__:
                         raise RuntimeError(
-                            "Bagel Co-RL UND decode hit the GEN diffusion replica "
+                            "Bagel Co-RL (Joint-Training) UND decode hit the GEN diffusion replica "
                             "(bagel_single_stage / DiffusionStrategy). UND needs AR TokenOutput "
                             "(Hermes tool-call); refuse soft-empty TQ. "
                             "Prove dual-role serving, then set agent.und_ar_serving_ready=True. "
@@ -147,13 +196,13 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                     raise
                 if hasattr(output, "diffusion_output"):
                     raise RuntimeError(
-                        "Bagel Co-RL UND decode received DiffusionOutput: rollout is on DiffusionStrategy "
+                        "Bagel Co-RL (Joint-Training) UND decode received DiffusionOutput: rollout is on DiffusionStrategy "
                         "(bagel_single_stage / output_mode≠ar). UND needs AR token generation; "
                         "refuse empty token_ids that would leave TQ with no materializable trajectories."
                     )
                 if not hasattr(output, "token_ids"):
                     raise RuntimeError(
-                        f"Bagel Co-RL UND decode expected TokenOutput with token_ids, got {type(output)!r}"
+                        f"Bagel Co-RL (Joint-Training) UND decode expected TokenOutput with token_ids, got {type(output)!r}"
                     )
                 token_ids = list(output.token_ids)
                 text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
@@ -345,7 +394,7 @@ class MultiturnAgentLoopWorker(CompositeAgentLoopWorker):
                     step=step,
                 )
             except (TypeError, KeyError, AttributeError) as exc:
-                logger.debug("dump_raw_rollouts skipped for Bagel Co-RL batch shape: %s", exc)
+                logger.debug("dump_raw_rollouts skipped for Bagel Co-RL (Joint-Training) batch shape: %s", exc)
                 dump_bagel_corl_episode_images(output, step=step)
         except ImportError as exc:
             logger.debug("rollout dump unavailable: %s", exc)

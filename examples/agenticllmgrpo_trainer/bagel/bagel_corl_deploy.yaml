@@ -1,11 +1,11 @@
-# Co-RL-only vLLM-Omni deploy. Does not affect FlowGRPO / other Bagel recipes:
+# Co-RL (Joint-Training)-only vLLM-Omni deploy. Does not affect FlowGRPO / other Bagel recipes:
 # those use ``examples/flowgrpo_trainer/bagel/bagel_deploy_config.yaml``.
 # This path is only passed from ``run_agentic_bagel_rpco_lora.sh``.
 #
 # Use the registered ``bagel_single_stage`` pipeline (same topology as FlowGRPO).
 # Do not invent ``bagel_und_gen_corl`` (not in OMNI_PIPELINES).
 # Do not switch to dual-stage ``bagel``: that is Thinker→KV-transfer→DiT, not
-# Co-RL's serial UND generate() then GEN generate() on one replica.
+# Co-RL (Joint-Training)'s serial UND generate() then GEN generate() on one replica.
 # ``bagel_single_stage`` is still not UND Hermes proof; that is a serving spike.
 
 pipeline: bagel_single_stage

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bagel Co-RL composite actor: UND token path + GEN diffusion path on one FSDP module.
+"""Bagel Co-RL (Joint-Training) composite actor: UND token path + GEN diffusion path on one FSDP module.
 
 RFC: one ``update_actor`` / one ``optimizer.step``. Outer owner is
 ``verl.trainer.main_ppo.TaskRunnerV1`` via ``OmniBagelCoRLTrainerSync``. GEN reuses
@@ -70,7 +70,7 @@ def unwrap_bagel_module(module: torch.nn.Module) -> torch.nn.Module:
             break
         current = nxt
     raise AttributeError(
-        "Bagel Co-RL composite UND path requires BagelForCoRL.compute_und_log_prob; "
+        "Bagel Co-RL (Joint-Training) composite UND path requires BagelForCoRL.compute_und_log_prob; "
         f"got {type(module).__name__}"
     )
 
@@ -165,9 +165,9 @@ def run_und_token_forward_backward(
 
     und = data.select(*[k for k in _UND_SELECT if k in data.keys()], strict=False)
     if "input_ids" not in und.keys():
-        raise KeyError("Bagel Co-RL UND phase requires input_ids on the actor batch")
+        raise KeyError("Bagel Co-RL (Joint-Training) UND phase requires input_ids on the actor batch")
     if not forward_only and ("old_log_probs" not in und.keys() or "advantages" not in und.keys()):
-        raise KeyError("Bagel Co-RL UND train phase requires old_log_probs and advantages (token GRPO)")
+        raise KeyError("Bagel Co-RL (Joint-Training) UND train phase requires old_log_probs and advantages (token GRPO)")
 
     tu.assign_non_tensor(und, sp_size=engine.ulysses_sequence_parallel_size)
     tu.assign_non_tensor(und, use_dynamic_bsz=False)

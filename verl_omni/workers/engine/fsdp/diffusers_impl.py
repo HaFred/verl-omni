@@ -921,9 +921,9 @@ class PPODiffusersFSDPEngine(DiffusersFSDPEngine):
     def forward_backward_batch(
         self, data: TensorDict, loss_function: Callable, forward_only: bool = False
     ) -> list[TensorDict]:
-        """Default: diffusion timestep loop. Bagel Co-RL: UND token then GEN diffusion.
+        """Default: diffusion timestep loop. Bagel Co-RL (Joint-Training): UND token then GEN diffusion.
 
-        Co-RL composition (RFC): one FSDP module, sequential branch backwards, then the
+        Co-RL (Joint-Training) composition (RFC): one FSDP module, sequential branch backwards, then the
         shared ``BaseEngine.train_batch`` issues a single ``optimizer.step``. This is
         library reuse of the diffusion V1 engine under the AR V1 outer trainer — not
         ``PolicyGradientDiffusionTrainerV1Sync``.

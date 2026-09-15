@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Mid-episode RM scoring adapter for Bagel Co-RL (RFC §4.2).
+"""Mid-episode RM scoring adapter for Bagel Co-RL (Joint-Training) (RFC §4.2).
 
 The rollout worker holds the dual reward handles (``reward_loop_worker_handles``,
 ``[0]`` = GEN pool, ``[1]`` = LLM/AR pool — the ``CompositeAgentLoopWorker``
@@ -25,11 +25,13 @@ and ``make_rm_score_fn`` turns it into the ``score_fn`` that
 ``good_enough`` stop/continue cue.
 
 Payload contract for the reward-loop worker (``compute_score``): a verl
-``DataProto`` whose ``non_tensor_batch`` carries one object row
-``{"bagel_rm_payload": <dict>}`` with keys ``image_paths``, ``reference_paths``,
-``extra_info``, ``scorer_knobs``. The reward function wired on the RM pool must
-read that key (recipe-level wiring); ``reward_score`` comes back as a scalar or
-per-image ``reward_extra_info["sample_scores"]`` aligned with ``image_paths``.
+``DataProto`` whose ``non_tensor_batch["extra_info"]`` carries one object row
+``{"bagel_corl": <dict>}`` — ``extra_info`` is the field the configured reward
+manager forwards verbatim, so the payload rides there (the dict itself holds
+``image_paths`` / ``reference_paths`` / ``extra_info`` / ``scorer_knobs``). The
+reward function wired on the RM pool reads that key (recipe-level wiring);
+``reward_score`` comes back as a scalar or per-image
+``reward_extra_info["sample_scores"]`` aligned with ``image_paths``.
 
 This module stays torch-free at import time (verl is imported lazily inside the
 closure) so the pure payload/parse logic is unit-testable without the training
@@ -39,6 +41,7 @@ stack.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from typing import Any, Callable
 
@@ -47,6 +50,7 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "BAGEL_RM_EXTRA_INFO_KEY",
     "RMScoringError",
     "bind_bagel_rm_handles",
     "build_rm_score_payload",
@@ -59,6 +63,11 @@ _RM_HANDLES_KEY = "_bagel_corl_rm_handles"
 # [0] is the GEN pool. The composite worker's generic name for this slot is "dit",
 # but Bagel is a MoT model (no DiT), so this module calls it GEN.
 _RM_GEN_HANDLE_INDEX = 0
+# Key the in-loop payload rides inside ``extra_info``. ``extra_info`` is the one
+# field the configured reward manager forwards verbatim to the reward function, so
+# the payload goes there (RFC §4.2). Kept in sync with
+# ``verl_omni.utils.reward_score.bagel_rm_image_scorer.BAGEL_RM_EXTRA_INFO_KEY``.
+BAGEL_RM_EXTRA_INFO_KEY = "bagel_corl"
 
 
 class RMScoringError(RuntimeError):
@@ -153,14 +162,45 @@ def parse_rm_result(
     return scores, flags
 
 
-def _default_data_builder(payload: dict[str, Any]) -> Any:
-    """Wrap the payload in a one-row verl ``DataProto`` (the worker-side contract)."""
+def _default_data_builder(payload: dict[str, Any], *, output_type: str = "image") -> Any:
+    """Wrap the payload in the one-row ``DataProto`` the reward manager consumes.
+
+    ``RewardLoopWorker.compute_score`` hands this straight to
+    ``reward_manager.run_single``. The repo default for omni is
+    ``VisualRewardManager`` (``verl_omni/reward_loop/reward_manager/visual.py``),
+    which validates ``batch["responses"]`` as a *visual* response before calling
+    the reward function (``_validate_visual_response``): ``uint8`` pixels, or a
+    floating-point tensor when ``rollout.pipeline.output_type == "latent"``. A
+    payload-only row therefore cannot ride through unchanged, so the fields the
+    manager insists on are filled with inert, *dtype-valid* placeholders — the
+    scorer dispatches on ``extra_info["bagel_corl"]`` and ignores them.
+
+    ``attention_mask`` / ``data_source`` / ``reward_model`` cover the
+    ``NaiveRewardManager`` variant (LLM side) without needing a second builder.
+    """
+    import torch
     from tensordict import TensorDict
     from verl.protocol import DataProto
 
+    # Mirror ``_validate_visual_response`` exactly: latent stays floating point,
+    # everything else is treated as uint8 pixels. Getting this wrong is a hard
+    # ValueError inside the RM worker, mid-episode, after the images were produced.
+    responses_dtype = torch.float32 if str(output_type) == "latent" else torch.uint8
     return DataProto(
-        batch=TensorDict({}, batch_size=[len(payload["image_paths"])]),
-        non_tensor_batch={"bagel_rm_payload": np.array([payload], dtype=object)},
+        batch=TensorDict(
+            {
+                # Placeholders: NaiveRewardManager decodes these to build an unused
+                # ``solution_str``; VisualRewardManager dtype-checks them.
+                "responses": torch.zeros((1, 1), dtype=responses_dtype),
+                "attention_mask": torch.ones((1, 1), dtype=torch.long),
+            },
+            batch_size=[1],
+        ),
+        non_tensor_batch={
+            "data_source": np.array(["bagel_corl_mid_loop_rm"], dtype=object),
+            "reward_model": np.array([{"ground_truth": ""}], dtype=object),
+            "extra_info": np.array([{BAGEL_RM_EXTRA_INFO_KEY: payload}], dtype=object),
+        },
     )
 
 
@@ -173,6 +213,7 @@ def make_rm_score_fn(
     get_scorer_knobs: Callable[[], dict[str, Any]] | None = None,
     get_image_prompt: Callable[[], str] | None = None,
     data_builder: Callable[[dict[str, Any]], Any] | None = None,
+    output_type: str = "image",
 ) -> Callable[[list[Any]], Any]:
     """Build the ``score_fn(samples) -> samples`` hook consumed by ``run_serial_episode``.
 
@@ -180,6 +221,11 @@ def make_rm_score_fn(
     Ray actor (``await handle.compute_score.remote(data)`` — the
     ``CompositeAgentLoopWorker`` idiom) or a plain async/sync callable. ``verl``
     is imported lazily so this module imports without the training stack.
+
+    ``output_type`` is the rollout pipeline's response kind
+    (``rollout.pipeline.output_type``); it selects the placeholder dtype the
+    manager's visual-response validation demands. Override it whenever the recipe
+    sets ``output_type=latent``, or the RM worker raises on dtype mid-episode.
     """
     if handle is None:
         raise RMScoringError(
@@ -187,6 +233,8 @@ def make_rm_score_fn(
             "wire agent-loop reward handles (trainer.get_reward_handles) or "
             "disable agent.rm_scoring explicitly"
         )
+    if data_builder is None:
+        data_builder = functools.partial(_default_data_builder, output_type=output_type)
 
     async def _invoke(data: Any) -> Any:
         method = getattr(handle, "compute_score", None)
@@ -216,7 +264,7 @@ def make_rm_score_fn(
         )
         if get_image_prompt is not None:
             payload["image_prompt"] = str(get_image_prompt() or "")
-        data = (data_builder or _default_data_builder)(payload)
+        data = data_builder(payload)
         scores, flags = parse_rm_result(await _invoke(data), payload["image_paths"])
         by_path = dict(zip(payload["image_paths"], scores, strict=True))
         flag_by_path = dict(zip(payload["image_paths"], flags, strict=True))

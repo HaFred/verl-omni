@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dual-lane TransferQueue packing for Bagel Co-RL (UND episode key vs GEN seed keys).
+"""Dual-lane TransferQueue packing for Bagel Co-RL (Joint-Training) (UND episode key vs GEN seed keys).
 
 In-episode counters (RFC):
   J = UND policy turns; K = generate_image calls; J >= K.
@@ -41,6 +41,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (
     strip_pixels_for_actor,
 )
 from verl_omni.agent_loop.bagel_corl_rm import bind_bagel_rm_handles
+from verl_omni.tools.trajectory.hydra_env import bind_agentic_image_gen
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -210,7 +211,12 @@ def pack_dual_lane_episode(
         "episode/K_complete": float(k_complete),
         "gen/num_rows": float(len(gen_records)),
         "gen/dropped_incomplete_groups": float(dropped),
-        "und/no_image_credit": 1.0 if k_complete == 0 else 0.0,
+        # ``used_image_credit`` is the authoritative signal (set when a generate_image
+        # call returned a usable image and the observation was fed back to UND).
+        # Keying off ``k_complete == 0`` under-counted: an episode with K>=1 whose
+        # every group was dropped also gave UND no image credit but reported 0 here,
+        # while the flatten path (bagel_corl_lib.flatten_multiturn_rollouts) counted it.
+        "und/no_image_credit": 0.0 if episode.used_image_credit else 1.0,
         "gen/skipped_no_groups": 1.0 if k_complete == 0 else 0.0,
         "episode/pattern_paired": 1.0 if pattern == "paired" else 0.0,
         "episode/pattern_mixed": 1.0 if pattern == "mixed" else 0.0,
@@ -289,26 +295,53 @@ def episode_from_agent_extra(
 
 @ray.remote
 class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
-    """TransferQueue worker that writes dual-lane UND + GEN keys for Bagel Co-RL."""
+    """TransferQueue worker that writes dual-lane UND + GEN keys for Bagel Co-RL (Joint-Training)."""
 
-    def __init__(self, *args, reward_loop_worker_handles=None, **kwargs):
+    def __init__(
+        self,
+        config,
+        llm_client,
+        teacher_client=None,
+        reward_loop_worker_handles=None,
+    ):
         """Accept the handles the pinned ``TaskRunnerV1`` forwards via the manager
         (``main_ppo`` passes ``trainer.get_reward_handles()`` unconditionally).
+
+        The signature mirrors ``AgentLoopManager._init_agent_loop_workers``'
+        ``.remote(config, llm_client, teacher_client, reward_loop_worker_handles)``
+        call positionally. It must NOT be ``(*args, reward_loop_worker_handles=None)``:
+        the base call then receives the handle list both positionally and by keyword
+        and raises ``TypeError: got multiple values for argument
+        'reward_loop_worker_handles'`` before any episode runs.
 
         ``[0]`` is the GEN pool (the composite contract's first slot, which it
         generically calls "dit"; Bagel is a MoT model with no DiT) and is bound for the
         in-loop RM adapter; the full list stays on ``self`` for the inherited
         episode-reward ``_compute_score`` when the base supports it.
         """
-        super().__init__(*args, reward_loop_worker_handles=reward_loop_worker_handles, **kwargs)
+        # Bind before anything reads agentic knobs: ``BagelMultiturnAgentLoop.run``
+        # calls ``agentic_get("good_enough_threshold")``, which raises while unbound.
+        bind_agentic_image_gen(config)
+        super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
         handles = list(reward_loop_worker_handles) if reward_loop_worker_handles else None
         if handles is not None and not hasattr(self, "reward_loop_worker_handles"):
             self.reward_loop_worker_handles = handles
         bind_bagel_rm_handles(handles)
 
     def _expected_s(self) -> int:
+        """Seeds per ``generate_image`` call (RFC §5 knob; no silent default).
+
+        The recipe sets ``agent.gen_samples_per_call``; defaulting to 4 here would
+        let the dual-lane GEN seed gate accept a group size nobody configured.
+        """
         agent = self.config.actor_rollout_ref.rollout.agent
-        return int(getattr(agent, "gen_samples_per_call", None) or agent.get("gen_samples_per_call") or 4)
+        raw = agent.get("gen_samples_per_call")
+        if raw is None:
+            raise ValueError(
+                "bagel_corl_sync requires actor_rollout_ref.rollout.agent.gen_samples_per_call; "
+                "the dual-lane GEN seed gate cannot infer S"
+            )
+        return int(raw)
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
@@ -317,7 +350,7 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
         uid, session_id = kwargs["uid"], kwargs["session_id"]
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
-            raise RuntimeError(f"Empty bagel Co-RL agent output for prompt {uid}_{session_id}")
+            raise RuntimeError(f"Empty bagel Co-RL (Joint-Training) agent output for prompt {uid}_{session_id}")
 
         await self._compute_score(outputs, kwargs=kwargs)
 
@@ -335,10 +368,10 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
                 out.reward_score = final_output.reward_score
                 out.extra_fields["reward_extra_info"] = final_output.extra_fields.get("reward_extra_info")
 
-        # Bagel Co-RL: one serial episode per session → single UND index 0.
+        # Bagel Co-RL (Joint-Training): one serial episode per session → single UND index 0.
         if len(outputs) != 1:
             raise RuntimeError(
-                f"Bagel Co-RL expected one AgentLoopOutput per session, got {len(outputs)}"
+                f"Bagel Co-RL (Joint-Training) expected one AgentLoopOutput per session, got {len(outputs)}"
             )
         episode_output = outputs[0]
         und_key = und_tq_key(dataset_task_uid=uid, session_id=session_id, episode_index=0)
@@ -461,6 +494,15 @@ class BagelCorlAgentLoopManagerTQ(AgentLoopManager):
     """AgentLoopManager wired to ``BagelCorlAgentLoopWorkerTQ`` (dual-lane ingest)."""
 
     def __init__(self, *args, **kwargs):
+        # Bind before AgentLoopManager.__init__ creates the Ray workers: the
+        # bagel_multiturn_agent loop reads agentic knobs (good_enough_threshold,
+        # max_generate_image_passes) via agentic_get, which raises while unbound.
+        # Mirrors OmniAgentLoopManager (verl_omni/agent_loop/omni_agent_loop.py).
+        config = kwargs.get("config")
+        if config is None and args:
+            config = args[0]
+        if config is not None:
+            bind_agentic_image_gen(config)
         self.agent_loop_workers_class = BagelCorlAgentLoopWorkerTQ
         super().__init__(*args, **kwargs)
 

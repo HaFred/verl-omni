@@ -91,7 +91,7 @@ class OmniActorConfig(FSDPActorConfig):
 
     trainer_type: str = "direct_preference"  # "direct_preference" or "policy_gradient"
     omni_loss: OmniLossConfig = field(default_factory=OmniLossConfig)
-    # Bagel Co-RL GEN branch (FlowGRPO); unused for standard omni AR / DPO.
+    # Bagel Co-RL (Joint-Training) GEN branch (FlowGRPO); unused for standard omni AR / DPO.
     diffusion_loss: Optional[DiffusionLossConfig] = None
 
     def __post_init__(self):

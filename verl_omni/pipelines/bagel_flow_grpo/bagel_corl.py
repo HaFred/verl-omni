@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Bagel UND+GEN Co-RL actor surface: untied ``lm_head``, dual disjoint LoRA, UND log-probs.
+"""Bagel UND+GEN Co-RL (Joint-Training) actor surface: untied ``lm_head``, dual disjoint LoRA, UND log-probs.
 
 PR1 keeps one FSDP owner (``BagelForTraining`` + ``lm_head``) with two forwards:
 token-path UND causal log-probs and the existing GEN velocity / FlowGRPO path.
@@ -91,7 +91,7 @@ def dual_lora_param_groups(module: nn.Module, *, lr_gen: float | None = None) ->
     """Split trainable parameters into UND (text-path) and GEN (``moe_gen``) groups.
 
     Args:
-        module: The Bagel Co-RL model (FSDP-wrapped or bare).
+        module: The Bagel Co-RL (Joint-Training) model (FSDP-wrapped or bare).
         lr_gen: Per-group LR override for the GEN group (UniGRPO per-expert LRs,
             text 1e-6 vs denoise 3e-5). ``None`` keeps the optimizer's base LR.
     """

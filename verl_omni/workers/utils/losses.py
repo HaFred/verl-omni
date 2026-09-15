@@ -135,7 +135,7 @@ def _bagel_corl_view(data: TensorDict, key: str):
 
 
 def _bagel_lane_weight(config, key: str, *, default: float | str = 1.0, cast=float):
-    """Read a Bagel Co-RL lane knob from ``config.diffusion_loss`` (SoT: DiffusionLossConfig).
+    """Read a Bagel Co-RL (Joint-Training) lane knob from ``config.diffusion_loss`` (SoT: DiffusionLossConfig).
 
     Older configs without the field keep the default; never invent a fallback for
     garbage values — cast errors fail loud.
@@ -148,7 +148,7 @@ def _bagel_lane_weight(config, key: str, *, default: float | str = 1.0, cast=flo
 
 
 def bagel_composite_loss(config, model_output, data, dp_group=None):
-    """Composite Co-RL loss: UND token PPO + GEN FlowGRPO on *separate* advantage views.
+    """Composite Co-RL (Joint-Training) loss: UND token PPO + GEN FlowGRPO on *separate* advantage views.
 
     UND uses token GRPO advantages on the main / ``bagel_corl_und`` tensors.
     GEN uses FlowGRPO advantages only from ``bagel_corl_gen`` — never the UND
@@ -161,6 +161,13 @@ def bagel_composite_loss(config, model_output, data, dp_group=None):
     has_complete = bool(tu.get_non_tensor_data(data, "has_complete_gen_groups", default=False))
     skip_gen = bool(tu.get_non_tensor_data(data, "skip_gen", default=not has_complete))
     num_gen_rows = tu.get_non_tensor_data(data, "num_gen_rows", default=0) or 0
+    # RFC §4.4: each branch is a mean over its own loss units, and the relative
+    # scale is governed solely by the lane weights. GEN's ``diffusion_loss``
+    # divides by this same non-tensor internally; ``ppo_loss`` does not (its
+    # ``agg_loss`` normalizes over the *local* micro-batch token count), so the
+    # UND term must be divided here or the accumulator sums G undivided UND terms
+    # and the lane weights silently drift by G.
+    gradient_accumulation_steps = tu.get_non_tensor_data(data, "gradient_accumulation_steps", default=None)
 
     loss_value = None
     model_output = model_output if isinstance(model_output, dict) else {}
@@ -179,6 +186,8 @@ def bagel_composite_loss(config, model_output, data, dp_group=None):
 
     if und_output is not None and und_data is not None and "log_probs" in und_output:
         und_loss, und_metrics = ppo_loss(config, und_output, und_data, dp_group=dp_group)
+        if gradient_accumulation_steps:
+            und_loss = und_loss / gradient_accumulation_steps
         loss_value = und_loss * _bagel_lane_weight(config, "loss_weight_und")
         metrics.update(und_metrics)
 

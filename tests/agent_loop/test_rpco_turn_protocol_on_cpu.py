@@ -22,12 +22,61 @@ from pathlib import Path
 
 
 def _ensure_pkg(name: str, path: Path) -> None:
-    """Register a package stub so submodule imports skip heavy ``__init__`` side effects."""
+    """Register a transparent package stub so submodule imports skip heavy ``__init__``.
+
+    A bare stub leaks for the rest of the pytest session: any later test file asking
+    for a name the stub lacks (``from verl_omni.tools.trajectory import ...``, or a
+    ``monkeypatch.setattr`` on ``verl_omni.tools.trajectory.hydra_env``) then dies with
+    ImportError or AttributeError, depending on collection order. ``_missing`` answers
+    those from the real package without making the heavy import eager.
+    """
     if name in sys.modules:
         return
     pkg = types.ModuleType(name)
     pkg.__path__ = [str(path)]
     pkg.__file__ = str(path / "__init__.py")
+
+    def _missing(attr: str):
+        # PEP 562 hook, invoked only for names this stub lacks, so anything a test file
+        # registered here still wins. Resolution mirrors a real package in two steps,
+        # only the second of which executes an ``__init__``:
+        #   1. a submodule of that name — ``getattr(verl_omni, "tools")``, and the
+        #      ``verl_omni.tools.trajectory.hydra_env`` that dotted-path patching needs;
+        #   2. otherwise the real ``__init__.py``, lazily — a re-export such as
+        #      ``from verl_omni.tools.trajectory import active_trajectory_relpath``.
+        if attr.startswith("__"):
+            raise AttributeError(attr)
+        try:
+            child = importlib.import_module(f"{pkg.__name__}.{attr}")
+        except ImportError:
+            pass
+        else:
+            pkg.__dict__[attr] = child  # real packages expose submodules as attributes
+            return child
+        if path.is_dir() and not pkg.__dict__.get("_real_init_loaded"):
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    pkg.__name__, path / "__init__.py", submodule_search_locations=[str(path)]
+                )
+                real = importlib.util.module_from_spec(spec)
+                # Execute the real ``__init__`` under the package name — that is what
+                # makes its relative ``from .x import y`` resolve — while this stub stays
+                # the canonical ``sys.modules`` entry, so the hook above keeps working.
+                real.__package__ = pkg.__name__
+                spec.loader.exec_module(real)
+            except Exception:  # optional/heavy deps absent: stay a stub
+                pass
+            else:
+                pkg.__dict__["_real_init_loaded"] = True
+                pkg.__dict__.update(
+                    {k: v for k, v in vars(real).items() if k not in {"__getattr__", "__dict__"}}
+                )
+        try:
+            return pkg.__dict__[attr]
+        except KeyError:
+            raise AttributeError(f"module {pkg.__name__!r} has no attribute {attr!r}") from None
+
+    pkg.__getattr__ = _missing
     sys.modules[name] = pkg
 
 

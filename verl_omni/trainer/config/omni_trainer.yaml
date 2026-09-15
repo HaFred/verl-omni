@@ -17,7 +17,7 @@ defaults:
 # Dataset / agent-loop data config.
 data:
 
-  # Required by verl AgentLoopBase (struct access). Disabled for Bagel Co-RL UND/GEN.
+  # Required by verl AgentLoopBase (struct access). Disabled for Bagel Co-RL (Joint-Training) UND/GEN.
   continuous_token:
 
     enable: false
@@ -78,7 +78,7 @@ trainer:
     # Use the omni trainer mode for omni models.
     trainer_mode: omni_sync
 
-    # Bagel UND+GEN Co-RL (PR1 serial gather, one composite optimizer step).
+    # Bagel UND+GEN Co-RL (Joint-Training) (PR1 serial gather, one composite optimizer step).
     bagel_corl_sync: {}
 
 

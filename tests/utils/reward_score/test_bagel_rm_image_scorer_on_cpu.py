@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for the Bagel Co-RL in-loop RM payload consumer (torch-free)."""
+"""CPU tests for the Bagel Co-RL (Joint-Training) in-loop RM payload consumer (torch-free)."""
 
 from __future__ import annotations
 
@@ -20,16 +20,65 @@ import sys
 import types
 from pathlib import Path
 
-import numpy as np
 import pytest
 
 
 def _ensure_pkg(name: str, path: Path) -> None:
+    """Register a transparent package stub so submodule imports skip heavy ``__init__``.
+
+    A bare stub leaks for the rest of the pytest session: any later test file asking
+    for a name the stub lacks (``from verl_omni.tools.trajectory import ...``, or a
+    ``monkeypatch.setattr`` on ``verl_omni.tools.trajectory.hydra_env``) then dies with
+    ImportError or AttributeError, depending on collection order. ``_missing`` answers
+    those from the real package without making the heavy import eager.
+    """
     if name in sys.modules:
         return
     pkg = types.ModuleType(name)
     pkg.__path__ = [str(path)]
     pkg.__file__ = str(path / "__init__.py")
+
+    def _missing(attr: str):
+        # PEP 562 hook, invoked only for names this stub lacks, so anything a test file
+        # registered here still wins. Resolution mirrors a real package in two steps,
+        # only the second of which executes an ``__init__``:
+        #   1. a submodule of that name — ``getattr(verl_omni, "tools")``, and the
+        #      ``verl_omni.tools.trajectory.hydra_env`` that dotted-path patching needs;
+        #   2. otherwise the real ``__init__.py``, lazily — a re-export such as
+        #      ``from verl_omni.tools.trajectory import active_trajectory_relpath``.
+        if attr.startswith("__"):
+            raise AttributeError(attr)
+        try:
+            child = importlib.import_module(f"{pkg.__name__}.{attr}")
+        except ImportError:
+            pass
+        else:
+            pkg.__dict__[attr] = child  # real packages expose submodules as attributes
+            return child
+        if path.is_dir() and not pkg.__dict__.get("_real_init_loaded"):
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    pkg.__name__, path / "__init__.py", submodule_search_locations=[str(path)]
+                )
+                real = importlib.util.module_from_spec(spec)
+                # Execute the real ``__init__`` under the package name — that is what
+                # makes its relative ``from .x import y`` resolve — while this stub stays
+                # the canonical ``sys.modules`` entry, so the hook above keeps working.
+                real.__package__ = pkg.__name__
+                spec.loader.exec_module(real)
+            except Exception:  # optional/heavy deps absent: stay a stub
+                pass
+            else:
+                pkg.__dict__["_real_init_loaded"] = True
+                pkg.__dict__.update(
+                    {k: v for k, v in vars(real).items() if k not in {"__getattr__", "__dict__"}}
+                )
+        try:
+            return pkg.__dict__[attr]
+        except KeyError:
+            raise AttributeError(f"module {pkg.__name__!r} has no attribute {attr!r}") from None
+
+    pkg.__getattr__ = _missing
     sys.modules[name] = pkg
 
 
@@ -68,8 +117,21 @@ def _load_modules():
 client, scorer = _load_modules()
 
 
-def _data(payload):
-    return types.SimpleNamespace(non_tensor_batch={"bagel_rm_payload": np.array([payload], dtype=object)})
+def _kwargs(payload=None, **extra):
+    """Build the exact call ``NaiveRewardManager`` makes into ``compute_score``.
+
+    The manager passes four keywords — ``data_source``, ``solution_str``,
+    ``ground_truth``, ``extra_info`` — and never a single positional ``data``.
+    The in-loop payload must ride ``extra_info["bagel_corl"]`` (L3/RFC §4.2).
+    """
+    extra_info = {"bagel_corl": payload} if payload is not None else {}
+    return {
+        "data_source": extra.pop("data_source", "bagel_corl_mid_loop_rm"),
+        "solution_str": extra.pop("solution_str", ""),
+        "ground_truth": extra.pop("ground_truth", ""),
+        "extra_info": extra.pop("extra_info", extra_info),
+        **extra,
+    }
 
 
 def _payload(**overrides):
@@ -84,21 +146,25 @@ def _payload(**overrides):
     return payload
 
 
-def test_extract_payload_and_fail_loud_shapes():
+def test_mid_loop_payload_and_fail_loud_shapes():
     payload = _payload()
-    assert scorer.extract_bagel_rm_payload(_data(payload)) is payload
-    # non_tensor_batch without the payload key
-    with pytest.raises(ValueError, match="missing non_tensor_batch"):
-        scorer.extract_bagel_rm_payload(types.SimpleNamespace(non_tensor_batch={}))
-    # payload row present but not a dict
-    bad_row = types.SimpleNamespace(
-        non_tensor_batch={"bagel_rm_payload": np.array(["not-a-dict"], dtype=object)}
-    )
+    assert scorer._mid_loop_payload({"bagel_corl": payload}) is payload
+    # extra_info without the wire key → episode path, not an error.
+    assert scorer._mid_loop_payload({"other": 1}) is None
+    assert scorer._mid_loop_payload(None) is None
+    assert scorer._mid_loop_payload("not-a-dict") is None
+    # payload present but not a dict → fail loud.
     with pytest.raises(ValueError, match="must be a dict"):
-        scorer.extract_bagel_rm_payload(bad_row)
-    two = types.SimpleNamespace(non_tensor_batch={"bagel_rm_payload": np.array([payload, payload], dtype=object)})
-    with pytest.raises(ValueError, match="exactly 1 payload row"):
-        scorer.extract_bagel_rm_payload(two)
+        scorer._mid_loop_payload({"bagel_corl": "not-a-dict"})
+
+
+def test_wire_key_matches_the_producer():
+    """The producer (agent_loop.bagel_corl_rm) and this consumer must agree.
+
+    Asserted as a literal so this module stays torch-free; the producer side is
+    covered by ``tests/agent_loop/test_bagel_corl_rm_on_cpu.py``.
+    """
+    assert scorer.BAGEL_RM_EXTRA_INFO_KEY == "bagel_corl"
 
 
 def test_compute_score_happy_path_aligns_per_image_outputs(monkeypatch):
@@ -112,11 +178,16 @@ def test_compute_score_happy_path_aligns_per_image_outputs(monkeypatch):
         return {"ok": True, "correctness": 0.4, "aesthetics": 0.2, "good_enough": False}
 
     monkeypatch.setattr(client, "call_reflect_vlm", fake_judge)
-    result = scorer.compute_score(_data(_payload()))
-    assert result["reward_extra_info"]["sample_scores"] == [pytest.approx(0.7), pytest.approx(0.3)]
-    assert result["reward_extra_info"]["sample_good_enough"] == [True, False]
-    assert result["reward_extra_info"]["good_enough"] is False
-    assert result["reward_score"] == pytest.approx(0.5)
+    result = scorer.compute_score(**_kwargs(_payload()))
+    # Flat, manager-shaped: NaiveRewardManager reads result["score"] and merges
+    # every other key into reward_extra_info (that is where parse_rm_result looks).
+    assert result["sample_scores"] == [pytest.approx(0.7), pytest.approx(0.3)]
+    assert result["sample_good_enough"] == [True, False]
+    assert result["good_enough"] is False
+    assert result["score"] == pytest.approx(0.5)
+    assert "reward_extra_info" not in result
+    assert "reward_score" not in result
+    assert [row["image_path"] for row in result["per_image"]] == ["/a.png", "/b.png"]
     # Threshold knob reached the judge, fail-loud contract satisfied.
     assert knobs_seen[0]["good_enough_threshold"] == pytest.approx(0.8)
     assert knobs_seen[0]["vllm_url"] == "http://rm:8000"
@@ -130,33 +201,38 @@ def test_compute_score_fails_loud_when_any_image_unscored(monkeypatch):
 
     monkeypatch.setattr(client, "call_reflect_vlm", fake_judge)
     with pytest.raises(ValueError, match="refusing zero-fill"):
-        scorer.compute_score(_data(_payload()))
+        scorer.compute_score(**_kwargs(_payload()))
 
 
 def test_compute_score_requires_threshold(monkeypatch):
     payload = _payload(scorer_knobs={"vllm_url": "http://rm:8000"})
     payload["extra_info"].pop("good_enough_threshold", None)
-    with pytest.raises((KeyError, TypeError, ValueError)):
-        scorer.compute_score(_data(payload))
+    with pytest.raises(ValueError, match="good_enough_threshold missing"):
+        scorer.compute_score(**_kwargs(payload))
 
 
 def test_compute_score_requires_image_paths():
     with pytest.raises(ValueError, match="no image_paths"):
-        scorer.compute_score(_data(_payload(image_paths=[])))
+        scorer.compute_score(**_kwargs(_payload(image_paths=[])))
 
 
 def test_compute_score_dispatches_to_episode_scorer(monkeypatch):
-    """No payload row → post-hoc episode scoring (agentic_multidim delegate)."""
+    """No payload → post-hoc episode scoring (agentic_multidim delegate)."""
     seen: dict = {}
     fake = types.ModuleType("verl_omni.utils.reward_score.agentic_multidim_reward")
 
-    def fake_compute(data):
-        seen["data"] = data
-        return {"reward_score": 0.42}
+    def fake_compute(data_source, solution_str, ground_truth, extra_info, **kwargs):
+        seen.update(
+            data_source=data_source,
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+        )
+        return {"score": 0.42}
 
     fake.compute_score = fake_compute
     monkeypatch.setitem(sys.modules, "verl_omni.utils.reward_score.agentic_multidim_reward", fake)
-    data = types.SimpleNamespace(non_tensor_batch={})
-    result = scorer.compute_score(data)
-    assert result == {"reward_score": 0.42}
-    assert seen["data"] is data
+    result = scorer.compute_score(**_kwargs(None, ground_truth="a castle"))
+    assert result == {"score": 0.42}
+    assert seen["ground_truth"] == "a castle"
+    assert seen["data_source"] == "bagel_corl_mid_loop_rm"

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Omni / Bagel Co-RL rollout agent config extensions (do not patch upstream verl)."""
+"""Omni / Bagel Co-RL (Joint-Training) rollout agent config extensions (do not patch upstream verl)."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ __all__ = ["BagelCorlAgentLoopConfig"]
 
 @dataclass
 class BagelCorlAgentLoopConfig(AgentLoopConfig):
-    """``AgentLoopConfig`` plus Bagel Co-RL knobs used by ``bagel_multiturn_agent``.
+    """``AgentLoopConfig`` plus Bagel Co-RL (Joint-Training) knobs used by ``bagel_multiturn_agent``.
 
     Kept in verl-omni so upstream ``verl.workers.config.AgentLoopConfig`` stays untouched.
     """
@@ -36,6 +36,13 @@ class BagelCorlAgentLoopConfig(AgentLoopConfig):
     max_generate_passes: Optional[int] = None
     # UND turn budget before force-stop (bounds in-episode J).
     max_und_turns: Optional[int] = None
+    # Reduction over the S per-seed ``good_enough`` flags when deciding the
+    # episode-level stop cue: ``"any"`` (best-of-S, default), ``"all"``, or
+    # ``"mean"`` (fraction of YES flags >= ``agentic_image_gen.good_enough_threshold``).
+    # Declared as a real field — ``bagel_corl.py`` reads it and fails loud on an
+    # unknown value, so leaving it undeclared would instead fail at ``instantiate``
+    # with "unexpected keyword" for any recipe that sets it.
+    good_enough_reduction: str = "any"
     # Set True only after Bagel UND AR (Hermes tool-call) is proven on the live
     # replica — ``bagel_single_stage`` is DiffusionStrategy / GEN-only today.
     und_ar_serving_ready: bool = False

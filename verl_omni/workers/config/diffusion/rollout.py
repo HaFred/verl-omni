@@ -88,6 +88,22 @@ class DiffusionPipelineConfig(BaseConfig):
     # Flow-matching sigma-schedule shift for the video stream (maps to vllm-omni's flow_shift)
     video_flow_shift: float = 12.0
 
+    # BAGEL CFG knobs, read by ``BagelDiffusion._get_cfg_params`` / ``_combine_cfg``.
+    # Declared as real fields (rather than only reached through a ``getattr``
+    # fallback) so the trainer can pin them on BOTH ``model.pipeline`` and
+    # ``rollout.pipeline`` and assert parity at launch (RFC §5): the GEN
+    # importance-sampling ratio is unbiased only when training and rollout share a
+    # single transition kernel, and an undeclared key makes the pipeline config
+    # fail to instantiate outright. Defaults mirror
+    # ``BAGEL_FLOWGRPO_CFG_DEFAULTS`` in ``verl_omni/pipelines/bagel_flow_grpo/common.py``.
+    cfg_text_scale: float = 4.0
+    cfg_img_scale: float = 1.0
+    cfg_renorm_type: str = "global"
+    cfg_renorm_min: float = 0.0
+    # ``(low, high)`` sigma window for applying CFG; ``None`` falls back to
+    # ``BAGEL_FLOWGRPO_CFG_DEFAULTS["cfg_interval"]`` (0.0, 1.0).
+    cfg_interval: Optional[list[float]] = None
+
 
 @dataclass
 class DiffusionSamplingConfig(BaseConfig):
@@ -192,7 +208,7 @@ class DiffusionRolloutConfig(BaseConfig):
 
     agent: AgentLoopConfig = field(default_factory=AgentLoopConfig)
 
-    # AgentLoopWorker reads this at init; Co-RL rewrites omni RolloutConfig → this class.
+    # AgentLoopWorker reads this at init; Co-RL (Joint-Training) rewrites omni RolloutConfig → this class.
     trace: TraceConfig = field(default_factory=TraceConfig)
 
     multi_turn: MultiTurnConfig = field(default_factory=MultiTurnConfig)

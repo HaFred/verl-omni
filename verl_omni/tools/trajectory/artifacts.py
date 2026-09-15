@@ -302,7 +302,7 @@ def build_generate_call_meta(*, prompt: str, user_prompt: str) -> dict:
     """Build initial/rewrite provenance for one generated-image metadata row.
 
     Ported from the legacy ``agent_loop/image_gen_trajectory_context`` layer so
-    the Bagel Co-RL lane and the Mode-2a tool loop share one registry and one
+    the Bagel Co-RL (Joint-Training) lane and the Mode-2a tool loop share one registry and one
     provenance implementation (audit T1.6).
 
     Args:

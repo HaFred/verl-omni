@@ -445,13 +445,13 @@ def dump_bagel_corl_episode_images(
     sample_index: Any = 0,
     rollout_n: int = 0,
 ) -> list[str]:
-    """Copy Bagel Co-RL gen_sample PNGs into the rollout image tree.
+    """Copy Bagel Co-RL (Joint-Training) gen_sample PNGs into the rollout image tree.
 
     Layout: ``<rollout_images_root>/step_XXXXXX/sample_i.nn/image_*.png``.
     Accepts CompositeAgentLoop ``extra_fields`` rows, a list of episodes, or a
     single episode-like object with ``gen_samples``.
 
-    Bagel Co-RL specific: kept even though upstream ``verl_omni.utils.agentic``
+    Bagel Co-RL (Joint-Training) specific: kept even though upstream ``verl_omni.utils.agentic``
     does not need it, because ``bagel_corl.py`` imports it from this module.
 
     Args:

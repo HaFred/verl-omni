@@ -335,7 +335,7 @@ agent:
   # default agent loop to use if `agent_name` not set in RL dataset
   default_agent_loop: diffusion_single_turn_agent
 
-# Rollout tracing (AgentLoopWorker reads this even on diffusion Co-RL)
+# Rollout tracing (AgentLoopWorker reads this even on diffusion Co-RL (Joint-Training))
 trace:
   _target_: verl.workers.config.TraceConfig
   project_name: ${oc.select:trainer.project_name,null}

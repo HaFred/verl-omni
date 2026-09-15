@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Reward function for the Bagel Co-RL in-loop RM payload (RFC §4.2).
+"""Reward function for the Bagel Co-RL (Joint-Training) in-loop RM payload (RFC §4.2).
 
 Wire as the custom reward function of the colocated RM pool — the SAME handles
 serve mid-loop GEN scoring and post-hoc episode scoring, so ``compute_score``
@@ -20,12 +20,26 @@ dispatches on payload shape::
     reward.custom_reward_function.path=pkg://verl_omni.utils.reward_score.bagel_rm_image_scorer
     reward.custom_reward_function.name=compute_score
 
-- Mid-loop (``verl_omni.agent_loop.bagel_corl_rm.build_rm_score_payload``): the
-  ``DataProto`` carries ``non_tensor_batch["bagel_rm_payload"]`` — one object row
-  with ``image_paths`` / ``reference_paths`` / ``extra_info`` / ``scorer_knobs`` /
-  ``image_prompt``. Each image is judged (C/A via the frozen VL judge) and the
-  result carries per-image ``sample_scores`` / ``sample_good_enough`` aligned to
-  ``image_paths`` — exactly what ``parse_rm_result`` consumes.
+Call contract (this is what the configured manager actually does)
+----------------------------------------------------------------
+``RewardLoopWorker.compute_score(data)`` → ``reward_manager.run_single(data)``.
+``NaiveRewardManager`` (the repo default) reads ``data_source`` /
+``reward_model["ground_truth"]`` and calls the reward function with exactly four
+keywords — ``data_source``, ``solution_str``, ``ground_truth``, ``extra_info``
+(``VisualRewardManager`` passes ``solution_image`` instead), and merges the
+returned dict's keys into ``reward_extra_info``. A reward function that takes a
+single positional ``data`` therefore fails with ``TypeError``/``KeyError``; so
+does one that returns ``reward_score`` instead of ``score``.
+
+The payload must ride a key the manager already forwards. ``extra_info`` is that
+key: the in-loop builder
+(``verl_omni.agent_loop.bagel_corl_rm._default_data_builder``) puts the payload
+under ``extra_info["bagel_corl"]``.
+
+- Mid-loop (``verl_omni.agent_loop.bagel_corl_rm.build_rm_score_payload``): each
+  image is judged (C/A via the frozen VL judge) and the result carries per-image
+  ``sample_scores`` / ``sample_good_enough`` aligned to ``image_paths`` — exactly
+  what ``parse_rm_result`` consumes off ``reward_extra_info``.
 - Episode post-hoc (no payload): delegated to
   ``agentic_multidim_reward.compute_score`` (image-grounded when ``K >= 1``,
   multi-dim RPCO when ``K = 0``) — the authoritative token-GRPO scalar.
@@ -41,67 +55,69 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["compute_score", "extract_bagel_rm_payload"]
+__all__ = ["BAGEL_RM_EXTRA_INFO_KEY", "compute_score"]
+
+# Wire key shared with the producer (verl_omni/agent_loop/bagel_corl_rm.py). Spelled
+# out in both modules rather than imported so this module stays importable in
+# isolation (the CPU test loads it by path without the agent_loop package).
+BAGEL_RM_EXTRA_INFO_KEY = "bagel_corl"
 
 
-def extract_bagel_rm_payload(data: Any) -> dict[str, Any]:
-    """Pull the single ``bagel_rm_payload`` row out of a DataProto-like object."""
-    ntb = getattr(data, "non_tensor_batch", None)
-    if ntb is None and isinstance(data, dict):
-        ntb = data
-    if ntb is None:
-        raise ValueError("bagel_rm_image_scorer: input carries no non_tensor_batch")
-    column = ntb.get("bagel_rm_payload") if hasattr(ntb, "get") else None
-    if column is None and isinstance(ntb, dict):
-        column = ntb.get("bagel_rm_payload")
-    if column is None:
-        raise ValueError("bagel_rm_image_scorer: missing non_tensor_batch['bagel_rm_payload']")
-    rows = list(column)
-    if len(rows) != 1:
-        raise ValueError(f"bagel_rm_image_scorer: expected exactly 1 payload row, got {len(rows)}")
-    payload = rows[0]
+def _mid_loop_payload(extra_info: Any) -> dict[str, Any] | None:
+    """Return the in-loop payload riding ``extra_info``, or ``None`` for episodes."""
+    if not isinstance(extra_info, dict):
+        return None
+    payload = extra_info.get(BAGEL_RM_EXTRA_INFO_KEY)
+    if payload is None:
+        return None
     if not isinstance(payload, dict):
-        raise ValueError(f"bagel_rm_image_scorer: payload row must be a dict, got {type(payload)!r}")
+        raise ValueError(
+            f"bagel_rm_image_scorer: extra_info[{BAGEL_RM_EXTRA_INFO_KEY!r}] must be a dict, "
+            f"got {type(payload)!r}"
+        )
     return payload
 
 
-def _has_bagel_rm_payload(data: Any) -> bool:
-    """True when the input carries a mid-loop ``bagel_rm_payload`` row."""
-    ntb = getattr(data, "non_tensor_batch", None)
-    if ntb is None and isinstance(data, dict):
-        ntb = data
-    if ntb is None or not hasattr(ntb, "get"):
-        return False
-    try:
-        return ntb.get("bagel_rm_payload") is not None
-    except (AttributeError, TypeError):
-        return False
-
-
-def compute_score(data: Any) -> dict[str, Any]:
+def compute_score(
+    data_source: str = "",
+    solution_str: str = "",
+    ground_truth: Any = None,
+    extra_info: dict[str, Any] | None = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
     """Dispatch on payload shape: mid-loop image scoring vs post-hoc episode scoring.
 
     Args:
-        data: DataProto. With a ``bagel_rm_payload`` row → judge each image
-            (mid-loop GEN scoring). Without one → delegate to
-            ``agentic_multidim_reward.compute_score`` (the authoritative episode
-            scalar for token GRPO).
+        data_source: Unused; kept for the verl ``compute_score`` signature.
+        solution_str: Decoded trajectory text (``NaiveRewardManager``). Unused —
+            the in-loop payload carries image paths, not text.
+        ground_truth: Episode ground truth, forwarded to the episode scorer.
+        extra_info: Manager-forwarded metadata. Carries ``bagel_corl`` →
+            mid-loop GEN scoring; absent → post-hoc episode scoring.
 
     Returns:
-        ``{"reward_score": float, "reward_extra_info": {...}}``.
+        Flat dict with ``score`` plus metric keys (``sample_scores``,
+        ``sample_good_enough``, ``good_enough`` for the in-loop path). Flat, not
+        nested under ``reward_extra_info``: the manager does the nesting.
 
     Raises:
-        KeyError: If ``good_enough_threshold`` is missing from the knobs.
-        ValueError: If any image fails to score (fail-loud, no zero-fill).
+        ValueError: If the payload is malformed, ``good_enough_threshold`` is
+            missing, or any image fails to score (fail-loud, no zero-fill).
     """
-    if not _has_bagel_rm_payload(data):
+    payload = _mid_loop_payload(extra_info)
+    if payload is None:
         from verl_omni.utils.reward_score.agentic_multidim_reward import compute_score as episode_compute_score
 
-        return episode_compute_score(data)
+        return episode_compute_score(
+            data_source=data_source,
+            solution_str=solution_str,
+            ground_truth=ground_truth,
+            extra_info=extra_info,
+            **kwargs,
+        )
 
     from verl_omni.utils.reward_score.agentic_image_judge_client import call_reflect_vlm
 
-    payload = extract_bagel_rm_payload(data)
     image_paths = [str(p) for p in payload.get("image_paths") or []]
     if not image_paths:
         raise ValueError("bagel_rm_image_scorer: payload has no image_paths")
@@ -153,12 +169,14 @@ def compute_score(data: Any) -> dict[str, Any]:
         )
 
     reward_score = sum(scores) / len(scores)
+    # Flat, manager-shaped dict: NaiveRewardManager does result["score"] and merges
+    # every key into reward_extra_info, which is where parse_rm_result looks for
+    # sample_scores / sample_good_enough. Nesting these under reward_extra_info
+    # here would KeyError on "score" before scoring ever returns.
     return {
-        "reward_score": float(reward_score),
-        "reward_extra_info": {
-            "sample_scores": scores,
-            "sample_good_enough": flags,
-            "good_enough": all(flags),
-            "per_image": per_image,
-        },
+        "score": float(reward_score),
+        "sample_scores": scores,
+        "sample_good_enough": flags,
+        "good_enough": all(flags),
+        "per_image": per_image,
     }

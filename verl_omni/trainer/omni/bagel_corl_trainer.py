@@ -11,11 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Bagel UND+GEN Co-RL trainer: one post-gather composite update + weight publish."""
+"""Bagel UND+GEN Co-RL (Joint-Training) trainer: one post-gather composite update + weight publish."""
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import fields
 from typing import Any
 
@@ -32,6 +33,13 @@ from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.config.diffusion import DiffusionRolloutConfig
 
 logger = logging.getLogger(__name__)
+
+# Bagel Co-RL (Joint-Training) agent knobs with no code default (RFC §5 "knob source of truth"):
+# ``actor_rollout_ref.rollout.agent.*`` is the single SoT, and
+# ``verl_omni/utils/config.py`` validates S >= 2 / max_generate_passes == 1 at
+# launch. The trainer must not invent values, or a missing/bad recipe knob would
+# be masked from that validation.
+_BAGEL_AGENT_REQUIRED_KNOBS = ("gen_samples_per_call", "max_generate_passes", "max_und_turns")
 
 # Fields accepted by DiffusionModelConfig (plus _target_). Omni YAML keys outside this
 # set must be stripped before instantiate/omega_conf_to_dataclass.
@@ -113,7 +121,15 @@ def _normalize_tq_kv_get_result(data, keys: list[str]) -> dict[str, dict]:
             out = {}
             for key in keys:
                 row = data.get(key)
-                if row is not None:
+                if row is None:
+                    continue
+                if isinstance(row, dict) and "fields" in row:
+                    # Already row-shaped ({"fields": {...}}): pass through. Wrapping
+                    # again would nest "fields" twice and every downstream
+                    # ``row["<column>"]`` lookup (gen_group_uid, rollout_log_probs, …)
+                    # would KeyError, silently dropping the whole GEN lane.
+                    out[str(key)] = row
+                else:
                     out[str(key)] = {"fields": row if isinstance(row, dict) else {"value": row}}
             return out
         # Columnar dict {field: [values...]} optionally carrying a "keys" column.
@@ -174,12 +190,12 @@ def _index_column(col, i: int):
 
 @register_trainer("bagel_corl_sync")
 class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
-    """Synchronous Bagel Co-RL: serial J-episode gather, then one UND+GEN optimizer step.
+    """Synchronous Bagel Co-RL (Joint-Training): serial J-episode gather, then one UND+GEN optimizer step.
 
     Weight sync runs once in ``on_step_end`` (inherited) to every replica. No mid-episode sync.
     Replay uses the sync ``ReplayBuffer`` even though ``trainer_mode`` is not the string ``sync``.
 
-    ``main_omni`` defaults to omni ``OmniModelConfig`` / ``RolloutConfig``. Bagel Co-RL needs
+    ``main_omni`` defaults to omni ``OmniModelConfig`` / ``RolloutConfig``. Bagel Co-RL (Joint-Training) needs
     the diffusion model + rollout surfaces (``algorithm``, ``pipeline``, ``algo``,
     ``rollout_adapter``) for FlowGRPO GEN / weight sync while keeping the omni actor for UND
     ``ppo_loss``. Rewrite those configs and inject ``diffusion_loss`` before tokenizer /
@@ -234,9 +250,18 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         rollout_filtered.setdefault("enable_sleep_mode", True)
         agent = dict(rollout_filtered.get("agent") or {})
         agent["_target_"] = "verl_omni.workers.config.omni.BagelCorlAgentLoopConfig"
-        agent.setdefault("gen_samples_per_call", 4)
-        agent.setdefault("max_generate_passes", 1)
-        agent.setdefault("max_und_turns", 8)
+        # RFC §5: ``gen_samples_per_call`` / ``max_generate_passes`` /
+        # ``max_und_turns`` have a single SoT of
+        # ``actor_rollout_ref.rollout.agent.*`` and **no code fallback** — the recipe
+        # (or yaml) must set them, and ``verl_omni/utils/config.py`` validates S >= 2
+        # and ``max_generate_passes == 1`` at launch. Inventing values here would
+        # silently mask a missing/bad recipe knob from that validation.
+        missing = [k for k in _BAGEL_AGENT_REQUIRED_KNOBS if agent.get(k) is None]
+        if missing:
+            raise ValueError(
+                "bagel_corl_sync requires actor_rollout_ref.rollout.agent."
+                f"{', '.join(missing)} (RFC §5 knob SoT, no code default)"
+            )
         agent.setdefault(
             "agent_loop_manager_class",
             "verl_omni.agent_loop.bagel_corl_tq.BagelCorlAgentLoopManagerTQ",
@@ -255,10 +280,21 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         pipeline = dict(rollout_filtered.get("pipeline") or {})
         pipeline.setdefault("num_inference_steps", 10)
         # UniGRPO (arXiv:2603.23500): CFG doubles per-step evaluations and branches
-        # the rollout graph — prohibitive for multi-turn episodes. Training runs
-        # CFG-free; the recipe's eval block re-enables CFG if desired.
+        # the rollout graph — prohibitive for multi-turn episodes. Joint-Training runs
+        # CFG-free on BOTH sides; the recipe's eval block re-enables CFG if desired.
         pipeline["cfg_text_scale"] = 1.0
         rollout_filtered["pipeline"] = pipeline
+
+        # ``cfg_text_scale`` is a transition-kernel knob, not a style knob: the
+        # GEN importance ratio is only unbiased when training and rollout use the
+        # SAME value (RFC §4.8.5 / §5). The training side reads
+        # ``model.pipeline.cfg_text_scale`` via
+        # ``BagelDiffusion._get_cfg_params``, which falls back to
+        # ``BAGEL_FLOWGRPO_CFG_DEFAULTS`` = 4.0 — so leaving it unset here silently
+        # trained with CFG while rollout ran CFG-free.
+        model_pipeline = dict(filtered.get("pipeline") or {})
+        model_pipeline["cfg_text_scale"] = pipeline["cfg_text_scale"]
+        filtered["pipeline"] = model_pipeline
 
         with open_dict(self.config):
             self.config.actor_rollout_ref.model = OmegaConf.create(filtered)
@@ -283,6 +319,21 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 data.continuous_token = OmegaConf.create({"enable": False, "model_family": "auto"})
             elif data.continuous_token.get("enable") is None:
                 data.continuous_token.enable = False
+
+        # RFC §5: ``cfg_text_scale`` is a transition-kernel knob whose single SoT is
+        # ``model.pipeline`` AND ``rollout.pipeline``. A mismatch is NON-CONFORMANT —
+        # the GEN importance ratio would be computed under a different kernel than
+        # the rollout that produced the trajectory. Assert it at launch, not later.
+        model_cfg = float(self.config.actor_rollout_ref.model.pipeline.cfg_text_scale)
+        rollout_cfg = float(self.config.actor_rollout_ref.rollout.pipeline.cfg_text_scale)
+        if model_cfg != rollout_cfg:
+            raise ValueError(
+                "bagel_corl_sync CFG parity violated: "
+                f"model.pipeline.cfg_text_scale={model_cfg} != "
+                f"rollout.pipeline.cfg_text_scale={rollout_cfg}. Training and rollout "
+                "must share one transition kernel (RFC §5); set both to 1 (CFG-free) "
+                "as §4.8.5 prescribes."
+            )
 
     def _init_tokenizer(self):
         self._rewrite_bagel_corl_configs()
@@ -313,8 +364,19 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 self.role_worker_mapping[role] = remote_cls
 
     def _expected_s(self) -> int:
+        """Seeds per ``generate_image`` call (RFC §5 knob; no silent default).
+
+        The recipe sets ``agent.gen_samples_per_call``; a fallback here would make
+        the dual-lane gate accept a group size nobody configured, so fail loud.
+        """
         agent = self.config.actor_rollout_ref.rollout.get("agent") or {}
-        return int(agent.get("gen_samples_per_call") or 4)
+        raw = agent.get("gen_samples_per_call")
+        if raw is None:
+            raise ValueError(
+                "bagel_corl_sync requires actor_rollout_ref.rollout.agent.gen_samples_per_call; "
+                "the dual-lane GEN seed gate cannot infer S"
+            )
+        return int(raw)
 
     def _gen_adv_estimator(self) -> str:
         """GEN FlowGRPO estimator — never reuse ``algorithm.adv_estimator`` (UND token GRPO)."""
@@ -339,11 +401,20 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         return extra
 
     def _diffusion_v1_gen_lane(self) -> DiffusionV1GenLane:
-        """GEN hooks from ``PolicyGradientDiffusionTrainerV1`` on this job's workers."""
+        """GEN hooks from ``PolicyGradientDiffusionTrainerV1`` on this job's workers.
+
+        The lane carries its own GEN estimator so ``_compute_advantage`` never reads
+        the UND token ``algorithm.adv_estimator`` (RFC §4.4).
+        """
         lane = getattr(self, "_diff_v1_gen_lane", None)
         wg = getattr(self, "actor_rollout_wg", None)
-        if lane is None or getattr(lane, "actor_rollout_wg", None) is not wg:
-            self._diff_v1_gen_lane = DiffusionV1GenLane(self)
+        gen_estimator = self._gen_adv_estimator()
+        if (
+            lane is None
+            or getattr(lane, "actor_rollout_wg", None) is not wg
+            or getattr(lane, "gen_adv_estimator", None) != gen_estimator
+        ):
+            self._diff_v1_gen_lane = DiffusionV1GenLane(self, gen_adv_estimator=gen_estimator)
         return self._diff_v1_gen_lane
 
     def _compute_old_log_prob(self, batch, metrics: dict):
@@ -500,7 +571,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         und_estimator = str(algo.get("adv_estimator", "grpo"))
         if gen_estimator == und_estimator and und_estimator in {"grpo", "gspo", "gae", "rloo", "reinforce_plus_plus"}:
             raise ValueError(
-                f"Bagel Co-RL GEN adv_estimator={gen_estimator!r} collides with UND token estimator; "
+                f"Bagel Co-RL (Joint-Training) GEN adv_estimator={gen_estimator!r} collides with UND token estimator; "
                 "set actor_rollout_ref.model.algorithm=flow_grpo (GEN) and leave algorithm.adv_estimator for UND"
             )
         proto = build_gen_flowgrpo_proto(self._gen_batch_from_step(batch))
@@ -597,6 +668,40 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         path = vo.get("und_deploy_config") if hasattr(vo, "get") else None
         return str(path) if path else None
 
+    # Bagel publishes weights only: its top-level ``config.json`` is
+    # ``model_type: bagel`` with no ``auto_map`` and no modeling code, so
+    # ``transformers.AutoConfig`` cannot resolve it. The MoT sub-configs ship
+    # alongside in the snapshot; the UND AR (Thinker) replica is an LLM and needs
+    # the language sub-config.
+    UND_HF_SUBCONFIG = "llm_config.json"
+
+    def _resolve_und_hf_config_path(self, model, agent) -> str | None:
+        """HF config path for the UND AR replica (RFC §4.7).
+
+        ``OmniModelConfig.__post_init__`` calls ``AutoConfig.from_pretrained`` on
+        ``hf_config_path``, falling back to ``path``. For a Bagel checkpoint that
+        fallback raises ``ValueError: ... model type ``bagel`` but Transformers
+        does not recognize this architecture``. Prefer the explicit
+        ``agent.und_hf_config_path`` knob; otherwise derive the LLM sub-config
+        from the snapshot so no recipe has to hand-set it. Non-Bagel checkpoints
+        (e.g. Qwen3-Omni) resolve from ``path`` directly and get ``None``.
+        """
+        explicit = agent.get("und_hf_config_path")
+        if explicit:
+            return str(explicit)
+        path = model.get("path")
+        if not path:
+            return None
+        try:
+            from verl_omni.utils.fs import resolve_model_local_dir
+
+            local_dir = resolve_model_local_dir(str(path))
+        except Exception as exc:  # noqa: BLE001 - optional derivation only
+            logger.warning("bagel_corl_sync cannot locate model snapshot %s: %s", path, exc)
+            return None
+        candidate = os.path.join(local_dir, self.UND_HF_SUBCONFIG)
+        return candidate if os.path.isfile(candidate) else None
+
     def _build_und_ar_entrypoint_config(self):
         """Clone entry config for a standalone UND AR ``LLMServerManager``.
 
@@ -612,6 +717,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         model = self.config.actor_rollout_ref.model
         rollout = self.config.actor_rollout_ref.rollout
         agent = rollout.get("agent") or {}
+        und_hf_config_path = self._resolve_und_hf_config_path(model, agent)
         und_n_gpus = int(agent.get("und_n_gpus") or 1)
         und_util = float(agent.get("und_gpu_memory_utilization") or 0.40)
         max_prompt = int(self.config.data.get("max_prompt_length") or rollout.get("prompt_length") or 1024)
@@ -633,10 +739,9 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     # OmniModelConfig.__post_init__ runs AutoConfig.from_pretrained on
                     # hf_config_path (falling back to ``path``). Bagel publishes weights
                     # only: its config.json is model_type "bagel" with no auto_map and no
-                    # modeling code, so transformers cannot resolve it. Point the UND
-                    # (Thinker) replica at the LLM sub-config via
-                    # agent.und_hf_config_path when the checkpoint is Bagel.
-                    "hf_config_path": agent.get("und_hf_config_path"),
+                    # modeling code, so transformers cannot resolve it. Use the explicit
+                    # agent.und_hf_config_path when set, else the snapshot's LLM sub-config.
+                    "hf_config_path": und_hf_config_path,
                     # No OmniModelBase adapter is registered for
                     # ("OmniBagelForConditionalGeneration", "thinker") — the registry only
                     # knows Qwen3-Omni — and OmniModelConfig.__post_init__ only consults it
@@ -699,7 +804,6 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         visible card (``Total available GPUs 0``). Reward/teacher use the same
         ``init_colocated`` pattern on the actor placement group.
         """
-        from verl.checkpoint_engine.base import CheckpointEngineManager
         from verl.single_controller.ray.base import split_resource_pool
         from verl.trainer.ppo.utils import Role
         from verl.utils.config import omega_conf_to_dataclass
@@ -762,14 +866,19 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
 
         und_replicas = [und_replica]
         self.und_rollout_replicas = und_replicas
+        # RFC §4.11: ONE publication path. The UND AR replica joins the shared
+        # ``checkpoint_manager`` so ``on_step_end`` publishes to it alongside the GEN
+        # hybrids — a second ``CheckpointEngineManager`` here was dead code (never
+        # invoked) and would have been a no-op anyway: the V1 trainer forces
+        # ``checkpoint_engine.backend="naive"`` (verl/trainer/ppo/v1/trainer_base.py),
+        # and ``CheckpointEngineManager.update_weights`` early-returns for that
+        # backend without touching ``self.replicas``.
         self.checkpoint_manager.add_replicas(und_replicas)
-
-        und_ckpt_config = omega_conf_to_dataclass(und_rollout.checkpoint_engine)
-        und_ckpt_config.backend = "naive"
-        self.und_checkpoint_manager = CheckpointEngineManager(
-            config=und_ckpt_config,
-            actor_wg=self.actor_rollout_wg,
-            replicas=und_replicas,
+        logger.info(
+            "bagel_corl_sync UND AR replica registered for weight publication "
+            "replica=%s und_n_gpus=%s (shared checkpoint_manager, RFC §4.11)",
+            getattr(und_replica, "replica_rank", None),
+            und_n_gpus,
         )
 
         und_lb = GlobalRequestLoadBalancer.remote(
@@ -841,5 +950,52 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
 
     def on_step_end(self):
         # Parent updates weights for every replica registered on checkpoint_manager
-        # (GEN hybrid + UND standalone via add_replicas).
+        # (GEN hybrid + UND standalone via add_replicas, RFC §4.11). The UND AR
+        # replica must NOT stay on step-0 weights, so record which replicas were
+        # published rather than trusting the registration implicitly.
         super().on_step_end()
+        if getattr(self, "und_rollout_replicas", None):
+            registered = getattr(getattr(self, "checkpoint_manager", None), "replicas", None) or []
+            missing = [r for r in self.und_rollout_replicas if r not in registered]
+            if missing:
+                raise RuntimeError(
+                    f"bagel_corl_sync: {len(missing)} UND AR replica(s) are not registered on "
+                    "checkpoint_manager; they would keep step-0 weights (RFC §4.11)"
+                )
+            logger.info(
+                "bagel_corl_sync published weights step=%s to %s rollout replica(s) incl. UND AR",
+                getattr(self, "global_steps", None),
+                len(registered),
+            )
+
+    def _validate(self):
+        """V1 validation, plus the RFC §8.2 evidence record.
+
+        Was NON-CONFORMANT: ``test_freq`` unset meant the required validation
+        evidence had no execution path. The cadence is restored by the recipe
+        (``trainer.test_freq``); this hook records what the validated episodes
+        actually exercise — in-episode J/K, pattern coverage, and whether UND got
+        image credit — because §8.2 gates PR1 on seeing pattern-1/2/3 episodes.
+        """
+        val_metrics = super()._validate()
+        evidence = {
+            key: float(value)
+            for key, value in (val_metrics or {}).items()
+            if isinstance(value, (int, float))
+            and (
+                "episode/J" in str(key)
+                or "episode/K" in str(key)
+                or "pattern" in str(key).lower()
+                or "no_image_credit" in str(key)
+                or "skipped_no_groups" in str(key)
+            )
+        }
+        val_metrics = dict(val_metrics or {})
+        val_metrics["val/rfc82_evidence_keys"] = float(len(evidence))
+        if "episode/K" in evidence and evidence.get("episode/J") == 0 and evidence.get("episode/K") == 0:
+            logger.warning(
+                "bagel_corl_sync §8.2: validation produced no dual-lane episode evidence "
+                "(J=0, K=0); the validation batch did not run the bagel_multiturn_agent loop."
+            )
+        logger.info("bagel_corl_sync §8.2 validation evidence: %s", evidence or "<none>")
+        return val_metrics

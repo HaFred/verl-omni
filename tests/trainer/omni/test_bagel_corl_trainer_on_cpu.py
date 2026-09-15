@@ -15,6 +15,9 @@
 
 from __future__ import annotations
 
+import json
+
+import hydra
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -96,6 +99,10 @@ def test_rewrite_bagel_corl_configs_strips_omni_model_keys():
                     "agent": {
                         "_target_": "verl.workers.config.AgentLoopConfig",
                         "default_agent_loop": "bagel_multiturn_agent",
+                        # RFC §5 knob SoT: no code default for these three.
+                        "gen_samples_per_call": 2,
+                        "max_generate_passes": 1,
+                        "max_und_turns": 8,
                     },
                 },
             }
@@ -118,8 +125,10 @@ def test_rewrite_bagel_corl_configs_strips_omni_model_keys():
     assert "do_sample" not in rollout
     agent = rollout.agent
     assert agent._target_.endswith("BagelCorlAgentLoopConfig")
-    assert agent.gen_samples_per_call == 4
+    # Passed through from the recipe, not invented by the rewrite (RFC §5).
+    assert agent.gen_samples_per_call == 2
     assert agent.max_generate_passes == 1
+    assert agent.max_und_turns == 8
     assert rollout.calculate_log_probs is True
     assert float(rollout.algo.noise_level) > 0.0
     assert int(rollout.algo.sde_window_size) >= 1
@@ -184,6 +193,97 @@ def test_qwen_und_forbidden():
         validate_bagel_corl_config(
             _corl_cfg(actor_rollout_ref={"model": {"path": "Qwen/Qwen3-VL-8B-Instruct", "lora_rank": 8}})
         )
+
+
+def _fake_bagel_snapshot(tmp_path):
+    """Minimal Bagel-shaped snapshot: the root ``config.json`` is weights-only.
+
+    This is the real checkpoint layout — ``config.json`` declares
+    ``model_type: bagel`` with no ``auto_map`` and no modeling code, so
+    ``AutoConfig.from_pretrained`` on the snapshot root raises. The LLM sub-config
+    (``llm_config.json``) is what transformers *can* resolve.
+    """
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "bagel", "architectures": ["OmniBagelForConditionalGeneration"]})
+    )
+    (tmp_path / "llm_config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen2",
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "vocab_size": 128,
+                "max_position_embeddings": 128,
+                "tie_word_embeddings": False,
+            }
+        )
+    )
+    return tmp_path
+
+
+def test_und_ar_model_node_pointing_at_the_snapshot_root_reproduces_the_reported_crash(tmp_path):
+    """Pins the failure this branch had to fix: ``AutoConfig`` on the snapshot root."""
+    snap = _fake_bagel_snapshot(tmp_path)
+    with pytest.raises(Exception, match="model type `bagel`"):
+        hydra.utils.instantiate(
+            {
+                "_target_": "verl_omni.workers.config.omni.OmniModelConfig",
+                "path": str(snap),
+                "tokenizer_path": str(snap),
+                "model_type": "omni_model",
+                "architecture": "OmniBagelForConditionalGeneration",
+                "trust_remote_code": True,
+                "composite_mode": "bagel_corl",
+                "load_tokenizer": False,
+                "lora_rank": 8,
+                "lora_alpha": 16,
+            }
+        )
+
+
+def test_und_ar_hf_config_path_resolves_to_the_llm_subconfig(tmp_path):
+    """``OmniModelConfig.__post_init__`` falls back to ``path``, so the UND AR node
+    must carry the snapshot's ``llm_config.json`` explicitly (or the trainer dies
+    with the InstantiationException above, before any worker starts)."""
+    snap = _fake_bagel_snapshot(tmp_path)
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+
+    resolved = trainer._resolve_und_hf_config_path(OmegaConf.create({"path": str(snap)}), OmegaConf.create({}))
+    assert resolved == str(snap / "llm_config.json")
+
+    # Explicit ``agent.und_hf_config_path`` wins over the derived sub-config.
+    explicit = str(snap / "llm_config.json")
+    assert (
+        trainer._resolve_und_hf_config_path(OmegaConf.create({"path": str(snap)}), OmegaConf.create({"und_hf_config_path": explicit}))
+        == explicit
+    )
+    # No model path at all: nothing to derive (caller must set the knob).
+    assert trainer._resolve_und_hf_config_path(OmegaConf.create({}), OmegaConf.create({})) is None
+
+
+def test_und_ar_model_node_with_the_resolved_hf_config_instantiates(tmp_path):
+    snap = _fake_bagel_snapshot(tmp_path)
+    cfg = hydra.utils.instantiate(
+        {
+            "_target_": "verl_omni.workers.config.omni.OmniModelConfig",
+            "path": str(snap),
+            "tokenizer_path": str(snap),
+            "model_type": "omni_model",
+            "architecture": "OmniBagelForConditionalGeneration",
+            "trust_remote_code": True,
+            "composite_mode": "bagel_corl",
+            "hf_config_path": str(snap / "llm_config.json"),
+            "load_tokenizer": False,
+            "lora_rank": 8,
+            "lora_alpha": 16,
+        }
+    )
+    assert cfg.hf_config.model_type == "qwen2"
+    assert cfg.local_hf_config_path == str(snap / "llm_config.json")
 
 
 def test_composite_loss_skips_gen_without_complete_groups():
@@ -637,7 +737,13 @@ def test_rewrite_sets_lr_gen_and_cfg_free_pipeline():
                 "rollout": {
                     "name": "vllm_omni",
                     "response_length": 512,
-                    "agent": {"default_agent_loop": "bagel_multiturn_agent"},
+                    "agent": {
+                        "default_agent_loop": "bagel_multiturn_agent",
+                        # RFC §5 knob SoT: no code default for these three.
+                        "gen_samples_per_call": 2,
+                        "max_generate_passes": 1,
+                        "max_und_turns": 8,
+                    },
                 },
             },
         }
@@ -647,15 +753,28 @@ def test_rewrite_sets_lr_gen_and_cfg_free_pipeline():
     assert model.lr_gen == pytest.approx(3e-5)
     pipeline = trainer.config.actor_rollout_ref.rollout.pipeline
     assert pipeline.cfg_text_scale == pytest.approx(1.0)  # UniGRPO CFG-free training
+    # RFC §5: the train side reads model.pipeline.cfg_text_scale. Leaving it at the
+    # Bagel CFG default (4.0) while rollout ran CFG-free silently biased the GEN ratio.
+    assert model.pipeline.cfg_text_scale == pytest.approx(pipeline.cfg_text_scale)
 
 
 def _non_tensor_stack(values):
-    """Version-robust NonTensorStack construction (API moved across tensordict pins)."""
+    """Version-robust NonTensorStack construction (API moved across tensordict pins).
+
+    On tensordict 0.10 the only correct form is ``from_list``: the bare
+    ``NonTensorStack([...])`` constructor collapses a list into a single element
+    (batch_size ``[1]``), which then trips this file's failures with the lazy-TD
+    "Received a new batch size torch.Size([2]) with an existing batch_size
+    torch.Size([1])" error instead of exercising the code under test.
+    """
     from tensordict import NonTensorData, NonTensorStack
 
+    items = [v if isinstance(v, NonTensorData) else NonTensorData(v) for v in values]
+    if hasattr(NonTensorStack, "from_list"):
+        return NonTensorStack.from_list(items)
     if hasattr(NonTensorStack, "from_list_positional_stack"):
         return NonTensorStack.from_list_positional_stack(values)
-    return NonTensorStack([NonTensorData(v) for v in values])
+    return NonTensorStack(items)
 
 
 def test_normalize_tq_kv_get_result_with_non_tensor_stack():

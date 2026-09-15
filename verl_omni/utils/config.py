@@ -43,7 +43,7 @@ def validate_config(config: Any) -> None:
 
 
 def validate_bagel_corl_config(config: Any) -> None:
-    """Fail-closed Bagel Co-RL recipe checks (sibling N, seeds S, LoRA, no Qwen UND).
+    """Fail-closed Bagel Co-RL (Joint-Training) recipe checks (sibling N, seeds S, LoRA, no Qwen UND).
 
     In-episode ``J`` (UND turns) and ``K`` (GEN calls) are runtime with ``J >= K``;
     they are **not** ``rollout.n`` / ``gen_samples_per_call``. Do not require ``N == 2S``.

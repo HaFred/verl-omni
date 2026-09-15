@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Hermes tool protocol, J×K IDs, serial episode, and flatten for Bagel Co-RL."""
+"""Hermes tool protocol, J×K IDs, serial episode, and flatten for Bagel Co-RL (Joint-Training)."""
 
 from __future__ import annotations
 
@@ -398,7 +398,16 @@ async def run_serial_episode(
             arguments = json.loads(arguments)
         prompt = str(arguments.get("prompt", ""))
         meta = build_generate_call_meta(prompt=prompt, user_prompt=active_user_prompt)
-        gen_call_id = str(ids["gen_call_id"]) if generate_tool._passes == 0 else str(uuid.uuid4())
+        # RFC component-1 IDs: GEN TQ keys must be deterministic per (episode, call)
+        # so a replay reproduces the same keys. Call 0 keeps the episode's base
+        # ``gen_call_id``; later calls derive from the episode id and their local
+        # index instead of a fresh uuid4, which left every K > 1 key unreproducible
+        # (``num_gen_calls`` is the 0-based local call index here; it increments below).
+        gen_call_id = (
+            str(ids["gen_call_id"])
+            if generate_tool._passes == 0
+            else f"{ids['episode_uid']}:call{num_gen_calls}"
+        )
         num_gen_calls += 1
         call_samples = await generate_tool(
             prompt=prompt,

@@ -1,4 +1,4 @@
-# Co-RL UND AR deploy (Thinker). Sibling of bagel_corl_deploy.yaml (GEN / bagel_single_stage).
+# Co-RL (Joint-Training) UND AR deploy (Thinker). Sibling of bagel_corl_deploy.yaml (GEN / bagel_single_stage).
 #
 # Uses registered ``bagel_think`` so stage-0 LLM_AR decodes planning / tool tokens
 # (Hermes ``<tool_call>``) before any KV transfer. Do NOT use bagel_single_stage here —

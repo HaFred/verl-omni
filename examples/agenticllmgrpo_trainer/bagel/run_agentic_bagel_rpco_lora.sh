@@ -1,4 +1,4 @@
-# Bagel UND+GEN Co-RL (PR1 correctness). Entry: python3 -m verl_omni.trainer.main_omni
+# Bagel UND+GEN Co-RL (Joint-Training) (PR1 correctness). Entry: python3 -m verl_omni.trainer.main_omni
 #
 # Fail-closed: UND must be the published Bagel checkpoint (Hermes tool-call).
 # Do not swap Qwen3-VL for UND. Do not edit Mode (2a) run_agenticrpco_grpo_lora.sh.
@@ -221,6 +221,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.actor.optim.lr=1e-4 \
     actor_rollout_ref.actor.ppo_mini_batch_size=$TRAIN_BSZ \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
@@ -233,6 +234,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEM_UTIL \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
+    actor_rollout_ref.rollout.layered_summon=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
@@ -248,6 +250,7 @@ python3 -m verl_omni.trainer.main_omni \
     actor_rollout_ref.rollout.agent.default_agent_loop=bagel_multiturn_agent \
     +actor_rollout_ref.rollout.agent.gen_samples_per_call=$S \
     +actor_rollout_ref.rollout.agent.max_generate_passes=1 \
+    +actor_rollout_ref.rollout.agent.max_und_turns=${MAX_UND_TURNS:-8} \
     +actor_rollout_ref.rollout.agent.und_ar_serving_ready=$BAGEL_UND_AR_SERVING_READY \
     +actor_rollout_ref.rollout.agent.und_deploy_config=$BAGEL_UND_DEPLOY_CONFIG \
     +actor_rollout_ref.rollout.agent.und_n_gpus=$UND_N_GPUS \
@@ -262,6 +265,8 @@ python3 -m verl_omni.trainer.main_omni \
     reward.reward_model.rollout.gpu_memory_utilization=$REWARD_GPU_MEM_UTIL \
     reward.reward_model.rollout.enforce_eager=True \
     trainer.val_before_train=False \
+    trainer.test_freq=${TEST_FREQ:-30} \
+    data.val_batch_size=${VAL_BSZ:-$TRAIN_BSZ} \
     trainer.total_epochs=1 \
     trainer.total_training_steps=1 \
     trainer.logger="['console']" \

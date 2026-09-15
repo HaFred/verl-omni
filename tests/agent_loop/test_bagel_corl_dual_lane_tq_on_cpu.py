@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CPU tests for dual-lane Bagel Co-RL TQ packing (patterns 1–3, child gather)."""
+"""CPU tests for dual-lane Bagel Co-RL (Joint-Training) TQ packing (patterns 1–3, child gather)."""
 
 from __future__ import annotations
 
@@ -197,7 +197,15 @@ def test_rewrite_sets_dual_lane_manager():
                     "name": "vllm_omni",
                     "response_length": 512,
                     "trace": {"backend": None, "token2text": False},
-                    "agent": {"default_agent_loop": "bagel_multiturn_agent"},
+                    "agent": {
+                        "default_agent_loop": "bagel_multiturn_agent",
+                        # RFC §5 knob SoT: these three have no code default, so the
+                        # recipe/yaml must carry them or _rewrite_bagel_corl_configs
+                        # fails loud.
+                        "gen_samples_per_call": 2,
+                        "max_generate_passes": 1,
+                        "max_und_turns": 8,
+                    },
                 },
             }
         }
@@ -205,3 +213,42 @@ def test_rewrite_sets_dual_lane_manager():
     trainer._rewrite_bagel_corl_configs()
     agent = trainer.config.actor_rollout_ref.rollout.agent
     assert agent.agent_loop_manager_class.endswith("BagelCorlAgentLoopManagerTQ")
+
+
+def test_rewrite_fails_loud_on_missing_agent_knobs():
+    """RFC §5: gen_samples_per_call / max_generate_passes / max_und_turns have a
+    single SoT and no code fallback; a missing knob must raise, not default."""
+    import pytest
+
+    from verl_omni.trainer.omni.bagel_corl_trainer import OmniBagelCoRLTrainerSync
+
+    for missing in ("gen_samples_per_call", "max_generate_passes", "max_und_turns"):
+        agent_cfg = {
+            "default_agent_loop": "bagel_multiturn_agent",
+            "gen_samples_per_call": 2,
+            "max_generate_passes": 1,
+            "max_und_turns": 8,
+        }
+        del agent_cfg[missing]
+        trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+        trainer.config = OmegaConf.create(
+            {
+                "actor_rollout_ref": {
+                    "model": {
+                        "path": "/tmp/bagel",
+                        "algorithm": "flow_grpo",
+                        "composite_mode": "bagel_corl",
+                        "architecture": "OmniBagelForConditionalGeneration",
+                    },
+                    "actor": {},
+                    "rollout": {
+                        "name": "vllm_omni",
+                        "response_length": 512,
+                        "trace": {"backend": None, "token2text": False},
+                        "agent": agent_cfg,
+                    },
+                }
+            }
+        )
+        with pytest.raises(ValueError, match=missing):
+            trainer._rewrite_bagel_corl_configs()

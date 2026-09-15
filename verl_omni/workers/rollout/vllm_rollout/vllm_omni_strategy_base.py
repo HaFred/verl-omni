@@ -80,7 +80,7 @@ class OmniStrategyBase(ABC):
 
         ``omega_conf_to_dataclass`` returns non-mapping objects unchanged, so an
         already-instantiated omni ``RolloutConfig`` would otherwise skip conversion
-        to ``DiffusionRolloutConfig`` (Bagel Co-RL via ``main_omni``). Nested omni
+        to ``DiffusionRolloutConfig`` (Bagel Co-RL (Joint-Training) via ``main_omni``). Nested omni
         blocks (e.g. ``val_kwargs``) are dropped when schemas diverge; scalars and
         plain mappings such as ``engine_kwargs`` are preserved.
         """

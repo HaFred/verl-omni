@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sidecar-agnostic RPCO turn protocol shared by Mode (2a) and Bagel Co-RL.
+"""Sidecar-agnostic RPCO turn protocol shared by Mode (2a) and Bagel Co-RL (Joint-Training).
 
 Mask semantics (single source of truth for both loops)
 -----------------------------------------------------
@@ -76,7 +76,7 @@ def format_rm_scores_as_judge_text(
     """Render colocated RM scores into the Mode-2a judge observation format.
 
     ``build_forced_reflection`` parses this string unchanged — one verdict format
-    for both Mode (2a) HTTP judge and Bagel Co-RL ``reward_loop_manager``.
+    for both Mode (2a) HTTP judge and Bagel Co-RL (Joint-Training) ``reward_loop_manager``.
     """
     findings_text = (findings or "").strip() or "see VL facet scores above"
     if similarity is not None and "similarity" not in findings_text.lower():

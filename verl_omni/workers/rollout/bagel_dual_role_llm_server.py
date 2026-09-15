@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Dual-role LLM client: UND AR + GEN diffusion for Bagel Co-RL.
+"""Dual-role LLM client: UND AR + GEN diffusion for Bagel Co-RL (Joint-Training).
 
 One vLLM-Omni replica is AR xor Diffusion (strategy chosen at server init).
-Bagel Co-RL therefore keeps two ``LLMServerManager`` pools and routes
+Bagel Co-RL (Joint-Training) therefore keeps two ``LLMServerManager`` pools and routes
 ``generate()`` by sampling-params shape.
 """
 

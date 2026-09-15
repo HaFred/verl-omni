@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tiny-Bagel GPU smoke for Co-RL UND log-probs (J=2,K=2 grouping is covered on CPU)."""
+"""Tiny-Bagel GPU smoke for Co-RL (Joint-Training) UND log-probs (J=2,K=2 grouping is covered on CPU)."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import pytest
 import torch
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="tiny-Bagel Co-RL smoke needs GPU")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="tiny-Bagel Co-RL (Joint-Training) smoke needs GPU")
 def test_tiny_bagel_corl_und_forward_gpu():
     pytest.importorskip("vllm_omni")
     pytest.importorskip("safetensors")
@@ -45,9 +45,9 @@ def test_tiny_bagel_corl_und_forward_gpu():
         assert logp.device.type == "cuda"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="tiny-Bagel Co-RL smoke needs GPU")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="tiny-Bagel Co-RL (Joint-Training) smoke needs GPU")
 def test_tiny_bagel_corl_dual_lora_groups_and_und_backward_gpu():
-    """Co-RL core on GPU: dual LoRA grouping (lr_gen override) + UND backward.
+    """Co-RL (Joint-Training) core on GPU: dual LoRA grouping (lr_gen override) + UND backward.
 
     Locks the composite training surface the RFC's (a) first claims: the text
     path trains through ``compute_und_log_prob`` while the optimizer carries

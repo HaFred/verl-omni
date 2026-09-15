@@ -47,7 +47,7 @@ run_test 8 "diffusers ulysses sp" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \
     torchrun --nproc_per_node="${NUM_GPUS}" --local-ranks-filter=0 tests/workers/test_diffusers_ulysses.py
 
-# Bagel Co-RL core (RFC 453): tiny-checkpoint UND log-probs, dual-LoRA param
+# Bagel Co-RL (Joint-Training) core (RFC 453): tiny-checkpoint UND log-probs, dual-LoRA param
 # groups with lr_gen override, and the UND backward path. Self-skips without GPU.
 run_test 9 "bagel corl tiny composite" \
     env CUDA_VISIBLE_DEVICES="${CUDA_DEVICE_LIST}" \

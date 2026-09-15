@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GEN FlowGRPO advantage for Bagel Co-RL (RFC flatten → GenAdv → composite update).
+"""GEN FlowGRPO advantage for Bagel Co-RL (Joint-Training) (RFC flatten → GenAdv → composite update).
 
 UND token GRPO stays on verl V1 ``_compute_advantage``. This module is the GEN
 slice: same ``compute_advantage`` helper the diffusion trainers use, grouped by
@@ -35,7 +35,7 @@ __all__ = ["apply_gen_flowgrpo_advantage", "build_gen_flowgrpo_proto", "select_g
 def select_gen_advantages_for_step(micro_batch, step: int, *, require_bagel_corl_gen: bool = False):
     """GEN timestep advantages: ``bagel_corl_gen['advantages'][:, step]`` only.
 
-    When ``require_bagel_corl_gen`` is True (Bagel Co-RL GEN engine path), refuse to
+    When ``require_bagel_corl_gen`` is True (Bagel Co-RL (Joint-Training) GEN engine path), refuse to
     fall back to UND / poisoned ``micro_batch['advantages']``.
     """
     from verl.utils import tensordict_utils as tu

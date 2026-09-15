@@ -743,7 +743,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             actor_model_type = actor_config.model_config.get("model_type", "language_model")
             composite_mode = actor_config.model_config.get("composite_mode") or actor_config.get("composite_mode")
             # Diffusion distillation lives inside diffusion_loss; distillation_ppo_loss is token-level only.
-            # Bagel Co-RL is not exclusive: UND ppo_loss and GEN diffusion_loss share one optimizer step.
+            # Bagel Co-RL (Joint-Training) is not exclusive: UND ppo_loss and GEN diffusion_loss share one optimizer step.
             if composite_mode == "bagel_corl":
                 self.loss_fn = partial(bagel_composite_loss, config=actor_config)
             elif is_diffusion:

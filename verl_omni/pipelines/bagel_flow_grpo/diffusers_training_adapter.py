@@ -59,7 +59,7 @@ class BagelDiffusion(DiffusionModelBase):
 
     @classmethod
     def get_optimizer_param_groups(cls, module, model_config: DiffusionModelConfig):
-        """Two optimizer param groups (UND LoRA vs GEN LoRA) when Co-RL dual LoRA is enabled.
+        """Two optimizer param groups (UND LoRA vs GEN LoRA) when Co-RL (Joint-Training) dual LoRA is enabled.
 
         ``lr_gen`` (model config) overrides the GEN group's LR — the UniGRPO
         per-expert pattern (text 1e-6 vs denoise 3e-5); ``None`` keeps the base
@@ -86,8 +86,8 @@ class BagelDiffusion(DiffusionModelBase):
     def configure_trainable_params(cls, module, model_config):
         """Freeze all params except the generation (``moe_gen``) pathway.
 
-        Bagel Co-RL dual LoRA is applied by PEFT; this hook is skipped when
-        ``lora_rank > 0``. Non-LoRA Co-RL is out of PR1 scope.
+        Bagel Co-RL (Joint-Training) dual LoRA is applied by PEFT; this hook is skipped when
+        ``lora_rank > 0``. Non-LoRA Co-RL (Joint-Training) is out of PR1 scope.
         """
         if model_config.get("composite_mode") == "bagel_corl":
             targets = model_config.get("target_modules") or []

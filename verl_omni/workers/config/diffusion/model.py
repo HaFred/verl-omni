@@ -64,7 +64,7 @@ class DiffusionModelConfig(BaseConfig):
     # model type, e.g., "diffusion_model"
     model_type: str = "diffusion_model"
 
-    # Bagel Co-RL: dual UND+GEN loss on one FSDP owner. Empty for GEN-only FlowGRPO.
+    # Bagel Co-RL (Joint-Training): dual UND+GEN loss on one FSDP owner. Empty for GEN-only FlowGRPO.
     composite_mode: Optional[str] = None
 
     # whether to load tokenizer. This is useful when we only want to load model config
@@ -96,7 +96,7 @@ class DiffusionModelConfig(BaseConfig):
     lora_init_weights: str = "gaussian"
     target_modules: Optional[Any] = "all-linear"  # allow both "all-linear" and ["q_proj","k_proj"]
     target_parameters: Optional[list[str]] = None  # for lora adapter on nn.Parameter
-    # Bagel Co-RL per-group LR (RFC §4.4 / UniGRPO per-expert LRs): GEN (*_moe_gen)
+    # Bagel Co-RL (Joint-Training) per-group LR (RFC §4.4 / UniGRPO per-expert LRs): GEN (*_moe_gen)
     # optimizer group LR override; None keeps the base actor.optim.lr for both groups.
     lr_gen: Optional[float] = None
 

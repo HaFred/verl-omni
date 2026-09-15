@@ -46,7 +46,7 @@ class DiffusionLossConfig(BaseConfig):
     dpo_beta: float = 2000.0
     kl_mask_threshold: float = 1e-5
     add_kl_coefficient: bool = True
-    # Bagel Co-RL dual-lane weighting (RFC §4.4): composite loss =
+    # Bagel Co-RL (Joint-Training) dual-lane weighting (RFC §4.4): composite loss =
     # loss_weight_und * ppo_loss(UND) + loss_weight_gen * diffusion_loss(GEN).
     loss_weight_und: float = 1.0
     loss_weight_gen: float = 1.0

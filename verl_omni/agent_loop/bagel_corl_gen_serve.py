@@ -189,19 +189,19 @@ def stash_gen_row_from_diffusion_output(
     """Build one GEN seed row; fail closed when latents / timesteps / logprobs are missing."""
     if not hasattr(output, "diffusion_output"):
         raise RuntimeError(
-            "Bagel Co-RL generate_image returned a non-diffusion output: dual-role GEN "
+            "Bagel Co-RL (Joint-Training) generate_image returned a non-diffusion output: dual-role GEN "
             "serving is not wired (bagel_single_stage is GEN-only / the AR replica is not "
             "diffusion-capable). Do not fall back to a Qwen sidecar."
         )
 
     stop_reason = getattr(output, "stop_reason", None)
     if stop_reason in ("aborted", "abort", "error"):
-        raise RuntimeError(f"Bagel Co-RL GEN aborted (stop_reason={stop_reason!r}); refuse soft-skip.")
+        raise RuntimeError(f"Bagel Co-RL (Joint-Training) GEN aborted (stop_reason={stop_reason!r}); refuse soft-skip.")
 
     latents, timesteps, log_probs = extract_gen_traj_from_diffusion_output(output)
     if latents is None or timesteps is None or log_probs is None:
         raise RuntimeError(
-            "Bagel Co-RL GEN traj stash incomplete from vLLM-Omni "
+            "Bagel Co-RL (Joint-Training) GEN traj stash incomplete from vLLM-Omni "
             f"(all_latents={'ok' if latents is not None else 'missing'}, "
             f"timesteps={'ok' if timesteps is not None else 'missing'}, "
             f"log_probs={'ok' if log_probs is not None else 'missing'}). "
