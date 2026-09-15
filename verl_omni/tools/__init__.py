@@ -12,28 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen ``generate_image`` / ``judge_image`` tools, loaded by file path.
+"""The two frozen tools the agent can call: ``generate_image`` and ``judge_image``.
 
-``OmniAgentLoopWorker`` binds ``image_gen.py`` as ``function_tool_path``.
-Importing this package does not register the tools.
+Each is a plain Python function tagged with ``@function_tool`` that calls an HTTP
+sidecar and returns **text** (scores, findings, file paths) — pixels are never
+attached to the agent's context. ``OmniAgentLoopWorker`` loads ``image_gen.py`` by
+file path, so importing this package registers nothing.
 
-Tools are registered as verl ``@function_tool`` callables so frozen HTTP sidecars
-register via ``function_tool_path`` with no create/execute/release lifecycle.
-
-Upstream ``FunctionTool.call`` runs **sync** tool bodies with ``asyncio.to_thread``.
-That call never receives ``agent_data`` (by design — see ``ToolAgentLoop._call_tool``).
-``asyncio.to_thread`` **copies the calling task's context**, so ContextVars bound on
-the agent-loop task (trajectory relpath, rollout id, user prompt) are visible inside
-the tool thread without changing verl's FunctionTool contract.
-
-Thread-locals alone are **not** enough: the default executor reuses workers across
-concurrent rollouts, so a TLS YES latch leaked between samples (blocked the next
-sample's first ``generate_image``). ContextVars + a rollout_id-keyed latch avoid that.
-
-``BaseTool.execute(..., agent_data=...)`` remains the upstream path for truly stateful
-tools; we deliberately did not take it here so sidecar tools stay file-path registered
-and HTTP-stateless. See ``trajectory/`` for ContextVar / registry / latch used by
-the tool bodies. See ``agent_helper/`` for *tool-agent* readers used by
-``ImageGenToolAgentLoop`` (curriculum / Hermes / forced Reflection) — not by
-``generate_image`` / ``judge_image``.
+Per-rollout state (which sample owns which PNG, the "judge said YES" flag) lives in
+``trajectory/``, scoped per rollout rather than per thread because the shared thread
+pool is reused across samples. ``agent_helper/`` holds the agent-loop-side readers.
 """

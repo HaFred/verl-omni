@@ -12,35 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Frozen agentic function tools for verl's stock ``ToolAgentLoop``.
+"""Frozen image tools the agent calls: ``generate_image`` and ``judge_image``.
 
-Module path: ``verl_omni/tools/image_gen.py``.
-Bound automatically via ``OmniAgentLoopWorker`` (``function_tool_path``).
+``generate_image`` asks a frozen image service for a PNG; ``judge_image`` asks a
+frozen vision model to score it. Both hand the agent **text only** (scores, findings,
+file paths) — pixels never enter the agent's context, and both sidecars stay frozen.
 
-Provides ``generate_image`` + ``judge_image``. Agentic LLM RL keeps image
-generation **outside** the actor optimizer. GRPO trains the actor as the
-tool-calling agent while a frozen image-gen sidecar produces candidate PNGs.
-A separate frozen VL sidecar (``judge_image``) scores those images; the actor
-only sees text tool observations (scores / findings / ``path=``) and then
-writes ``Reflection:`` / ``Done.`` or a rewritten ``generate_image``.
-
-Config: Hydra ``agentic_image_gen`` (see
-``verl_omni/trainer/config/agentic/image_gen_tools.yaml``) is the source of
-truth. ``OmniAgentLoopWorker`` / ``OmniAgentLoopManager`` call
-``bind_agentic_image_gen`` so FunctionTool bodies (``asyncio.to_thread``) read
-the bound process-local knobs — no AGENTIC_* env.
-
-Backends (first match wins):
-  1. ``agentic_image_gen.vllm_omni_url`` — vLLM-Omni OpenAI image generations
-     (``/v1/images/generations``).
-  2. ``agentic_image_gen.qwen_image_url`` — bundled Qwen-Image HTTP service
-     (POST ``{"prompt"}`` → base64 image JSON).
-  3. ``agentic_image_gen.diffusion_tool_url`` — generic service with the same
-     response contract.
-  4. Else text-only stub (acceptance smoke when no gen service is up).
-
-Observation modality is always text: PNGs are written under the rollout image
-dir for the sidecar judge; they are never attached to the actor context.
+Settings live in Hydra ``agentic_image_gen`` (the yaml is the source of truth) and are
+bound per process by ``OmniAgentLoopWorker`` — no ``AGENTIC_*`` env vars. Backends are
+tried in order: ``vllm_omni_url`` → ``qwen_image_url`` → ``diffusion_tool_url`` → stub.
 """
 
 from __future__ import annotations

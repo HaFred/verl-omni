@@ -12,17 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Rollout artifact paths, ContextVars, PNG registry, and YES latch.
+"""Per-rollout bookkeeping for the frozen image tools.
 
-Import from this package (not ``image_gen.py``) so helpers can be shared without
-re-executing ``@function_tool`` registration.
+A *rollout* is one attempt at one task. While it runs, the tools must know where to
+write images and trajectories, which sample they belong to, and whether the judge
+already said "good enough" — those values live here.
 
-Artifact layout (under the e2e run dir)::
-
-    rollout_trajectories/step_{S:06d}/sample_{index}.{rollout_n:02d}.json
-    rollout_images/step_{S:06d}/sample_{index}.{rollout_n:02d}/
-        image_00_<artifact_id>.png ...
-        meta.json
+Import from this package, not ``image_gen.py``, so helpers can be shared without
+re-running ``@function_tool`` registration. See ``paths.py`` for the on-disk layout.
 """
 
 from .artifacts import (

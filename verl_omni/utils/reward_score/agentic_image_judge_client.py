@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""HTTP client for the frozen image-judge sidecar (reward C/A fallback).
+"""Fallback client that asks the frozen vision judge for image scores.
 
-Primary C/A comes from trajectory ``agentic_judge`` observations. Knobs come
-from ``extra_info``; HTTP POST lives in ``verl_omni.utils.agentic.vllm_chat``.
+Scores normally come from the ``judge_image`` observations already in the
+trajectory; this client only fills the gap. Knobs come from ``extra_info``; the HTTP
+POST itself lives in ``verl_omni.utils.agentic.vllm_chat``.
 """
 
 from __future__ import annotations

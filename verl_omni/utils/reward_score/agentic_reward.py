@@ -11,54 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Scalar reward: ``generate_image`` + actor self-reflection protocol.
+"""How the agentic image rollout is scored.
 
-Protocol (gated):
-  generate_image → (image obs attached)
-  actor writes a short reflection, then either ``Done.`` OR rewrite +
-  ``generate_image`` in the **same** assistant turn.
+One scalar per rollout, mixed from simple parts:
+  - used the tools for real (a parsed ``generate_image`` / ``judge_image`` call),
+  - image quality as rated by the frozen judge (correctness + aesthetics),
+  - finished cleanly with ``Done.`` instead of looping,
+  - a small bonus for improving the image after a first "not good enough".
 
-Frozen Qwen3-VL judge serves dual role: (1) in-turn ``judge_image`` agent tool
-(structured VL feedback the agent reads before deciding Done / rewrite), and
-(2) reward C/A for ``reward_correctness`` / ``reward_aesthetics``. Reward prefers
-scores from the first ``good_enough=YES`` ``agentic_judge ok=1`` observation
-(protocol: YES → Done); otherwise the last successful judge. This blocks
-rewrite-after-YES roulette from replacing a good C/A with a failed last image.
-If absent, it falls back to ``call_reflect_vlm`` via ``agentic_image_gen.vllm_url``
-(OpenAI chat) **only** for a PNG under the rollout images root (never an
-arbitrary ``path=`` the policy wrote). There is no legacy ``/reflect`` path.
-C/A and closed-protocol credit require a real ``judge_image`` ``<tool_call>``;
-forged ``agentic_judge ok=1`` prose without that call does not count.
-
-Scalar mix terms (enter ``score`` via weighted mix):
-  ``reward_tool_call``, ``reward_correctness`` (gated), ``reward_aesthetics``
-  (gated), ``reward_done``.
-Additive multiturn term (also enters ``score``):
-  ``reward_delta_c`` = C lift after first ``good_enough=NO`` → rewrite → closed;
-  applied as ``score += w_delta_c * f_delta_c`` (default ``w_delta_c=0.15``).
-  Zero when first judge is not NO, trajectory is not closed, or rewrite-after-YES.
-  ``reward_rewrite_yes`` = 1 when closed after first-NO → ≤2 gens → YES (the
-  preferred overfit path); applied as ``score += w_rewrite_yes * f_rewrite_yes``
-  (default ``w_rewrite_yes=0.12``). Max-pass ``Done`` without YES is discounted.
-
-Final score (before ΔC):
-  score = base + scale * mix
-  mix   = (w_tool_call * f_tool_call
-         + w_correctness * f_correctness_mix
-         + w_aesthetics * f_aesthetics_mix
-         + w_done * f_done) / w_sum
-  then score = min(1, score + w_delta_c * f_delta_c)
-
-``base``/``scale`` are a protocol tier: Qwen3-VL often returns C/A ≈ 0.9 even on
-mediocre images. Open loops use a tiny ``scale`` so high VL C/A cannot plateau the
-mean reward without learning Done.
-
-Tiers (mix ∈ [0, 1]; open-loop C/A enter mix at 5%):
-  no generate_image / no successful PNG     → score = 0
-  gen, no Reflection:     base=0.02 scale=0.05 → ≈0.02–0.07
-  Reflection:, open       base=0.04 scale=0.30 → ≈0.04–0.34
-  closed, weak C/A        base=0.05 scale=0.65 → ≈0.05–0.70  (protocol_ok=1)
-  closed, C/A ≥ 0.70      base=0.10 scale=0.90 → ≈0.10–1.00  (protocol_ok=1)
+Image quality only counts in full once the loop closes with a reflection + ``Done.``,
+and no credit is given for prose that merely guesses the judge's verdict.
 """
 
 from __future__ import annotations

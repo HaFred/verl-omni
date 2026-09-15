@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-rollout ``good_enough=YES`` latch (env hard-stop for further generate_image)."""
+"""Per-rollout "the judge already said YES" flag, which stops more generates."""
 
 from __future__ import annotations
 

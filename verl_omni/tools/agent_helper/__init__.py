@@ -12,8 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helpers for ``ImageGenToolAgentLoop`` (not FunctionTool bodies).
+"""Readers used by the image-gen agent loop, not by the frozen tools.
 
-Curriculum, Hermes injection, and forced Reflection live here so
-``agent_loop.utils`` stays diffusion-only.
+Keeping the curriculum / tool-format / reflection helpers here lets
+``agent_loop.utils`` stay diffusion-only.
 """

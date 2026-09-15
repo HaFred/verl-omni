@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Agent-loop worker wiring, rollout monitoring, and invalid-rollout masking."""
+"""Ray worker/manager that runs the image-gen agent loop and records its dumps."""
 
 from __future__ import annotations
 
@@ -55,14 +55,14 @@ __all__ = [
 
 
 def _stamp_reward_context(batch, config) -> None:
-    """Stamp reward-side inputs onto each sample ``extra_info``.
+    """Copy the reward settings and image dir onto every sample's ``extra_info``.
 
-    Copies composed ``SCORER_KNOB_KEYS`` (judge knobs) plus the resolved
-    ``rollout_images_root``. Reward actors run in Ray processes that never bind
-    Hydra ``config`` or ``tools.trajectory``, so both must travel on the row:
-    the knobs let ``compute_score`` avoid yaml-filling, and the images root lets
-    its ``call_reflect_vlm`` fallback resolve the last generated PNG when the
-    trajectory has no parseable ``judge_image`` observation.
+    Reward scoring runs in separate Ray processes that never see the Hydra config, so
+    the values it needs must travel with each sample. Two things are copied: the judge
+    knobs (``SCORER_KNOB_KEYS``, so ``compute_score`` does not have to yaml-fill them)
+    and the resolved ``rollout_images_root`` (so its ``call_reflect_vlm`` fallback can
+    find the last generated PNG when the trajectory has no parseable ``judge_image``
+    observation).
 
     Args:
         batch: ``DataProto`` (or test stub) with ``non_tensor_batch``. Used for
@@ -113,11 +113,11 @@ def _stamp_reward_context(batch, config) -> None:
 
 
 class OmniAgentLoopWorker(AgentLoopWorker):
-    """Bind trajectory Hydra knobs and pass step kwargs into the agent loop.
+    """Rollout worker that binds the agentic settings and runs the image-gen loop.
 
-    Overrides must live here: ``AgentLoopManager.generate_sequences`` dispatches
-    to Ray workers. Hermes / ``image_gen.py`` bind is gated on
-    ``default_agent_loop == image_gen_tool_agent`` and only fills unset keys.
+    Overrides must live here: ``AgentLoopManager.generate_sequences`` dispatches to
+    Ray workers. The tool-format / ``image_gen.py`` bind only happens when
+    ``default_agent_loop == image_gen_tool_agent``, and it only fills unset keys.
     """
 
     _AGENTIC_TOOL_FORMAT = "hermes"
@@ -185,7 +185,7 @@ class OmniAgentLoopWorker(AgentLoopWorker):
 
 
 class OmniAgentLoopManager(AgentLoopManager):
-    """Use stock rollout management, dump outputs, and mask invalid rollouts."""
+    """Reuse verl's rollout management, then dump outputs and drop invalid rollouts."""
 
     def __init__(self, *args, **kwargs):
         # Must set before AgentLoopManager.__init__ creates Ray workers.

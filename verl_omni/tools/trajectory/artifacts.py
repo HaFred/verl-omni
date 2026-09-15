@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Live generate_image PNG registry and judge path lookup (rollout-scoped)."""
+"""Keeps track of the PNGs saved during a rollout so the judge can find them."""
 
 from __future__ import annotations
 

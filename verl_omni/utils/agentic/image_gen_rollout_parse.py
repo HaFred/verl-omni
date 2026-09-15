@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Rollout turn parsing helpers for agentic image-gen monitoring."""
+"""Splits a decoded rollout into turns and labels each stage for the dumps."""
 
 from __future__ import annotations
 

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-rollout ContextVars: trajectory relpath, rollout id, user prompt."""
+"""Per-rollout values (trajectory path, rollout id, user prompt) held in ContextVars."""
 
 from __future__ import annotations
 

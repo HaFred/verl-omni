@@ -39,6 +39,12 @@ run_name: str = "agentic_run"
 _e2e_root: Path | None = None
 _diffusion_image_dir: Path | None = None
 
+# On-disk layout produced by the builders below, under the e2e run dir:
+#   rollout_trajectories/step_{S:06d}/sample_{index}.{rollout_n:02d}.json
+#   rollout_images/step_{S:06d}/sample_{index}.{rollout_n:02d}/
+#       image_00_<artifact_id>.png ...
+#       meta.json
+
 
 def default_e2e_root() -> Path:
     """Return the default e2e artifact root.

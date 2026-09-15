@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Dump / materialization / invalid-rollout masking for agentic monitoring."""
+"""Writes rollout dumps (trajectory / image / meta) and masks invalid rollouts."""
 
 from __future__ import annotations
 

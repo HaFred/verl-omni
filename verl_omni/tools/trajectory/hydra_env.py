@@ -12,13 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Process-local store for Hydra ``agentic_image_gen`` knobs.
+"""The ``agentic_image_gen`` settings, made readable outside Hydra.
 
-Yaml ``image_gen_tools.yaml`` is the default source of truth. Bind on the
-rollout worker; stamp scorer knobs onto inbound ``prompts`` extra_info
-before worker dispatch (and again on concatenated output). Reward scorers
-call ``merge_agentic_scorer_knobs`` and fail loud if those keys are missing
-when Hydra ``config`` is absent.
+The yaml (``image_gen_tools.yaml``) is the source of truth. ``OmniAgentLoopWorker``
+binds it per process so the frozen tools can read it; the same values are copied onto
+each sample's ``extra_info`` for reward workers, which never see Hydra.
+``merge_agentic_scorer_knobs`` raises if those copies are missing.
 """
 
 from __future__ import annotations
