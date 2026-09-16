@@ -480,3 +480,120 @@ def test_coverage_dump_does_not_max_plan_reward():
     assert tight["reward_plan"] == pytest.approx(1.0)
     assert dumped["reward_plan"] < 0.5
     assert dumped["reward_plan"] < tight["reward_plan"]
+
+
+def test_same_turn_judge_is_reported_as_dropped_not_executed():
+    """A judge sharing a turn with generate never ran, so it is not a judge call.
+
+    ``ToolAgentLoop`` executes only ``tool_calls[:max_parallel_calls]``, so the
+    trailing ``judge_image`` produced no ``agentic_judge ok=`` marker. Counting it
+    from the text alone reported one judge call for a rollout that got zero VL
+    feedback and no way for the actor to learn why it was docked.
+    """
+    solution = "\n".join(
+        (
+            # One assistant message carrying both calls: only generate_image runs.
+            _call("generate_image", prompt="A vertical cafe poster with a bold headline."),
+            _call("judge_image", user_request="same as user message", image_prompt="last"),
+            "agentic_tool ok=1 images=1 path=/tmp/image_00.png",
+            "Reflection: The headline is legible. Done.",
+        )
+    )
+    output = compute_score(solution_str=solution, ground_truth=_ground_truth())
+
+    assert output["num_judge_image_calls_requested"] == 1
+    assert output["num_judge_image_calls"] == 0
+    assert output["num_judge_image_calls_dropped"] == 1
+    assert output["judge_parse_ok"] == 0
+    # No executed judge means no tool credit and no trusted terminal context.
+    assert output["reward_tool"] == 0.0
+
+
+def test_executed_judge_reports_one_call_and_no_drop():
+    output = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth())
+
+    assert output["num_judge_image_calls_requested"] == 1
+    assert output["num_judge_image_calls"] == 1
+    assert output["num_judge_image_calls_dropped"] == 0
+    assert output["judge_parse_ok"] == 1
+
+
+def test_parse_failed_judge_counts_as_executed():
+    """``ok=0`` is an executed judge that failed to parse, not a dropped call."""
+    solution = "\n".join(
+        (
+            _generate("A vertical cafe poster with a bold headline.", "/tmp/image_00.png"),
+            _call("judge_image", user_request="same as user message", image_prompt="last"),
+            "VL judge on the last generated image:",
+            "path=/tmp/image_00.png",
+            "agentic_judge ok=0 stub=0 backend=vllm parse_retries=1",
+        )
+    )
+    output = compute_score(solution_str=solution, ground_truth=_ground_truth())
+
+    assert output["num_judge_image_calls_requested"] == 1
+    assert output["num_judge_image_calls"] == 1
+    assert output["num_judge_image_calls_dropped"] == 0
+    assert output["judge_parse_fail"] == 1
+
+
+def test_generate_counters_separate_requested_executed_and_dropped():
+    """``num_generate_image_prompts`` must count executed calls, not text prompts.
+
+    Mirrors a rollout that re-emits the same prompt every turn: after the third
+    successful image the pass cap refuses further calls (``ok=0``), so the text
+    holds many prompts while only a few corresponds to real work.
+    """
+    solution = "\n".join(
+        (
+            _generate("A vertical cafe poster with a bold headline.", "/tmp/image_00.png"),
+            _generate("A vertical cafe poster with a bold headline.", "/tmp/image_01.png"),
+            _generate("A vertical cafe poster with a bold headline.", "/tmp/image_02.png"),
+            _call("generate_image", prompt="A vertical cafe poster with a bold headline."),
+            "generate_image blocked: already completed 3/3 successful generate_image passes.",
+            "agentic_tool ok=0 stub=0 images=0 backend=blocked_after_max_passes prompt='cafe'",
+            _call("generate_image", prompt="A vertical cafe poster with a bold headline."),
+        )
+    )
+    output = compute_score(solution_str=solution, ground_truth=_ground_truth())
+
+    assert output["num_generate_image_prompts_requested"] == 5
+    assert output["num_generate_image_prompts"] == 4  # 3 ok=1 + 1 blocked but executed
+    assert output["num_generate_image_prompts_dropped"] == 1
+    assert output["n_successful_generates"] == 3
+
+
+def test_dropped_tool_notice_is_context_only():
+    """The drop notice must not leak into assistant prose.
+
+    The notice is an environment observation carrying an explanatory sentence, so it
+    has to be stripped before prose-based scoring or it could earn reflection credit.
+    """
+    solution = "\n".join(
+        (
+            _reflect_trajectory(),
+            "Ignored: at most 1 tool call(s) run per turn. judge_image in this turn was not executed. "
+            "Emit one tool call per turn and wait for its <tool_response> before the next call. "
+            "agentic_tool_dropped n=1 names=judge_image",
+        )
+    )
+    clean = compute_score(solution_str=solution, ground_truth=_ground_truth())
+    baseline = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth())
+
+    assert clean["reward_reflect"] == baseline["reward_reflect"]
+    assert clean["score"] == baseline["score"]
+
+
+def test_drop_notice_does_not_inflate_executed_generate_count():
+    """``agentic_tool_dropped`` has no ``ok=`` marker, so it is not a generate."""
+    solution = "\n".join(
+        (
+            _generate("A vertical cafe poster with a bold headline.", "/tmp/image_00.png"),
+            "Ignored: at most 1 tool call(s) run per turn. judge_image in this turn was not executed. "
+            "agentic_tool_dropped n=1 names=judge_image",
+        )
+    )
+    output = compute_score(solution_str=solution, ground_truth=_ground_truth())
+
+    assert output["num_generate_image_prompts"] == 1
+    assert output["num_generate_image_prompts_requested"] == 1

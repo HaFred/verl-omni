@@ -50,7 +50,7 @@ _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE 
 _JUDGE_OK_RE = re.compile(r"\bagentic_judge\s+ok=1\b", re.IGNORECASE)
 _TOOL_OBS_LINE_RE = re.compile(
     r"(?im)^(?!.*\bReflection\s*:).*\b("
-    r"agentic_tool|agentic_reflect|agentic_judge|"
+    r"agentic_tool(?:_dropped)?|agentic_reflect|agentic_judge|"
     r"VL judge on the last generated image|"
     r"image_vis=|Frozen (?:diffusion|Qwen)|Image reflection vs user request"
     r")\b.*$"
@@ -66,7 +66,11 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
         "reward_tool_call": 0.0,
         "num_hermes_tool_calls": 0,
         "num_generate_image_prompts": 0,
+        "num_generate_image_prompts_requested": 0,
+        "num_generate_image_prompts_dropped": 0,
         "num_judge_image_calls": 0,
+        "num_judge_image_calls_requested": 0,
+        "num_judge_image_calls_dropped": 0,
         "judge_parse_ok": 0,
         "judge_parse_fail": 0,
         "judge_parse_ok_rate": 0.0,
@@ -207,6 +211,24 @@ def _coverage(candidate: str, reference: str) -> float:
     recall = overlap / len(reference_tokens)
     precision = overlap / len(candidate_tokens)
     return 2.0 * precision * recall / (precision + recall)
+
+
+def _count_executed_generates(text: str) -> int:
+    """Count ``generate_image`` responses the harness actually ran.
+
+    Every executed generate leaves one ``agentic_tool ok=`` marker: ``ok=1`` with an
+    image path, or ``ok=0`` when ``max_generate_image_passes`` refuses the call.
+    Judges emit ``agentic_judge``, the Reflection cue emits ``agentic_reflect`` and the
+    drop notice emits ``agentic_tool_dropped`` (no ``ok=``), so this counts generates
+    only and cannot be inflated by the text's ``<tool_call>`` blocks.
+
+    Args:
+        text: Decoded trajectory text.
+
+    Returns:
+        Number of executed ``generate_image`` calls.
+    """
+    return len(re.findall(r"\bagentic_tool\s+ok=[01]\b", text or "", re.IGNORECASE))
 
 
 def _count_successful_generates(text: str) -> int:
@@ -547,13 +569,31 @@ def compute_score(
         )
     )
     rewrites_after_yes = _generates_after_first_yes(text, calls)
-    tool_reward = float(successful_generates >= 1 and judge_ok >= 1)
+    with_judge_reward = float(successful_generates >= 1 and judge_ok >= 1)
+
+    # ``judge_image`` calls the model emitted, from the text alone.
+    judge_calls_requested = sum(name == "judge_image" for name in names)
+    # Calls the harness actually ran: every executed judge leaves an
+    # ``agentic_judge ok=`` marker (ok=1 parsed, ok=0 parse-failed). With
+    # ``multi_turn.max_parallel_calls=1`` a judge emitted in the same assistant
+    # turn as a generate is dropped, so ``requested`` over-counts and must not be
+    # what the metrics report as "calls".
+    judge_calls_executed = judge_ok + judge_failed
+    # Same requested/executed split for generates, so ``num_generate_image_prompts``
+    # is comparable to ``num_judge_image_calls`` and cannot report 16 prompts for a
+    # rollout that produced three images.
+    generate_prompts_requested = len(prompts)
+    generate_prompts_executed = _count_executed_generates(text)
 
     result = _zero_result(method="agentic_multidim")
     result.update(
         num_hermes_tool_calls=len(calls),
-        num_generate_image_prompts=len(prompts),
-        num_judge_image_calls=sum(name == "judge_image" for name in names),
+        num_generate_image_prompts=generate_prompts_executed,
+        num_generate_image_prompts_requested=generate_prompts_requested,
+        num_generate_image_prompts_dropped=max(0, generate_prompts_requested - generate_prompts_executed),
+        num_judge_image_calls=judge_calls_executed,
+        num_judge_image_calls_requested=judge_calls_requested,
+        num_judge_image_calls_dropped=max(0, judge_calls_requested - judge_calls_executed),
         judge_parse_ok=judge_ok,
         judge_parse_fail=judge_failed,
         judge_parse_ok_rate=float(judge_rate),
@@ -565,7 +605,7 @@ def compute_score(
         task_type=task_type,
         rewrite_after_yes=rewrites_after_yes,
         reward_tool_call=float(bool(calls)),
-        reward_tool=tool_reward,
+        reward_tool=with_judge_reward,
     )
     if not prompts or successful_generates == 0:
         return result
@@ -581,7 +621,7 @@ def compute_score(
             successful_generates=successful_generates,
             forced_context=forced_context,
         ),
-        "tool": tool_reward,
+        "tool": with_judge_reward,
         "result": _result_reward(
             text,
             task_type=task_type,

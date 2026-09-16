@@ -20,6 +20,31 @@ import json
 import re
 from typing import Any
 
+# Hermes JSON (``{"name": "generate_image"}``) or Qwen XML (``<function=...>``).
+_TOOL_CALL_NAME_PAT = r"<function={name}\b|\"name\"\s*:\s*\"{name}\""
+
+
+def tool_call_order(decode: str) -> list[str]:
+    """Return the tool names this turn calls, in the order they appear.
+
+    One assistant turn may hold several ``<tool_call>`` blocks. Only the first
+    ``multi_turn.max_parallel_calls`` of them are executed, so anything after the
+    first is context the trainer never ran and must not decide the turn's label.
+
+    Args:
+        decode: Decoded assistant text for one turn.
+
+    Returns:
+        Tool names in appearance order, e.g. ``["generate_image", "judge_image"]``.
+        Empty when the turn calls no tool.
+    """
+    found: list[tuple[int, str]] = []
+    for name in ("generate_image", "judge_image"):
+        match = re.search(_TOOL_CALL_NAME_PAT.format(name=name), decode or "", re.IGNORECASE)
+        if match:
+            found.append((match.start(), name))
+    return [name for _, name in sorted(found)]
+
 
 def turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
     """Label a turn so trajectory dumps make protocol stages grep-able.
@@ -34,14 +59,25 @@ def turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
     """
     resp = response or ""
     forced_context = f"{turn_prompt or ''}\n{resp}"
-    if re.search(r"<function=judge_image\b|\"name\"\s*:\s*\"judge_image\"", decode or "", re.IGNORECASE):
-        return "call_judge_image"
-    if re.search(r"<function=generate_image\b|\"name\"\s*:\s*\"generate_image\"", decode or "", re.IGNORECASE):
-        if re.search(r"\bagentic_forced_reflection=1\b", resp, re.IGNORECASE) or re.search(
+    called = tool_call_order(decode)
+    if called:
+        # Label by the call the model emitted *first*: that is the only one that
+        # executes (``multi_turn.max_parallel_calls``). Testing ``judge_image``
+        # first mislabelled a "generate then judge" turn as ``call_judge_image``,
+        # which read as a judge-first rollout in the dumps. Trailing calls are
+        # appended as ``_then_call_<name>`` so the drop stays visible.
+        first, trailing = called[0], called[1:]
+        if first == "judge_image":
+            label = "call_judge_image"
+        elif re.search(r"\bagentic_forced_reflection=1\b", resp, re.IGNORECASE) or re.search(
             r"\bagentic_forced_reflection=1\b", turn_prompt or "", re.IGNORECASE
         ):
-            return "agent_rewrite_after_forced_reflection"
-        return "call_generate_image"
+            label = "agent_rewrite_after_forced_reflection_then_call_generate_image"
+        else:
+            label = "call_generate_image"
+        for name in trailing:
+            label = f"{label}_then_call_{name}"
+        return label
     if re.search(
         r"(?is)^\s*(?:Reflection\s*:.*?)?Done\.\s*(?:<\|im_end\|>)?\s*$",
         decode or "",
@@ -67,7 +103,7 @@ def turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
             decode or "",
             re.IGNORECASE,
         ):
-            return "agent_reflection_rewrite"
+            return "agent_reflection_rewrite_then_call_generate_image"
         return "agent_reflection_done"
     if re.search(r"\b(?:VL judge|agentic_judge)\b", turn_prompt or "", re.IGNORECASE):
         return "after_judge_feedback"

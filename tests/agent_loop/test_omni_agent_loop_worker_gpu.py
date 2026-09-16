@@ -268,7 +268,9 @@ def test_omni_agent_loop_worker_image_gen_generate_sequences(init_config):
             n_gen = int(np.asarray(ntb["num_generate_image_prompts"]).reshape(-1)[0])
             valid = int(np.asarray(ntb["rollout_valid"]).reshape(-1)[0])
             # Force-first + fake HTTP PNG → live ok=1 generate observation.
-            assert n_gen >= 1, f"expected >=1 successful generate, got {n_gen}"
+            # ``num_generate_image_prompts`` is the *executed* count; ``rollout_valid``
+            # stays on the successful count that gates invalid-rollout discarding.
+            assert n_gen >= 1, f"expected >=1 executed generate, got {n_gen}"
             assert valid == 1
 
             metrics = result.meta_info.get("agentic_metrics") or {}

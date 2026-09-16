@@ -12,7 +12,7 @@
 #     bash examples/agenticllmgrpo_trainer/agent_llm/run_agentic_rpco.sh
 set -e
 set -x
-
+VAL_BEFORE_TRAIN=true
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"

@@ -31,6 +31,7 @@ from verl.experimental.agent_loop.tool_parser import FunctionCall
 
 from verl_omni.tools.agent_helper.image_gen_utils import (
     build_forced_reflection,
+    count_executed_generates,
     count_successful_generates,
     count_successful_judges,
     fits_response_budget,
@@ -130,6 +131,96 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             None,
             lambda: self.tokenizer.encode(payload, add_special_tokens=False),
         )
+
+    @staticmethod
+    def _agentic_last_tool_message(agent_data: AgentData) -> dict[str, Any] | None:
+        """Return the trailing tool message, or ``None`` when there is none.
+
+        Args:
+            agent_data: Live per-rollout agent state.
+
+        Returns:
+            Last ``role="tool"`` message when it is the most recent message.
+        """
+        for message in reversed(agent_data.messages):
+            if message.get("role") != "tool":
+                return None
+            return message
+        return None
+
+    def _agentic_dropped_tool_calls(self, agent_data: AgentData) -> list[Any]:
+        """Return the tool calls the parent will not execute this turn.
+
+        Args:
+            agent_data: Live per-rollout agent state.
+
+        Returns:
+            Calls beyond ``multi_turn.max_parallel_calls``, in emission order.
+        """
+        limit = int(getattr(self, "max_parallel_calls", 1) or 1)
+        return list(agent_data.tool_calls[limit:])
+
+    async def _agentic_append_dropped_tool_notice(self, agent_data: AgentData, dropped: list[Any]) -> AgentState:
+        """Report dropped same-turn tool calls back to the actor as tool responses.
+
+        ``ToolAgentLoop`` executes only ``tool_calls[:max_parallel_calls]`` and says
+        nothing about the rest. A model that emits ``generate_image`` and
+        ``judge_image`` in one message therefore lost its judge with no observation
+        and no error, while the scorer still saw the textual call and docked
+        ``judge_parse_ok``. Appending one tool response per dropped call keeps the
+        message list well-formed and turns a silent harness truncation into a
+        visible, learnable signal.
+
+        Args:
+            agent_data: Live per-rollout agent state, already holding the executed
+                tool responses.
+            dropped: Calls skipped by the parent this turn.
+
+        Returns:
+            ``AgentState.GENERATING`` when the notice fits, else ``TERMINATED``.
+        """
+        names = [str(getattr(call, "name", "") or "unknown") for call in dropped]
+        limit = max(1, int(getattr(self, "max_parallel_calls", 1) or 1))
+        joined = ", ".join(names)
+        text = (
+            f"Ignored: at most {limit} tool call(s) run per turn. "
+            f"{joined} in this turn was not executed. "
+            "Emit one tool call per turn and wait for its <tool_response> before the next call. "
+            f"agentic_tool_dropped n={len(names)} names={joined}"
+        )
+        previous_messages = list(agent_data.messages)
+        for call in dropped:
+            message: dict[str, Any] = {"role": "tool", "content": text}
+            tool_call_id = getattr(call, "tool_call_id", None)
+            if tool_call_id is not None:
+                message["tool_call_id"] = tool_call_id
+            agent_data.messages.append(message)
+
+        schemas = getattr(agent_data, "_active_tool_schemas", self.tool_schemas)
+        merge_result, response_mask, response_logprobs = await self.ct_merge_non_assistant_msg(
+            previous_messages,
+            agent_data.messages,
+            agent_data.prompt_ids,
+            agent_data.response_mask,
+            agent_data.response_logprobs if agent_data.response_logprobs else None,
+            tools=schemas,
+        )
+        if len(response_mask) >= self.response_length:
+            return AgentState.TERMINATED
+        agent_data.prompt_ids = merge_result.token_ids
+        agent_data.response_mask = response_mask
+        if agent_data.response_logprobs:
+            agent_data.response_logprobs = response_logprobs or []
+        agent_data.extra_fields["num_dropped_tool_calls"] = len(names)
+        agent_data.extra_fields["dropped_tool_names"] = ",".join(names)
+        logger.info(
+            "Ignored %d extra tool call(s) beyond max_parallel_calls=%s at global_step=%s: %s",
+            len(names),
+            getattr(self, "max_parallel_calls", 1),
+            getattr(self, "_agentic_step", 0),
+            ", ".join(names),
+        )
+        return AgentState.GENERATING
 
     async def _replace_last_assistant_with_tool_call(
         self,
@@ -289,24 +380,35 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         agent_data.extra_fields.setdefault("forced_reflection", False)
         agent_data.extra_fields.setdefault("force_stop_max_passes", False)
         agent_data.extra_fields.setdefault("stop_decision_required", False)
+        # Capture what the harness is about to drop: the parent slices
+        # ``tool_calls[:max_parallel_calls]`` and never reports the rest.
+        dropped = self._agentic_dropped_tool_calls(agent_data)
         state = await super()._handle_processing_tools_state(agent_data)
         # Stamp generate-count after every tool turn so discard_invalid_rollouts
         # can run in generate_sequences before the reward manager writes keys.
+        # ``num_generate_image_prompts`` is the *executed* count (any live
+        # ``agentic_tool ok=`` response), matching ``num_judge_image_calls`` in the
+        # scorer. ``rollout_has_generate``/``rollout_valid`` stay on the *successful*
+        # count: a call refused by the pass cap produced no image and must not keep
+        # an otherwise-empty rollout alive. ``discard_invalid_rollouts`` reads those
+        # two stamps before falling back to this counter, so masking is unchanged.
         n_gen = count_successful_generates(agent_data.messages)
-        agent_data.extra_fields["num_generate_image_prompts"] = int(n_gen)
+        agent_data.extra_fields["num_generate_image_prompts"] = int(count_executed_generates(agent_data.messages))
         agent_data.extra_fields["rollout_has_generate"] = int(n_gen >= 1)
         agent_data.extra_fields["rollout_valid"] = int(n_gen >= 1)
         if state == AgentState.TERMINATED:
             return state
 
-        last_tool: dict[str, Any] | None = None
-        for message in reversed(agent_data.messages):
-            if message.get("role") != "tool":
-                break
-            last_tool = message
-            break
+        # Resolve this from the *executed* responses, before the drop notice lands,
+        # so forced Reflection still quotes the real judge/generate feedback.
+        last_tool = self._agentic_last_tool_message(agent_data)
         if last_tool is None:
             return state
+
+        if dropped:
+            state = await self._agentic_append_dropped_tool_notice(agent_data, dropped)
+            if state == AgentState.TERMINATED:
+                return state
 
         gen_passes = n_gen
         max_passes = max_generate_passes()

@@ -36,6 +36,7 @@ from verl_omni.utils.agentic.image_gen_rollout_parse import (
     extract_generate_image_prompts,
     split_env_blob,
     split_rollout_turns,
+    tool_call_order,
     turn_kind,
 )
 
@@ -201,9 +202,37 @@ def test_turn_kind_stop_rewrite_and_continue():
     rewrite = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "lion"}}\n</tool_call>'
     done = "Reflection: The image meets the original request. Done.<|im_end|>"
     assert turn_kind(done, judge_yes, stop_cue) == "agent_done_after_forced_reflection"
-    assert turn_kind(rewrite, judge_no, continue_cue) == "agent_rewrite_after_forced_reflection"
+    assert turn_kind(rewrite, judge_no, continue_cue) == (
+        "agent_rewrite_after_forced_reflection_then_call_generate_image"
+    )
     assert turn_kind("", judge_yes, stop_cue) == "forced_reflection_stop_cue"
     assert turn_kind(done, judge_no, "") == "agent_reflection_done"
+
+
+def test_turn_kind_labels_the_first_tool_call():
+    """A generate+judge turn is a generate turn with a dropped trailing call.
+
+    Regression: ``turn_kind`` tested ``judge_image`` before ``generate_image``, so a
+    turn whose *first* call was ``generate_image`` was labelled ``call_judge_image``
+    and read as a judge-first rollout in the dumps.
+    """
+    gen_only = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "skull"}}\n</tool_call>'
+    judge_only = (
+        '<tool_call>\n{"name": "judge_image", "arguments": {"user_request": "same as user message"}}\n</tool_call>'
+    )
+    gen_then_judge = f"{gen_only}\n{judge_only}"
+    judge_then_gen = f"{judge_only}\n{gen_only}"
+
+    assert tool_call_order(gen_then_judge) == ["generate_image", "judge_image"]
+    assert tool_call_order(judge_then_gen) == ["judge_image", "generate_image"]
+    assert tool_call_order("no tools here") == []
+
+    # The first call names the turn; trailing calls are appended, never promoted.
+    assert turn_kind(gen_then_judge, "prompt", "") == "call_generate_image_then_call_judge_image"
+    assert turn_kind(judge_then_gen, "prompt", "") == "call_judge_image_then_call_generate_image"
+    # Single-call labels are unchanged.
+    assert turn_kind(gen_only, "prompt", "") == "call_generate_image"
+    assert turn_kind(judge_only, "prompt", "") == "call_judge_image"
 
 
 def test_extract_generate_image_prompts_hermes_and_qwen():
@@ -365,3 +394,89 @@ def test_tq_run_agent_loop_wires_session_id_into_relpath(monkeypatch):
 
     asyncio.run(_run_all())
     assert captured == [f"step_000004/sample_2086.{n:02d}" for n in range(8)]
+
+
+def _drop_notice_setup(monkeypatch, tool_names):
+    """Build a loop whose parent executes only the first tool call of a turn."""
+    from types import SimpleNamespace
+
+    from verl.experimental.agent_loop.tool_parser import FunctionCall
+
+    from verl_omni.agent_loop import tool_agent_loop as mod
+
+    async def _parent(self, agent_data):
+        agent_data.messages.append(
+            {"role": "tool", "content": "generated path=/tmp/image_00.png agentic_tool ok=1 images=1"}
+        )
+        return mod.AgentState.GENERATING
+
+    async def _merge(self, previous_messages, updated_messages, token_ids, response_mask, *args, **kwargs):
+        added = len(updated_messages) - len(previous_messages)
+        return (
+            SimpleNamespace(token_ids=[*token_ids, *([0] * added)]),
+            [*response_mask, *([0] * added)],
+            [*(kwargs.get("response_logprobs") or []), *([0.0] * added)],
+        )
+
+    monkeypatch.setattr(mod.ToolAgentLoop, "_handle_processing_tools_state", _parent)
+    monkeypatch.setattr(mod.ToolAgentLoop, "ct_merge_non_assistant_msg", _merge)
+    monkeypatch.setattr(mod, "max_generate_passes", lambda: 99)
+    # Hydra knobs are unbound outside a live worker; forced Reflection is not
+    # under test here, so take the early return after the drop notice.
+    monkeypatch.setattr(mod, "agentic_get_bool", lambda *args, **kwargs: False)
+
+    loop = mod.ImageGenToolAgentLoop.__new__(mod.ImageGenToolAgentLoop)
+    loop.max_parallel_calls = 1
+    loop.response_length = 4096
+    loop.tool_schemas = []
+    agent_data = SimpleNamespace(
+        tool_calls=[
+            FunctionCall(name=name, arguments="{}", tool_call_id=f"call_{index}")
+            for index, name in enumerate(tool_names)
+        ],
+        messages=[],
+        prompt_ids=[],
+        response_mask=[],
+        response_logprobs=[],
+        extra_fields={},
+    )
+    return mod, loop, agent_data
+
+
+def test_dropped_same_turn_tool_call_gets_a_tool_response_notice(monkeypatch):
+    """A same-turn call past ``max_parallel_calls`` must not vanish silently.
+
+    Regression: the parent slices ``tool_calls[:max_parallel_calls]`` and reports
+    nothing, so "generate then judge in one message" lost its judge with no tool
+    response and no error, while the scorer still docked the rollout.
+    """
+    mod, loop, agent_data = _drop_notice_setup(monkeypatch, ["generate_image", "judge_image"])
+
+    state = asyncio.run(mod.ImageGenToolAgentLoop._handle_processing_tools_state(loop, agent_data))
+
+    assert state == mod.AgentState.GENERATING
+    notices = [
+        message
+        for message in agent_data.messages
+        if message.get("role") == "tool" and "agentic_tool_dropped" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+    assert notices[0]["tool_call_id"] == "call_1"
+    assert "judge_image" in notices[0]["content"]
+    assert "not executed" in notices[0]["content"]
+    assert agent_data.extra_fields["num_dropped_tool_calls"] == 1
+    assert agent_data.extra_fields["dropped_tool_names"] == "judge_image"
+    # The notice is an environment observation, so its tokens must not be sampled.
+    assert set(agent_data.response_mask) <= {0}
+
+
+def test_single_tool_call_turn_gets_no_drop_notice(monkeypatch):
+    """The common one-call-per-turn rollout must stay byte-identical."""
+    mod, loop, agent_data = _drop_notice_setup(monkeypatch, ["generate_image"])
+
+    state = asyncio.run(mod.ImageGenToolAgentLoop._handle_processing_tools_state(loop, agent_data))
+
+    assert state == mod.AgentState.GENERATING
+    contents = [str(message.get("content")) for message in agent_data.messages]
+    assert not any("agentic_tool_dropped" in content for content in contents)
+    assert "num_dropped_tool_calls" not in agent_data.extra_fields

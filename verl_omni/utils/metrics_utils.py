@@ -132,7 +132,11 @@ class AgenticRewardMetrics:
         "reward_done",
         "num_hermes_tool_calls",
         "num_generate_image_prompts",
+        "num_generate_image_prompts_requested",
+        "num_generate_image_prompts_dropped",
         "num_judge_image_calls",
+        "num_judge_image_calls_requested",
+        "num_judge_image_calls_dropped",
         "judge_parse_ok",
         "judge_parse_fail",
         "judge_parse_ok_rate",
@@ -148,7 +152,11 @@ class AgenticRewardMetrics:
         {
             "num_hermes_tool_calls",
             "num_generate_image_prompts",
+            "num_generate_image_prompts_requested",
+            "num_generate_image_prompts_dropped",
             "num_judge_image_calls",
+            "num_judge_image_calls_requested",
+            "num_judge_image_calls_dropped",
             "protocol_ok",
             "rollout_valid",
         }

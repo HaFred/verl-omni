@@ -195,6 +195,41 @@ def _is_live_generate_observation(text: str) -> bool:
     )
 
 
+def _is_executed_generate_observation(text: str) -> bool:
+    """True when ``text`` is a live ``generate_image`` response that actually ran.
+
+    ``ok=0`` covers a call the pass cap refused (``backend=blocked_after_max_passes``);
+    the tool ran and answered, so it is executed even though it produced no image.
+    """
+    return (
+        re.search(r"\bagentic_tool\s+ok=[01]\b", text, re.IGNORECASE) is not None
+        and re.search(r"\bbackend\s*=\s*(?!fewshot\b)[A-Za-z0-9_]+\b", text, re.IGNORECASE) is not None
+    )
+
+
+def count_executed_generates(messages: list[dict[str, Any]]) -> int:
+    """Count live ``generate_image`` observations the harness executed.
+
+    Distinct from :func:`count_successful_generates`: a call refused by
+    ``max_generate_image_passes`` executed (``agentic_tool ok=0``) but produced no
+    image. Distinct from the raw ``<tool_call>`` count in the decode, which also
+    includes calls dropped for exceeding ``max_parallel_calls``.
+
+    Args:
+        messages: Full chat message list.
+
+    Returns:
+        Number of live executed ``generate_image`` tool observations.
+    """
+    return sum(
+        1
+        for message in messages_after_last_user(messages)
+        if message.get("role") == "tool"
+        and _is_executed_generate_observation(tool_message_text(message))
+        and not _is_fewshot_observation(tool_message_text(message))
+    )
+
+
 def count_successful_judges(messages: list[dict[str, Any]]) -> int:
     """Count successful live judge observations after the live user turn.
 
