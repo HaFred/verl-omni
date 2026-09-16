@@ -21,9 +21,10 @@ their agent-loop or dataset modules.
 Wire with ``reward.reward_manager.name=naive`` so verl passes ``solution_str``.
 ``VisualRewardManager``'s ``solution_image`` is the wrong modality and raises.
 
-The active reward set is ``{reflect, plan, format, tool, result}``. ``plan`` is
-active only for plan rows. ``done`` and ``tool_call`` reproduce the PR1
-closed-loop indicators for metrics, but are not additional score dimensions.
+The active reward set is ``{reflect, plan, format, tool, result, improve}``. ``plan``
+is active only for plan rows. ``improve`` scores the judge-outcome lift across the
+rewrite chain. ``done`` and ``tool_call`` reproduce the PR1 closed-loop indicators for
+metrics, but are not additional score dimensions.
 Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
 receive score zero and ``rollout_valid=0``. ``task_type`` is required.
 
@@ -41,7 +42,11 @@ import json
 import re
 from typing import Any
 
-DIMS = ("reflect", "plan", "format", "tool", "result")
+from verl_omni.utils.agentic.judge_delta import judge_delta_reward
+
+DIMS = ("reflect", "plan", "format", "tool", "result", "improve")
+#: Dims renamed after parquet was already built under the old weight key.
+_LEGACY_WEIGHT_ALIASES: dict[str, tuple[str, ...]] = {"improve": ("w_novelty",)}
 # Names consumed by AgenticMetricsAgentLoopManager when PR1 and PR3 are
 # composed. Keeping them here lets this independent PR specify that contract.
 REWARD_COMPONENTS = tuple(f"reward_{name}" for name in (*DIMS, "done", "tool_call"))
@@ -74,6 +79,8 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
         "judge_parse_ok": 0,
         "judge_parse_fail": 0,
         "judge_parse_ok_rate": 0.0,
+        "judge_delta": 0.0,
+        "num_prompt_rewrites": 0,
         "protocol_ok": 0,
         "rewrite_after_yes": 0,
         "rollout_valid": 0,
@@ -409,11 +416,50 @@ def _format_reward(
     return sum(checks) / len(checks)
 
 
+def _expected_num_images(ground_truth: dict[str, Any], extra_info: dict[str, Any]) -> int | None:
+    """Return the reference image budget for a row, or ``None`` when there is none.
+
+    ``expected_num_images`` is *derived*, not a curated label: reflect rows take it
+    from the image count of the reference trajectory and plan rows from the number of
+    plan slots. Rows with no reference trajectory at all (the ``No breakdown
+    needed.`` sentinel) therefore have no budget to report, and the field is absent or
+    ``None``. Coercing those to ``1`` would invent a one-shot cap.
+
+    Args:
+        ground_truth: ``reward_model.ground_truth`` mapping.
+        extra_info: ``extra_info`` fallback mapping.
+
+    Returns:
+        Positive budget, or ``None`` when the row carries no reference budget.
+    """
+    for source in (ground_truth, extra_info):
+        if source is None or "expected_num_images" not in source:
+            continue
+        raw = source["expected_num_images"]
+        if raw is None:
+            continue
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _report_expected(expected: int | None) -> int:
+    """Project the budget into the reward dict as an int.
+
+    ``0`` means "this row has no reference budget" (no reference trajectory), which is
+    distinct from a positive budget. Kept numeric so the field stays safe to average
+    and log.
+    """
+    return 0 if expected is None else int(expected)
+
+
 def _result_reward(
     text: str,
     *,
     task_type: str,
-    expected: int,
+    expected: int | None,
     successful_generates: int,
     terminal_done: bool,
     blocked: bool,
@@ -422,11 +468,20 @@ def _result_reward(
     if blocked or not terminal_done or successful_generates < 1 or rewrite_after_yes > 0:
         return 0.0
     if task_type == "plan":
-        return 1.0 if successful_generates == expected else 0.0
+        # A plan's whole point is one image per subtask, so the count must match.
+        return 1.0 if expected is not None and successful_generates == expected else 0.0
     judges = _successful_judges(text)
     final_yes = bool(judges) and judges[-1][2] is True
+    # ``expected`` is deliberately NOT enforced here. It is the reference trajectory's
+    # image count, and the reflect protocol tells the agent to rewrite until the judge is
+    # satisfied while hiding this field from it, so capping at the reference's budget
+    # punishes exactly the iteration the task asks for. Nothing is lost by dropping it:
+    # ``rewrite_after_yes`` already blocks generating after a YES (so a rollout cannot
+    # farm result points by looping), and ``agentic_image_gen.max_generate_image_passes``
+    # already bounds total generates at the tool. Enforcing cost belongs there, not here,
+    # because a per-dim reward cannot separate "iterated usefully" from "iterated".
     # Fail closed on a terminal NO: early-stop alone is not a free result point.
-    return 1.0 if final_yes and successful_generates <= expected else 0.0
+    return 1.0 if final_yes else 0.0
 
 
 def _resolve_solution_text(
@@ -499,6 +554,16 @@ def _active_weights(
         if raw is None:
             raw = extra_info.get(f"w_{dim}")
         if raw is None:
+            # ``improve`` replaced the ``novelty`` dim, and parquet built before the
+            # swap baked ``w_novelty``. Honour the old key so a dataset rebuild is not
+            # required to keep ``RPCO_W_NOVELTY`` meaningful.
+            for alias in _LEGACY_WEIGHT_ALIASES.get(dim, ()):
+                raw = ground_truth.get(alias)
+                if raw is None:
+                    raw = extra_info.get(alias)
+                if raw is not None:
+                    break
+        if raw is None:
             value = 1.0
         else:
             try:
@@ -543,16 +608,13 @@ def compute_score(
     if weights is None:
         return _zero_result(method="agentic_multidim_bad_weights")
 
-    try:
-        expected = max(1, int(gt.get("expected_num_images", metadata.get("expected_num_images", 1))))
-    except (TypeError, ValueError):
-        expected = 1
+    expected = _expected_num_images(gt, metadata)
 
     text = _resolve_solution_text(solution_str, kwargs=kwargs, extra_info=metadata)
     kwargs.pop("solution_image", None)
     if not text.strip():
         result = _zero_result(method="agentic_multidim_empty")
-        result.update(task_type=task_type, expected_num_images=expected)
+        result.update(task_type=task_type, expected_num_images=_report_expected(expected))
         return result
 
     calls = _extract_tool_calls(text)
@@ -584,6 +646,12 @@ def compute_score(
     # rollout that produced three images.
     generate_prompts_requested = len(prompts)
     generate_prompts_executed = _count_executed_generates(text)
+    # Judge-outcome lift across the rewrite chain: did iterating actually help?
+    # ``judge_delta_reward`` documents why this replaced an n-gram novelty measure.
+    judges = _successful_judges(text)
+    judge_delta_score, judge_delta_value = judge_delta_reward(
+        [(correctness, aesthetics, good_enough) for correctness, aesthetics, good_enough, _ in judges]
+    )
 
     result = _zero_result(method="agentic_multidim")
     result.update(
@@ -597,11 +665,13 @@ def compute_score(
         judge_parse_ok=judge_ok,
         judge_parse_fail=judge_failed,
         judge_parse_ok_rate=float(judge_rate),
+        judge_delta=judge_delta_value,
+        num_prompt_rewrites=max(0, len(prompts) - 1),
         terminal_done=int(terminal_done),
         terminal_policy_reflection=int(policy_reflection),
         forced_reflection_context=int(forced_context),
         n_successful_generates=successful_generates,
-        expected_num_images=expected,
+        expected_num_images=_report_expected(expected),
         task_type=task_type,
         rewrite_after_yes=rewrites_after_yes,
         reward_tool_call=float(bool(calls)),
@@ -622,6 +692,7 @@ def compute_score(
             forced_context=forced_context,
         ),
         "tool": with_judge_reward,
+        "improve": judge_delta_score,
         "result": _result_reward(
             text,
             task_type=task_type,

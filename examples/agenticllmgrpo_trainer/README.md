@@ -56,8 +56,14 @@ Useful controls:
 
 - `RPCO_INIT_CKPT`: initialize from a stage-1 agent checkpoint.
 - `RPCO_W_REFLECT`, `RPCO_W_PLAN`, `RPCO_W_FORMAT`, `RPCO_W_TOOL`,
-  `RPCO_W_RESULT`: per-dimension weights baked into parquet ground truth
-  (`RPCO_W_TOOL_CALL` is accepted as an alias for `RPCO_W_TOOL`).
+  `RPCO_W_RESULT`, `RPCO_W_IMPROVE`: per-dimension weights baked into parquet
+  ground truth (`RPCO_W_TOOL_CALL` is accepted as an alias for `RPCO_W_TOOL`).
+  `RPCO_W_IMPROVE` scores the judge-outcome lift across a rewrite chain: the mean
+  `(correctness, aesthetics)` gain from the first `judge_image` to the preferred one.
+  A rewrite chain that leaves the judge where it started earns nothing, however much
+  its text changed. Set `RPCO_W_IMPROVE=0` to score without it.
+  (Predecessor `RPCO_W_NOVELTY` and the baked `w_novelty` key still resolve as an
+  alias, so parquet built before the swap keeps working without a rebuild.)
 - `AGENTIC_VLLM_OMNI_URL` / `AGENTIC_VLLM_URL`: sidecar endpoints, forwarded
   to Hydra `agentic_image_gen.vllm_omni_url` / `vllm_url`.
 - `AGENTIC_E2E_ROOT`: dump root for traj / images (`agentic_image_gen.e2e_root`).

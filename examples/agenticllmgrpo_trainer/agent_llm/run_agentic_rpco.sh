@@ -87,7 +87,7 @@ export UNICOT_BREAKDOWN_DIR UNICOT_REFLECTION_DIR UNICOT_MIX_RATIO UNICOT_VAL_RA
 if [[ -z "${RPCO_W_TOOL:-}" && -n "${RPCO_W_TOOL_CALL:-}" ]]; then
   export RPCO_W_TOOL="${RPCO_W_TOOL_CALL}"
 fi
-for DIM in REFLECT PLAN FORMAT TOOL RESULT; do
+for DIM in REFLECT PLAN FORMAT TOOL RESULT IMPROVE; do
   KEY="RPCO_W_${DIM}"
   if [[ -z "${!KEY:-}" ]]; then
     export "${KEY}=1.0"

@@ -142,8 +142,12 @@ class DiffusionAgentLoopWorkerTQ(DiffusionAgentLoopWorker):
                     # Seed from the global prompt index: each worker only sees a
                     # chunk of the batch, so a chunk-local position would reuse
                     # the same seed offsets in every worker and roll out
-                    # duplicated noise.
-                    run_sampling_params["seed"] = derive_rollout_seed(rollout_base_seed, sample_index * n + session_id)
+                    # duplicated noise. ``prompt_index`` is ``index[i]`` from the
+                    # batch, i.e. the global index, and ``prompt_index * n +
+                    # session_id`` is the expanded row index in
+                    # ``0 .. num_prompts * n - 1`` that ``derive_rollout_seed``
+                    # expects.
+                    run_sampling_params["seed"] = derive_rollout_seed(rollout_base_seed, prompt_index * n + session_id)
                 task = asyncio.create_task(
                     self._run_agent_loop(
                         run_sampling_params,

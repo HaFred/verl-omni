@@ -250,6 +250,53 @@ def test_build_forced_reflection_max_passes_stop_cue():
     assert "agentic_stop_decision_required=1" in text
 
 
+def test_build_forced_reflection_never_splits_a_sentence_mid_word():
+    """The judge's diagnosis is an observation; a mid-word cut corrupts it.
+
+    Live cue 2 on ``sample_9003`` ended ``"...to match the 'Sofa M"`` because
+    ``findings`` was sliced at a fixed 220 characters. The policy then read a malformed
+    token run as its instruction for the next rewrite, and the clipped tail silently
+    discarded whichever concrete fixes the judge wrote later in the field.
+    """
+    sentence = (
+        "The requested English title 'Sofa Montain Slummerfest' is replaced by illegible "
+        "white glyphs. "
+    )
+    text, _ = utils.build_forced_reflection(_judge_obs(good_enough="NO", findings=sentence * 6))
+
+    assert "'Sofa M " not in text
+    body = text.split("good_enough=NO. ", 1)[1].split(" Rewriting the diffusion prompt next.")[0]
+    # Whole sentences, and the cut is marked so the policy can tell the text continues.
+    assert body.endswith("…")
+    assert body[: -len(" …")].rstrip().endswith("glyphs.")
+    assert len(body) <= 222
+
+
+def test_build_forced_reflection_cuts_a_long_sentence_on_a_word_boundary():
+    """A single sentence longer than the budget still must not cut mid-word."""
+    collapsed = " ".join(f"word{index:02d}" for index in range(80))
+    text, _ = utils.build_forced_reflection(_judge_obs(good_enough="NO", findings=collapsed))
+    body = text.split("good_enough=NO. ", 1)[1].split(" Rewriting the diffusion prompt next.")[0]
+
+    assert body.endswith("…")
+    retained = body[: -len(" …")].rstrip()
+    # Every retained token is a whole word of the original, so nothing was split.
+    retained_tokens = retained.split()
+    assert retained_tokens == collapsed.split()[: len(retained_tokens)]
+    assert len(retained) <= 220
+
+
+def test_build_forced_reflection_leaves_short_fields_untouched():
+    """No ellipsis unless something was actually cut."""
+    text, _ = utils.build_forced_reflection(
+        _judge_obs(good_enough="NO", findings="text is legible", fixes="bolden the headline")
+    )
+
+    assert "good_enough=NO. text is legible." in text
+    assert "Suggested fixes: bolden the headline." in text
+    assert "…" not in text
+
+
 def test_build_forced_reflection_requires_judge_ok():
     assert utils.build_forced_reflection("no judge marker here") is None
 

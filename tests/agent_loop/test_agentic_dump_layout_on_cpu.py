@@ -61,6 +61,18 @@ def _bind(root, run_name="layout_test"):
     trajectory.bind_run_artifacts(cfg)
 
 
+class _PieceTok:
+    """Token id -> text piece, so a dumped turn decodes into real tool-call JSON."""
+
+    pad_token_id = 0
+
+    def __init__(self, pieces):
+        self.pieces = pieces
+
+    def decode(self, ids, skip_special_tokens=False):  # noqa: ARG002
+        return "".join(self.pieces.get(int(token), "") for token in ids)
+
+
 def _output(response_ids):
     return SimpleNamespace(
         prompt_ids=[1, 2, 3],
@@ -162,6 +174,55 @@ def test_dump_rollout_artifacts_preserves_live_image_meta(tmp_path):
     meta = json.loads((image_dir / "meta.json").read_text())
     assert meta["trajectory_relpath"] == relpath
     assert meta["source"] == "direct_tool_write"
+
+
+def test_dumped_turns_expose_the_rewritten_diffusion_prompt(tmp_path):
+    """``tool_prompt`` makes a rewrite chain readable without unescaping ``decode``.
+
+    ``turn_prompt`` is the whole chat template (identical on every turn) and
+    ``turn_obs`` only the judge observation, so the rewritten diffusion prompt that
+    the harness accepted existed only inside the escaped JSON tool call.
+    """
+    _bind(tmp_path)
+    gen = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "PROMPT_V1"}}\n</tool_call>'
+    judge_call = (
+        '<tool_call>\n{"name": "judge_image", "arguments": '
+        '{"user_request": "same as user message", "image_prompt": "PROMPT_V1"}}\n</tool_call>'
+    )
+    judge_obs = "<tool_response>\nagentic_judge ok=1 good_enough =NO\n</tool_response>"
+    rewrite = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "PROMPT_V2"}}\n</tool_call>'
+    tokenizer = _PieceTok({10: gen, 11: judge_obs, 12: judge_call, 13: judge_obs, 14: rewrite})
+
+    dump_rollout_artifacts(
+        tokenizer=tokenizer,
+        step=0,
+        relpath="step_000000/sample_9003",
+        sample_index=9003,
+        raw_prompt=[{"role": "user", "content": "a poster"}],
+        outputs=SimpleNamespace(
+            prompt_ids=[1, 2, 3],
+            response_ids=[10, 11, 12, 13, 14],
+            response_mask=[1, 0, 1, 0, 1],
+            reward_score=0.1,
+            extra_fields={},
+        ),
+    )
+
+    run_dir = tmp_path / "layout_test"
+    payload = json.loads((run_dir / "rollout_trajectories" / "step_000000" / "sample_9003.json").read_text())
+    assert [(turn["tool_name"], turn["tool_prompt"]) for turn in payload["rollout_turns"]] == [
+        ("generate_image", "PROMPT_V1"),
+        ("judge_image", "PROMPT_V1"),
+        ("generate_image", "PROMPT_V2"),
+    ]
+    # The judge echoes the prompt it inspected, so the pair reads as
+    # submit v1 -> echo v1 -> submit v2 without unescaping ``decode``.
+
+    row = json.loads((run_dir / "hermes_actions" / "step_000000.jsonl").read_text().splitlines()[0])
+    assert [turn["tool_prompt"] for turn in row["rollout_turns"]] == ["PROMPT_V1", "PROMPT_V1", "PROMPT_V2"]
+    text_block = (run_dir / "rollout_trajectories" / "step_000000" / "sample_9003.txt").read_text()
+    assert "turn_3_tool_prompt:" in text_block
+    assert "PROMPT_V2" in text_block
 
 
 def test_val_set_rows_never_touch_rollout_trajectories_or_monitor(monkeypatch):

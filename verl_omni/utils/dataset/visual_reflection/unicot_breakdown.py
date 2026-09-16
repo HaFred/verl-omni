@@ -41,7 +41,15 @@ MAX_SUBTASK_SLOTS = 3
 
 @dataclass(frozen=True)
 class UniCoTBreakdownRecord:
-    """Canonical validated UniCoT-Breakdown record."""
+    """Canonical validated UniCoT-Breakdown record.
+
+    Attributes:
+        expected_num_images: Reference image budget, taken from the record's plan
+            slots (``len(subtasks)``). ``None`` for the ``No breakdown needed.``
+            sentinel: that record carries no images and no reference trajectory, so
+            any budget would be invented rather than derived. Scoring treats ``None``
+            as "no reference budget" instead of a cap.
+    """
 
     data_id: str
     prompt: str
@@ -49,7 +57,7 @@ class UniCoTBreakdownRecord:
     subtasks: tuple[str, ...]
     subtask_images: tuple[str | None, ...]
     plan_expected: bool
-    expected_num_images: int
+    expected_num_images: int | None
 
 
 def breakdown_converter_config() -> dict[str, Any]:
@@ -131,7 +139,10 @@ def parse_unicot_breakdown_record(
             subtasks=(),
             subtask_images=(),
             plan_expected=False,
-            expected_num_images=1,
+            # No reference images or trajectory exist for this sentinel, so there is
+            # no budget to derive. ``1`` here used to fabricate a one-shot cap that
+            # also punished the reflect protocol's rewrite-until-good-enough loop.
+            expected_num_images=None,
         )
 
     first_none = next((index for index, value in enumerate(subtasks) if value is None), len(subtasks))

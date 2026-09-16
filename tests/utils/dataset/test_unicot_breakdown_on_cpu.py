@@ -64,7 +64,9 @@ def test_no_breakdown_normalizes_to_reflect():
 
     assert parsed.task_type == "reflect"
     assert parsed.plan_expected is False
-    assert parsed.expected_num_images == 1
+    # ``No breakdown needed.`` carries no images and no reference trajectory, so the
+    # budget is unknown rather than invented as 1.
+    assert parsed.expected_num_images is None
     assert parsed.subtasks == ()
     assert parsed.subtask_images == ()
 

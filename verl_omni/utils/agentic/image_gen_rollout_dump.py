@@ -248,6 +248,8 @@ def _annotate_ordered_turns(rollout_turns: list[dict[str, Any]], user_prompt: st
             "turn_kind": t.get("turn_kind"),
             "turn_prompt": t.get("turn_prompt") or "",
             "turn_obs": t.get("turn_obs") or "",
+            "tool_name": t.get("tool_name") or "",
+            "tool_prompt": t.get("tool_prompt") or "",
             "decode": t.get("decode") or "",
             "response": t.get("response") or "",
             "decode_has_tool_call": bool(t.get("decode_has_tool_call")),
@@ -304,15 +306,39 @@ def _build_trajectory_payload(
     }
 
 
+def _compact_turn_record(turn: dict[str, Any]) -> dict[str, Any]:
+    """Project a trajectory turn into the compact ``hermes_actions`` row shape.
+
+    ``hermes_actions`` keeps the short env observation in ``turn_prompt`` (not the
+    full chat template) and drops ``decode`` to stay readable, so ``tool_name`` and
+    ``tool_prompt`` have to be carried over explicitly — otherwise the rewritten
+    diffusion prompt exists only inside the escaped JSON in ``decode``.
+    """
+    return {
+        "turn": turn["turn"],
+        "turn_kind": turn["turn_kind"],
+        "turn_prompt": turn.get("turn_obs") or "",
+        "tool_name": turn.get("tool_name") or "",
+        "tool_prompt": turn.get("tool_prompt") or "",
+        "response": turn.get("response") or "",
+        "decode_has_tool_call": bool(turn.get("decode_has_tool_call")),
+    }
+
+
 def _format_turn_text_block(turn: dict[str, Any]) -> list[str]:
     t = int(turn["turn"])
     turn_prompt = turn.get("turn_prompt") or ""
     response = turn.get("response") or ""
     decode = turn.get("decode") or ""
     kind = turn.get("turn_kind") or "other"
+    tool_prompt = turn.get("tool_prompt") or ""
     header = f"  turn={t} kind={kind} decode_has_tool_call={turn['decode_has_tool_call']}"
-    return [
-        header,
+    lines = [header]
+    if tool_prompt:
+        # Only generate turns carry one; shown here so a rewrite chain is readable
+        # without unescaping the JSON tool call out of ``decode``.
+        lines += [f"    turn_{t}_tool_prompt:", *[f"      {line}" for line in tool_prompt.splitlines()]]
+    lines += [
         f"    turn_{t}_prompt:",
         *[f"      {line}" for line in (turn_prompt.splitlines() or [""])],
         f"    turn_{t}_response:",
@@ -320,6 +346,7 @@ def _format_turn_text_block(turn: dict[str, Any]) -> list[str]:
         "    decode:",
         *[f"      {line}" for line in (decode.splitlines() or [""])],
     ]
+    return lines
 
 
 def dump_raw_rollouts(
@@ -438,16 +465,7 @@ def dump_raw_rollouts(
             # Hermes JSONL stays compact: short env obs only (not the full template).
             monitor_payload = {
                 **payload,
-                "rollout_turns": [
-                    {
-                        "turn": turn["turn"],
-                        "turn_kind": turn["turn_kind"],
-                        "turn_prompt": turn.get("turn_obs") or "",
-                        "response": turn.get("response") or "",
-                        "decode_has_tool_call": bool(turn.get("decode_has_tool_call")),
-                    }
-                    for turn in ordered_turns
-                ],
+                "rollout_turns": [_compact_turn_record(turn) for turn in ordered_turns],
                 "reward_metrics": reward_metrics,
             }
             jsonl_rows.append(json.dumps(monitor_payload, ensure_ascii=False))
@@ -617,16 +635,7 @@ def dump_rollout_artifacts(
         step_text.append("")
         monitor_payload = {
             **payload,
-            "rollout_turns": [
-                {
-                    "turn": turn["turn"],
-                    "turn_kind": turn["turn_kind"],
-                    "turn_prompt": turn.get("turn_obs") or "",
-                    "response": turn.get("response") or "",
-                    "decode_has_tool_call": bool(turn.get("decode_has_tool_call")),
-                }
-                for turn in ordered_turns
-            ],
+            "rollout_turns": [_compact_turn_record(turn) for turn in ordered_turns],
             "reward_metrics": _rollout_reward_metrics(
                 getattr(final, "extra_fields", None),
                 getattr(final, "reward_score", None),

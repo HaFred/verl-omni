@@ -217,7 +217,13 @@ def test_plan_result_requires_exact_successful_image_count():
     assert short["reward_result"] == 0.0
 
 
-def test_reflect_result_requires_terminal_yes_and_rejects_over_generation():
+def test_reflect_result_requires_terminal_yes_and_ignores_the_reference_budget():
+    """Reflect scores on the judge's verdict, not on the reference image count.
+
+    ``expected_num_images`` is the reference trajectory's image count. Enforcing it would
+    punish iterating, which is what the reflect protocol asks the agent to do, so the
+    budget is logged but never gates ``reward_result``.
+    """
     early_yes = compute_score(solution_str=_reflect_trajectory(), ground_truth=_ground_truth(expected=3))
     early_no = compute_score(
         solution_str=_reflect_trajectory(accepted=False),
@@ -227,15 +233,25 @@ def test_reflect_result_requires_terminal_yes_and_rejects_over_generation():
         (
             _generate("version one", "/tmp/one.png"),
             _generate("version two", "/tmp/two.png"),
-            _judge("/tmp/two.png", accepted=False),
-            "Reflection: The second version is still weak. Done.",
+            _judge("/tmp/two.png", accepted=True),
+            "Reflection: The second version resolved the findings. Done.",
         )
     )
     over_output = compute_score(solution_str=over, ground_truth=_ground_truth(expected=1))
+    blocked = compute_score(
+        solution_str="\n".join((over, "agentic_tool ok=0 path=none blocked_after_max_passes=1")),
+        ground_truth=_ground_truth(expected=1),
+    )
 
+    # A YES is a YES regardless of how far below the reference budget it is...
     assert early_yes["reward_result"] == 1.0
+    # ...and iterating past the reference budget is no longer penalised.
+    assert over_output["n_successful_generates"] == 2
+    assert over_output["reward_result"] == 1.0
+    # A terminal NO still fails closed.
     assert early_no["reward_result"] == 0.0
-    assert over_output["reward_result"] == 0.0
+    # And so does a blocked rollout, which is the tool-level dithering guard.
+    assert blocked["reward_result"] == 0.0
 
 
 def test_weighted_total_uses_only_the_task_active_set():
@@ -249,9 +265,9 @@ def test_weighted_total_uses_only_the_task_active_set():
         w_result=1.0,
     )
     output = compute_score(solution_str=text, ground_truth=ground_truth)
-    expected = (
-        2 * output["reward_reflect"] + output["reward_format"] + output["reward_tool"] + output["reward_result"]
-    ) / 5
+    # ``w_plan`` is inactive for a reflect row, so it is the only dim left out.
+    active = {"reflect": 2.0, "format": 1.0, "tool": 1.0, "result": 1.0, "improve": 1.0}
+    expected = sum(weight * output[f"reward_{dim}"] for dim, weight in active.items()) / sum(active.values())
 
     assert output["score"] == pytest.approx(expected)
     without_plan_weight = compute_score(
@@ -420,6 +436,7 @@ def test_all_paths_emit_stable_schema_and_metric_contract():
         "reward_format",
         "reward_tool",
         "reward_result",
+        "reward_improve",
         "reward_done",
         "reward_tool_call",
     )
@@ -597,3 +614,257 @@ def test_drop_notice_does_not_inflate_executed_generate_count():
 
     assert output["num_generate_image_prompts"] == 1
     assert output["num_generate_image_prompts_requested"] == 1
+
+
+def _rewrite_trajectory(first: str, second: str) -> str:
+    """A two-pass reflect rollout that rewrites ``first`` into ``second``."""
+    return "\n".join(
+        (
+            _generate(first, "/tmp/image_00.png"),
+            _judge("/tmp/image_00.png", accepted=False),
+            _generate(second, "/tmp/image_01.png"),
+            _judge("/tmp/image_01.png", accepted=True),
+            "Reflection: The rewrite resolved the findings. Done.",
+        )
+    )
+
+
+def _rewrite_trajectory_scored(
+    first: str,
+    second: str,
+    *,
+    first_correctness: float,
+    first_aesthetics: float,
+    last_correctness: float,
+    last_aesthetics: float,
+    first_accepted: bool = False,
+) -> str:
+    """A two-pass reflect rollout whose judges report explicit facet scores."""
+    return "\n".join(
+        (
+            _generate(first, "/tmp/image_00.png"),
+            _judge(
+                "/tmp/image_00.png",
+                correctness=first_correctness,
+                aesthetics=first_aesthetics,
+                accepted=first_accepted,
+            ),
+            _generate(second, "/tmp/image_01.png"),
+            _judge(
+                "/tmp/image_01.png",
+                correctness=last_correctness,
+                aesthetics=last_aesthetics,
+                accepted=True,
+            ),
+            "Reflection: The rewrite resolved the findings. Done.",
+        )
+    )
+
+
+def test_improve_scores_the_judge_lift_not_the_text_change():
+    """This dim scores the outcome, not the wording — the reverse of its predecessor.
+
+    The replaced measure scored text distance, so it read the live CN-poster chain as
+    "append-only" and paid ``0.097`` for it. The judge scores for that same chain went
+    ``correctness 0.00 -> 0.56`` and ``aesthetics 0.44 -> 0.80``, so the appends were
+    working and the rollout was still climbing when the pass cap stopped it. Scoring the
+    lift pays for that, and pays nothing for a text change the judge did not reward.
+    """
+    base = "A vertical cafe poster with a ceramic coffee cup on a rustic table."
+    appended = f"{base} The text is rendered in a clear, legible sans-serif font."
+    ground_truth = _ground_truth(expected=2)
+
+    lifted = compute_score(
+        solution_str=_rewrite_trajectory_scored(
+            base,
+            appended,
+            first_correctness=0.0,
+            first_aesthetics=0.44,
+            last_correctness=0.56,
+            last_aesthetics=0.80,
+        ),
+        ground_truth=ground_truth,
+    )
+    stalled = compute_score(
+        solution_str=_rewrite_trajectory_scored(
+            base,
+            appended,
+            first_correctness=0.30,
+            first_aesthetics=0.50,
+            last_correctness=0.30,
+            last_aesthetics=0.50,
+        ),
+        ground_truth=ground_truth,
+    )
+
+    assert lifted["num_prompt_rewrites"] == 1
+    # mean(0.56 - 0.00, 0.80 - 0.44) = 0.46
+    assert lifted["judge_delta"] == pytest.approx(0.46)
+    assert lifted["reward_improve"] == pytest.approx(0.46)
+    # The same text change, judged as leaving the image where it was, earns nothing.
+    assert stalled["judge_delta"] == pytest.approx(0.0)
+    assert stalled["reward_improve"] == pytest.approx(0.0)
+
+
+def test_improve_reports_a_regression_as_negative_without_paying():
+    """A rewrite that makes the image worse must not bank a positive delta.
+
+    The unclamped value stays visible in the metrics so a regression is diagnosable,
+    while the reward term contributes nothing.
+    """
+    base = "A vertical cafe poster with a ceramic coffee cup on a rustic table."
+    worse = f"{base} Oversaturated neon colors, cluttered composition, illegible text."
+    ground_truth = _ground_truth(expected=2)
+
+    output = compute_score(
+        solution_str=_rewrite_trajectory_scored(
+            base,
+            worse,
+            first_correctness=0.60,
+            first_aesthetics=0.70,
+            last_correctness=0.10,
+            last_aesthetics=0.20,
+        ),
+        ground_truth=ground_truth,
+    )
+
+    # mean(0.10 - 0.60, 0.20 - 0.70) = -0.50
+    assert output["judge_delta"] == pytest.approx(-0.50)
+    assert output["reward_improve"] == pytest.approx(0.0)
+
+
+def test_improve_is_zero_for_a_single_generate():
+    """No chain means no lift to measure, so the dim stays out of single-pass rows.
+
+    The predecessor scored these rows against the raw request. A judge-lift measure has
+    nothing to compare, and the absolute image quality they do produce is already scored
+    by ``reward_reflect``, which reads the preferred judge directly.
+    """
+    output = compute_score(
+        solution_str=_reflect_trajectory(correctness=0.9, aesthetics=0.9),
+        ground_truth=_ground_truth(expected=1),
+    )
+
+    assert output["num_prompt_rewrites"] == 0
+    assert output["judge_delta"] == 0.0
+    assert output["reward_improve"] == 0.0
+
+
+def test_improve_ignores_a_chain_whose_first_judge_already_passed():
+    """Nothing to recover from: the protocol asked the policy to stop, and it did.
+
+    ``agentic_reward._delta_c_bonus`` gates on a first-pass NO for the same reason, and
+    ``rewrite_after_yes`` is what penalises rewriting once the judge is satisfied.
+    """
+    output = compute_score(
+        solution_str=_rewrite_trajectory_scored(
+            "A vertical cafe poster with a warm cup illustration.",
+            "A vertical cafe poster with a warm cup illustration, refined lighting.",
+            first_correctness=0.80,
+            first_aesthetics=0.80,
+            last_correctness=1.00,
+            last_aesthetics=1.00,
+            first_accepted=True,
+        ),
+        ground_truth=_ground_truth(expected=2),
+    )
+
+    assert output["num_prompt_rewrites"] == 1
+    assert output["judge_delta"] == 0.0
+    assert output["reward_improve"] == 0.0
+
+
+def test_legacy_novelty_weight_aliases_the_improve_dim():
+    """Parquet built before the swap baked ``w_novelty``; it must still take effect.
+
+    Without the alias, an operator's ``RPCO_W_NOVELTY=0`` would silently stop working
+    and the dim would return to weight 1.0 on a dataset rebuild.
+    """
+    text = _rewrite_trajectory_scored(
+        "A vertical cafe poster with a warm cup illustration.",
+        "Risograph poster, flat ink layers, geometric cup on cobalt, condensed caps headline.",
+        first_correctness=0.0,
+        first_aesthetics=0.40,
+        last_correctness=0.50,
+        last_aesthetics=0.80,
+    )
+    ground_truth = _ground_truth(expected=2, w_novelty=0.0)
+    output = compute_score(solution_str=text, ground_truth=ground_truth)
+
+    assert output["reward_improve"] > 0.0
+    # The dim is still reported, but contributes nothing to the scalar.
+    active = {"reflect": 1.0, "format": 1.0, "tool": 1.0, "result": 1.0}
+    expected = sum(weight * output[f"reward_{dim}"] for dim, weight in active.items()) / sum(active.values())
+    assert output["score"] == pytest.approx(expected)
+
+
+def test_explicit_improve_weight_beats_the_legacy_alias():
+    """An explicit ``w_improve`` must not be overridden by a stale ``w_novelty``."""
+    text = _rewrite_trajectory_scored(
+        "A vertical cafe poster with a warm cup illustration.",
+        "Risograph poster, flat ink layers, geometric cup on cobalt, condensed caps headline.",
+        first_correctness=0.0,
+        first_aesthetics=0.40,
+        last_correctness=0.50,
+        last_aesthetics=0.80,
+    )
+    ground_truth = _ground_truth(expected=2, w_improve=0.0, w_novelty=1.0)
+    output = compute_score(solution_str=text, ground_truth=ground_truth)
+
+    assert output["reward_improve"] > 0.0
+    active = {"reflect": 1.0, "format": 1.0, "tool": 1.0, "result": 1.0}
+    expected = sum(weight * output[f"reward_{dim}"] for dim, weight in active.items()) / sum(active.values())
+    assert output["score"] == pytest.approx(expected)
+
+
+def test_reference_budget_never_caps_reflect_iteration():
+    """Whatever the budget says — absent, fabricated, or derived — reflect may iterate.
+
+    ``UniCoT-Breakdown-3K``'s ``No breakdown needed.`` sentinel has no reference
+    trajectory, so its budget is ``None``; the derived rows carry 1/2/3. None of these
+    may gate ``reward_result``, or the 3906 reflect rows whose reference generated once
+    would forbid the rewrite loop the system prompt asks for.
+    """
+    text = _rewrite_trajectory(
+        "A vertical cafe poster with a warm cup illustration.",
+        "Risograph poster, flat ink layers, geometric cup on cobalt, condensed caps headline.",
+    )
+    budgets = {
+        "absent": {"task_type": "reflect"},
+        "null": {"task_type": "reflect", "expected_num_images": None},
+        "derived one-shot": {"task_type": "reflect", "expected_num_images": 1},
+        "derived multi": {"task_type": "reflect", "expected_num_images": 3},
+    }
+    for label, ground_truth in budgets.items():
+        output = compute_score(solution_str=text, ground_truth=ground_truth)
+        assert output["n_successful_generates"] == 2, label
+        assert output["reward_result"] == 1.0, label
+
+    # The field stays numeric for logging; 0 signals "no reference budget".
+    assert compute_score(solution_str=text, ground_truth=budgets["null"])["expected_num_images"] == 0
+    assert compute_score(solution_str=text, ground_truth=budgets["derived one-shot"])["expected_num_images"] == 1
+
+
+def test_plan_still_requires_an_exact_image_count():
+    """Plan keeps its exact match: one image per planned subtask is a content requirement."""
+    subtasks = [
+        "A snowy market with wooden stalls and warm lights.",
+        "A decorated carousel in the same winter market.",
+    ]
+    text = _plan_trajectory(subtasks)
+    exact = compute_score(
+        solution_str=text,
+        ground_truth={"task_type": "plan", "expected_num_images": 2, "reference_subtasks": subtasks},
+    )
+    short = compute_score(
+        solution_str=_plan_trajectory(subtasks, generated=1),
+        ground_truth={"task_type": "plan", "expected_num_images": 2, "reference_subtasks": subtasks},
+    )
+    absent = compute_score(
+        solution_str=text,
+        ground_truth={"task_type": "plan", "reference_subtasks": subtasks},
+    )
+    assert exact["reward_result"] == 1.0
+    assert short["reward_result"] == 0.0
+    # A plan with no declared budget cannot satisfy an exact match.
+    assert absent["reward_result"] == 0.0

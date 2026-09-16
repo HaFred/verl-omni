@@ -140,6 +140,32 @@ def test_references_and_weights_live_only_in_ground_truth(tmp_path):
             assert ground_truth.get("reference_subtasks") is None
 
 
+def test_system_prompts_demand_a_tool_facing_recipe_not_a_restatement():
+    """Guard the rewrite contract against a silent rebase revert.
+
+    The prompts are the only lever that makes GRPO explore prompt space, so both
+    must frame the agent's job as turning a user request into a *rendering recipe*
+    for ``generate_image``. Without that framing the observed failure returned:
+    each pass appended one legibility assertion, the tool read the same recipe and
+    returned the same defect, and the rollout burned all passes without improving.
+    """
+    for name, prompt in (
+        ("reflect", builder.REFLECT_SYSTEM_PROMPT),
+        ("plan", builder.PLAN_SYSTEM_PROMPT),
+    ):
+        # Normalise the hard-wrapped prose so an assertion cannot hinge on where a
+        # phrase happens to fall across a line.
+        normalized = " ".join(prompt.split())
+        assert "rendering recipe" in normalized, name
+        assert "generate_image" in normalized, name
+        # Typography is the axis the failing rollouts needed most; dropping the
+        # concrete guidance reverts to "make the text legible" restatements.
+        assert "typography" in normalized, name
+    assert "rewrite" in builder.REFLECT_SYSTEM_PROMPT
+    assert "standalone" in builder.PLAN_SYSTEM_PROMPT
+    assert builder.REFLECT_SYSTEM_PROMPT != builder.PLAN_SYSTEM_PROMPT
+
+
 def test_plan_and_reflect_rows_use_task_specific_system_prompts(tmp_path):
     output = _build(
         tmp_path,
@@ -170,7 +196,9 @@ def test_no_breakdown_rows_become_single_image_reflect_tasks(tmp_path):
     for reward_model in rows["reward_model"]:
         ground_truth = reward_model["ground_truth"]
         assert ground_truth["task_type"] == "reflect"
-        assert ground_truth["expected_num_images"] == 1
+        # No reference trajectory exists for this sentinel, so there is no image
+        # budget to derive; the reward must not enforce a fabricated cap.
+        assert ground_truth["expected_num_images"] is None
         assert ground_truth["plan_expected"] is False
     assert set(rows["data_source"]) == {builder.REFLECT_DATA_SOURCE}
     for extra in rows["extra_info"]:

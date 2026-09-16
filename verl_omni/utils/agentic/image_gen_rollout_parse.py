@@ -22,6 +22,13 @@ from typing import Any
 
 # Hermes JSON (``{"name": "generate_image"}``) or Qwen XML (``<function=...>``).
 _TOOL_CALL_NAME_PAT = r"<function={name}\b|\"name\"\s*:\s*\"{name}\""
+#: Hermes block: ``<tool_call>{"name": ..., "arguments": {...}}</tool_call>``.
+#: Non-greedy ``\{.*?\}`` plus the ``</tool_call>`` anchor matches the *outermost*
+#: object, so nested ``arguments`` braces stay inside the captured group.
+_HERMES_TOOL_CALL_PAT = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+#: Qwen block: ``<tool_call><function=NAME><parameter=K>v</parameter></function></tool_call>``.
+_QWEN_TOOL_CALL_PAT = r"<tool_call>\s*<function=([^>\s]+)\s*>(.*?)</function>\s*</tool_call>"
+_QWEN_PARAM_PAT = r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>"
 
 
 def tool_call_order(decode: str) -> list[str]:
@@ -112,6 +119,111 @@ def turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
     return "other"
 
 
+def extract_tool_calls(decoded_response: str) -> list[dict[str, Any]]:
+    """Parse the assistant tool calls in one decoded turn, in emission order.
+
+    Args:
+        decoded_response: Decoded assistant / trajectory text.
+
+    Returns:
+        ``[{"name": str, "arguments": dict}, ...]`` ordered by position. Calls whose
+        payload is unparseable are skipped rather than guessed at.
+    """
+    found: list[tuple[int, dict[str, Any]]] = []
+    for match in re.finditer(_HERMES_TOOL_CALL_PAT, decoded_response or "", re.IGNORECASE | re.DOTALL):
+        call = _parse_hermes_call(match.group(1))
+        if call is not None:
+            found.append((match.start(), call))
+    for match in re.finditer(_QWEN_TOOL_CALL_PAT, decoded_response or "", re.IGNORECASE | re.DOTALL):
+        params = re.findall(_QWEN_PARAM_PAT, match.group(2), re.IGNORECASE | re.DOTALL)
+        found.append(
+            (
+                match.start(),
+                {
+                    "name": match.group(1).strip(),
+                    "arguments": {key.strip(): value.strip() for key, value in params},
+                },
+            )
+        )
+    return [call for _, call in sorted(found, key=lambda item: item[0])]
+
+
+def _parse_hermes_call(raw: str) -> dict[str, Any] | None:
+    """Parse one Hermes ``<tool_call>`` JSON body into ``{"name", "arguments"}``.
+
+    Args:
+        raw: JSON object text captured between the ``<tool_call>`` tags.
+
+    Returns:
+        Normalised call dict, or ``None`` when the payload is unusable.
+    """
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    name = str(payload.get("name", "")).strip()
+    if not name:
+        return None
+    args = payload.get("arguments") or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except json.JSONDecodeError:
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    return {"name": name, "arguments": args}
+
+
+def first_tool_call(decode: str) -> dict[str, Any] | None:
+    """Return the call this turn actually runs, or ``None``.
+
+    ``ToolAgentLoop`` executes only ``tool_calls[:multi_turn.max_parallel_calls]``
+    (default 1), so the first call is the accepted one and any trailing call is
+    dropped context.
+
+    Args:
+        decode: Decoded assistant text for one turn.
+
+    Returns:
+        First parsed call, or ``None`` when the turn emits no parseable tool call.
+    """
+    calls = extract_tool_calls(decode)
+    return calls[0] if calls else None
+
+
+def tool_prompt_of(call: dict[str, Any] | None) -> str:
+    """Return the prompt string the accepted tool call carries.
+
+    ``generate_image`` submits a fresh prompt to the frozen diffusion model;
+    ``judge_image`` inspects an existing image and echoes the prompt it judged in
+    ``image_prompt``. Both are captured, so read the value together with
+    :func:`tool_name`: under ``generate_image`` this is a new submission, under
+    ``judge_image`` it is an echo. The judge schema invites the literal shortcut
+    ``image_prompt="last"`` instead of a real echo ("Do not re-paste long prompts"),
+    so ``"last"`` there means the model took the shortcut rather than that no prompt
+    was involved.
+
+    Args:
+        call: Parsed call dict from :func:`first_tool_call`.
+
+    Returns:
+        Stripped prompt string, or ``""`` when the call carries none.
+    """
+    if not call:
+        return ""
+    args = call.get("arguments") or {}
+    if call.get("name") == "generate_image":
+        value = args.get("prompt")
+    elif call.get("name") == "judge_image":
+        value = args.get("image_prompt")
+    else:
+        return ""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def extract_generate_image_prompts(decoded_response: str) -> list[str]:
     """Extract ordered ``generate_image`` prompts from decoded trajectory text.
 
@@ -121,39 +233,14 @@ def extract_generate_image_prompts(decoded_response: str) -> list[str]:
     Returns:
         List of prompt strings in call order.
     """
-    found: list[tuple[int, str]] = []
-    hermes_pat = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
-    for match in re.finditer(hermes_pat, decoded_response or "", re.IGNORECASE | re.DOTALL):
-        raw = match.group(1)
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
+    prompts: list[str] = []
+    for call in extract_tool_calls(decoded_response):
+        if call["name"] != "generate_image":
             continue
-        if not isinstance(payload, dict):
-            continue
-        if str(payload.get("name", "")).strip() != "generate_image":
-            continue
-        args = payload.get("arguments") or {}
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except json.JSONDecodeError:
-                args = {}
-        if not isinstance(args, dict):
-            continue
-        prompt = args.get("prompt")
+        prompt = call["arguments"].get("prompt")
         if isinstance(prompt, str) and prompt.strip():
-            found.append((match.start(), prompt.strip()))
-    qwen_pat = (
-        r"<tool_call>\s*<function=generate_image\s*>.*?"
-        r"<parameter=prompt\s*>\s*(.*?)\s*</parameter>.*?"
-        r"</function>\s*</tool_call>"
-    )
-    for match in re.finditer(qwen_pat, decoded_response or "", re.IGNORECASE | re.DOTALL):
-        prompt = match.group(1).strip()
-        if prompt:
-            found.append((match.start(), prompt))
-    return [prompt for _, prompt in sorted(found)]
+            prompts.append(prompt.strip())
+    return prompts
 
 
 def split_env_blob(blob: str) -> tuple[str, str]:
@@ -234,12 +321,19 @@ def turn_record(
         turn_input: Optional raw turn input text.
 
     Returns:
-        Dict with turn / prompt / response / decode fields.
+        Dict with turn / prompt / tool / decode fields.
     """
+    accepted = first_tool_call(decode or "")
     return {
         "turn": turn,
         "turn_prompt": turn_prompt or "",
         "turn_input": turn_input or "",
+        "tool_name": accepted["name"] if accepted else "",
+        # The prompt string the accepted call carries: a fresh diffusion prompt on a
+        # ``generate_image`` turn, the judged-prompt echo on a ``judge_image`` turn
+        # (often the literal shortcut ``last``). ``turn_prompt`` is the whole chat
+        # template and ``turn_obs`` the raw env delta, so neither exposes either.
+        "tool_prompt": tool_prompt_of(accepted),
         "decode": decode or "",
         "response": response or "",
         "decode_has_tool_call": "<tool_call>" in (decode or "").lower(),

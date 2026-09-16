@@ -62,7 +62,7 @@ REFLECT_DATA_SOURCE = "unicot_reflection"
 BREAKDOWN_DATA_SOURCE = "unicot_breakdown"
 # Parquet data_source follows task_type. Hub corpus stays on extra_info.unicot_source.
 PLAN_DATA_SOURCE = BREAKDOWN_DATA_SOURCE
-REWARD_DIMS = ("reflect", "plan", "format", "tool", "result")
+REWARD_DIMS = ("reflect", "plan", "format", "tool", "result", "improve")
 # Public alias retained for reward/dataset consumers.
 DIMS = REWARD_DIMS
 MANIFEST_ID = "agentic_rl_unicot_v1"
@@ -74,10 +74,35 @@ REFLECT_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
 Protocol:
 1. Call generate_image with a complete prompt for the user's request.
 2. Call judge_image on the last generated image.
-3. Reflect briefly on the feedback. If the image needs improvement, rewrite the
-   diffusion prompt and repeat. If it is good enough, finish with Done.
+3. Reflect on the feedback, then rewrite the diffusion prompt and repeat, unless
+   the judge is good enough — then finish with Done.
 
-Always generate before judging, judge before deciding, and use no other tools."""
+Rewriting rules — the rewrite is the work, not a formality:
+- The user's request is the content spec; your diffusion prompt is a rendering
+  recipe for the generate_image tool. The tool never sees the request, so anything
+  the recipe does not say does not get drawn. A rewrite keeps the content and
+  changes the recipe.
+- Rewrite drastically. A prompt that grows by one quality assertion per pass is not
+  a rewrite: the tool reads the same recipe and returns the same defect. Never
+  append reassurances such as "the text is legible", "clearly rendered" or "high
+  quality" — change what the tool actually reads.
+- Change at least two things that reach the pixels: subject and framing, composition
+  and layout grid, medium and style, palette and contrast, lighting, camera angle or
+  aspect ratio, level of detail, and — when the image must show text — the typography
+  strategy (how many words, which lines, weight, case, size on the canvas, placement,
+  and the background behind the glyphs). Never ask for more words than the tool can
+  draw legibly.
+- Fail forward from the last judge: resolve every finding and apply the
+  suggested_fixes. Never re-send a recipe this rollout already used — the earlier
+  prompts are in the conversation, so mine them for what already failed and try a
+  materially different one rather than a reworded repeat.
+- Preserve every explicit requirement of the request: subjects, colours, counts, and
+  any literal strings that must appear. Reordering or translating the wording is
+  allowed; silently dropping requested content is not.
+
+Always generate before judging, judge before deciding, and use no other tools.
+The brevity note on the user turn bounds your private thinking and your reflection
+only — never let it shorten or water down a diffusion prompt."""
 
 PLAN_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
 1) generate_image — create an image from a complete diffusion prompt
@@ -89,7 +114,23 @@ Protocol:
 3. After the final image, call judge_image on that image.
 4. Reflect briefly on the feedback and finish with Done.
 
-Do not judge between subtasks or generate more images than the plan lists."""
+Subtask prompts — the plan is the work, not a table of contents:
+- The user's request is the content spec; each subtask prompt is a rendering recipe
+  for the generate_image tool. The tool never sees the request or the other
+  subtasks, so every subtask prompt must be standalone and self-contained — never a
+  fragment such as "now the second one", and never a bare restatement of the request.
+- Decompose rather than summarise. Give each subtask its own subject, framing,
+  composition, style, palette, lighting and level of detail, and carry the requested
+  content that belongs to that subtask with its literal strings intact.
+- Each subtask prompt must differ substantially from the others and from the raw
+  request wording. Reusing the request with a different noun is not a decomposition.
+- When a subtask must render text, describe the typography strategy (how many words,
+  which lines, weight, case, size on the canvas, placement, and the background behind
+  the glyphs) instead of asserting that the text will be legible.
+
+Do not judge between subtasks or generate more images than the plan lists.
+The brevity note on the user turn bounds your private thinking and your reflection
+only — never let it shorten or water down a subtask prompt."""
 
 _BREVITY_SUFFIX = (
     " Keep any private thinking to one short paragraph; do not repeat the request, "

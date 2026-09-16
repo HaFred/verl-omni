@@ -34,10 +34,12 @@ from verl_omni.tools.trajectory import (
 from verl_omni.utils.agentic.image_gen_rollout_dump import discard_invalid_rollouts
 from verl_omni.utils.agentic.image_gen_rollout_parse import (
     extract_generate_image_prompts,
+    extract_tool_calls,
     split_env_blob,
     split_rollout_turns,
     tool_call_order,
     turn_kind,
+    turn_record,
 )
 
 
@@ -240,6 +242,68 @@ def test_extract_generate_image_prompts_hermes_and_qwen():
     qwen = "<tool_call>\n<function=generate_image>\n<parameter=prompt>\na dog\n</parameter>\n</function>\n</tool_call>"
     assert extract_generate_image_prompts(hermes) == ["a cat"]
     assert extract_generate_image_prompts(qwen) == ["a dog"]
+
+
+def test_extract_tool_calls_parses_hermes_and_qwen_arguments():
+    hermes = (
+        '<tool_call>\n{"name": "judge_image", "arguments": '
+        '{"user_request": "same as user message", "image_prompt": "a cat"}}\n</tool_call>'
+    )
+    qwen = (
+        "<tool_call>\n<function=judge_image>\n"
+        "<parameter=user_request>\nsame as user message\n</parameter>\n"
+        "<parameter=image_prompt>\na cat\n</parameter>\n</function>\n</tool_call>"
+    )
+    for decode in (hermes, qwen):
+        assert extract_tool_calls(decode) == [
+            {"name": "judge_image", "arguments": {"user_request": "same as user message", "image_prompt": "a cat"}}
+        ]
+    # A body that is not valid JSON is skipped rather than misread.
+    assert extract_tool_calls("<tool_call>{not json}</tool_call>") == []
+    assert extract_tool_calls("no tools here") == []
+
+
+def test_turn_record_exposes_the_accepted_tool_prompt():
+    """``tool_prompt`` is the prompt string the accepted tool call carries.
+
+    Regression for the rewrite turns: ``turn_prompt`` carries the whole chat
+    template (identical on every turn) and ``turn_obs`` only the judge feedback, so
+    the rewritten prompt was visible nowhere but the escaped JSON in ``decode``.
+    """
+    first = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "a cat poster"}}\n</tool_call>'
+    rewrite = (
+        '<tool_call>\n{"name": "generate_image", "arguments": '
+        '{"prompt": "a cat poster, the title is legible and correctly spelled"}}\n</tool_call>'
+    )
+    judge = (
+        '<tool_call>\n{"name": "judge_image", "arguments": '
+        '{"user_request": "x", "image_prompt": "ECHO_OF_LAST"}}\n</tool_call>'
+    )
+    judge_then_gen = f"{judge}\n{first}"
+
+    record = turn_record(turn=1, turn_prompt="<|im_start|>system\nblah", response="", decode=first)
+    assert (record["tool_name"], record["tool_prompt"]) == ("generate_image", "a cat poster")
+
+    rewritten = turn_record(turn=3, turn_prompt="<|im_start|>system\nblah", response="", decode=rewrite)
+    assert rewritten["turn_prompt"] == record["turn_prompt"]
+    assert rewritten["tool_prompt"] != record["tool_prompt"]
+    assert rewritten["tool_prompt"].endswith("legible and correctly spelled")
+
+    # Judge turns echo the prompt they judged; ``tool_name`` says which is which.
+    judged = turn_record(turn=2, turn_prompt="obs", response="", decode=judge)
+    assert (judged["tool_name"], judged["tool_prompt"]) == ("judge_image", "ECHO_OF_LAST")
+    # Only the *first* call runs, so a dropped trailing generate must not win.
+    assert turn_record(turn=4, turn_prompt="obs", response="", decode=judge_then_gen)["tool_prompt"] == "ECHO_OF_LAST"
+
+    # The judge schema suggests the literal shortcut ``image_prompt="last"``; report
+    # the placeholder verbatim so dumps show the model skipped the echo.
+    shortcut = '<tool_call>\n{"name": "judge_image", "arguments": {"image_prompt": "last"}}\n</tool_call>'
+    assert turn_record(turn=5, turn_prompt="obs", response="", decode=shortcut)["tool_prompt"] == "last"
+
+    # A turn with no call, or a call that carries no prompt, leaves the field empty.
+    assert turn_record(turn=6, turn_prompt="obs", response="", decode="Done.")["tool_name"] == ""
+    silent = '<tool_call>\n{"name": "judge_image", "arguments": {}}\n</tool_call>'
+    assert turn_record(turn=7, turn_prompt="obs", response="", decode=silent)["tool_prompt"] == ""
 
 
 def test_split_env_blob_and_rollout_turns():

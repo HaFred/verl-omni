@@ -115,6 +115,7 @@ class AgenticRewardMetrics:
         "reward_correctness",
         "reward_aesthetics",
         "reward_done",
+        "reward_improve",
     )
     # Available at generate_sequences time (before the reward manager).
     ROLLOUT_KEYS: tuple[str, ...] = (
@@ -140,6 +141,8 @@ class AgenticRewardMetrics:
         "judge_parse_ok",
         "judge_parse_fail",
         "judge_parse_ok_rate",
+        "judge_delta",
+        "num_prompt_rewrites",
         "protocol_ok",
         "rewrite_after_yes",
         "reward_delta_c",
@@ -157,6 +160,7 @@ class AgenticRewardMetrics:
             "num_judge_image_calls",
             "num_judge_image_calls_requested",
             "num_judge_image_calls_dropped",
+            "num_prompt_rewrites",
             "protocol_ok",
             "rollout_valid",
         }
