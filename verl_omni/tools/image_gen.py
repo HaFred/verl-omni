@@ -73,6 +73,8 @@ from verl_omni.tools.trajectory import (
     resolve_tool_image_path,
     set_good_enough_yes_reached,
     set_latest_tool_image_path,
+    traj_dir_exclusive,
+    write_json_atomic,
 )
 from verl_omni.tools.trajectory import paths as traj_paths
 from verl_omni.tools.trajectory.hydra_env import (
@@ -125,6 +127,12 @@ def _next_call_dir(root: Path) -> Path:
     return call_dir
 
 
+# ``generate_image`` bodies run in ``asyncio.to_thread``; concurrent calls inside
+# one rollout (parallel plan subtasks / forced reflection) share a trajectory
+# folder. Without serialization they both read the same "next" index and
+# interleave the ``meta.json`` read-modify-write, which produced duplicate
+# ``image_NN`` files and concatenated (invalid) JSON. ``traj_dir_exclusive`` is
+# shared with ``image_gen_rollout_dump`` so both writers of this folder serialise.
 def _next_image_index(traj_dir: Path) -> int:
     """Next ``image_XX`` index under a trajectory folder."""
     idxs: list[int] = []
@@ -181,7 +189,9 @@ def _update_traj_meta(traj_dir: Path, entry: dict) -> None:
     meta["num_images"] = len(calls)
     meta["reflection_controlled_image_files"] = [c.get("file") for c in calls if c.get("controlled_by_reflection")]
     meta["time"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
+    # Publish atomically so a concurrent reader/live tool never sees a
+    # half-written (or concatenated) document.
+    write_json_atomic(meta_path, meta)
 
 
 def _image_call_entry(
@@ -222,60 +232,63 @@ def _save_images(images: list[Image.Image], prompt: str, *, backend: str, tool_s
     if relpath:
         traj_dir = root / relpath
         traj_dir.mkdir(parents=True, exist_ok=True)
-        start_idx = _next_image_index(traj_dir)
-        artifact_ids: list[str] = []
-        if images:
-            for offset, img in enumerate(images):
-                idx = start_idx + offset
-                aid = build_artifact_id(relpath=relpath, index=idx, prompt=prompt)
-                path = traj_dir / f"image_{idx:02d}_{aid}.png"
-                img.save(path)
-                paths.append(str(path))
+        # One writer per trajectory folder: index allocation, PNG writes and the
+        # meta.json read-modify-write must be atomic together.
+        with traj_dir_exclusive(traj_dir):
+            start_idx = _next_image_index(traj_dir)
+            artifact_ids: list[str] = []
+            if images:
+                for offset, img in enumerate(images):
+                    idx = start_idx + offset
+                    aid = build_artifact_id(relpath=relpath, index=idx, prompt=prompt)
+                    path = traj_dir / f"image_{idx:02d}_{aid}.png"
+                    img.save(path)
+                    paths.append(str(path))
+                    artifact_ids.append(aid)
+                    meta_entry = _image_call_entry(
+                        idx, path, prompt=prompt, backend=backend, stubbed=tool_stubbed, provenance=provenance
+                    )
+                    meta_entry["artifact_id"] = aid
+                    meta_entry["rollout_id"] = get_active_rollout_id()
+                    _update_traj_meta(traj_dir, meta_entry)
+            else:
+                aid = build_artifact_id(relpath=relpath, index=start_idx, prompt=prompt)
+                stub_path = traj_dir / f"STUB_NO_IMAGE_{start_idx:02d}_{aid}.txt"
+                stub_path.write_text(
+                    "No PNG produced (text stub or empty tool response).\n"
+                    f"user_prompt={user_prompt!r}\n"
+                    f"tool_prompt={prompt!r}\n"
+                    f"controlled_by_reflection={provenance.get('controlled_by_reflection')}\n"
+                    f"reflection={provenance.get('reflection')!r}\n"
+                    f"backend={backend}\n"
+                    f"artifact_id={aid}\n"
+                    "Set agentic_image_gen.qwen_image_url (or vllm_omni_url / diffusion_tool_url) "
+                    "for real images.\n"
+                )
+                paths.append(str(stub_path))
                 artifact_ids.append(aid)
                 meta_entry = _image_call_entry(
-                    idx, path, prompt=prompt, backend=backend, stubbed=tool_stubbed, provenance=provenance
+                    start_idx, stub_path, prompt=prompt, backend=backend, stubbed=True, provenance=provenance
                 )
                 meta_entry["artifact_id"] = aid
                 meta_entry["rollout_id"] = get_active_rollout_id()
                 _update_traj_meta(traj_dir, meta_entry)
-        else:
-            aid = build_artifact_id(relpath=relpath, index=start_idx, prompt=prompt)
-            stub_path = traj_dir / f"STUB_NO_IMAGE_{start_idx:02d}_{aid}.txt"
-            stub_path.write_text(
-                "No PNG produced (text stub or empty tool response).\n"
-                f"user_prompt={user_prompt!r}\n"
-                f"tool_prompt={prompt!r}\n"
-                f"controlled_by_reflection={provenance.get('controlled_by_reflection')}\n"
-                f"reflection={provenance.get('reflection')!r}\n"
-                f"backend={backend}\n"
-                f"artifact_id={aid}\n"
-                "Set agentic_image_gen.qwen_image_url (or vllm_omni_url / diffusion_tool_url) "
-                "for real images.\n"
+            logger.info(
+                "diffusion tool artifacts (%d image(s), stub=%s, reflect_ctrl=%s) -> %s",
+                len(images),
+                tool_stubbed,
+                provenance.get("controlled_by_reflection"),
+                traj_dir,
             )
-            paths.append(str(stub_path))
-            artifact_ids.append(aid)
-            meta_entry = _image_call_entry(
-                start_idx, stub_path, prompt=prompt, backend=backend, stubbed=True, provenance=provenance
+            register_tool_artifact(
+                prompt=prompt,
+                paths=paths,
+                backend=backend,
+                tool_stubbed=tool_stubbed,
+                artifact_id=artifact_ids[0] if artifact_ids else None,
+                trajectory_relpath=relpath,
+                rollout_id=get_active_rollout_id(),
             )
-            meta_entry["artifact_id"] = aid
-            meta_entry["rollout_id"] = get_active_rollout_id()
-            _update_traj_meta(traj_dir, meta_entry)
-        logger.info(
-            "diffusion tool artifacts (%d image(s), stub=%s, reflect_ctrl=%s) -> %s",
-            len(images),
-            tool_stubbed,
-            provenance.get("controlled_by_reflection"),
-            traj_dir,
-        )
-        register_tool_artifact(
-            prompt=prompt,
-            paths=paths,
-            backend=backend,
-            tool_stubbed=tool_stubbed,
-            artifact_id=artifact_ids[0] if artifact_ids else None,
-            trajectory_relpath=relpath,
-            rollout_id=get_active_rollout_id(),
-        )
         return paths
 
     # Legacy fallback (no active trajectory context).

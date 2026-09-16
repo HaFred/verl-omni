@@ -180,21 +180,32 @@ def _sanitize_sample_index(sample_index: object | None) -> str:
         return re.sub(r"[^\w.\-]+", "_", raw)[:64] or "unknown"
 
 
-def build_trajectory_relpath(*, step: int | None, sample_index: object | None, rollout_n: int) -> str:
+def build_trajectory_relpath(
+    *, step: int | None, sample_index: object | None, rollout_n: int, validate: bool = False
+) -> str:
     """Build a trajectory relative path for one sample/rollout.
 
     Args:
         step: Global step (``None`` → ``step_unknown``).
         sample_index: Dataset sample index.
         rollout_n: Rollout index within the sample.
+        validate: Validation rollouts use ``n=1`` and omit the group suffix.
 
     Returns:
-        Path like ``step_XXXXXX/sample_{index}.{rollout_n:02d}``.
+        Train: ``step_XXXXXX/sample_{index}.{rollout_n:02d}``.
+        Val: ``step_XXXXXX/sample_{index}`` — no ``.00``, so a val folder can
+        never collide with a train group member that shares ``extra_info.index``
+        (concurrent writers to the same folder duplicated image indices and
+        corrupted ``meta.json``).
     """
     try:
         step_i = int(step) if step is not None else -1
     except (TypeError, ValueError):
         step_i = -1
     step_part = f"step_{step_i:06d}" if step_i >= 0 else "step_unknown"
-    sample_part = f"sample_{_sanitize_sample_index(sample_index)}.{int(rollout_n):02d}"
+    sample_id = _sanitize_sample_index(sample_index)
+    if validate:
+        sample_part = f"sample_{sample_id}"
+    else:
+        sample_part = f"sample_{sample_id}.{int(rollout_n):02d}"
     return f"{step_part}/{sample_part}"

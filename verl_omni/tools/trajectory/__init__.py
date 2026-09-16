@@ -50,6 +50,12 @@ from .judge_latch import (
     get_good_enough_yes_reached,
     set_good_enough_yes_reached,
 )
+from .locking import (
+    meta_lock_path,
+    traj_dir_exclusive,
+    traj_dir_lock,
+    write_json_atomic,
+)
 from .paths import (
     bind_run_artifacts,
     build_artifact_id,
@@ -75,6 +81,7 @@ __all__ = [
     "get_active_rollout_id",
     "get_good_enough_yes_reached",
     "get_latest_generate_prompt_for_active_rollout",
+    "meta_lock_path",
     "register_tool_artifact",
     "reset_active_trajectory_relpath",
     "resolve_rollout_images_root",
@@ -83,4 +90,7 @@ __all__ = [
     "set_active_trajectory_relpath",
     "set_good_enough_yes_reached",
     "set_latest_tool_image_path",
+    "traj_dir_exclusive",
+    "traj_dir_lock",
+    "write_json_atomic",
 ]

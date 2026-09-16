@@ -34,6 +34,7 @@ if (( TRAIN_BATCH_SIZE % N_GPUS != 0 || PPO_MINI_BATCH_SIZE % N_GPUS != 0 )); th
   echo "[ERROR] train and mini-batch sizes must be divisible by N_GPUS=${N_GPUS}" >&2
   exit 2
 fi
+CUDA_VISIBLE_DEVICES=3,5
 if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   IFS=',' read -r -a CUDA_DEVS <<< "${CUDA_VISIBLE_DEVICES}"
   if (( ${#CUDA_DEVS[@]} != N_GPUS )); then
@@ -66,11 +67,18 @@ MAX_USER_TURNS="${MAX_USER_TURNS:-16}"
 
 # Sidecar URLs + dump root are Hydra ``agentic_image_gen`` knobs (PR #409).
 # Keep the AGENTIC_* env names as a recipe-facing convenience.
+# ``e2e_root`` is the *parent* of the per-run dir: paths.py appends
+# ``trainer.experiment_name`` itself, so passing the run dir here would nest
+# ``<experiment>/<experiment>`` (regressed during the 409/411/412 rebase).
 AGENTIC_E2E_ROOT="${AGENTIC_E2E_ROOT:-${REPO_ROOT}/outputs/e2e}"
 AGENTIC_E2E_RUN_DIR="${AGENTIC_E2E_ROOT}/${EXPERIMENT_NAME}"
 AGENTIC_VLLM_OMNI_URL="${AGENTIC_VLLM_OMNI_URL:-http://127.0.0.1:8092}"
 AGENTIC_VLLM_URL="${AGENTIC_VLLM_URL:-http://127.0.0.1:8093}"
 mkdir -p "${AGENTIC_E2E_RUN_DIR}"
+
+# Fixed val holdout (9001-9004) demo rollouts, dumped under
+# ``rollout_images/step_XXXXXX/sample_90xx/`` on every validation step.
+export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 
 export UNICOT_BREAKDOWN_DIR UNICOT_REFLECTION_DIR UNICOT_MIX_RATIO UNICOT_VAL_RATIO UNICOT_SPLIT_SEED
 
@@ -173,7 +181,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.ref.fsdp_config.use_orig_params=true \
   +agentic_image_gen.vllm_omni_url="$AGENTIC_VLLM_OMNI_URL" \
   +agentic_image_gen.vllm_url="$AGENTIC_VLLM_URL" \
-  +agentic_image_gen.e2e_root="$AGENTIC_E2E_RUN_DIR" \
+  +agentic_image_gen.e2e_root="$AGENTIC_E2E_ROOT" \
   reward.reward_manager.source=register \
   reward.reward_manager.name=naive \
   reward.custom_reward_function.path=verl_omni/utils/reward_score/agentic_multidim_reward.py \

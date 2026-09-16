@@ -152,6 +152,8 @@ def test_inbound_stamp_reaches_compute_score_kwargs(monkeypatch):
     out_extra = output.non_tensor_batch["extra_info"][0]
     assert out_extra["vllm_url"] == "http://cli"
     assert out_extra["good_enough_threshold"] == 0.55
+
+
 def test_manager_v1_tensordict_dispatches_without_meta_info(monkeypatch):
     import torch
     from tensordict import TensorDict
@@ -278,3 +280,88 @@ def test_discard_invalid_rollouts_zeros_mask_but_restores_if_all_invalid():
     )
     assert all_invalid.rows[0].vals == [1, 1]
     assert all_invalid.rows[1].vals == [1, 0]
+
+
+def test_tq_sessions_get_distinct_artifact_relpaths():
+    """All ``rollout.n`` sessions of one sample must get their own folder.
+
+    Regression: V1 TransferQueue expands ``rollout.n`` inside the worker
+    (``session_id``) *after* ``get_trajectory_info`` has already inferred
+    ``rollout_n`` from repeated batch indices. Every sibling therefore reported
+    ``rollout_n=0`` and collapsed onto ``sample_<index>.00``, which collapsed one
+    trajectory JSON (last writer wins), merged every sibling's PNGs into one
+    folder (so ``image_paths`` became the union and ``image_paths_in_obs`` only a
+    subset), and gave all siblings one ``rollout_id`` — letting a sibling's image
+    reach ``judge_image`` and a sibling's registry clear abort it.
+    """
+    from verl_omni.tools.trajectory import build_trajectory_relpath
+
+    worker = omni_agent_loop.OmniAgentLoopWorkerTQImpl.__new__(omni_agent_loop.OmniAgentLoopWorkerTQImpl)
+    assert omni_agent_loop.OmniAgentLoopWorkerTQImpl._AGENTIC_ROLLOUT_N_FROM_SESSION_ID is True
+
+    # Exactly what ``AgentLoopWorkerTQ._run_prompt`` hands each sibling: same
+    # ``trajectory`` dict, differing ``session_id``.
+    trajectory = {"step": 1, "sample_index": 2086, "rollout_n": 0, "validate": False}
+    relpaths = [
+        build_trajectory_relpath(
+            step=trajectory["step"],
+            sample_index=trajectory["sample_index"],
+            rollout_n=omni_agent_loop.OmniAgentLoopWorkerTQImpl._agentic_rollout_n(
+                worker, trajectory, {"session_id": session_id}
+            ),
+            validate=trajectory["validate"],
+        )
+        for session_id in range(8)
+    ]
+    assert relpaths == [f"step_000001/sample_2086.{n:02d}" for n in range(8)]
+    assert len(set(relpaths)) == 8
+
+    # The per-relpath rollout id is what scopes the artifact registry / judge lookup.
+    from verl_omni.tools.trajectory.paths import rollout_id_from_relpath
+
+    assert len({rollout_id_from_relpath(relpath) for relpath in relpaths}) == 8
+
+
+def test_datapath_rollout_n_wins_over_stray_session_id():
+    """DataProto rows are pre-expanded, so ``rollout_n`` must not be overridden."""
+    data_proto_worker = OmniAgentLoopWorker.__new__(OmniAgentLoopWorker)
+    assert OmniAgentLoopWorker._AGENTIC_ROLLOUT_N_FROM_SESSION_ID is False
+    trajectory = {"step": 0, "sample_index": 7, "rollout_n": 3, "validate": False}
+    # Even if a batch column happens to be named ``session_id``, rollout_n wins.
+    assert OmniAgentLoopWorker._agentic_rollout_n(data_proto_worker, trajectory, {"session_id": 5}) == 3
+    assert OmniAgentLoopWorker._agentic_rollout_n(data_proto_worker, trajectory, {}) == 3
+
+
+def test_tq_rollout_n_falls_back_when_session_id_absent():
+    """A missing ``session_id`` must degrade to the old behaviour, not crash."""
+    worker = omni_agent_loop.OmniAgentLoopWorkerTQImpl.__new__(omni_agent_loop.OmniAgentLoopWorkerTQImpl)
+    trajectory = {"step": 0, "sample_index": 11, "rollout_n": 2, "validate": False}
+    assert omni_agent_loop.OmniAgentLoopWorkerTQImpl._agentic_rollout_n(worker, trajectory, {}) == 2
+
+
+def test_tq_run_agent_loop_wires_session_id_into_relpath(monkeypatch):
+    """The TQ ``_run_agent_loop`` must bind ``sample_<index>.<session_id>``."""
+    captured: list[str] = []
+
+    async def _parent_run(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
+        del sampling_params, trajectory, agent_name, trace
+        captured.append(kwargs["_agentic_trajectory_relpath"])
+        return "ok"
+
+    monkeypatch.setattr(omni_agent_loop._AgentLoopWorkerTQImpl, "_run_agent_loop", _parent_run)
+    worker = omni_agent_loop.OmniAgentLoopWorkerTQImpl.__new__(omni_agent_loop.OmniAgentLoopWorkerTQImpl)
+    trajectory = {"step": 4, "sample_index": 2086, "rollout_n": 0, "validate": False}
+
+    async def _run_all():
+        for session_id in range(8):
+            await omni_agent_loop.OmniAgentLoopWorkerTQImpl._run_agent_loop(
+                worker,
+                {},
+                trajectory,
+                agent_name="image_gen_tool_agent",
+                session_id=session_id,
+                raw_prompt=[{"role": "user", "content": "draw a cafe poster"}],
+            )
+
+    asyncio.run(_run_all())
+    assert captured == [f"step_000004/sample_2086.{n:02d}" for n in range(8)]

@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import base64
 import io
+import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from omegaconf import OmegaConf
@@ -26,6 +28,7 @@ from verl.tools.function_tool import FUNCTION_TOOL_REGISTRY
 import verl_omni.tools.image_gen as image_gen
 from verl_omni.tools import trajectory
 from verl_omni.tools.trajectory import artifacts
+from verl_omni.utils.agentic import image_gen_rollout_dump as dump_mod
 
 
 def _bind_tool_cfg(*, e2e_root=None, run_name="cpu_test", **overrides):
@@ -236,3 +239,75 @@ def test_count_live_generate_artifacts_unbound_rid_is_zero(tmp_path):
     assert trajectory.get_active_rollout_id() is None
     assert trajectory.count_live_generate_artifacts_for_active_rollout() == 0
     _clear_all_tool_artifacts()
+
+
+def test_save_images_serializes_index_and_meta_under_concurrency(tmp_path):
+    """Concurrent ``generate_image`` calls must not share an ``image_NN`` index.
+
+    Regression: parallel plan subtasks inside one rollout both read the same
+    "next" index and interleaved the ``meta.json`` read-modify-write, producing
+    duplicate ``image_NN`` files and concatenated (invalid) JSON.
+    """
+    _bind_tool_cfg(e2e_root=tmp_path, run_name="cpu_test")
+    relpath = "step_000001/sample_7.00"
+    calls = 24
+
+    def _worker(index):
+        # ``asyncio.to_thread`` copies the caller context; mirror that per thread.
+        trajectory.set_active_trajectory_relpath(relpath)
+        trajectory.active_user_prompt.set(f"poster {index}")
+        image_gen._save_images(
+            [Image.new("RGB", (1, 1), (index % 255, 0, 0))],
+            f"prompt {index}",
+            backend="vllm_omni",
+            tool_stubbed=False,
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(_worker, range(calls)))
+
+    traj_dir = tmp_path / "cpu_test" / "rollout_images" / relpath
+    names = sorted(path.name for path in traj_dir.glob("image_*.png"))
+    assert [int(name.split("_")[1]) for name in names] == list(range(calls))
+    meta = json.loads((traj_dir / "meta.json").read_text())
+    assert meta["num_images"] == calls
+    assert len(meta["calls"]) == calls
+    assert sorted(call["index"] for call in meta["calls"]) == list(range(calls))
+
+
+def test_live_write_and_materialize_share_the_traj_dir_lock(tmp_path):
+    """The live tool and post-processing must serialise on one folder lock.
+
+    Regression: ``materialize_rollout_images`` rewrote ``meta.json`` without the
+    lock that ``_save_images`` takes, so a post-processing rewrite could land
+    between the live tool's read and write and drop or corrupt its call rows.
+    """
+    _bind_tool_cfg(e2e_root=tmp_path, run_name="cpu_test")
+    relpath = "step_000001/sample_9.00"
+    calls = 16
+    image_gen._save_images([Image.new("RGB", (1, 1))], "seed", backend="vllm_omni", tool_stubbed=False)
+
+    def _live(index):
+        trajectory.set_active_trajectory_relpath(relpath)
+        trajectory.active_user_prompt.set(f"poster {index}")
+        image_gen._save_images([Image.new("RGB", (1, 1))], f"prompt {index}", backend="vllm_omni", tool_stubbed=False)
+
+    def _materialize(index):
+        dump_mod.materialize_rollout_images(
+            decoded_response=f"prompt {index}",
+            run_dir=tmp_path / "cpu_test",
+            relpath=relpath,
+            user_prompt=f"poster {index}",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(lambda i: _live(i) if i % 2 else _materialize(i), range(calls)))
+
+    traj_dir = tmp_path / "cpu_test" / "rollout_images" / relpath
+    # A single valid document: the lock + atomic publish never interleave writers.
+    meta = json.loads((traj_dir / "meta.json").read_text())
+    assert meta["trajectory_relpath"] == relpath
+    assert meta["source"] == "direct_tool_write"
+    assert meta["num_images"] == len(meta["calls"]) == len(list(traj_dir.glob("image_*.png")))
+    assert sorted(call["index"] for call in meta["calls"]) == list(range(meta["num_images"]))
+    assert not list(traj_dir.glob("*.tmp"))
