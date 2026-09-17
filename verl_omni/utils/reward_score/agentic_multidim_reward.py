@@ -43,6 +43,7 @@ import re
 from typing import Any
 
 from verl_omni.utils.agentic.judge_delta import judge_delta_reward
+from verl_omni.utils.agentic.plan_protocol import plan_lines_from_prose
 
 DIMS = ("reflect", "plan", "format", "tool", "result", "improve")
 #: Dims renamed after parquet was already built under the old weight key.
@@ -339,14 +340,18 @@ def _generates_after_first_yes(text: str, calls: list[tuple[int, int, dict[str, 
 
 
 def _extract_plan_lines(text: str) -> list[str]:
-    prose = _assistant_prose_lines(text)
-    header = re.search(r"\bPlan\s*:", prose, re.IGNORECASE)
-    body = prose[header.end() :] if header else prose
-    return [
-        line
-        for match in re.finditer(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+(.+)$", body)
-        if len(_tokens(line := match.group(1).strip())) >= 4
-    ]
+    """Extract the policy's numbered subtask prompts from a rollout transcript.
+
+    The line grammar lives in ``plan_protocol`` so the loop's "did the model write its
+    plan" predicate and this reference comparison cannot drift apart.
+
+    Args:
+        text: Full rollout transcript.
+
+    Returns:
+        Plan item texts in order, empty when the policy wrote no plan.
+    """
+    return plan_lines_from_prose(_assistant_prose_lines(text))
 
 
 def _reflection_text(text: str) -> str:

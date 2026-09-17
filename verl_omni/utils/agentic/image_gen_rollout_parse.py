@@ -20,6 +20,8 @@ import json
 import re
 from typing import Any
 
+from verl_omni.utils.agentic.plan_protocol import plan_lines_from_prose
+
 # Hermes JSON (``{"name": "generate_image"}``) or Qwen XML (``<function=...>``).
 _TOOL_CALL_NAME_PAT = r"<function={name}\b|\"name\"\s*:\s*\"{name}\""
 #: Hermes block: ``<tool_call>{"name": ..., "arguments": {...}}</tool_call>``.
@@ -29,6 +31,42 @@ _HERMES_TOOL_CALL_PAT = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
 #: Qwen block: ``<tool_call><function=NAME><parameter=K>v</parameter></function></tool_call>``.
 _QWEN_TOOL_CALL_PAT = r"<tool_call>\s*<function=([^>\s]+)\s*>(.*?)</function>\s*</tool_call>"
 _QWEN_PARAM_PAT = r"<parameter=([^>\s]+)\s*>\s*(.*?)\s*</parameter>"
+
+#: Turn mask compositions, in the vocabulary of the trainer's ``response_mask``.
+#:
+#: ``response_mask`` is what the advantage is built from: ``1`` for tokens the policy
+#: contributed (sampled, or teacher-forced Hermes tool tokens, which the loop also
+#: trains) and ``0`` for everything the harness injected or observed. The dump splits
+#: a rollout on that same mask, so each turn can carry the composition it really had
+#: instead of a guess read back out of the text. See :func:`advantage_class`.
+#: Every token in the turn is mask=1 → the turn trains.
+ADVANTAGE_POLICY = "policy"
+#: A mask=1 span plus a mask=0 harness-injected Reflection cue in the same turn.
+ADVANTAGE_POLICY_AND_CUE = "policy+cue"
+#: A mask=0 harness-injected Reflection cue only → the turn trains nothing.
+ADVANTAGE_CUE = "cue"
+#: A mask=0 observation only (tool feedback): nothing injected, nothing trainable.
+ADVANTAGE_ENV = "env"
+
+
+def advantage_class(*, policy_tokens: int | None, injected_cue: bool) -> str:
+    """Classify a turn by its ``response_mask`` composition.
+
+    Args:
+        policy_tokens: Count of mask=1 tokens in the turn, or ``None`` when the caller
+            does not know the mask.
+        injected_cue: Whether a harness-injected (mask=0) Reflection span is attached to
+            the turn.
+
+    Returns:
+        One of :data:`ADVANTAGE_POLICY`, :data:`ADVANTAGE_POLICY_AND_CUE`,
+        :data:`ADVANTAGE_CUE`, :data:`ADVANTAGE_ENV`, or ``""`` when unknown.
+    """
+    if policy_tokens is None:
+        return ""
+    if policy_tokens > 0:
+        return ADVANTAGE_POLICY_AND_CUE if injected_cue else ADVANTAGE_POLICY
+    return ADVANTAGE_CUE if injected_cue else ADVANTAGE_ENV
 
 
 def tool_call_order(decode: str) -> list[str]:
@@ -53,13 +91,35 @@ def tool_call_order(decode: str) -> list[str]:
     return [name for _, name in sorted(found)]
 
 
-def turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
+def turn_kind(
+    decode: str,
+    turn_prompt: str,
+    response: str = "",
+    *,
+    task_type: str = "",
+    advantage: str = "",
+) -> str:
     """Label a turn so trajectory dumps make protocol stages grep-able.
+
+    Every label is also a claim about trainability, and the trainer decides that with
+    ``response_mask``, not with the text. ``forced_reflection_*`` claims the turn is a
+    harness-injected span (mask=0, outside the advantage); ``call_*``, ``plan`` and
+    ``agent_reflection_*`` claim the policy produced the tokens (mask=1, inside it).
+    When ``advantage`` is supplied — the dump takes it straight off ``response_mask`` —
+    the claim is checked against the mask and the label is withheld rather than
+    asserted, so a trainable turn can never be filed under a cue label and a cue-only
+    turn can never masquerade as model work. Context labels (``after_*``, ``other``)
+    are not claims about who wrote the tokens and stay available to either side.
 
     Args:
         decode: Decoded assistant text for this turn.
         turn_prompt: Prompt / observation text feeding the turn.
         response: Optional response text used for forced-reflection cues.
+        task_type: ``reflect`` / ``plan`` for this rollout. Plan labels are only applied
+            to ``plan`` rows, because a reflect rewrite can carry numbered lines too and
+            must not be relabelled as planning.
+        advantage: :func:`advantage_class` of this turn, or ``""`` when the caller does
+            not know the mask. ``""`` keeps the legacy text sniffing.
 
     Returns:
         Stage label string (for example ``call_generate_image``).
@@ -67,7 +127,21 @@ def turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
     resp = response or ""
     forced_context = f"{turn_prompt or ''}\n{resp}"
     called = tool_call_order(decode)
-    if called:
+    mask_aware = bool(advantage)
+    # A mask=0-only turn trains nothing, so it must not be labelled as model work; a
+    # turn holding policy tokens must not be labelled as the injected cue.
+    policy_side_ok = not mask_aware or advantage in (ADVANTAGE_POLICY, ADVANTAGE_POLICY_AND_CUE)
+    cue_side_ok = not mask_aware or advantage in (ADVANTAGE_CUE, ADVANTAGE_POLICY_AND_CUE)
+    cue_attached = (
+        advantage in (ADVANTAGE_CUE, ADVANTAGE_POLICY_AND_CUE)
+        if mask_aware
+        else bool(re.search(r"\bagentic_forced_reflection=1\b", forced_context, re.IGNORECASE))
+    )
+    # A plan-mode turn either carries the plan alone (the protocol spends its first
+    # turn on it) or, if the splitter could not separate the adjacent model spans,
+    # plan text followed by the first tool call. Label both so the plan stays visible.
+    planned = task_type == "plan" and policy_side_ok and bool(plan_lines_from_prose(decode or ""))
+    if called and policy_side_ok:
         # Label by the call the model emitted *first*: that is the only one that
         # executes (``multi_turn.max_parallel_calls``). Testing ``judge_image``
         # first mislabelled a "generate then judge" turn as ``call_judge_image``,
@@ -76,35 +150,44 @@ def turn_kind(decode: str, turn_prompt: str, response: str = "") -> str:
         first, trailing = called[0], called[1:]
         if first == "judge_image":
             label = "call_judge_image"
-        elif re.search(r"\bagentic_forced_reflection=1\b", resp, re.IGNORECASE) or re.search(
-            r"\bagentic_forced_reflection=1\b", turn_prompt or "", re.IGNORECASE
-        ):
+        elif cue_attached:
             label = "agent_rewrite_after_forced_reflection_then_call_generate_image"
         else:
             label = "call_generate_image"
+        if planned:
+            label = f"plan_then_{label}"
         for name in trailing:
             label = f"{label}_then_call_{name}"
         return label
-    if re.search(
-        r"(?is)^\s*(?:Reflection\s*:.*?)?Done\.\s*(?:<\|im_end\|>)?\s*$",
-        decode or "",
-    ) and re.search(r"\bagentic_stop_decision_required=1\b", forced_context, re.IGNORECASE):
+    if planned:
+        return "plan"
+    if (
+        policy_side_ok
+        and cue_attached
+        and re.search(r"(?is)^\s*(?:Reflection\s*:.*?)?Done\.\s*(?:<\|im_end\|>)?\s*$", decode or "")
+        and re.search(r"\bagentic_stop_decision_required=1\b", forced_context, re.IGNORECASE)
+    ):
         if re.search(r"\bagentic_force_stop_max_passes=1\b", forced_context):
             return "agent_done_after_max_passes"
         return "agent_done_after_forced_reflection"
-    if re.search(r"\bagentic_force_stop_max_passes=1\b", resp) or (
-        not (decode or "").strip() and re.search(r"\bagentic_force_stop_max_passes=1\b", turn_prompt or "")
+    if cue_side_ok and (
+        re.search(r"\bagentic_force_stop_max_passes=1\b", resp)
+        or (not (decode or "").strip() and re.search(r"\bagentic_force_stop_max_passes=1\b", turn_prompt or ""))
     ):
         return "forced_reflection_max_passes_stop_cue"
-    if re.search(r"\bagentic_forced_reflection=1\b", resp, re.IGNORECASE):
+    if cue_side_ok and re.search(r"\bagentic_forced_reflection=1\b", resp, re.IGNORECASE):
         if re.search(r"\bagentic_stop_decision_required=1\b", resp, re.IGNORECASE):
             return "forced_reflection_stop_cue"
         return "forced_reflection_continue"
-    if not (decode or "").strip() and re.search(r"\bagentic_forced_reflection=1\b", turn_prompt or "", re.IGNORECASE):
+    if (
+        cue_side_ok
+        and not (decode or "").strip()
+        and re.search(r"\bagentic_forced_reflection=1\b", turn_prompt or "", re.IGNORECASE)
+    ):
         if re.search(r"\bagentic_stop_decision_required=1\b", turn_prompt or "", re.IGNORECASE):
             return "forced_reflection_stop_cue"
         return "forced_reflection_continue"
-    if re.search(r"\bReflection\s*:", decode or "", re.IGNORECASE):
+    if policy_side_ok and re.search(r"\bReflection\s*:", decode or "", re.IGNORECASE):
         if re.search(
             r"<function=generate_image\b|\"name\"\s*:\s*\"generate_image\"",
             decode or "",
@@ -310,6 +393,9 @@ def turn_record(
     response: str,
     decode: str,
     turn_input: str = "",
+    policy_tokens: int | None = None,
+    env_tokens: int | None = None,
+    injected_cue: bool = False,
 ) -> dict[str, Any]:
     """Build one trajectory-dump turn record.
 
@@ -319,9 +405,15 @@ def turn_record(
         response: Assistant response text.
         decode: Decoded model tokens for the turn.
         turn_input: Optional raw turn input text.
+        policy_tokens: Mask=1 token count for the turn (trainable: sampled or
+            teacher-forced Hermes). ``None`` when the caller does not know the mask.
+        env_tokens: Mask=0 token count attached to the turn: the observation plus any
+            injected cue that preceded ``decode``.
+        injected_cue: Whether that mask=0 span includes a harness-injected Reflection.
 
     Returns:
-        Dict with turn / prompt / tool / decode fields.
+        Dict with turn / prompt / tool / decode fields plus the mask provenance, whose
+        ``turn_advantage`` is what :func:`turn_kind` checks its labels against.
     """
     accepted = first_tool_call(decode or "")
     return {
@@ -337,6 +429,15 @@ def turn_record(
         "decode": decode or "",
         "response": response or "",
         "decode_has_tool_call": "<tool_call>" in (decode or "").lower(),
+        # Advantage provenance, straight off ``response_mask``. ``policy_tokens`` is
+        # the trainable count and ``env_tokens`` the delivered context; the injected
+        # cue lives inside ``env_tokens`` as a mask=0 suffix of the observation blob,
+        # so ``injected_cue`` records its presence without pretending the split is
+        # token-exact.
+        "policy_tokens": policy_tokens,
+        "env_tokens": env_tokens,
+        "injected_cue": bool(injected_cue),
+        "turn_advantage": advantage_class(policy_tokens=policy_tokens, injected_cue=injected_cue),
     }
 
 
@@ -355,6 +456,10 @@ class _RolloutTurnSplitter:
         self.current_tool: list[int] = []
         self.pending_prompt = ""
         self.pending_response = ""
+        # Mask=0 token count of the env blob the ``pending_*`` text came from. Each
+        # mask=0 token belongs to exactly one turn, so summing the per-turn policy and
+        # env counts back up recovers ``len(ids)``.
+        self.pending_env_tokens = 0
         self.model_start = 0
 
     def _decode_input(self, response_prefix_len: int) -> str:
@@ -366,11 +471,13 @@ class _RolloutTurnSplitter:
     def _flush_tool(self) -> None:
         if not self.current_tool:
             return
-        blob = self.tokenizer.decode(self.current_tool, skip_special_tokens=True).strip()
+        tokens = self.current_tool
+        blob = self.tokenizer.decode(tokens, skip_special_tokens=True).strip()
         self.current_tool = []
         prompt, response = split_env_blob(blob)
         self.pending_prompt = prompt
         self.pending_response = response
+        self.pending_env_tokens = len(tokens)
 
     def _flush_model(self) -> None:
         if not self.current_model:
@@ -383,10 +490,14 @@ class _RolloutTurnSplitter:
                 response=self.pending_response,
                 decode=decode,
                 turn_input=self._decode_input(self.model_start),
+                policy_tokens=len(self.current_model),
+                env_tokens=self.pending_env_tokens,
+                injected_cue=bool(self.pending_response),
             )
         )
         self.pending_prompt = ""
         self.pending_response = ""
+        self.pending_env_tokens = 0
         self.current_model = []
 
     def run(self) -> list[dict[str, Any]]:
@@ -403,7 +514,9 @@ class _RolloutTurnSplitter:
                 self.current_tool.append(int(token_id))
         if self.current_model:
             self._flush_model()
-        # Trailing env (e.g. final judge + forced Done with no further decode).
+        # Trailing env (e.g. final judge + forced Done with no further decode). The
+        # record trains nothing, so it is ``cue`` when a Reflection was injected into
+        # it and ``env`` when it is only tool feedback.
         if self.current_tool:
             self._flush_tool()
             if self.pending_prompt or self.pending_response:
@@ -414,10 +527,14 @@ class _RolloutTurnSplitter:
                         response=self.pending_response,
                         decode="",
                         turn_input=self._decode_input(len(self.ids)),
+                        policy_tokens=0,
+                        env_tokens=self.pending_env_tokens,
+                        injected_cue=bool(self.pending_response),
                     )
                 )
             self.pending_prompt = ""
             self.pending_response = ""
+            self.pending_env_tokens = 0
         return self.turns
 
 

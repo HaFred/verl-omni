@@ -42,6 +42,7 @@ from typing import Any
 
 import pandas as pd
 
+from verl_omni.utils.agentic.plan_protocol import cumulative_subtasks
 from verl_omni.utils.dataset.visual_reflection import VisualReflectionDataError
 from verl_omni.utils.dataset.visual_reflection.contracts import RejectionReason, derive_prompt_source_dedup_key
 from verl_omni.utils.dataset.visual_reflection.partition import assign_source_splits
@@ -66,6 +67,10 @@ REWARD_DIMS = ("reflect", "plan", "format", "tool", "result", "improve")
 # Public alias retained for reward/dataset consumers.
 DIMS = REWARD_DIMS
 MANIFEST_ID = "agentic_rl_unicot_v1"
+#: Plan references are rewritten at build time, so the manifest records which transform
+#: produced them. ``expected_num_images`` still equals the source slot count; only the
+#: text of each reference changes.
+PLAN_REFERENCE_TRANSFORM = "cumulative_self_contained_v1"
 
 REFLECT_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
 1) generate_image — create an image from a complete diffusion prompt
@@ -109,26 +114,32 @@ PLAN_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
 2) judge_image — inspect the last generated image and return structured feedback
 
 Protocol:
-1. Write a short numbered plan of at most three complete subtask image prompts.
-2. Call generate_image once per planned subtask, in order.
-3. After the final image, call judge_image on that image.
+1. First turn: write a plan — a numbered list of at most three complete subtask
+   prompts. Send no tool call on this turn.
+2. Then call generate_image once per planned subtask, in order, one call per turn.
+3. After the final image, call judge_image once on that image.
 4. Reflect briefly on the feedback and finish with Done.
 
 Subtask prompts — the plan is the work, not a table of contents:
 - The user's request is the content spec; each subtask prompt is a rendering recipe
   for the generate_image tool. The tool never sees the request or the other
-  subtasks, so every subtask prompt must be standalone and self-contained — never a
-  fragment such as "now the second one", and never a bare restatement of the request.
+  subtasks, and it cannot edit an image it has already drawn.
+- Plan cumulatively. generate_image starts from scratch on every call, so subtask N
+  must be standalone and self-contained: restate in full everything subtasks 1..N-1
+  asked for, then add what subtask N contributes. Never write "keep the previous
+  elements unchanged" or "add the following details" — the tool cannot see the
+  earlier image, so an edit instruction draws nothing. Write the standing prompt
+  again, extended.
 - Decompose rather than summarise. Give each subtask its own subject, framing,
-  composition, style, palette, lighting and level of detail, and carry the requested
-  content that belongs to that subtask with its literal strings intact.
+  composition, style, palette, lighting, camera angle or level of detail, and carry
+  the requested content that belongs to that subtask with its literal strings intact.
 - Each subtask prompt must differ substantially from the others and from the raw
   request wording. Reusing the request with a different noun is not a decomposition.
 - When a subtask must render text, describe the typography strategy (how many words,
   which lines, weight, case, size on the canvas, placement, and the background behind
   the glyphs) instead of asserting that the text will be legible.
 
-Do not judge between subtasks or generate more images than the plan lists.
+Do not judge between subtasks and do not generate more images than the plan lists.
 The brevity note on the user turn bounds your private thinking and your reflection
 only — never let it shorten or water down a subtask prompt."""
 
@@ -301,7 +312,11 @@ def _parse_breakdown_rows(metadata: list[dict[str, Any]]) -> tuple[list[dict[str
             **weights,
         }
         if parsed.plan_expected:
-            ground_truth["reference_subtasks"] = list(parsed.subtasks)
+            # The source subtasks assume an image-edit tool ("keep the outline unchanged
+            # and edit …"). With a stateless text-to-image tool (``generate_image``
+            # rather than ``edit_image``), step i must restate steps 0..i, so the reward
+            # reference is the accumulated chain.
+            ground_truth["reference_subtasks"] = list(cumulative_subtasks(parsed.subtasks))
         rows.append(
             {
                 "data_id": parsed.data_id,
@@ -472,6 +487,7 @@ def main_cli(
         "partition_id": partition_id,
         "seed": seed,
         "val_ratio": val_ratio,
+        "plan_reference_transform": PLAN_REFERENCE_TRANSFORM,
         "source_configs": {
             "reflection": unicot_converter_config(),
             "breakdown": breakdown_converter_config(),

@@ -125,6 +125,9 @@ class AgenticRewardMetrics:
         "forced_reflection",
         "forced_first_generate",
         "forced_first_judge",
+        # How often the policy judges before any image exists. Kept as an observation:
+        # the harness answers the slip but no longer rewrites it.
+        "refused_premature_judge",
     )
     ARTIFACT_KEYS: tuple[str, ...] = (
         "reward_tool_call",

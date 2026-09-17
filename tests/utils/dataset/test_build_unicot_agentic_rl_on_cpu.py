@@ -57,6 +57,21 @@ def _breakdown_row(data_id: str, count: int = 2) -> dict:
     }
 
 
+def _edit_style_breakdown_row(data_id: str) -> dict:
+    """A three-slot row worded the way the hub corpus words it, for an *edit* tool."""
+    return {
+        "data_id": data_id,
+        "prompt": f"Breakdown prompt {data_id}.",
+        "subtasks": [
+            "An African American librarian floats while reading a book in an underwater library.",
+            "Keep the outline of the image unchanged and edit with the following details. "
+            "The librarian wears a luxurious gold satin gown.",
+            "Keep all previously rendered elements unchanged. Apply visual effects that reinforce the ethereal mood.",
+        ],
+        "subtask_images": [f"./images/{data_id}_{index}.png" for index in range(3)],
+    }
+
+
 def _no_breakdown_row(data_id: str) -> dict:
     return {
         "data_id": data_id,
@@ -140,7 +155,40 @@ def test_references_and_weights_live_only_in_ground_truth(tmp_path):
             assert ground_truth.get("reference_subtasks") is None
 
 
-def test_system_prompts_demand_a_tool_facing_recipe_not_a_restatement():
+def test_plan_references_are_flattened_for_a_stateless_generate_tool(tmp_path):
+    """Plan references must restate 0..N, because ``generate_image`` cannot edit.
+
+    The hub subtasks are written for an image-edit tool ("keep the outline unchanged
+    and edit with the following details"), and the harness has none. Scoring the
+    policy against an edit instruction would reward text the tool cannot act on, so the
+    builder accumulates and drops the framing. ``expected_num_images`` still equals the
+    source slot count — only the reference text changes.
+    """
+    output = _build(
+        tmp_path,
+        reflection_rows=[],
+        breakdown_rows=[_edit_style_breakdown_row(f"b{i}") for i in range(6)],
+        train_size=None,
+        val_size=None,
+    )
+    rows = pd.concat([_read(output, "train"), _read(output, "val")])
+
+    for reward_model in rows["reward_model"]:
+        ground_truth = reward_model["ground_truth"]
+        references = list(ground_truth["reference_subtasks"])
+        assert ground_truth["task_type"] == "plan"
+        assert ground_truth["expected_num_images"] == 3
+        assert len(references) == 3
+        assert [len(reference) for reference in references] == sorted(len(reference) for reference in references)
+        assert references[0] in references[1] and references[0] in references[2]
+        assert "gold satin gown" in references[1]
+        assert "ethereal mood" in references[2]
+        assert not any("Keep the outline" in reference for reference in references)
+        assert not any("Keep all previously rendered" in reference for reference in references)
+
+    report = json.loads((output / "build_report.json").read_text())
+    assert report["plan_reference_transform"] == builder.PLAN_REFERENCE_TRANSFORM
+
     """Guard the rewrite contract against a silent rebase revert.
 
     The prompts are the only lever that makes GRPO explore prompt space, so both
@@ -164,6 +212,24 @@ def test_system_prompts_demand_a_tool_facing_recipe_not_a_restatement():
     assert "rewrite" in builder.REFLECT_SYSTEM_PROMPT
     assert "standalone" in builder.PLAN_SYSTEM_PROMPT
     assert builder.REFLECT_SYSTEM_PROMPT != builder.PLAN_SYSTEM_PROMPT
+
+
+def test_plan_prompt_asks_for_an_own_turn_cumulative_plan():
+    """Plan mode needs both halves of the protocol stated explicitly.
+
+    The plan is a turn of its own (the loop only reopens a tool-call-free turn when it
+    carries a plan), and each subtask must restate its predecessors because
+    ``generate_image`` is stateless. Getting either wrong reproduces ``sample_9004``:
+    no plan written, then a reflect-style rewrite loop that the protocol forbids.
+    """
+    normalized = " ".join(builder.PLAN_SYSTEM_PROMPT.split())
+
+    assert "no tool call" in normalized
+    assert "cumulative" in normalized
+    assert "restate" in normalized
+    assert "cannot edit" in normalized
+    # Reflect mode must not inherit the plan-only turn contract.
+    assert "no tool call on this turn" not in " ".join(builder.REFLECT_SYSTEM_PROMPT.split())
 
 
 def test_plan_and_reflect_rows_use_task_specific_system_prompts(tmp_path):

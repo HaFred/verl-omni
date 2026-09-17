@@ -225,6 +225,72 @@ def test_dumped_turns_expose_the_rewritten_diffusion_prompt(tmp_path):
     assert "PROMPT_V2" in text_block
 
 
+def test_dumped_turns_expose_the_token_wise_advantage(tmp_path):
+    """The dump reports the mask the optimizer used, per turn and per rollout.
+
+    ``turn_kind`` labels a protocol stage; ``turn_advantage`` is the trainer's view of
+    who owns the tokens. Without it a reader cannot tell a policy rewrite from the
+    harness-injected Reflection sitting in the same turn.
+    """
+    _bind(tmp_path)
+    gen = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "V1"}}\n</tool_call>'
+    # The judge observation and the injected cue are one contiguous mask=0 run, which
+    # is why the splitter has to separate them textually.
+    judge_then_cue = (
+        "<tool_response>\nVL judge on the last generated image:\n  agentic_judge ok=1 good_enough =NO\n"
+        "</tool_response>\nReflection: rewrite next. agentic_forced_reflection=1"
+    )
+    rewrite = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "V2"}}\n</tool_call>'
+    stop_cue = "Reflection: Stop. agentic_stop_decision_required=1 agentic_forced_reflection=1"
+    tokenizer = _PieceTok({10: gen, 11: judge_then_cue, 12: rewrite, 13: stop_cue})
+
+    dump_rollout_artifacts(
+        tokenizer=tokenizer,
+        step=0,
+        relpath="step_000000/sample_9004",
+        sample_index=9004,
+        raw_prompt=[{"role": "user", "content": "a poster"}],
+        outputs=SimpleNamespace(
+            prompt_ids=[1, 2, 3],
+            response_ids=[10, 11, 12, 13],
+            response_mask=[1, 0, 1, 0],
+            reward_score=0.1,
+            extra_fields={},
+        ),
+    )
+
+    run_dir = tmp_path / "layout_test"
+    payload = json.loads((run_dir / "rollout_trajectories" / "step_000000" / "sample_9004.json").read_text())
+    turns = payload["rollout_turns"]
+    assert [(turn["turn_advantage"], turn["policy_tokens"], turn["env_tokens"]) for turn in turns] == [
+        ("policy", 1, 0),
+        ("policy+cue", 1, 1),
+        ("cue", 0, 1),
+    ]
+    assert [turn["injected_cue"] for turn in turns] == [False, True, True]
+    # The labels agree with the mask: the rewrite turn was trainable and the trailing
+    # cue turn was not, so the cue gets the cue label and the rewrite does not.
+    assert [turn["turn_kind"] for turn in turns] == [
+        "call_generate_image",
+        "agent_rewrite_after_forced_reflection_then_call_generate_image",
+        "forced_reflection_stop_cue",
+    ]
+    assert payload["num_policy_tokens"] == 2
+    assert payload["num_injected_cue_turns"] == 2
+    # The mask partition holds end to end: every response token is accounted for.
+    assert sum(turn["policy_tokens"] + turn["env_tokens"] for turn in turns) == 4
+
+    text_block = (run_dir / "rollout_trajectories" / "step_000000" / "sample_9004.txt").read_text()
+    # The text transcript names the mask on both bodies, so a cue is not read as a
+    # model response and a policy span is not read as harness scaffolding.
+    assert "advantage=policy+cue" in text_block
+    assert "turn_3_response_masked0_injected_cue:" in text_block
+    assert "decode_masked1_policy:" in text_block
+
+    row = json.loads((run_dir / "hermes_actions" / "step_000000.jsonl").read_text().splitlines()[0])
+    assert [turn["turn_advantage"] for turn in row["rollout_turns"]] == ["policy", "policy+cue", "cue"]
+
+
 def test_val_set_rows_never_touch_rollout_trajectories_or_monitor(monkeypatch):
     """A val-set batch is neither dumped nor mask-discarded (baseline contract).
 
@@ -381,3 +447,49 @@ def test_manager_runs_val_holdout_once_per_step(monkeypatch):
 
     assert len(dispatched) == 2
     assert manager._val_viz_logged_steps == {5, 6}
+
+
+def test_val_holdouts_split_reflect_from_plan(monkeypatch):
+    """9001/9003 must run reflect and 9002/9004 plan, each with a usable reference.
+
+    The holdout labels were always right, but the loop never read ``task_type``, so the
+    plan cases ran the reflect machinery. The plan references must also be cumulative —
+    with a stateless ``generate_image`` the last subtask has to restate the earlier ones
+    — and ``expected_num_images`` must match the plan length, because a plan's result
+    reward requires exactly one image per subtask.
+    """
+    monkeypatch.setenv("AGENTIC_VAL_VIZ", "1")
+    provider = resolve_agentic_val_viz_provider()
+    batch = provider.build_batch(0, eos_token_id=2, pad_token_id=0)
+
+    from verl_omni.utils.dataset.visual_reflection import build_unicot_agentic_rl
+
+    expected_types = {9001: "reflect", 9002: "plan", 9003: "reflect", 9004: "plan"}
+    seen: dict[int, str] = {}
+    for index, reward_model, raw_prompt in zip(
+        batch.non_tensor_batch["index"],
+        batch.non_tensor_batch["reward_model"],
+        batch.non_tensor_batch["raw_prompt"],
+        strict=True,
+    ):
+        ground_truth = dict(reward_model)["ground_truth"]
+        system_prompt = list(raw_prompt)[0]["content"]
+        index = int(index)
+        task_type = ground_truth["task_type"]
+        seen[index] = task_type
+        if task_type == "plan":
+            references = list(ground_truth["reference_subtasks"])
+            assert len(references) >= 2, index
+            assert ground_truth["expected_num_images"] == len(references), index
+            # Cumulative: each step restates the ones before it.
+            assert [len(reference) for reference in references] == sorted(len(reference) for reference in references), (
+                index
+            )
+            assert references[0] in references[-1], index
+            assert system_prompt == build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT, index
+        else:
+            assert "reference_subtasks" not in ground_truth, index
+            assert ground_truth["expected_num_images"] == 1, index
+            assert system_prompt == build_unicot_agentic_rl.REFLECT_SYSTEM_PROMPT, index
+
+    assert seen == expected_types

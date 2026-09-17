@@ -22,6 +22,7 @@ from typing import Any
 
 from verl_omni.tools.trajectory.hydra_env import agentic_get, agentic_get_bool
 from verl_omni.utils.agentic.max_passes import max_generate_passes
+from verl_omni.utils.agentic.text_clip import clip_to_sentences
 
 __all__ = [
     "build_forced_reflection",
@@ -295,46 +296,6 @@ def _field(text: str, pattern: str, *, flags: int = re.IGNORECASE) -> str | None
     return match.group(1) if match else None
 
 
-#: Judge fields end sentences on ASCII or CJK full stops.
-_SENTENCE_END_RE = re.compile(r"(?<=[.!?。！？])\s+")
-
-
-def _clip_to_sentences(text: str, budget: int) -> str:
-    """Clip ``text`` to whole sentences within ``budget`` characters.
-
-    The judge writes a diagnosis and the policy reads it as the observation driving
-    the next rewrite. Cutting mid-word (``"...to match the 'Sofa M"``) hands the
-    policy a malformed token run that reads as a broken instruction, and it silently
-    favours whichever sentence happens to come first over the concrete fixes the
-    judge wrote later. Clipping on sentence boundaries keeps the observation an
-    observation; the trailing ellipsis marks the cut so the policy can tell the text
-    continues rather than that the judge stopped there.
-
-    Args:
-        text: Raw judge field text.
-        budget: Character budget for the returned text.
-
-    Returns:
-        Whitespace-collapsed ``text``, unchanged when it already fits; otherwise
-        whole sentences up to ``budget`` followed by ``" …"``. When a single
-        sentence already exceeds ``budget`` the cut falls back to the last word
-        boundary, so the result is still never split mid-word.
-    """
-    collapsed = re.sub(r"\s+", " ", (text or "").strip())
-    if not collapsed or len(collapsed) <= budget:
-        return collapsed
-    kept = ""
-    for sentence in _SENTENCE_END_RE.split(collapsed):
-        candidate = f"{kept} {sentence}".strip()
-        if len(candidate) > budget:
-            break
-        kept = candidate
-    if not kept:
-        head = collapsed[:budget]
-        kept = head[: head.rfind(" ")].strip() if " " in head else head
-    return f"{kept} …"
-
-
 def build_forced_reflection(
     tool_text: str,
     *,
@@ -369,8 +330,8 @@ def build_forced_reflection(
         flags=re.IGNORECASE | re.DOTALL,
     )
     good_enough = (good_enough_value or "").upper() == "YES"
-    findings = _clip_to_sentences(findings_value, 220)
-    fixes = _clip_to_sentences(fixes_value, 160)
+    findings = clip_to_sentences(findings_value, 220)
+    fixes = clip_to_sentences(fixes_value, 160)
     if not findings:
         findings = "see VL facet scores above"
     findings_clause = findings if findings.endswith((".", "…", "!", "?", "。", "！", "？")) else f"{findings}."
@@ -391,7 +352,10 @@ def build_forced_reflection(
             "agentic_force_stop_max_passes=1 agentic_stop_decision_required=1"
         )
         return text, True
-    fix_note = f" Suggested fixes: {fixes}." if fixes and fixes.lower() != "none" else ""
+    fix_note = ""
+    if fixes and fixes.lower() != "none":
+        fix_clause = fixes if fixes.endswith((".", "…", "!", "?", "。", "！", "？")) else f"{fixes}."
+        fix_note = f" Suggested fixes: {fix_clause}"
     text = (
         f"Reflection: VL judge reports correctness={correctness}, aesthetics={aesthetics}, "
         f"good_enough=NO. {findings_clause}{fix_note} Rewriting the diffusion prompt next."

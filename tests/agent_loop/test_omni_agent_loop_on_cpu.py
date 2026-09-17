@@ -19,6 +19,7 @@ import asyncio
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from verl.experimental.agent_loop import AgentLoopManager
 from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 
@@ -33,6 +34,11 @@ from verl_omni.tools.trajectory import (
 )
 from verl_omni.utils.agentic.image_gen_rollout_dump import discard_invalid_rollouts
 from verl_omni.utils.agentic.image_gen_rollout_parse import (
+    ADVANTAGE_CUE,
+    ADVANTAGE_ENV,
+    ADVANTAGE_POLICY,
+    ADVANTAGE_POLICY_AND_CUE,
+    advantage_class,
     extract_generate_image_prompts,
     extract_tool_calls,
     split_env_blob,
@@ -211,6 +217,50 @@ def test_turn_kind_stop_rewrite_and_continue():
     assert turn_kind(done, judge_no, "") == "agent_reflection_done"
 
 
+def test_advantage_class_names_the_mask_composition():
+    """The class is the trainer's ``response_mask`` view of a turn, not a text read."""
+    assert advantage_class(policy_tokens=None, injected_cue=False) == ""
+    assert advantage_class(policy_tokens=None, injected_cue=True) == ""
+    assert advantage_class(policy_tokens=7, injected_cue=False) == ADVANTAGE_POLICY
+    assert advantage_class(policy_tokens=7, injected_cue=True) == ADVANTAGE_POLICY_AND_CUE
+    assert advantage_class(policy_tokens=0, injected_cue=True) == ADVANTAGE_CUE
+    assert advantage_class(policy_tokens=0, injected_cue=False) == ADVANTAGE_ENV
+
+
+def test_turn_kind_checks_its_claim_against_the_mask():
+    """A label that claims mask=0 tokens must not be put on a mask=1 turn.
+
+    The cue labels describe harness text the optimizer never saw and the call labels
+    describe policy tokens it did see, so the same transcript text has to be labelled
+    differently depending on the mask, and the mask wins over the text.
+    """
+    cue = "Reflection: rewrite next. agentic_forced_reflection=1"
+    rewrite = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "v2"}}\n</tool_call>'
+
+    # Injected cue plus a policy rewrite: the label records both.
+    assert turn_kind(rewrite, "obs", cue, advantage=ADVANTAGE_POLICY_AND_CUE) == (
+        "agent_rewrite_after_forced_reflection_then_call_generate_image"
+    )
+    # The identical text on a policy-only turn must not claim an injection happened.
+    assert turn_kind(rewrite, "obs", cue, advantage=ADVANTAGE_POLICY) == "call_generate_image"
+    # A cue-only turn trains nothing: the cue family is what its mask entitles it to.
+    assert turn_kind("", "obs", cue, advantage=ADVANTAGE_CUE) == "forced_reflection_continue"
+
+    done = "Reflection: The image meets the original request. Done.<|im_end|>"
+    stop_cue = "Reflection: Stop. agentic_stop_decision_required=1 agentic_forced_reflection=1"
+    assert turn_kind(done, "VL judge ok=1", stop_cue, advantage=ADVANTAGE_POLICY_AND_CUE) == (
+        "agent_done_after_forced_reflection"
+    )
+    # With no injected cue the same ``Done.`` is the policy ending on its own, and
+    # calling it a forced stop would credit the harness with the policy's decision.
+    assert turn_kind(done, "VL judge ok=1", "", advantage=ADVANTAGE_POLICY) == "agent_reflection_done"
+
+    # An unknown advantage keeps the legacy text sniffing, so older callers and
+    # hand-written transcripts still label.
+    assert turn_kind(rewrite, "obs", cue) == "agent_rewrite_after_forced_reflection_then_call_generate_image"
+    assert turn_kind("", "obs", cue) == "forced_reflection_continue"
+
+
 def test_turn_kind_labels_the_first_tool_call():
     """A generate+judge turn is a generate turn with a dropped trailing call.
 
@@ -326,6 +376,49 @@ def test_split_env_blob_and_rollout_turns():
     turns = split_rollout_turns([1, 2, 3, 4], [1, 1, 0, 0], _Tok())
     assert [turn["decode"] for turn in turns] == ["AB", ""]
     assert turns[1]["turn_prompt"] == "CD"
+
+
+def test_splitter_reports_the_mask_each_turn_owns():
+    """Per-turn counts are the mask itself: policy is mask=1, env is mask=0.
+
+    The counts have to partition the response exactly, because they are what a reader
+    uses to see how much of a rollout the optimizer actually trained on.
+    """
+    pieces = {
+        10: '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "v1"}}\n</tool_call>',
+        11: " plus a sampled continuation",
+        # One contiguous mask=0 run holding the judge observation *and* the injected
+        # cue, which is exactly what ``split_env_blob`` has to separate.
+        12: (
+            "<tool_response>\nVL judge on the last generated image:\n  agentic_judge ok=1 good_enough =NO\n"
+            "</tool_response>\nReflection: rewrite next. agentic_forced_reflection=1"
+        ),
+        13: '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "v2"}}\n</tool_call>',
+        14: "Reflection: Stop. agentic_stop_decision_required=1 agentic_forced_reflection=1",
+    }
+
+    class _PieceTok:
+        pad_token_id = 0
+
+        @staticmethod
+        def decode(ids, skip_special_tokens=False):
+            del skip_special_tokens
+            return "".join(pieces.get(int(token), "") for token in ids)
+
+    ids = [10, 11, 12, 13, 14]
+    mask = [1, 1, 0, 1, 0]
+    turns = split_rollout_turns(ids, mask, _PieceTok())
+
+    assert [(turn["policy_tokens"], turn["env_tokens"]) for turn in turns] == [(2, 0), (1, 1), (0, 1)]
+    assert [turn["turn_advantage"] for turn in turns] == [
+        ADVANTAGE_POLICY,
+        ADVANTAGE_POLICY_AND_CUE,
+        ADVANTAGE_CUE,
+    ]
+    assert [turn["injected_cue"] for turn in turns] == [False, True, True]
+    # The two counts partition the response, so nothing is double-counted or lost.
+    assert sum(turn["policy_tokens"] for turn in turns) == sum(mask)
+    assert sum(turn["env_tokens"] for turn in turns) == len(mask) - sum(mask)
 
 
 def test_discard_invalid_rollouts_zeros_mask_but_restores_if_all_invalid():
@@ -544,3 +637,271 @@ def test_single_tool_call_turn_gets_no_drop_notice(monkeypatch):
     contents = [str(message.get("content")) for message in agent_data.messages]
     assert not any("agentic_tool_dropped" in content for content in contents)
     assert "num_dropped_tool_calls" not in agent_data.extra_fields
+
+
+def test_worker_stamps_task_type_from_extra_info(monkeypatch):
+    """``plan`` rows must reach the loop as plan rows, not merely as plan prompts.
+
+    ``task_type`` lives in ``extra_info`` and used to stop at the prompt: the loop never
+    read it, so the plan holdouts (9002/9004) ran the reflect machinery — forced
+    Reflection injected after every judge — despite carrying the plan system prompt.
+    """
+    captured: dict = {}
+
+    async def _parent_run(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
+        del sampling_params, trajectory, agent_name, trace
+        captured["kwargs"] = dict(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(AgentLoopWorker, "_run_agent_loop", _parent_run)
+    worker = OmniAgentLoopWorker.__new__(OmniAgentLoopWorker)
+
+    asyncio.run(
+        OmniAgentLoopWorker._run_agent_loop(
+            worker,
+            {},
+            {"step": 0, "sample_index": 9004, "rollout_n": 0, "validate": True},
+            agent_name="image_gen_tool_agent",
+            raw_prompt=[{"role": "user", "content": "draw a poster"}],
+            extra_info={"task_type": "PLAN"},
+        )
+    )
+
+    assert captured["kwargs"]["_agentic_task_type"] == "plan"
+    assert captured["kwargs"]["_agentic_validate"] is True
+
+
+def _bare_loop(*, task_type: str, validate: bool = False):
+    from verl_omni.agent_loop import tool_agent_loop as mod
+
+    loop = mod.ImageGenToolAgentLoop.__new__(mod.ImageGenToolAgentLoop)
+    loop._agentic_task_type = task_type
+    loop._agentic_validate = validate
+    loop._agentic_step = 3
+    return mod, loop
+
+
+def test_forced_actions_are_exempt_for_plan_and_validation():
+    """Every harness intervention is withheld from plan and validation rollouts.
+
+    Regression: the gates were applied per-site, so ``force_reflection_after_judge``
+    had no protocol or validate gate and a plan rollout that judged after its first
+    image was told "Rewriting the diffusion prompt next." and entered the reflect
+    rewrite loop, while val transcripts were partly curriculum. The premature-judge
+    rewrite was then missed too — and it is the worst of the three, because it replaces
+    a policy action with harness text and marks the replacement mask=1.
+    """
+    _, reflect_train = _bare_loop(task_type="reflect")
+    _, reflect_val = _bare_loop(task_type="reflect", validate=True)
+    _, plan_train = _bare_loop(task_type="plan")
+    _, plan_val = _bare_loop(task_type="plan", validate=True)
+    _, unknown = _bare_loop(task_type="")
+
+    assert reflect_train._agentic_exempt_from_forced_actions() is False
+    assert reflect_val._agentic_exempt_from_forced_actions() is True
+    assert plan_train._agentic_exempt_from_forced_actions() is True
+    assert plan_val._agentic_exempt_from_forced_actions() is True
+    assert unknown._agentic_exempt_from_forced_actions() is False
+
+
+def _premature_judge_setup(monkeypatch, *, task_type: str = "reflect", validate: bool = False):
+    """Build a loop holding one ``judge_image`` call with no image behind it."""
+    from verl.experimental.agent_loop.tool_parser import FunctionCall
+
+    from verl_omni.agent_loop import tool_agent_loop as mod
+
+    async def _merge(self, previous_messages, updated_messages, token_ids, response_mask, *args, **kwargs):
+        added = len(updated_messages) - len(previous_messages)
+        return (
+            SimpleNamespace(token_ids=[*token_ids, *([0] * added)]),
+            [*response_mask, *([0] * added)],
+            [*(kwargs.get("response_logprobs") or []), *([0.0] * added)],
+        )
+
+    monkeypatch.setattr(mod.ToolAgentLoop, "ct_merge_non_assistant_msg", _merge)
+
+    mod, loop = _bare_loop(task_type=task_type, validate=validate)
+    loop.response_length = 4096
+    loop.tool_schemas = []
+    request = "一张垂直构图的平面设计海报，背景是纯粹而鲜艳的宝蓝色"
+    agent_data = SimpleNamespace(
+        tool_calls=[FunctionCall(name="judge_image", arguments="{}", tool_call_id="call_0")],
+        messages=[
+            {"role": "user", "content": request},
+            {
+                "role": "assistant",
+                "content": '<tool_call>\n{"name": "judge_image", "arguments": {"user_request": "x"}}\n</tool_call>',
+            },
+        ],
+        prompt_ids=[],
+        response_mask=[],
+        response_logprobs=[],
+        extra_fields={},
+    )
+    return mod, loop, agent_data
+
+
+def test_premature_judge_is_refused_with_an_observation(monkeypatch):
+    """A judge with no image must be answered, never silently overwritten.
+
+    Regression: the harness replaced the call with
+    ``generate_image(prompt=<raw user request>)`` and marked the replacement ``mask=1``.
+    The policy's own action vanished, the bare restatement both system prompts forbid was
+    trained as the policy's text, and the transcript described the harness rather than
+    the model.
+    """
+    mod, loop, agent_data = _premature_judge_setup(monkeypatch)
+
+    state = asyncio.run(mod.ImageGenToolAgentLoop._agentic_refuse_premature_judge(loop, agent_data))
+
+    assert state == mod.AgentState.GENERATING
+    # The policy's call is still in the transcript: nothing was overwritten.
+    assistant = [message for message in agent_data.messages if message.get("role") == "assistant"]
+    assert len(assistant) == 1
+    assert "judge_image" in str(assistant[0].get("content"))
+    notices = [
+        message
+        for message in agent_data.messages
+        if message.get("role") == "tool" and "agentic_tool_refused" in str(message.get("content"))
+    ]
+    assert len(notices) == 1
+    assert notices[0]["tool_call_id"] == "call_0"
+    assert "no image to judge" in notices[0]["content"]
+    assert "generate_image" in notices[0]["content"]
+    # The old write-path sent the raw request as the diffusion prompt.
+    assert "宝蓝色" not in notices[0]["content"]
+    # Nothing ran, so the calls must not reach the processing state.
+    assert agent_data.tool_calls == []
+    # The notice is environment feedback: its tokens must not enter the advantage.
+    assert set(agent_data.response_mask) <= {0}
+    assert agent_data.extra_fields["refused_premature_judge"] is True
+
+
+@pytest.mark.parametrize(("task_type", "validate"), [("reflect", False), ("plan", False), ("reflect", True)])
+def test_premature_judge_refusal_is_not_gated_on_protocol_or_validate(monkeypatch, task_type, validate):
+    """A refusal is env feedback, so plan and validation rollouts get it too.
+
+    The retired substitution had to be withheld from them because it injected harness
+    text as the policy's action. A refusal injects nothing the policy owns, so withholding
+    it would only deny those rollouts the recovery a real environment grants.
+    """
+    mod, loop, agent_data = _premature_judge_setup(monkeypatch, task_type=task_type, validate=validate)
+
+    state = asyncio.run(mod.ImageGenToolAgentLoop._agentic_refuse_premature_judge(loop, agent_data))
+
+    assert state == mod.AgentState.GENERATING
+    assert agent_data.extra_fields["refused_premature_judge"] is True
+
+
+def test_premature_judge_refusal_replaced_the_action_substitution():
+    """The call site refuses and the write-path is gone.
+
+    Two properties made the old behavior harmful, and both are asserted here: the refusal
+    must not sit behind the forced-action predicate (that would deny plan/val the
+    recovery), and the method must not author a replacement action for the policy.
+    """
+    import inspect
+
+    from verl_omni.agent_loop.tool_agent_loop import ImageGenToolAgentLoop
+
+    handler = inspect.getsource(ImageGenToolAgentLoop._handle_generating_state)
+    refuse = inspect.getsource(ImageGenToolAgentLoop._agentic_refuse_premature_judge)
+
+    condition_start = handler.index('agentic_get_bool("refuse_premature_judge")')
+    condition_end = handler.index("return await self._agentic_refuse_premature_judge", condition_start)
+    assert "_agentic_exempt_from_forced_actions" not in handler[condition_start:condition_end]
+    # No substitution: the refusal neither rewrites the assistant span nor builds a call.
+    assert "_replace_last_assistant_with_tool_call" not in refuse
+    assert "hermes_tool_call" not in refuse
+    assert "last_user_text" not in refuse
+    assert "_rewrite_premature_judge_to_generate" not in inspect.getsource(ImageGenToolAgentLoop)
+
+
+def test_turn_kind_labels_plan_turns_only_for_plan_rows():
+    """A reflect rewrite can contain numbered lines, so ``plan`` needs the task type."""
+    plan_text = "Plan:\n1. A librarian floats in an underwater cave library with fish nearby.\n"
+    merged = f'{plan_text}<tool_call>\n{{"name": "generate_image", "arguments": {{"prompt": "skull"}}}}\n</tool_call>'
+
+    assert turn_kind(plan_text, "prompt", "", task_type="plan") == "plan"
+    # The splitter groups adjacent model spans, so the plan can share a turn with the
+    # first call; label that rather than hiding the plan behind ``call_generate_image``.
+    assert turn_kind(merged, "prompt", "", task_type="plan") == "plan_then_call_generate_image"
+    # Reflect rows are never relabelled as planning.
+    assert turn_kind(plan_text, "prompt", "", task_type="reflect") == "other"
+    assert turn_kind(merged, "prompt", "", task_type="reflect") == "call_generate_image"
+
+
+#: A plan turn the policy could plausibly emit, reused across the loop tests.
+_PLAN_TURN_TEXT = "Plan:\n1. A librarian floats in an underwater cave library with fish nearby.\n"
+
+
+def _plan_turn_agent_data(*, tool_calls=(), extra_messages=()):
+    messages = [
+        {"role": "user", "content": "draw a poster"},
+        {"role": "assistant", "content": _PLAN_TURN_TEXT},
+        *extra_messages,
+    ]
+    return SimpleNamespace(
+        messages=messages,
+        tool_calls=list(tool_calls),
+        extra_fields={},
+    )
+
+
+def test_plan_turn_continues_to_the_first_generate():
+    """The stock loop ends on a tool-call-free turn; a plan must survive that rule."""
+    mod, loop = _bare_loop(task_type="plan")
+    agent_data = _plan_turn_agent_data()
+
+    state = loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=1)
+
+    assert state == mod.AgentState.GENERATING
+    # Latched so a policy that only emits prose cannot loop on the reopen.
+    assert agent_data.extra_fields["plan_turn_seen"] is True
+    assert loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=2) is None
+
+
+@pytest.mark.parametrize("task_type", ["reflect", ""])
+def test_plan_turn_does_not_reopen_other_protocols(task_type):
+    mod, loop = _bare_loop(task_type=task_type)
+    agent_data = _plan_turn_agent_data()
+
+    assert loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=1) is None
+
+
+def test_plan_turn_does_not_reopen_without_a_written_plan():
+    """A prose-only turn that carries no plan is still a finished rollout."""
+    mod, loop = _bare_loop(task_type="plan")
+    agent_data = _plan_turn_agent_data()
+    agent_data.messages[-1]["content"] = "I am still thinking about the poster."
+    assert loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=1) is None
+
+    # A tool call on the turn means it was never a tool-call-free exit.
+    mod, loop = _bare_loop(task_type="plan")
+    agent_data = _plan_turn_agent_data(tool_calls=[SimpleNamespace(name="generate_image")])
+    assert loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=1) is None
+
+
+def test_plan_turn_does_not_reopen_after_an_image_exists():
+    """Once generating has started, the stock terminal rules apply again."""
+    mod, loop = _bare_loop(task_type="plan")
+    agent_data = _plan_turn_agent_data(
+        extra_messages=[
+            {"role": "tool", "content": "prompt='poster' backend=vllm agentic_tool ok=1 images=1"},
+            {"role": "assistant", "content": _PLAN_TURN_TEXT},
+        ]
+    )
+
+    assert loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=3) is None
+
+
+def test_plan_turn_does_not_reopen_when_the_harness_terminated():
+    """Only the no-tool-call exit appends a message; budget exits must not be reopened."""
+    mod, loop = _bare_loop(task_type="plan")
+    agent_data = _plan_turn_agent_data()
+    continue_plan = loop._agentic_continue_after_plan_turn
+
+    # No new message appended → a length or turn-budget termination.
+    assert continue_plan(agent_data, mod.AgentState.TERMINATED, messages_before=2) is None
+    # A non-TERMINATED state is returned untouched.
+    assert continue_plan(agent_data, mod.AgentState.PROCESSING_TOOLS, messages_before=1) is None

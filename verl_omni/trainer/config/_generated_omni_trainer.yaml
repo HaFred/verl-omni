@@ -1130,5 +1130,5 @@ agentic_image_gen:
   force_first_warmup_steps: 10
   force_first_end_step: 20
   force_reflection_after_judge: true
-  rewrite_judge_before_generate: true
+  refuse_premature_judge: true
   e2e_root: null

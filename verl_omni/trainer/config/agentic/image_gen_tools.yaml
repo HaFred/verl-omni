@@ -83,8 +83,9 @@ force_first_end_step: 20
 # Insert a forced reflection turn after a successful judge_image.
 force_reflection_after_judge: true
 
-# Rewrite a premature first-turn judge_image call into generate_image.
-rewrite_judge_before_generate: true
+# Refuse a judge_image call made while no image exists yet, answering it with an
+# observation instead of substituting an action. See ``_agentic_refuse_premature_judge``.
+refuse_premature_judge: true
 
 # Optional dump root for traj / hermes / images (null → repo ``outputs/e2e``).
 e2e_root: null

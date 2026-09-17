@@ -246,6 +246,10 @@ class OmniAgentLoopMixin:
         kwargs["_agentic_validate"] = trajectory["validate"]
         kwargs["_agentic_trajectory_relpath"] = relpath
         extra = kwargs.get("extra_info")
+        # Selects the reflect vs plan protocol inside the loop, not just the prompt.
+        kwargs["_agentic_task_type"] = (
+            str(extra.get("task_type") or "").strip().lower() if isinstance(extra, dict) else ""
+        )
         stamp = getattr(self, "_agentic_scorer_bind", None)
         if stamp is not None:
             kwargs["extra_info"] = stamp(extra if isinstance(extra, dict) else {}, self.config)

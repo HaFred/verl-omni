@@ -95,6 +95,47 @@ class AgenticValVizProvider:
         return batch
 
 
+#: Plan holdouts need a reference decomposition, and the harness has only a stateless
+#: text-to-image tool, so references are accumulated rather than authored as edits. These
+#: are written as plain content (no "keep the outline unchanged and edit …" lead-in), so
+#: ``cumulative_subtasks`` just accumulates: element N restates 0..N.
+_CAFE_POSTER_SUBTASKS = (
+    "A vertical cafe poster rendering: a rustic wooden table lit by soft morning sunlight "
+    "through a nearby window, with gentle steam rising from a warm-toned ceramic coffee cup "
+    "centered on the table. Warm amber and brown color grading, shallow depth of field, "
+    "cozy aesthetic.",
+    'A bold serif headline reading "ARTISAN ROAST" set across the top of the poster in '
+    "cream lettering on a deep roast-brown band, with generous margins and a thin gold rule "
+    "beneath it.",
+    'A bottom text block reading "Freshly Brewed Daily — Open at 7 AM" in a smaller clean '
+    "sans-serif, centered with even spacing beneath the illustration, completing the poster.",
+)
+
+_CN_POSTER_SUBTASKS = (
+    "一张垂直构图的平面设计海报，纯色鲜艳宝蓝背景；下半部分由一幅巨大的插画风格老虎占据，"
+    "老虎趴着面向观众，黄色眼睛，皮毛由橙、黑、白三色构成；头顶漂浮一个含红色爱心的思想泡泡；"
+    "整体风格俏皮、超现实、刻意荒诞。",
+    "海报顶部为巨大无衬线字体主标题：上半部分浅灰色 “Sofa Montain Slummerfest”，"
+    "下半部分白色 “Annual Napping Festival 2025”；其下方是巨大的黑色书法字体中文标题 "
+    "“沙发山打呼节”；严肃主标题与荒诞细节形成强烈对比。",
+    "海报布满详尽活动文字：左栏白色字体列出猫主题乐队名 “The Fluffy Paws Grumbers (毛爪咕噜)”、"
+    "“DJ Meow Mix”、“九命怪猫 (Nine Lives)”、“激光笔追逐者 (The Laser Dots)”、"
+    "“纸箱爱好者 (Cardbock Box Lovers)”、“呼噜神教 (The Purr-fectionists)”、"
+    "“猫草成瘾者 (The Catnip Junkies)”、“DJ Chairman Meow (猫主席)”、"
+    "“Varh Radator Fesidenl Paw-Five”；右栏活动细节含滑稽拼写错误 “4/1 MONDAY SUNL SUNSET”、"
+    "“上海市浦东新区猫抓板路1号顶楼阳台”、“ADV. 1 CAN OF TUNA, DOOR 2 CANS, KITTENS FREE!”；"
+    "最底部一排虚构赞助商标志 “Catberd”、“好主人罐罐有限公司 (Good Oinar Canned Food Ltd)”、"
+    "“iNONEPAWS”。",
+)
+
+
+def _plan_references(subtasks: tuple[str, ...]) -> tuple[str, ...]:
+    """Return the cumulative plan references for a holdout decomposition."""
+    from verl_omni.utils.agentic.plan_protocol import cumulative_subtasks
+
+    return cumulative_subtasks(subtasks)
+
+
 def _cafe_poster_cases() -> list[ValVizCase]:
     """UniCoT reflect/plan cafe-poster holdout used by the RPCO e2e recipe."""
     from verl_omni.utils.dataset.visual_reflection import build_unicot_agentic_rl
@@ -122,8 +163,8 @@ def _cafe_poster_cases() -> list[ValVizCase]:
             task_type="plan",
             system_prompt=build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT,
             user_request=user_text,
-            expected_num_images=1,
-            reference_subtasks=(task,),
+            expected_num_images=len(_CAFE_POSTER_SUBTASKS),
+            reference_subtasks=_plan_references(_CAFE_POSTER_SUBTASKS),
         ),
     ]
 
@@ -168,8 +209,8 @@ def _cn_poster_cases() -> list[ValVizCase]:
             task_type="plan",
             system_prompt=build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT,
             user_request=user_text,
-            expected_num_images=1,
-            reference_subtasks=(_CN_POSTER_TASK,),
+            expected_num_images=len(_CN_POSTER_SUBTASKS),
+            reference_subtasks=_plan_references(_CN_POSTER_SUBTASKS),
         ),
     ]
 

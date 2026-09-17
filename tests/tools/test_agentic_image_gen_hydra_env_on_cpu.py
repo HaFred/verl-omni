@@ -43,7 +43,7 @@ def test_omni_trainer_composes_agentic_image_gen():
     assert cfg.agentic_image_gen.block_generate_after_yes is True
     assert cfg.agentic_image_gen.force_first_generate is False
     assert cfg.agentic_image_gen.force_reflection_after_judge is True
-    assert cfg.agentic_image_gen.rewrite_judge_before_generate is True
+    assert cfg.agentic_image_gen.refuse_premature_judge is True
     assert cfg.agentic_image_gen.e2e_root is None
     assert cfg.agentic_image_gen.good_enough_threshold == 0.80
     assert cfg.agentic_image_gen.qwen_image_height == 512

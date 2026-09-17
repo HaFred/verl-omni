@@ -20,6 +20,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from verl_omni.utils.agentic.text_clip import clip_to_sentences
+
 # Discrete facet grid. Continuous VLM scores are snapped to nearest level
 # (ties → lower value) so good_enough flips only across 0.2 boundaries.
 _SCORE_GRID: tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
@@ -369,8 +371,8 @@ def format_judge_observation(
     correctness = float(parsed["correctness"])
     aesthetics = float(parsed["aesthetics"])
     good = bool(parsed.get("good_enough", False))
-    findings_short = re.sub(r"\s+", " ", str(parsed.get("findings") or "no specific findings")).strip()[:220]
-    fixes_short = re.sub(r"\s+", " ", str(parsed.get("suggested_fixes") or "none")).strip()[:160]
+    findings_short = clip_to_sentences(str(parsed.get("findings") or "no specific findings"), 220)
+    fixes_short = clip_to_sentences(str(parsed.get("suggested_fixes") or "none"), 160)
     text = (
         f"VL judge on the last generated image:\n"
         f"  path={image_path}\n"

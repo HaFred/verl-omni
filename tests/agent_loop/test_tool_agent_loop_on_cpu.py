@@ -111,14 +111,14 @@ def test_force_first_generate_probability_schedule():
     clear_agentic_image_gen()
 
 
-def test_rewrite_judge_before_generate_hydra():
+def test_refuse_premature_judge_hydra():
     from verl_omni.tools.trajectory.hydra_env import agentic_get_bool
 
     clear_agentic_image_gen()
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
-    assert agentic_get_bool("rewrite_judge_before_generate") is True  # yaml default on
-    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"rewrite_judge_before_generate": False}}))
-    assert agentic_get_bool("rewrite_judge_before_generate") is False
+    assert agentic_get_bool("refuse_premature_judge") is True  # yaml default on
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"refuse_premature_judge": False}}))
+    assert agentic_get_bool("refuse_premature_judge") is False
     clear_agentic_image_gen()
 
 
@@ -258,10 +258,7 @@ def test_build_forced_reflection_never_splits_a_sentence_mid_word():
     token run as its instruction for the next rewrite, and the clipped tail silently
     discarded whichever concrete fixes the judge wrote later in the field.
     """
-    sentence = (
-        "The requested English title 'Sofa Montain Slummerfest' is replaced by illegible "
-        "white glyphs. "
-    )
+    sentence = "The requested English title 'Sofa Montain Slummerfest' is replaced by illegible white glyphs. "
     text, _ = utils.build_forced_reflection(_judge_obs(good_enough="NO", findings=sentence * 6))
 
     assert "'Sofa M " not in text

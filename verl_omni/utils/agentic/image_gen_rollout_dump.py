@@ -226,7 +226,9 @@ def _resolve_sample_relpath(
     return relpath, sample_key, rollout_n
 
 
-def _annotate_ordered_turns(rollout_turns: list[dict[str, Any]], user_prompt: str) -> list[dict[str, Any]]:
+def _annotate_ordered_turns(
+    rollout_turns: list[dict[str, Any]], user_prompt: str, *, task_type: str = ""
+) -> list[dict[str, Any]]:
     if rollout_turns and not rollout_turns[0].get("turn_prompt"):
         rollout_turns[0]["turn_prompt"] = user_prompt
     # Prefer the full chat-templated model input in ``turn_prompt`` (system +
@@ -241,11 +243,21 @@ def _annotate_ordered_turns(rollout_turns: list[dict[str, Any]], user_prompt: st
             turn.get("decode") or "",
             turn_obs,
             turn.get("response") or "",
+            task_type=task_type,
+            # The turn's ``response_mask`` composition, so the label is checked
+            # against the mask the trainer used rather than sniffed from the text.
+            advantage=str(turn.get("turn_advantage") or ""),
         )
     return [
         {
             "turn": t.get("turn"),
             "turn_kind": t.get("turn_kind"),
+            # Who owns the tokens: mask=1 policy spans versus the mask=0 observation
+            # and any harness-injected cue. This is the advantage view of the turn.
+            "turn_advantage": t.get("turn_advantage") or "",
+            "policy_tokens": t.get("policy_tokens"),
+            "env_tokens": t.get("env_tokens"),
+            "injected_cue": bool(t.get("injected_cue")),
             "turn_prompt": t.get("turn_prompt") or "",
             "turn_obs": t.get("turn_obs") or "",
             "tool_name": t.get("tool_name") or "",
@@ -293,6 +305,11 @@ def _build_trajectory_payload(
             len(re.findall(_EXECUTED_TOOL_RESPONSE_PAT, turn.get("turn_obs") or "", flags=re.IGNORECASE))
             for turn in ordered_turns
         ),
+        # Advantage view of the rollout: the mask=1 tokens the optimizer actually saw.
+        # A rollout whose ``num_policy_tokens`` is small relative to its length is
+        # mostly harness scaffolding and observation, however long the transcript is.
+        "num_policy_tokens": sum(int(turn.get("policy_tokens") or 0) for turn in ordered_turns),
+        "num_injected_cue_turns": sum(1 for turn in ordered_turns if turn.get("injected_cue")),
         "num_forced_tool_calls": 0,
         "num_voluntary_tool_calls": sum(
             len(re.findall(_TOOL_CALL_PAT, turn.get("decode") or "", flags=re.IGNORECASE | re.DOTALL))
@@ -317,6 +334,12 @@ def _compact_turn_record(turn: dict[str, Any]) -> dict[str, Any]:
     return {
         "turn": turn["turn"],
         "turn_kind": turn["turn_kind"],
+        # Kept next to the label: the dump's labels are mask-consistent, and this is
+        # the mask the consistency was checked against.
+        "turn_advantage": turn.get("turn_advantage") or "",
+        "policy_tokens": turn.get("policy_tokens"),
+        "env_tokens": turn.get("env_tokens"),
+        "injected_cue": bool(turn.get("injected_cue")),
         "turn_prompt": turn.get("turn_obs") or "",
         "tool_name": turn.get("tool_name") or "",
         "tool_prompt": turn.get("tool_prompt") or "",
@@ -332,18 +355,30 @@ def _format_turn_text_block(turn: dict[str, Any]) -> list[str]:
     decode = turn.get("decode") or ""
     kind = turn.get("turn_kind") or "other"
     tool_prompt = turn.get("tool_prompt") or ""
-    header = f"  turn={t} kind={kind} decode_has_tool_call={turn['decode_has_tool_call']}"
+    advantage = turn.get("turn_advantage") or "?"
+    header = (
+        f"  turn={t} kind={kind} advantage={advantage} "
+        f"policy_tokens={turn.get('policy_tokens')} decode_has_tool_call={turn['decode_has_tool_call']}"
+    )
     lines = [header]
     if tool_prompt:
         # Only generate turns carry one; shown here so a rewrite chain is readable
         # without unescaping the JSON tool call out of ``decode``.
         lines += [f"    turn_{t}_tool_prompt:", *[f"      {line}" for line in tool_prompt.splitlines()]]
+    # Mark the mask on the two text bodies a reader would otherwise take at face value:
+    # ``response`` on a cue turn is harness text the optimizer never saw, and ``decode``
+    # is the trainable span. Naming the mask here keeps the transcript honest without
+    # changing the field names the JSON payload uses.
+    response_label = (
+        f"    turn_{t}_response_masked0_injected_cue:" if turn.get("injected_cue") else f"    turn_{t}_response:"
+    )
+    decode_label = "    decode_masked1_policy:" if turn.get("policy_tokens") else "    decode:"
     lines += [
         f"    turn_{t}_prompt:",
         *[f"      {line}" for line in (turn_prompt.splitlines() or [""])],
-        f"    turn_{t}_response:",
+        response_label,
         *[f"      {line}" for line in (response.splitlines() or [""])],
-        "    decode:",
+        decode_label,
         *[f"      {line}" for line in (decode.splitlines() or [""])],
     ]
     return lines
@@ -603,7 +638,8 @@ def dump_rollout_artifacts(
             user_prompt=user_prompt,
         )
         image_dir = str(run_dir / "rollout_images" / relpath) if image_paths else ""
-        ordered_turns = _annotate_ordered_turns(rollout_turns, user_prompt)
+        task_type = str((getattr(final, "extra_fields", None) or {}).get("agentic_task_type") or "").strip().lower()
+        ordered_turns = _annotate_ordered_turns(rollout_turns, user_prompt, task_type=task_type)
         payload = _build_trajectory_payload(
             relpath=relpath,
             image_dir=image_dir,
