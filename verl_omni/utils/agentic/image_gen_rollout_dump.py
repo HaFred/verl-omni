@@ -186,6 +186,45 @@ def _row_has_generate(*, valid: Any, has_gen: Any, n_gen: Any, index: int) -> bo
     return True
 
 
+#: ``sample_<index>`` or ``sample_<index>.<rollout_n>``, the two relpath shapes this
+#: module writes. The index is stamped by the agent loop from the *dataset* index, so
+#: the relpath is the one place that still names the sample after ``output`` has lost
+#: ``index`` (see :func:`_resolve_sample_relpath`).
+_SAMPLE_RELPATH_RE = re.compile(r"sample_(-?\d+)(?:\.(\d+))?$")
+
+
+def _sample_index_from_relpath(relpath: str) -> int | None:
+    """Return the dataset index a trajectory relpath names, or ``None``.
+
+    Args:
+        relpath: ``…/sample_<index>[.<rollout_n>]``.
+
+    Returns:
+        The index, or ``None`` when the path is not in that shape.
+    """
+    match = _SAMPLE_RELPATH_RE.fullmatch(Path(relpath).name)
+    return int(match.group(1)) if match else None
+
+
+def _row_task_type(values: Any, index: int) -> str:
+    """Return the ``agentic_task_type`` for one batch row, normalised or empty.
+
+    Args:
+        values: The output non-tensor batch entry, or ``None``.
+        index: Row index.
+
+    Returns:
+        Lower-cased task type, or ``""`` when the row carries none.
+    """
+    if values is None:
+        return ""
+    try:
+        raw = values[index]
+    except (TypeError, IndexError, KeyError):
+        return ""
+    return str(raw or "").strip().lower()
+
+
 def _resolve_sample_relpath(
     *,
     i: int,
@@ -207,12 +246,12 @@ def _resolve_sample_relpath(
             live_relpath = None
     if live_relpath:
         relpath = live_relpath
-        # Parse sample_index.rollout_n from ``…/sample_6.03`` when present.
-        name = Path(relpath).name
-        m = re.fullmatch(r"sample_(.+)\.(\d+)$", name)
-        if m:
-            sample_key = m.group(1)
-            rollout_n = int(m.group(2))
+        # Parse sample_index[.rollout_n] from ``…/sample_6.03`` when present, and the
+        # index alone from the val holdout form ``…/sample_9004``.
+        match = _SAMPLE_RELPATH_RE.fullmatch(Path(relpath).name)
+        if match:
+            sample_key = match.group(1)
+            rollout_n = int(match.group(2)) if match.group(2) is not None else rollout_counts.get(sample_key, 0)
         else:
             rollout_n = rollout_counts.get(sample_key, 0)
     else:
@@ -280,6 +319,9 @@ def _build_trajectory_payload(
     user_prompt: str,
     ordered_turns: list[dict[str, Any]],
     image_paths: list[str],
+    task_type: str = "",
+    raw_prompt: str = "",
+    raw_response: str = "",
 ) -> dict[str, Any]:
     return {
         "trajectory_relpath": relpath,
@@ -287,7 +329,16 @@ def _build_trajectory_payload(
         "step": step_i,
         "sample_index": int(sample_index) if str(sample_index).lstrip("-").isdigit() else str(sample_index),
         "rollout_n": rollout_n,
+        # ``plan`` / ``reflect`` for this row. Recorded because it is what
+        # ``turn_kind`` keys its plan labels off, so a dump that shows no ``plan``
+        # label can be told apart from one whose row never claimed the plan protocol.
+        "task_type": task_type,
         "user_prompt": user_prompt,
+        # The literal episode the trainer held: the prompt tokens the policy read and the
+        # response tokens it produced, decoded in order. ``rollout_turns`` below is a
+        # mask-annotated *interpretation* of this; these two are the raw ``output`` row.
+        "raw_prompt": raw_prompt,
+        "raw_response": raw_response,
         "rollout_turns": ordered_turns,
         "image_paths": image_paths,
         "image_paths_in_obs": sorted(
@@ -348,9 +399,84 @@ def _compact_turn_record(turn: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _raw_text_block(label: str, text: str) -> list[str]:
+    """Render one literal token-stream section, indented and never an empty body.
+
+    Args:
+        label: Section heading.
+        text: Decoded token text.
+
+    Returns:
+        Lines to extend a dump with.
+    """
+    return [f"{label}:", *[f"  {line}" for line in (text.splitlines() or [""])]]
+
+
+def _dump_header_lines(
+    *,
+    relpath: str,
+    sample_index: Any,
+    rollout_n: int,
+    user_prompt: str,
+    task_type: str,
+    prefixed: bool = False,
+) -> list[str]:
+    """Return the identifying header for one rollout's text dump.
+
+    Args:
+        relpath: Trajectory relpath (or bare sample name for the step monitor).
+        sample_index: Dataset sample index actually used for this row.
+        rollout_n: Rollout group index.
+        user_prompt: The user turn.
+        task_type: ``plan`` / ``reflect`` / ``""``.
+        prefixed: Wrap in a ``=== ===`` banner (the step monitor holds many rollouts).
+
+    Returns:
+        Header lines.
+    """
+    ident = f"{relpath}  sample={sample_index} rollout_n={rollout_n}" if prefixed else relpath
+    first = f"=== {ident} ===" if prefixed else f"relpath={ident}"
+    return [
+        first,
+        f"task_type={task_type or 'unspecified'} sample_index={sample_index} rollout_n={rollout_n}",
+        f"user_prompt: {user_prompt}",
+    ]
+
+
+def _raw_sections(raw_prompt: str, raw_response: str) -> list[str]:
+    """Return the literal prompt/response sections plus the annotated-turn preamble.
+
+    These come first so the file can be read as the episode the trainer optimised. The
+    per-turn blocks that follow re-present the same tokens with the ``response_mask``
+    made explicit, which is what the raw decode cannot show.
+
+    Args:
+        raw_prompt: Decoded prompt token ids.
+        raw_response: Decoded response token ids.
+
+    Returns:
+        Lines to extend a dump with.
+    """
+    return [
+        "",
+        *_raw_text_block("raw_prompt (decoded prompt tokens: the exact input)", raw_prompt),
+        "",
+        *_raw_text_block("raw_response (decoded response tokens: the exact episode output)", raw_response),
+        "",
+        "# annotated_turns: the same tokens split by response_mask. advantage=policy spans",
+        "# are mask=1 (trainable); advantage=cue/env spans are mask=0 (observation or a",
+        "# harness-injected cue, outside the advantage).",
+        "annotated_turns:",
+    ]
+
+
 def _format_turn_text_block(turn: dict[str, Any]) -> list[str]:
     t = int(turn["turn"])
-    turn_prompt = turn.get("turn_prompt") or ""
+    # The full chat-templated model input is deliberately *not* printed per turn: it is
+    # the whole system prompt plus every earlier turn, so printing it each time repeats
+    # the same ~40 lines and buries the episode. It stays in the JSON payload as
+    # ``turn_prompt``; the text dump leads with the literal raw prompt/response instead.
+    turn_obs = turn.get("turn_obs") or ""
     response = turn.get("response") or ""
     decode = turn.get("decode") or ""
     kind = turn.get("turn_kind") or "other"
@@ -374,8 +500,8 @@ def _format_turn_text_block(turn: dict[str, Any]) -> list[str]:
     )
     decode_label = "    decode_masked1_policy:" if turn.get("policy_tokens") else "    decode:"
     lines += [
-        f"    turn_{t}_prompt:",
-        *[f"      {line}" for line in (turn_prompt.splitlines() or [""])],
+        f"    turn_{t}_obs:",
+        *[f"      {line}" for line in (turn_obs.splitlines() or [""])],
         response_label,
         *[f"      {line}" for line in (response.splitlines() or [""])],
         decode_label,
@@ -436,6 +562,16 @@ def dump_raw_rollouts(
                 validate=validate,
             )
             rollout_counts[sample_key] = max(rollout_counts.get(sample_key, 0), int(rollout_n) + 1)
+            # The payload's ``sample_index`` must name the sample the artifacts name.
+            # ``indices`` above reads ``output.non_tensor_batch["index"]``, which the
+            # parent ``_postprocess`` only forwards when ``reward_loop_worker_handles``
+            # is None; with the agent reward loop enabled the key is absent and the
+            # lookup falls back to ``np.arange`` — so the 9001-9004 holdout was dumped
+            # with ``sample_index`` 0,1,2,3 beside folders named 9001-9004. The relpath
+            # is stamped by the loop from the real index, so it wins.
+            relpath_index = _sample_index_from_relpath(relpath)
+            if relpath_index is not None:
+                sample_index = relpath_index
             user_prompt = last_user_prompt(raw_prompts[i]) if raw_prompts is not None else ""
             prompt_ids = None
             if "prompts" in output.batch:
@@ -460,7 +596,17 @@ def dump_raw_rollouts(
                 user_prompt=user_prompt,
             )
             image_dir = str(run_dir / "rollout_images" / relpath) if image_paths else ""
-            ordered_turns = _annotate_ordered_turns(rollout_turns, user_prompt)
+            # ``agentic_task_type`` is stamped into the loop's ``extra_fields`` and the
+            # parent ``_postprocess`` copies every extra-field key into the output's
+            # non-tensor batch, so it is available here even when the input non-tensor
+            # batch (and with it ``extra_info``) is not forwarded. ``turn_kind`` no longer
+            # branches on it — labels are read off the turn's own text — so this only
+            # stamps the row's provenance onto the dump header.
+            task_type = _row_task_type(output.non_tensor_batch.get("agentic_task_type"), i)
+            ordered_turns = _annotate_ordered_turns(rollout_turns, user_prompt, task_type=task_type)
+            # The literal token streams: ``raw_response`` is the whole episode exactly as
+            # the agent loop produced it, before any turn splitting or relabelling.
+            raw_prompt_text = "" if prompt_ids is None else tokenizer.decode(prompt_ids, skip_special_tokens=False)
             payload = _build_trajectory_payload(
                 relpath=relpath,
                 image_dir=image_dir,
@@ -470,23 +616,33 @@ def dump_raw_rollouts(
                 user_prompt=user_prompt,
                 ordered_turns=ordered_turns,
                 image_paths=image_paths,
+                task_type=task_type,
+                raw_prompt=raw_prompt_text,
+                raw_response=decoded_response,
             )
             reward_metrics = AgenticRewardMetrics.for_rollout(output, i)
 
             name = Path(relpath).name
             (trajectory_dir / f"{name}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
-            trajectory_text = [
-                f"relpath={relpath}",
-                f"user_prompt: {user_prompt}",
-                "assistant_rollout:",
-            ]
-            step_text.extend(
-                [
-                    f"=== {name}  sample={sample_index} rollout_n={rollout_n} ===",
-                    f"user_prompt: {user_prompt}",
-                    "assistant_rollout:",
-                ]
+            trajectory_text = _dump_header_lines(
+                relpath=relpath,
+                sample_index=sample_index,
+                rollout_n=rollout_n,
+                user_prompt=user_prompt,
+                task_type=task_type,
             )
+            trajectory_text += _raw_sections(raw_prompt_text, decoded_response)
+            step_text.extend(
+                _dump_header_lines(
+                    relpath=name,
+                    sample_index=sample_index,
+                    rollout_n=rollout_n,
+                    user_prompt=user_prompt,
+                    task_type=task_type,
+                    prefixed=True,
+                )
+            )
+            step_text += _raw_sections(raw_prompt_text, decoded_response)
             for turn in ordered_turns:
                 block = _format_turn_text_block(turn)
                 trajectory_text.extend(block)
@@ -640,6 +796,7 @@ def dump_rollout_artifacts(
         image_dir = str(run_dir / "rollout_images" / relpath) if image_paths else ""
         task_type = str((getattr(final, "extra_fields", None) or {}).get("agentic_task_type") or "").strip().lower()
         ordered_turns = _annotate_ordered_turns(rollout_turns, user_prompt, task_type=task_type)
+        raw_prompt_text = "" if not prompt_ids else tokenizer.decode(list(prompt_ids), skip_special_tokens=False)
         payload = _build_trajectory_payload(
             relpath=relpath,
             image_dir=image_dir,
@@ -649,23 +806,33 @@ def dump_rollout_artifacts(
             user_prompt=user_prompt,
             ordered_turns=ordered_turns,
             image_paths=image_paths,
+            task_type=task_type,
+            raw_prompt=raw_prompt_text,
+            raw_response=decoded_response,
         )
-        trajectory_text = [
-            f"relpath={relpath}",
-            f"user_prompt: {user_prompt}",
-            "assistant_rollout:",
-        ]
+        trajectory_text = _dump_header_lines(
+            relpath=relpath,
+            sample_index=sample_index,
+            rollout_n=rollout_n,
+            user_prompt=user_prompt,
+            task_type=task_type,
+        )
+        trajectory_text += _raw_sections(raw_prompt_text, decoded_response)
         for turn in ordered_turns:
             trajectory_text.extend(_format_turn_text_block(turn))
         trajectory_text.append("")
         (trajectory_dir / f"{name}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
         (trajectory_dir / f"{name}.txt").write_text("\n".join(trajectory_text) + "\n")
 
-        step_text = [
-            f"=== {name}  sample={sample_index} rollout_n={rollout_n} ===",
-            f"user_prompt: {user_prompt}",
-            "assistant_rollout:",
-        ]
+        step_text = _dump_header_lines(
+            relpath=name,
+            sample_index=sample_index,
+            rollout_n=rollout_n,
+            user_prompt=user_prompt,
+            task_type=task_type,
+            prefixed=True,
+        )
+        step_text += _raw_sections(raw_prompt_text, decoded_response)
         for turn in ordered_turns:
             step_text.extend(_format_turn_text_block(turn))
         step_text.append("")

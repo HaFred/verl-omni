@@ -21,18 +21,22 @@ their agent-loop or dataset modules.
 Wire with ``reward.reward_manager.name=naive`` so verl passes ``solution_str``.
 ``VisualRewardManager``'s ``solution_image`` is the wrong modality and raises.
 
-The active reward set is ``{reflect, plan, format, tool, result, improve}``. ``plan``
-is active only for plan rows. ``improve`` scores the judge-outcome lift across the
-rewrite chain. ``done`` and ``tool_call`` reproduce the PR1 closed-loop indicators for
-metrics, but are not additional score dimensions.
-Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
-receive score zero and ``rollout_valid=0``. ``task_type`` is required.
+The active reward set is ``{reflect, format, tool, result, improve}``. ``improve``
+scores the judge-outcome lift across the rewrite chain. ``done`` and ``tool_call``
+reproduce the PR1 closed-loop indicators for metrics, but are not additional score
+dimensions. Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
+receive score zero and ``rollout_valid=0``.
+
+Every data source is scored by this one formula. The reflect and plan corpora run the
+same loop and the same weights and differ only in their system prompt, so their reward
+curves are comparable; a row's ``task_type`` is carried for monitoring only and never
+selects a dimension. ``task_type`` is still required as a data contract.
 
 Judge C/A is trusted only after a parsed ``judge_image`` ``<tool_call>`` and the
 tool observation header. Coverage is token F1 (not recall-only), so dumping
-reference words into a long blob does not max ``R_reflect`` / ``R_plan``.
-Rewrite-after-YES zeros ``R_result`` as well as the Done indicator. Reflect
-``R_result`` requires a terminal trusted YES. ``R_tool`` needs a successful
+reference words into a long blob does not max ``R_reflect``.
+Rewrite-after-YES zeros ``R_result`` as well as the Done indicator. ``R_result``
+requires a terminal trusted YES. ``R_tool`` needs a successful
 PNG generate plus a trusted judge (not merely a parsed tool call).
 """
 
@@ -43,9 +47,8 @@ import re
 from typing import Any
 
 from verl_omni.utils.agentic.judge_delta import judge_delta_reward
-from verl_omni.utils.agentic.plan_protocol import plan_lines_from_prose
 
-DIMS = ("reflect", "plan", "format", "tool", "result", "improve")
+DIMS = ("reflect", "format", "tool", "result", "improve")
 #: Dims renamed after parquet was already built under the old weight key.
 _LEGACY_WEIGHT_ALIASES: dict[str, tuple[str, ...]] = {"improve": ("w_novelty",)}
 # Names consumed by AgenticMetricsAgentLoopManager when PR1 and PR3 are
@@ -192,7 +195,7 @@ def _assistant_prose(text: str) -> str:
 
 
 def _assistant_prose_lines(text: str) -> str:
-    """Strip protocol payloads while preserving plan-item line boundaries."""
+    """Strip protocol payloads while preserving line boundaries."""
     prose = _TOOL_CALL_RE.sub("\n", text or "")
     prose = _TOOL_OBS_LINE_RE.sub("", prose)
     prose = re.sub(r"</?think>", "", prose, flags=re.IGNORECASE)
@@ -339,21 +342,6 @@ def _generates_after_first_yes(text: str, calls: list[tuple[int, int, dict[str, 
     return sum(1 for start, _, call in calls if start > yes_position and _tool_name(call) == "generate_image")
 
 
-def _extract_plan_lines(text: str) -> list[str]:
-    """Extract the policy's numbered subtask prompts from a rollout transcript.
-
-    The line grammar lives in ``plan_protocol`` so the loop's "did the model write its
-    plan" predicate and this reference comparison cannot drift apart.
-
-    Args:
-        text: Full rollout transcript.
-
-    Returns:
-        Plan item texts in order, empty when the policy wrote no plan.
-    """
-    return plan_lines_from_prose(_assistant_prose_lines(text))
-
-
 def _reflection_text(text: str) -> str:
     prose = _assistant_prose(text)
     match = re.search(r"\bReflection\s*:(.*?)(?:\bDone\.\s*$|$)", prose, re.IGNORECASE | re.DOTALL)
@@ -383,20 +371,9 @@ def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
     return 0.5 * quality + 0.5 * _coverage(_reflection_text(text), reference)
 
 
-def _plan_reward(text: str, ground_truth: dict[str, Any]) -> float:
-    references = [str(item).strip() for item in ground_truth.get("reference_subtasks") or [] if str(item).strip()]
-    candidates = _extract_plan_lines(text)
-    if not references or not candidates:
-        return 0.0
-    return sum(max(_coverage(candidate, reference) for candidate in candidates) for reference in references) / len(
-        references
-    )
-
-
 def _format_reward(
     text: str,
     *,
-    task_type: str,
     successful_generates: int,
     forced_context: bool = False,
 ) -> float:
@@ -405,19 +382,16 @@ def _format_reward(
     names = [_tool_name(call) for _, _, call in calls]
     generates = [index for index, name in enumerate(names) if name == "generate_image"]
     judges = [index for index, name in enumerate(names) if name == "judge_image"]
-    terminal_done, policy_reflection, _ = _terminal_decision(text)
+    terminal_done, _, _ = _terminal_decision(text)
     checks = [
         raw_blocks > 0 and len(calls) == raw_blocks,
         successful_generates >= 1,
         bool(judges) and (not generates or max(judges) > max(generates)),
         terminal_done,
-    ]
-    if task_type == "plan":
-        checks.extend((bool(_extract_plan_lines(text)), policy_reflection or forced_context))
-    else:
         # #409 force-injects Reflection (stripped from prose) then policy Done.
         # Count forced_context so the default curriculum can still saturate format.
-        checks.append(bool(_REFLECTION_RE.search(_assistant_prose(text))) or forced_context)
+        bool(_REFLECTION_RE.search(_assistant_prose(text))) or forced_context,
+    ]
     return sum(checks) / len(checks)
 
 
@@ -463,29 +437,27 @@ def _report_expected(expected: int | None) -> int:
 def _result_reward(
     text: str,
     *,
-    task_type: str,
-    expected: int | None,
     successful_generates: int,
     terminal_done: bool,
     blocked: bool,
     rewrite_after_yes: int,
 ) -> float:
+    """Score the rollout's own stopping decision, for every data source.
+
+    ``expected_num_images`` is deliberately NOT enforced. It is the reference
+    trajectory's image count, and the protocol tells the agent to rewrite until the
+    judge is satisfied while hiding this field from it, so capping at the reference's
+    budget punishes exactly the iteration the task asks for. Nothing is lost by dropping
+    it: ``rewrite_after_yes`` already blocks generating after a YES (so a rollout cannot
+    farm result points by looping), and ``agentic_image_gen.max_generate_image_passes``
+    already bounds total generates at the tool. Enforcing cost belongs there, not here,
+    because a per-dim reward cannot separate "iterated usefully" from "iterated". Fail
+    closed on a terminal NO: early-stop alone is not a free result point.
+    """
     if blocked or not terminal_done or successful_generates < 1 or rewrite_after_yes > 0:
         return 0.0
-    if task_type == "plan":
-        # A plan's whole point is one image per subtask, so the count must match.
-        return 1.0 if expected is not None and successful_generates == expected else 0.0
     judges = _successful_judges(text)
     final_yes = bool(judges) and judges[-1][2] is True
-    # ``expected`` is deliberately NOT enforced here. It is the reference trajectory's
-    # image count, and the reflect protocol tells the agent to rewrite until the judge is
-    # satisfied while hiding this field from it, so capping at the reference's budget
-    # punishes exactly the iteration the task asks for. Nothing is lost by dropping it:
-    # ``rewrite_after_yes`` already blocks generating after a YES (so a rollout cannot
-    # farm result points by looping), and ``agentic_image_gen.max_generate_image_passes``
-    # already bounds total generates at the tool. Enforcing cost belongs there, not here,
-    # because a per-dim reward cannot separate "iterated usefully" from "iterated".
-    # Fail closed on a terminal NO: early-stop alone is not a free result point.
     return 1.0 if final_yes else 0.0
 
 
@@ -547,14 +519,10 @@ def _require_task_type(ground_truth: dict[str, Any], extra_info: dict[str, Any])
     return task_type
 
 
-def _active_weights(
-    ground_truth: dict[str, Any], extra_info: dict[str, Any], *, task_type: str
-) -> dict[str, float] | None:
+def _active_weights(ground_truth: dict[str, Any], extra_info: dict[str, Any]) -> dict[str, float] | None:
     """Return positive active-set weights, or None if a ``w_*`` value is garbage."""
     weights = {}
     for dim in DIMS:
-        if dim == "plan" and task_type != "plan":
-            continue
         raw = ground_truth.get(f"w_{dim}")
         if raw is None:
             raw = extra_info.get(f"w_{dim}")
@@ -595,7 +563,8 @@ def compute_score(
         data_source: Unused; kept for the verl ``compute_score`` signature.
         solution_str: Decoded trajectory text (NaiveRewardManager).
         ground_truth: Must include ``task_type`` (``reflect`` / ``plan``) plus
-            optional references and ``w_*`` weights.
+            optional references and ``w_*`` weights. ``task_type`` is carried into the
+            metrics for monitoring; it does not select a dimension.
         extra_info: Fallback for ``task_type`` / weights; optional tokenizer.
         **kwargs: May include ``responses`` + tokenizer, or ``solution_image``
             (rejected).
@@ -609,7 +578,7 @@ def compute_score(
     task_type = _require_task_type(gt, metadata)
     if task_type is None:
         return _zero_result(method="agentic_multidim_missing_task_type")
-    weights = _active_weights(gt, metadata, task_type=task_type)
+    weights = _active_weights(gt, metadata)
     if weights is None:
         return _zero_result(method="agentic_multidim_bad_weights")
 
@@ -689,10 +658,8 @@ def compute_score(
     closed = valid_terminal_context and terminal_done and (policy_reflection or forced_context)
     rewards = {
         "reflect": _reflection_reward(text, gt),
-        "plan": _plan_reward(text, gt),
         "format": _format_reward(
             text,
-            task_type=task_type,
             successful_generates=successful_generates,
             forced_context=forced_context,
         ),
@@ -700,8 +667,6 @@ def compute_score(
         "improve": judge_delta_score,
         "result": _result_reward(
             text,
-            task_type=task_type,
-            expected=expected,
             successful_generates=successful_generates,
             terminal_done=terminal_done,
             blocked=blocked,

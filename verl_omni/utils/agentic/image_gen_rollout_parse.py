@@ -115,9 +115,9 @@ def turn_kind(
         decode: Decoded assistant text for this turn.
         turn_prompt: Prompt / observation text feeding the turn.
         response: Optional response text used for forced-reflection cues.
-        task_type: ``reflect`` / ``plan`` for this rollout. Plan labels are only applied
-            to ``plan`` rows, because a reflect rewrite can carry numbered lines too and
-            must not be relabelled as planning.
+        task_type: Unused by the labelling rules; kept so the dump can pass the row's
+            ``task_type`` through one signature. Reflect and plan rollouts are labelled
+            identically, so the same turn shape reads the same in either corpus.
         advantage: :func:`advantage_class` of this turn, or ``""`` when the caller does
             not know the mask. ``""`` keeps the legacy text sniffing.
 
@@ -137,10 +137,12 @@ def turn_kind(
         if mask_aware
         else bool(re.search(r"\bagentic_forced_reflection=1\b", forced_context, re.IGNORECASE))
     )
-    # A plan-mode turn either carries the plan alone (the protocol spends its first
-    # turn on it) or, if the splitter could not separate the adjacent model spans,
-    # plan text followed by the first tool call. Label both so the plan stays visible.
-    planned = task_type == "plan" and policy_side_ok and bool(plan_lines_from_prose(decode or ""))
+    # A plan turn either carries the plan alone (the prompt spends its first turn on it)
+    # or, if the splitter could not separate the adjacent model spans, plan text followed
+    # by the first tool call. Label both so the plan stays visible. The gate is the
+    # numbered list itself, not the row's ``task_type``: the reflect and plan corpora run
+    # the same loop, and it is the prompt that decides which one writes prose first.
+    planned = policy_side_ok and bool(plan_lines_from_prose(decode or ""))
     if called and policy_side_ok:
         # Label by the call the model emitted *first*: that is the only one that
         # executes (``multi_turn.max_parallel_calls``). Testing ``judge_image``

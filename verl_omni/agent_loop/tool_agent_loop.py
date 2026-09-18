@@ -80,7 +80,9 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         # Per-rollout latch reset: YES from sample N must not block sample N+1.
         self._agentic_step = kwargs.pop("_agentic_step", 0)
         self._agentic_validate = bool(kwargs.pop("_agentic_validate", False))
-        # ``reflect``/``plan`` select different protocols, not just different prompts.
+        # Monitoring label only. Reflect and plan rollouts run the *same* loop; the only
+        # difference between the two data sources is the system prompt, so nothing here
+        # may branch on this value.
         self._agentic_task_type = str(kwargs.pop("_agentic_task_type", "") or "").strip().lower()
         self._agentic_trajectory_relpath = (
             kwargs.pop("_agentic_trajectory_relpath", None) or active_trajectory_relpath.get()
@@ -103,8 +105,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             output.extra_fields.setdefault("force_first_probability", 0.0)
             output.extra_fields.setdefault("force_first_swap_rejected", False)
             output.extra_fields.setdefault("plan_turn_seen", False)
-            # Carried to the monitoring dump, where ``turn_kind`` only labels ``plan``
-            # turns for ``plan`` rows (a reflect rewrite can also contain numbered lines).
+            # Monitoring label, mirrored from the row's ``task_type``.
             output.extra_fields.setdefault("agentic_task_type", self._agentic_task_type)
             output.extra_fields.setdefault("num_generate_image_prompts", 0)
             output.extra_fields.setdefault("rollout_has_generate", 0)
@@ -117,27 +118,28 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             if path_tokens is not None:
                 reset_active_trajectory_relpath(path_tokens)
 
-    async def _agentic_refuse_premature_judge(self, agent_data: AgentData) -> AgentState:
-        """Answer a ``judge_image`` call that has no image to inspect.
+    async def _agentic_refuse_tool_calls(
+        self,
+        agent_data: AgentData,
+        *,
+        reason: str,
+        guidance: str,
+        flag: str,
+    ) -> AgentState:
+        """Answer every call in this turn with one observation and execute none of them.
 
-        ``REFLECT_SYSTEM_PROMPT`` says "Always generate before judging", but a policy
-        still sometimes judges first, and the tool cannot satisfy that: there is no live
-        PNG. The honest response is an observation saying so.
-
-        The harness used to answer this by *replacing* the call with
-        ``generate_image(prompt=<raw user request>)`` and marking the replacement
-        ``mask=1``. That deleted the policy's own action, trained the bare restatement
-        both system prompts forbid, and put harness text inside the advantage. A tool
-        response keeps the call visible, leaves the prompt to the policy, and costs one
-        generation round-trip on a slip that should be rare.
-
-        Unlike the forced-Reflection cue and the force-first substitution, this is
-        environment feedback rather than harness-authored model text, so it applies to
-        every rollout — plan and validation included. A val rollout should recover from
-        a slip the way a real environment lets it.
+        A refusal is *environment* feedback, not harness-authored model text. The policy's
+        call stays in the transcript, the harness substitutes nothing, and the notice is
+        merged as ``mask=0``, so it never enters the advantage. That is what separates a
+        refusal from the substitutions this loop used to perform, and why a refusal is
+        deliberately not gated on ``validate``: a validation rollout gets it too, and
+        recovers from an invalid action the way a real environment lets it.
 
         Args:
             agent_data: Live per-rollout agent state, holding the refused calls.
+            reason: Marker for the notice (``agentic_tool_refused reason=…``).
+            guidance: Sentences describing what an acceptable turn looks like.
+            flag: ``extra_fields`` key set True so the refusal rate is monitorable.
 
         Returns:
             ``AgentState.GENERATING`` when the notice fits, else ``TERMINATED``.
@@ -146,11 +148,10 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         names = [str(getattr(call, "name", "") or "unknown") for call in refused]
         joined = ", ".join(names)
         text = (
-            "Refused: there is no image to judge yet. "
+            f"Refused: {guidance} "
             f"{joined} in this turn was not executed. "
-            "Call generate_image for the user's request and wait for its <tool_response>, "
-            "then judge the image it returns. "
-            f"agentic_tool_refused reason=no_image n={len(names)} names={joined}"
+            "Emit one tool call per turn and wait for its <tool_response> before the next call. "
+            f"agentic_tool_refused reason={reason} n={len(names)} names={joined}"
         )
         previous_messages = list(agent_data.messages)
         for call in refused:
@@ -178,14 +179,44 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         agent_data.response_mask = response_mask
         if agent_data.response_logprobs:
             agent_data.response_logprobs = response_logprobs or []
-        agent_data.extra_fields["refused_premature_judge"] = True
-        agent_data.extra_fields["refused_judge_names"] = joined
+        agent_data.extra_fields[flag] = True
         logger.info(
-            "Refused premature judge_image at global_step=%s (no live image): %s",
+            "Refused %s at global_step=%s: %s",
+            reason,
             getattr(self, "_agentic_step", 0),
             joined,
         )
         return AgentState.GENERATING
+
+    async def _agentic_refuse_premature_judge(self, agent_data: AgentData) -> AgentState:
+        """Answer a ``judge_image`` call that has no image to inspect.
+
+        ``REFLECT_SYSTEM_PROMPT`` says "Always generate before judging", but a policy
+        still sometimes judges first, and the tool cannot satisfy that: there is no live
+        PNG. The honest response is an observation saying so.
+
+        The harness used to answer this by *replacing* the call with
+        ``generate_image(prompt=<raw user request>)`` and marking the replacement
+        ``mask=1``. That deleted the policy's own action, trained the bare restatement
+        both system prompts forbid, and put harness text inside the advantage. A tool
+        response keeps the call visible, leaves the prompt to the policy, and costs one
+        generation round-trip on a slip that should be rare.
+
+        Args:
+            agent_data: Live per-rollout agent state, holding the refused calls.
+
+        Returns:
+            ``AgentState.GENERATING`` when the notice fits, else ``TERMINATED``.
+        """
+        return await self._agentic_refuse_tool_calls(
+            agent_data,
+            reason="no_image",
+            guidance=(
+                "there is no image to judge yet. Call generate_image for the user's request "
+                "and wait for its <tool_response>, then judge the image it returns."
+            ),
+            flag="refused_premature_judge",
+        )
 
     async def _encode_assistant_completion(self, text: str) -> list[int]:
         """Encode as a generation delta (content + EOS), matching server-sampled tokens.
@@ -332,43 +363,28 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         return AgentState.PROCESSING_TOOLS
 
     def _agentic_exempt_from_forced_actions(self) -> bool:
-        """Whether the policy must author every action in this rollout.
+        """Whether the harness must not inject cues or substitute actions.
 
-        One rule for one concept: the harness is allowed to inject a Reflection cue and
-        to substitute an action, and both count as harness-authored tokens. Two kinds of
-        rollout must be left alone.
+        Only validation is exempt. ``force_first_generate_probability`` already
+        short-circuits on ``validate``, but the Reflection cue and the action
+        substitutions did not, so val transcripts — and val advantages — were partly
+        curriculum. Exempting all of them makes a val rollout measure what the policy
+        chooses.
 
-        * **Plan mode.** The reflect machinery contradicts the plan protocol: the cue
-          says "rewriting the diffusion prompt next" after every judge, and the action
-          substitutions replace the model's span with ``generate_image(prompt=<raw user
-          request>)`` — the bare restatement ``PLAN_SYSTEM_PROMPT`` explicitly forbids,
-          and which deletes the plan the model just wrote. With them enabled a plan
-          rollout is pushed into the reflect rewrite loop, which is what ``sample_9004``
-          did.
-        * **Validation.** ``force_first_generate_probability`` already short-circuits on
-          ``validate``, but the cue and the substitutions did not, so val transcripts —
-          and val advantages — were partly curriculum. Exempting all of them makes a val
-          rollout measure what the policy chooses.
-
-        Checked before the ``force_reflection_after_judge`` knob so a protocol exemption
-        cannot be re-enabled by config, while that knob keeps its full meaning for reflect
+        Checked before the ``force_reflection_after_judge`` knob so a validation exemption
+        cannot be re-enabled by config, while that knob keeps its full meaning for
         training. A refusal that only reports a fact back to the actor — see
         :meth:`_agentic_refuse_premature_judge` — is not harness-authored model text and
         is deliberately not gated here.
 
+        Reflect and plan rollouts are *not* distinguished here. Both data sources run the
+        same loop; the difference between them lives in the system prompt, which is what
+        makes the two validation reward curves comparable.
+
         Returns:
             ``True`` when the harness must not inject cues or substitute actions.
         """
-        return self._agentic_protocol() == "plan" or bool(getattr(self, "_agentic_validate", False))
-
-    def _agentic_protocol(self) -> str:
-        """Return ``reflect`` / ``plan`` / ``""`` for this rollout.
-
-        ``run()`` binds the value from ``_agentic_task_type``; helpers are also called
-        directly by unit tests against a loop that never ran, so the lookup tolerates
-        the attribute being absent.
-        """
-        return str(getattr(self, "_agentic_task_type", "") or "").strip().lower()
+        return bool(getattr(self, "_agentic_validate", False))
 
     def _agentic_continue_after_plan_turn(
         self,
@@ -377,20 +393,27 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         *,
         messages_before: int,
     ) -> AgentState | None:
-        """Reopen one tool-call-free plan turn as ``GENERATING``.
+        """Reopen one tool-call-free *plan* turn as ``GENERATING``.
 
         The stock loop ends a rollout the moment an assistant turn carries no tool
-        call, because a finished policy writes prose and stops. Plan mode spends its
-        first turn on the numbered subtask list and only starts generating on the
-        next, so that rule would end every plan rollout at the plan.
+        call, because a finished policy writes prose and stops. The plan data is built on
+        a two-step shape: the agent writes the numbered plan, and only calls
+        ``generate_image`` on the next turn. Without this override every plan rollout
+        would end at the plan with zero images.
+
+        This is the one place the loop looks at what a turn *contains*. It is deliberately
+        not a ``task_type`` branch: the gate is the numbered list itself, so reflect and
+        plan rollouts run the same code and it is the system prompt that decides which
+        one writes prose first. A reflect rollout calls the tool on turn one, so this
+        never fires for it.
 
         Only the no-tool-call exit appends an assistant message — the length and turn
         budget exits return before that — so growth in ``agent_data.messages``
         identifies this termination as "the model stopped talking" rather than "the
         harness stopped it". The continuation is bounded to one turn
         (``plan_turn_seen``) and to the window before the first image, so a policy that
-        emits prose without a plan, or rambles after generating, still terminates on
-        the stock rules.
+        rambles after generating, or writes prose twice, still terminates on the stock
+        rules.
 
         Args:
             agent_data: Live per-rollout agent state, already post-generation.
@@ -401,7 +424,7 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             ``AgentState.GENERATING`` to consume the plan turn, else ``None`` to keep
             the caller's state.
         """
-        if state != AgentState.TERMINATED or self._agentic_protocol() != "plan":
+        if state != AgentState.TERMINATED:
             return None
         if agent_data.tool_calls or agent_data.extra_fields.get("plan_turn_seen"):
             return None
@@ -419,6 +442,23 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             getattr(self, "_agentic_step", 0),
         )
         return AgentState.GENERATING
+
+    @staticmethod
+    def _agentic_last_assistant_prose(agent_data: AgentData) -> str:
+        """Return the text of the most recent assistant turn, or ``""``.
+
+        Args:
+            agent_data: Live per-rollout agent state.
+
+        Returns:
+            Assistant text with multimodal parts joined; empty when the last turn is not
+            an assistant turn.
+        """
+        for message in reversed(agent_data.messages):
+            if message.get("role") != "assistant":
+                continue
+            return _assistant_content_text(message)
+        return ""
 
     def _record_force_first_swap_rejected(self, agent_data: AgentData, *, reason: str) -> None:
         agent_data.extra_fields["force_first_swap_rejected"] = True
@@ -471,18 +511,16 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         # that last assistant span, so budget is checked inside
         # ``_replace_last_assistant_with_tool_call`` after the swap.
         #
-        # Plan mode opts out entirely. Both substitutions below contradict its
-        # protocol: the first-turn one replaces the assistant span with
-        # ``generate_image(prompt=<raw user request>)``, deleting the plan the model
-        # just wrote and training on the bare restatement the prompt forbids, and the
-        # later one forces a judge after every generate, which is judging between
-        # subtasks.
+        # Every rollout gets the same substitutions; nothing here branches on the data
+        # source. Reflect and plan differ only in their system prompt. A reflect rollout
+        # calls the tool on turn one, so there is nothing to replace. A plan rollout
+        # writes its plan first, and that turn was already reopened as ``GENERATING`` by
+        # :meth:`_agentic_continue_after_plan_turn` above, so this block never sees it.
         if (
             state != AgentState.TERMINATED
             or agent_data.tool_calls
             or probability <= 0.0
             or random.random() >= probability
-            or self._agentic_protocol() == "plan"
         ):
             return state
 
@@ -586,12 +624,13 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         gen_passes = n_gen
         max_passes = max_generate_passes()
         force_done = gen_passes >= max_passes
-        if self._agentic_exempt_from_forced_actions():
-            # Plan mode / validation: neither the continue cue nor the max-pass stop
-            # cue. The plan protocol terminates on the policy's own ``Done.``, and a val
-            # rollout must measure the policy rather than the curriculum.
-            return state
+        # Both cues are gated by one predicate, and it exempts validation only: a val
+        # rollout must measure the policy rather than the curriculum. Reflect and plan
+        # training both keep them, so the two corpora see the same loop.
         force_reflection = agentic_get_bool("force_reflection_after_judge")
+        if self._agentic_exempt_from_forced_actions():
+            force_reflection = False
+            force_done = False
         if not force_reflection and not force_done:
             return state
 
@@ -606,6 +645,9 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
 
         reflection_text, stop_required = forced
         if not force_reflection:
+            # Stop cue only: ``force_reflection_after_judge`` is off, so a continue cue
+            # must not be authored, and the stop cue is ours to author only when the cap
+            # is what ended the run.
             if not stop_required:
                 return state
             if not force_done:

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -285,6 +286,25 @@ def test_turn_kind_labels_the_first_tool_call():
     # Single-call labels are unchanged.
     assert turn_kind(gen_only, "prompt", "") == "call_generate_image"
     assert turn_kind(judge_only, "prompt", "") == "call_judge_image"
+
+
+def test_plan_turn_labels_do_not_depend_on_the_task_type():
+    """The label is a claim about the text, and both corpora are labelled the same way.
+
+    Regression: the ``plan``/``plan_then_*`` labels were gated on ``task_type == "plan"``
+    so the dump carried a protocol the loop no longer implements. The gate is the
+    numbered list now, which is also what the loop's reopen checks — so a plan turn and
+    a plan-labelled turn are the same turn by construction.
+    """
+    plan = "Plan:\n1. A librarian floats in an underwater cave library with fish nearby.\n"
+    call = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "a poster"}}\n</tool_call>'
+
+    for task_type in ("reflect", "plan", ""):
+        assert turn_kind(plan, "prompt", "", task_type=task_type) == "plan"
+        assert turn_kind(f"{plan}{call}", "prompt", "", task_type=task_type) == "plan_then_call_generate_image"
+
+    # A turn with no numbered list is never a plan turn, whatever the row says it is.
+    assert turn_kind(call, "prompt", "", task_type="plan") == "call_generate_image"
 
 
 def test_extract_generate_image_prompts_hermes_and_qwen():
@@ -563,7 +583,7 @@ def _drop_notice_setup(monkeypatch, tool_names):
 
     async def _parent(self, agent_data):
         agent_data.messages.append(
-            {"role": "tool", "content": "generated path=/tmp/image_00.png agentic_tool ok=1 images=1"}
+            {"role": "tool", "content": "path=/tmp/image_00.png agentic_tool ok=1 images=1 backend=vllm_omni"}
         )
         return mod.AgentState.GENERATING
 
@@ -640,11 +660,12 @@ def test_single_tool_call_turn_gets_no_drop_notice(monkeypatch):
 
 
 def test_worker_stamps_task_type_from_extra_info(monkeypatch):
-    """``plan`` rows must reach the loop as plan rows, not merely as plan prompts.
+    """``task_type`` reaches the loop as a monitoring label.
 
-    ``task_type`` lives in ``extra_info`` and used to stop at the prompt: the loop never
-    read it, so the plan holdouts (9002/9004) ran the reflect machinery — forced
-    Reflection injected after every judge — despite carrying the plan system prompt.
+    ``task_type`` lives in ``extra_info`` and used to stop at the prompt. The loop now
+    carries it for the trajectory dump and the reward metrics. It no longer selects a
+    protocol: reflect and plan rollouts run the same loop, and only their system prompt
+    differs.
     """
     captured: dict = {}
 
@@ -681,15 +702,14 @@ def _bare_loop(*, task_type: str, validate: bool = False):
     return mod, loop
 
 
-def test_forced_actions_are_exempt_for_plan_and_validation():
-    """Every harness intervention is withheld from plan and validation rollouts.
+def test_forced_actions_are_exempt_for_validation_only():
+    """Reflect and plan training both get the cues and the substitutions.
 
-    Regression: the gates were applied per-site, so ``force_reflection_after_judge``
-    had no protocol or validate gate and a plan rollout that judged after its first
-    image was told "Rewriting the diffusion prompt next." and entered the reflect
-    rewrite loop, while val transcripts were partly curriculum. The premature-judge
-    rewrite was then missed too — and it is the worst of the three, because it replaces
-    a policy action with harness text and marks the replacement mask=1.
+    Regression: the gate used to read ``_agentic_protocol() == "plan" or validate``, so
+    the two corpora ran different loops — plan was pushed out of the rewrite loop the
+    wording of its own prompt assumes, and the two validation reward curves were not
+    comparable. Only validation is exempt now: a val rollout must measure the policy
+    rather than the curriculum.
     """
     _, reflect_train = _bare_loop(task_type="reflect")
     _, reflect_val = _bare_loop(task_type="reflect", validate=True)
@@ -698,10 +718,28 @@ def test_forced_actions_are_exempt_for_plan_and_validation():
     _, unknown = _bare_loop(task_type="")
 
     assert reflect_train._agentic_exempt_from_forced_actions() is False
-    assert reflect_val._agentic_exempt_from_forced_actions() is True
-    assert plan_train._agentic_exempt_from_forced_actions() is True
-    assert plan_val._agentic_exempt_from_forced_actions() is True
+    assert plan_train._agentic_exempt_from_forced_actions() is False
     assert unknown._agentic_exempt_from_forced_actions() is False
+    assert reflect_val._agentic_exempt_from_forced_actions() is True
+    assert plan_val._agentic_exempt_from_forced_actions() is True
+
+
+def test_the_loop_never_branches_on_task_type():
+    """``task_type`` is a label, not a protocol selector.
+
+    A structural guard rather than a behavioural one: any reintroduced branch would be
+    invisible to the behavioural tests until a rollout happened to hit it, which is
+    exactly how the plan/reflect split grew back the first time.
+    """
+    import inspect
+
+    from verl_omni.agent_loop import tool_agent_loop as mod
+
+    source = inspect.getsource(mod)
+    assert "_agentic_protocol" not in source
+    # No comparison of the label against a literal either, however it is spelled.
+    assert not re.search(r'task_type["\']?\s*(?:==|!=|in)\s*[\(\{\[]?["\']plan', source)
+    assert not re.search(r'["\']plan["\']\s*(?:==|!=)\s*self\._agentic_task_type', source)
 
 
 def _premature_judge_setup(monkeypatch, *, task_type: str = "reflect", validate: bool = False):
@@ -805,34 +843,25 @@ def test_premature_judge_refusal_replaced_the_action_substitution():
     from verl_omni.agent_loop.tool_agent_loop import ImageGenToolAgentLoop
 
     handler = inspect.getsource(ImageGenToolAgentLoop._handle_generating_state)
-    refuse = inspect.getsource(ImageGenToolAgentLoop._agentic_refuse_premature_judge)
+    refuse = inspect.getsource(ImageGenToolAgentLoop._agentic_refuse_tool_calls)
 
     condition_start = handler.index('agentic_get_bool("refuse_premature_judge")')
     condition_end = handler.index("return await self._agentic_refuse_premature_judge", condition_start)
     assert "_agentic_exempt_from_forced_actions" not in handler[condition_start:condition_end]
-    # No substitution: the refusal neither rewrites the assistant span nor builds a call.
+    # No substitution anywhere on the refusal path: it neither rewrites the assistant
+    # span nor builds a call, so it can never train harness text as the policy's own.
     assert "_replace_last_assistant_with_tool_call" not in refuse
     assert "hermes_tool_call" not in refuse
     assert "last_user_text" not in refuse
     assert "_rewrite_premature_judge_to_generate" not in inspect.getsource(ImageGenToolAgentLoop)
 
 
-def test_turn_kind_labels_plan_turns_only_for_plan_rows():
-    """A reflect rewrite can contain numbered lines, so ``plan`` needs the task type."""
-    plan_text = "Plan:\n1. A librarian floats in an underwater cave library with fish nearby.\n"
-    merged = f'{plan_text}<tool_call>\n{{"name": "generate_image", "arguments": {{"prompt": "skull"}}}}\n</tool_call>'
-
-    assert turn_kind(plan_text, "prompt", "", task_type="plan") == "plan"
-    # The splitter groups adjacent model spans, so the plan can share a turn with the
-    # first call; label that rather than hiding the plan behind ``call_generate_image``.
-    assert turn_kind(merged, "prompt", "", task_type="plan") == "plan_then_call_generate_image"
-    # Reflect rows are never relabelled as planning.
-    assert turn_kind(plan_text, "prompt", "", task_type="reflect") == "other"
-    assert turn_kind(merged, "prompt", "", task_type="reflect") == "call_generate_image"
-
-
-#: A plan turn the policy could plausibly emit, reused across the loop tests.
-_PLAN_TURN_TEXT = "Plan:\n1. A librarian floats in an underwater cave library with fish nearby.\n"
+#: A first turn that writes the numbered plan and calls nothing.
+_PLAN_TURN_TEXT = (
+    "Plan:\n"
+    "1. A librarian floats in an underwater cave library with fish nearby.\n"
+    "2. Add a gold satin gown and filtered light beams from above.\n"
+)
 
 
 def _plan_turn_agent_data(*, tool_calls=(), extra_messages=()):
@@ -861,12 +890,19 @@ def test_plan_turn_continues_to_the_first_generate():
     assert loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=2) is None
 
 
-@pytest.mark.parametrize("task_type", ["reflect", ""])
-def test_plan_turn_does_not_reopen_other_protocols(task_type):
-    mod, loop = _bare_loop(task_type=task_type)
+def test_plan_turn_reopens_for_every_task_type():
+    """The reopen is gated by the numbered list, not by the row's label.
+
+    That is what keeps reflect and plan on one code path: it is the system prompt that
+    decides which corpus writes prose first, and a reflect rollout calls the tool on turn
+    one so this never fires for it.
+    """
+    mod, loop = _bare_loop(task_type="reflect")
     agent_data = _plan_turn_agent_data()
 
-    assert loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=1) is None
+    state = loop._agentic_continue_after_plan_turn(agent_data, mod.AgentState.TERMINATED, messages_before=1)
+
+    assert state == mod.AgentState.GENERATING
 
 
 def test_plan_turn_does_not_reopen_without_a_written_plan():

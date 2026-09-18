@@ -125,8 +125,9 @@ class AgenticRewardMetrics:
         "forced_reflection",
         "forced_first_generate",
         "forced_first_judge",
-        # How often the policy judges before any image exists. Kept as an observation:
-        # the harness answers the slip but no longer rewrites it.
+        # Why a call was refused rather than executed (the ``agentic_tool_refused``
+        # notices). Distinct from the ``*_dropped`` counters, which attribute
+        # non-execution to the ``max_parallel_calls`` slice.
         "refused_premature_judge",
     )
     ARTIFACT_KEYS: tuple[str, ...] = (

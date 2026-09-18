@@ -606,34 +606,44 @@ def _call_vllm_omni(
 
 
 def _expand_judge_user_request(user_request: str) -> str:
-    """Expand compact / truncated judge args to the bound live user task."""
-    potential_bound_holders = {
-        "",
-        "same",
-        "same as user",
-        "same as user message",
-        "same as user task",
-        "same as the user message",
-        "same as the user task",
-        "user",
-        "user request",
-        "user_request",
-        "last",
-        "previous",
-    }
+    """Resolve the judge's evaluation target: always the bound original request.
+
+    The taught protocol is explicit that the judge grades the latest image against
+    the ORIGINAL user request, and that "rewritten diffusion prompts may improve
+    pixels but never replace the evaluation target". The model's ``user_request``
+    argument is therefore a compact tag, never a source of truth.
+
+    This used to trust the argument when it did not look like a placeholder or a
+    truncated paste, which left the evaluation target policy-controlled: a rollout
+    that pasted its own elaborated rewrite had its ``correctness`` measured against
+    that rewrite instead of the task. That is a self-scoring loop, and the loop is the
+    one thing a frozen judge exists to close.
+
+    The bound prompt is authoritative whenever one is set. The argument stays in the
+    signature because the tool schema still asks for it and because of the fallback: a
+    judge called outside a bound rollout (tests, a bare tool call) has nothing to
+    resolve against and must use what it was given.
+
+    Args:
+        user_request: The model's compact task tag, or a paste that is not trusted.
+
+    Returns:
+        The bound original user request, or ``user_request`` when none is bound.
+    """
     raw = (user_request or "").strip()
     bound = (active_user_prompt.get() or "").strip()
     if not bound:
         return raw
-    low = re.sub(r"\s+", " ", raw.lower()).rstrip(".")
-    if low in potential_bound_holders:
-        return bound
-    # Truncated paste of the full task (common when response budget runs out).
-    if len(raw) < max(80, int(0.55 * len(bound))) and bound.lower().startswith(raw[:48].lower()):
-        return bound
-    if len(raw) <= 120 and raw.lower() in bound.lower():
-        return bound
-    return raw
+    if raw and raw != bound:
+        # Kept observable at debug level so the compact-args rule can be audited from
+        # logs without widening the metrics contract.
+        logger.debug(
+            "judge_image user_request override: grading against the bound request "
+            "(%d chars), not the supplied text (%d chars)",
+            len(bound),
+            len(raw),
+        )
+    return bound
 
 
 def _expand_judge_image_prompt(image_prompt: str) -> str:
@@ -764,9 +774,10 @@ def judge_image(user_request: str, image_prompt: str) -> tuple[ToolResponse, flo
     ``user_request='same as user message'`` and ``image_prompt='last'``.
 
     Args:
-        user_request: Compact task tag only. Prefer exactly ``same as user
-            message``; do not paste the full user task. The server expands this
-            to the bound user request.
+        user_request: Compact task tag only. The judge always grades against the
+            bound original user request, so pasting a rewrite cannot move the
+            evaluation target — it only spends response budget. Prefer exactly
+            ``same as user message``.
         image_prompt: Prefer exactly ``last``, or a short echo of the diffusion
             prompt. Do not re-paste long prompts.
 

@@ -92,9 +92,12 @@ def _ground_truth(task_type: str = "reflect", expected: int = 1, **extra) -> dic
 
 def _plan_trajectory(lines: list[str], generated: int | None = None) -> str:
     count = len(lines) if generated is None else generated
-    parts = ["Plan:", *(f"{index}. {line}" for index, line in enumerate(lines, start=1))]
-    for index, line in enumerate(lines[:count]):
-        parts.append(_generate(line, f"/tmp/image_{index:02d}.png"))
+    plan = [f"{index}. {line}" for index, line in enumerate(lines, start=1)]
+    parts = ["Plan:", *plan]
+    # Plan mode sends the whole numbered list as one prompt, so every call carries all of
+    # it — not one item per call.
+    for index in range(count):
+        parts.append(_generate("\n".join(plan), f"/tmp/image_{index:02d}.png"))
     parts.extend(
         (
             _judge(f"/tmp/image_{max(0, count - 1):02d}.png"),
@@ -113,8 +116,37 @@ def test_reflect_reward_blends_judge_quality_and_reference_coverage():
 
     assert output["rollout_valid"] == 1
     assert output["reward_reflect"] == pytest.approx(0.85)
-    assert output["reward_plan"] == 0.0
     assert output["reward_done"] == 1.0
+
+
+def test_task_type_labels_the_row_without_changing_the_score():
+    """The plan corpus has no dimension of its own.
+
+    Plan rows are graded by the same ``reflect`` dimension as the reflect corpus, and
+    ``task_type`` only reaches the output as a monitoring label. The two calls below take
+    the *same* trajectory and differ only in ``task_type`` (and in the reference field, so
+    that neither has a reflect reference to lean on), so every metric but the label must
+    be identical — and the dimension must still be scored, not left at zero.
+    """
+    subtasks = ["A snowy market with wooden stalls and warm string lights."]
+    text = _plan_trajectory(subtasks)
+    plan = compute_score(
+        solution_str=text,
+        ground_truth=_ground_truth(task_type="plan", expected=1, reference_subtasks=subtasks),
+    )
+    reflect = compute_score(
+        solution_str=text,
+        ground_truth=_ground_truth(task_type="reflect", expected=1),
+    )
+
+    assert plan["task_type"] == "plan"
+    assert reflect["task_type"] == "reflect"
+    assert set(plan) == set(reflect)
+    assert {key: value for key, value in plan.items() if key != "task_type"} == {
+        key: value for key, value in reflect.items() if key != "task_type"
+    }
+    assert plan["rollout_valid"] == 1
+    assert plan["reward_reflect"] > 0.0
 
 
 def test_reflect_reward_falls_back_to_live_judge_findings():
@@ -128,23 +160,7 @@ def test_reflect_reward_falls_back_to_live_judge_findings():
     assert output["reward_reflect"] == pytest.approx(0.5 * 0.7 + 0.5 * (10 / 12))
 
 
-def test_plan_reward_covers_each_reference_subtask():
-    subtasks = [
-        "A snowy market with wooden stalls and warm string lights.",
-        "A decorated carousel centered in the same winter market.",
-        "A cocoa stand with steaming mugs beside the carousel.",
-    ]
-    output = compute_score(
-        solution_str=_plan_trajectory(subtasks),
-        ground_truth=_ground_truth(task_type="plan", expected=3, reference_subtasks=subtasks),
-    )
-
-    assert output["reward_plan"] == pytest.approx(1.0)
-    assert output["reward_result"] == 1.0
-    assert output["reward_format"] == 1.0
-
-
-def test_plan_forced_reflection_counts_toward_format():
+def test_forced_reflection_context_counts_toward_format():
     subtasks = ["A snowy market with wooden stalls and warm string lights."]
     parts = ["Plan:", f"1. {subtasks[0]}", _generate(subtasks[0], "/tmp/image_00.png"), _judge("/tmp/image_00.png")]
     parts.extend(("Reflection: injected stop cue agentic_forced_reflection=1", "Done."))
@@ -199,22 +215,48 @@ def test_tool_reward_requires_successful_generate_and_trusted_judge():
     assert malformed["rollout_valid"] == 0
 
 
-def test_plan_result_requires_exact_successful_image_count():
+def test_result_follows_the_terminal_judge_not_the_declared_image_count():
+    """The result is the judge's verdict, not the declared image budget.
+
+    ``expected_num_images`` is the reference trajectory's image count. Gating on it would
+    reward iterating exactly that many times and punish stopping as soon as the judge is
+    satisfied, which is the opposite of what the protocol asks for.
+    """
     subtasks = [
         "A snowy market with wooden stalls and warm lights.",
         "A decorated carousel in the same winter market.",
     ]
-    exact = compute_score(
-        solution_str=_plan_trajectory(subtasks),
-        ground_truth=_ground_truth(task_type="plan", expected=2, reference_subtasks=subtasks),
-    )
-    short = compute_score(
+    accepted_after_one = compute_score(
         solution_str=_plan_trajectory(subtasks, generated=1),
         ground_truth=_ground_truth(task_type="plan", expected=2, reference_subtasks=subtasks),
     )
+    accepted_after_two = compute_score(
+        solution_str=_plan_trajectory(subtasks, generated=2),
+        ground_truth=_ground_truth(task_type="plan", expected=2, reference_subtasks=subtasks),
+    )
+    no_budget_declared = compute_score(
+        solution_str=_plan_trajectory(subtasks),
+        ground_truth={"task_type": "plan", "reference_subtasks": subtasks},
+    )
+    rejected = compute_score(
+        solution_str="\n".join(
+            (
+                "Plan:",
+                *(f"{index}. {line}" for index, line in enumerate(subtasks, start=1)),
+                _generate("\n".join(subtasks), "/tmp/image_00.png"),
+                _judge("/tmp/image_00.png", accepted=False),
+                "Reflection: The image still misses the requested lights. Done.",
+            )
+        ),
+        ground_truth=_ground_truth(task_type="plan", expected=2, reference_subtasks=subtasks),
+    )
 
-    assert exact["reward_result"] == 1.0
-    assert short["reward_result"] == 0.0
+    assert accepted_after_one["reward_result"] == 1.0
+    assert accepted_after_two["reward_result"] == 1.0
+    # The budget is reported, not enforced, so its absence is not a failure either.
+    assert no_budget_declared["reward_result"] == 1.0
+    # Fail closed on a terminal NO: stopping early is not a free result point.
+    assert rejected["reward_result"] == 0.0
 
 
 def test_reflect_result_requires_terminal_yes_and_ignores_the_reference_budget():
@@ -254,27 +296,31 @@ def test_reflect_result_requires_terminal_yes_and_ignores_the_reference_budget()
     assert blocked["reward_result"] == 0.0
 
 
-def test_weighted_total_uses_only_the_task_active_set():
+def test_weighted_total_scores_every_dimension_for_every_data_source():
+    """``task_type`` labels a row; it does not select a dimension.
+
+    There is no per-task active set any more, so a ``w_plan`` key left in an older
+    parquet is ignored by both corpora and the same weights apply to reflect and plan rows.
+    """
     text = _reflect_trajectory(correctness=0.8, aesthetics=0.6)
     ground_truth = _ground_truth(
         reference_steps=[{"reflection": "unrelated reference tokens", "action": "stop"}],
         w_reflect=2.0,
-        w_plan=99.0,
         w_format=1.0,
         w_tool=1.0,
         w_result=1.0,
     )
     output = compute_score(solution_str=text, ground_truth=ground_truth)
-    # ``w_plan`` is inactive for a reflect row, so it is the only dim left out.
     active = {"reflect": 2.0, "format": 1.0, "tool": 1.0, "result": 1.0, "improve": 1.0}
     expected = sum(weight * output[f"reward_{dim}"] for dim, weight in active.items()) / sum(active.values())
 
     assert output["score"] == pytest.approx(expected)
-    without_plan_weight = compute_score(
+    # A stale ``w_plan`` is inert: it is not a dimension, so it cannot shift the total.
+    with_plan_weight = compute_score(
         solution_str=text,
-        ground_truth={**ground_truth, "w_plan": 0.0},
+        ground_truth={**ground_truth, "w_plan": 99.0},
     )
-    assert without_plan_weight["score"] == pytest.approx(output["score"])
+    assert with_plan_weight["score"] == pytest.approx(output["score"])
 
 
 def test_zero_weights_keep_valid_rollout_but_zero_score():
@@ -432,7 +478,6 @@ def test_all_paths_emit_stable_schema_and_metric_contract():
     assert all(set(output) == expected_keys for output in outputs)
     assert REWARD_COMPONENTS == (
         "reward_reflect",
-        "reward_plan",
         "reward_format",
         "reward_tool",
         "reward_result",
@@ -481,22 +526,6 @@ def test_rewrite_after_yes_with_final_yes_still_zeros_result():
     assert output["rewrite_after_yes"] == 1
     assert output["reward_done"] == 0.0
     assert output["reward_result"] == 0.0
-
-
-def test_coverage_dump_does_not_max_plan_reward():
-    reference = "A snowy market with wooden stalls and warm string lights."
-    tight = compute_score(
-        solution_str=_plan_trajectory([reference]),
-        ground_truth=_ground_truth(task_type="plan", expected=1, reference_subtasks=[reference]),
-    )
-    dump_line = reference + " " + " ".join(f"paddingtoken{i}" for i in range(40))
-    dumped = compute_score(
-        solution_str=_plan_trajectory([dump_line]),
-        ground_truth=_ground_truth(task_type="plan", expected=1, reference_subtasks=[reference]),
-    )
-    assert tight["reward_plan"] == pytest.approx(1.0)
-    assert dumped["reward_plan"] < 0.5
-    assert dumped["reward_plan"] < tight["reward_plan"]
 
 
 def test_same_turn_judge_is_reported_as_dropped_not_executed():
@@ -843,28 +872,3 @@ def test_reference_budget_never_caps_reflect_iteration():
     # The field stays numeric for logging; 0 signals "no reference budget".
     assert compute_score(solution_str=text, ground_truth=budgets["null"])["expected_num_images"] == 0
     assert compute_score(solution_str=text, ground_truth=budgets["derived one-shot"])["expected_num_images"] == 1
-
-
-def test_plan_still_requires_an_exact_image_count():
-    """Plan keeps its exact match: one image per planned subtask is a content requirement."""
-    subtasks = [
-        "A snowy market with wooden stalls and warm lights.",
-        "A decorated carousel in the same winter market.",
-    ]
-    text = _plan_trajectory(subtasks)
-    exact = compute_score(
-        solution_str=text,
-        ground_truth={"task_type": "plan", "expected_num_images": 2, "reference_subtasks": subtasks},
-    )
-    short = compute_score(
-        solution_str=_plan_trajectory(subtasks, generated=1),
-        ground_truth={"task_type": "plan", "expected_num_images": 2, "reference_subtasks": subtasks},
-    )
-    absent = compute_score(
-        solution_str=text,
-        ground_truth={"task_type": "plan", "reference_subtasks": subtasks},
-    )
-    assert exact["reward_result"] == 1.0
-    assert short["reward_result"] == 0.0
-    # A plan with no declared budget cannot satisfy an exact match.
-    assert absent["reward_result"] == 0.0

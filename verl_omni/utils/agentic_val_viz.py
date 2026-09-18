@@ -95,10 +95,9 @@ class AgenticValVizProvider:
         return batch
 
 
-#: Plan holdouts need a reference decomposition, and the harness has only a stateless
-#: text-to-image tool, so references are accumulated rather than authored as edits. These
-#: are written as plain content (no "keep the outline unchanged and edit …" lead-in), so
-#: ``cumulative_subtasks`` just accumulates: element N restates 0..N.
+#: Plan holdouts need a reference decomposition. These are written as plain content parts
+#: (no "keep the outline unchanged and edit …" lead-in), and plan mode sends the whole
+#: list as one prompt, so ``delta_subtasks`` only strips framing and keeps each part.
 _CAFE_POSTER_SUBTASKS = (
     "A vertical cafe poster rendering: a rustic wooden table lit by soft morning sunlight "
     "through a nearby window, with gentle steam rising from a warm-toned ceramic coffee cup "
@@ -130,10 +129,10 @@ _CN_POSTER_SUBTASKS = (
 
 
 def _plan_references(subtasks: tuple[str, ...]) -> tuple[str, ...]:
-    """Return the cumulative plan references for a holdout decomposition."""
-    from verl_omni.utils.agentic.plan_protocol import cumulative_subtasks
+    """Return the per-part plan references for a holdout decomposition."""
+    from verl_omni.utils.agentic.plan_protocol import delta_subtasks
 
-    return cumulative_subtasks(subtasks)
+    return delta_subtasks(subtasks)
 
 
 def _cafe_poster_cases() -> list[ValVizCase]:

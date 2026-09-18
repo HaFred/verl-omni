@@ -138,15 +138,28 @@ def test_judge_image_stub_without_vllm():
     assert metrics["judge_stub"] is True
 
 
-def test_expand_judge_user_request_placeholders():
+def test_expand_judge_user_request_always_defers_to_the_bound_task():
+    """The evaluation target is the bound request, whatever the model supplies.
+
+    A rollout that pastes its own rewritten diffusion prompt must not be able to pick
+    the text its ``correctness`` is scored against. The old resolver only canonicalised
+    placeholders and truncated pastes, so a longer elaborated rewrite passed straight
+    through and became the judge's "User request"; this asserts that hole is closed.
+    """
     bound = "A vertical artistic cafe poster."
     token = trajectory.active_user_prompt.set(bound)
     try:
-        assert image_gen._expand_judge_user_request("same as user message") == bound
-        assert image_gen._expand_judge_user_request("last") == bound
-        assert image_gen._expand_judge_user_request("some other task text") == "some other task text"
+        for supplied in (
+            "same as user message",
+            "last",
+            "some other task text",
+            # The observed 9001 shape: the model's own rewrite, longer than the task.
+            bound + " The headline reads ARTISAN ROAST in bold, heavy, elegant serif font.",
+        ):
+            assert image_gen._expand_judge_user_request(supplied) == bound
     finally:
         trajectory.active_user_prompt.reset(token)
+    # Nothing bound: the argument is all there is to grade against.
     assert image_gen._expand_judge_user_request("raw without binding") == "raw without binding"
 
 

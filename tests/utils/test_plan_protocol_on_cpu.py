@@ -14,9 +14,9 @@
 """CPU tests for the plan-protocol primitives.
 
 Two contracts matter and both are exercised against the real UniCoT-Breakdown
-wordings, not invented ones: the plan-line grammar shared by the loop and the reward,
-and the edit-lead-in strip used to flatten source subtasks for a harness that has no
-image-editing tool.
+wordings, not invented ones: the plan-line grammar the loop uses to tell "the model
+wrote its plan" from "the model stopped talking", and the edit-lead-in strip used to
+flatten source subtasks for a harness that has no image-editing tool.
 """
 
 from __future__ import annotations
@@ -25,7 +25,8 @@ import pytest
 
 from verl_omni.utils.agentic.plan_protocol import (
     MIN_PLAN_LINE_TOKENS,
-    cumulative_subtasks,
+    blank_tool_payloads,
+    delta_subtasks,
     plan_lines_from_prose,
     strip_edit_lead_in,
 )
@@ -145,13 +146,13 @@ def test_strip_edit_lead_in_keeps_the_original_when_the_strip_is_implausible():
     assert strip_edit_lead_in(raw) == raw
 
 
-def test_cumulative_subtasks_accumulate_and_drop_the_edit_framing():
-    """The canvas sample: step N must carry steps 0..N because the tool is stateless.
+def test_delta_subtasks_drop_the_edit_framing_and_keep_each_part():
+    """The canvas sample: each item is the part it contributes, not a re-render.
 
     Source subtasks 1 and 2 are written for an image-*edit* tool ("keep the outline
-    unchanged and edit …"). ``generate_image`` cannot edit, so a carried-forward
-    subtask has to restate everything before it, and the edit instruction itself is an
-    instruction the tool cannot act on.
+    unchanged and edit …"). Plan mode sends the whole list as one prompt, so an item is
+    a part of that description; the edit instruction is something a stateless
+    text-to-image tool cannot act on and must not reach the reward as content.
     """
     source = (
         "An African American librarian floats while reading a book in an underwater library in a cave.",
@@ -161,20 +162,39 @@ def test_cumulative_subtasks_accumulate_and_drop_the_edit_framing():
         "Apply visual effects that reinforce the elegant and ethereal mood.",
     )
 
-    prompts = cumulative_subtasks(source)
+    parts = delta_subtasks(source)
 
-    assert len(prompts) == len(source)
-    # Monotone: each step restates the ones before it.
-    assert [len(prompt) for prompt in prompts] == sorted(len(prompt) for prompt in prompts)
-    assert source[0] in prompts[1] and source[0] in prompts[2]
-    assert "gold satin gown" in prompts[1] and "gold satin gown" in prompts[2]
-    assert "ethereal mood" in prompts[2]
-    # The edit framing reaches none of the prompts.
-    assert not any("Keep the outline" in prompt for prompt in prompts)
-    assert not any("Keep all previously rendered" in prompt for prompt in prompts)
-    assert not any("following details" in prompt for prompt in prompts)
+    assert len(parts) == len(source)
+    # Each part is the source subtask with its lead-in removed, never the accumulated chain.
+    assert parts[0] == source[0]
+    assert "gold satin gown" in parts[1]
+    assert source[0] not in parts[1]
+    assert "ethereal mood" in parts[2]
+    # The edit framing reaches none of the parts.
+    assert not any("Keep the outline" in part for part in parts)
+    assert not any("Keep all previously rendered" in part for part in parts)
+    assert not any("following details" in part for part in parts)
 
 
-def test_cumulative_subtasks_handles_empty_input():
-    assert cumulative_subtasks(()) == ()
-    assert cumulative_subtasks(["", "   "]) == ()
+def test_delta_subtasks_handle_empty_input():
+    assert delta_subtasks(()) == ()
+    assert delta_subtasks(["", "   "]) == ()
+
+
+def test_plan_lines_ignore_the_plan_copied_into_a_tool_call():
+    """A call's prompt is the plan *again*, so counting it would double every revision.
+
+    Plan mode now passes the numbered list as ``generate_image``'s ``prompt``. If the
+    extractor read the raw transcript, the call-only turn that carries it would look like
+    a second plan turn — and the labeler, which classifies raw decode, would tag a call
+    turn as a plan turn.
+    """
+    plan = "1. A librarian floats in an underwater cave library with fish nearby.\n"
+    call = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": ' + repr(plan) + "}}\n</tool_call>\n"
+
+    assert plan_lines_from_prose(plan) == ["A librarian floats in an underwater cave library with fish nearby."]
+    assert plan_lines_from_prose(call) == []
+    assert plan_lines_from_prose(plan + call) == plan_lines_from_prose(plan)
+    # Blanking preserves length, so a caller comparing positions still can: the number
+    # of characters removed and the number of blanks inserted are equal.
+    assert len(blank_tool_payloads(plan + call)) == len(plan + call)

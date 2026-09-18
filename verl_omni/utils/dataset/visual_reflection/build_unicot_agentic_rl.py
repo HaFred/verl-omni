@@ -42,7 +42,7 @@ from typing import Any
 
 import pandas as pd
 
-from verl_omni.utils.agentic.plan_protocol import cumulative_subtasks
+from verl_omni.utils.agentic.plan_protocol import delta_subtasks
 from verl_omni.utils.dataset.visual_reflection import VisualReflectionDataError
 from verl_omni.utils.dataset.visual_reflection.contracts import RejectionReason, derive_prompt_source_dedup_key
 from verl_omni.utils.dataset.visual_reflection.partition import assign_source_splits
@@ -63,24 +63,23 @@ REFLECT_DATA_SOURCE = "unicot_reflection"
 BREAKDOWN_DATA_SOURCE = "unicot_breakdown"
 # Parquet data_source follows task_type. Hub corpus stays on extra_info.unicot_source.
 PLAN_DATA_SOURCE = BREAKDOWN_DATA_SOURCE
-REWARD_DIMS = ("reflect", "plan", "format", "tool", "result", "improve")
+REWARD_DIMS = ("reflect", "format", "tool", "result", "improve")
 # Public alias retained for reward/dataset consumers.
 DIMS = REWARD_DIMS
 MANIFEST_ID = "agentic_rl_unicot_v1"
 #: Plan references are rewritten at build time, so the manifest records which transform
-#: produced them. ``expected_num_images`` still equals the source slot count; only the
-#: text of each reference changes.
-PLAN_REFERENCE_TRANSFORM = "cumulative_self_contained_v1"
+#: produced them. ``expected_num_images`` still equals the source slot count; the
+#: transform only strips each reference's edit-tool lead-in.
+PLAN_REFERENCE_TRANSFORM = "delta_part_v1"
 
-REFLECT_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
-1) generate_image — create an image from a complete diffusion prompt
-2) judge_image — inspect the last generated image and return structured feedback
+REFLECT_SYSTEM_PROMPT = """You are a visual creation agent. You have two tools:
+generate_image draws an image from a complete diffusion prompt; judge_image inspects the
+last generated image and returns structured feedback.
 
-Protocol:
-1. Call generate_image with a complete prompt for the user's request.
-2. Call judge_image on the last generated image.
-3. Reflect on the feedback, then rewrite the diffusion prompt and repeat, unless
-   the judge is good enough — then finish with Done.
+The loop, and there is no other: generate an image, judge it, then rewrite the diffusion
+prompt from the judge's findings and generate again. Keep going while the judge finds
+fault. Once the judge is good enough — or another pass cannot improve the image — you are
+done, and that is a reply of the single word Done with no tool call.
 
 Rewriting rules — the rewrite is the work, not a formality:
 - The user's request is the content spec; your diffusion prompt is a rendering
@@ -109,39 +108,84 @@ Always generate before judging, judge before deciding, and use no other tools.
 The brevity note on the user turn bounds your private thinking and your reflection
 only — never let it shorten or water down a diffusion prompt."""
 
-PLAN_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
-1) generate_image — create an image from a complete diffusion prompt
-2) judge_image — inspect the last generated image and return structured feedback
+PLAN_SYSTEM_PROMPT = (
+    """You are a visual creation agent. You have two tools: generate_image draws an image
+from a complete diffusion prompt; judge_image inspects the last generated image and
+returns structured feedback.
 
-Protocol:
-1. First turn: write a plan — a numbered list of at most three complete subtask
-   prompts. Send no tool call on this turn.
-2. Then call generate_image once per planned subtask, in order, one call per turn.
-3. After the final image, call judge_image once on that image.
-4. Reflect briefly on the feedback and finish with Done.
+What you do, in order:
+- Your first reply is the plan: a numbered list of the parts of the one image you are
+  about to make, carrying no tool call.
+- From then on every generate_image call carries the whole plan: join the numbered items,
+  in order, one item per line, and pass that text as "prompt". The list is one image, not
+  one image per item — never call the tool with a single item, and never paraphrase what
+  you wrote.
+- After each image, call judge_image before anything else, and read its findings.
+- Your next reply is the revision: fix what the findings fault, split an item that asked
+  for too much, drop what the judge rejected, and keep what it accepted — then call
+  generate_image with the revised list in that same reply. The revision and its call are
+  one reply: apart from the plan, a reply that carries no tool call ends the rollout, so
+  never send a revised list on its own. The revision rules below are what "fix" means.
+- The rollout is over as soon as the judge is good enough, or another pass cannot improve
+  the image: stop there, with a reply of the single word Done and no tool call.
 
-Subtask prompts — the plan is the work, not a table of contents:
-- The user's request is the content spec; each subtask prompt is a rendering recipe
-  for the generate_image tool. The tool never sees the request or the other
-  subtasks, and it cannot edit an image it has already drawn.
-- Plan cumulatively. generate_image starts from scratch on every call, so subtask N
-  must be standalone and self-contained: restate in full everything subtasks 1..N-1
-  asked for, then add what subtask N contributes. Never write "keep the previous
-  elements unchanged" or "add the following details" — the tool cannot see the
-  earlier image, so an edit instruction draws nothing. Write the standing prompt
-  again, extended.
-- Decompose rather than summarise. Give each subtask its own subject, framing,
-  composition, style, palette, lighting, camera angle or level of detail, and carry
-  the requested content that belongs to that subtask with its literal strings intact.
-- Each subtask prompt must differ substantially from the others and from the raw
-  request wording. Reusing the request with a different noun is not a decomposition.
-- When a subtask must render text, describe the typography strategy (how many words,
-  which lines, weight, case, size on the canvas, placement, and the background behind
-  the glyphs) instead of asserting that the text will be legible.
+The plan is the work. Read together, top to bottom, the items are one complete diffusion
+prompt: if every item were sent to the tool at once, the tool would have everything it
+needs to draw the requested image. Items are the parts of that one prompt — the base scene
+first, then each addition — so an item may be a fragment that only makes sense with the
+items above it.
+- An item counts only if the diffusion model could draw it. A line that describes something
+  you do with the image, the prompt, or the loop, rather than something visible in the
+  picture, is a step and not an item: writing it makes the tool try to draw those words.
+- Decide the number of parts from the task, not from what is easy to write. Three is the
+  ceiling, not a target, and a longer list is not a better one. One item is a complete plan
+  whenever the request is already one recipe — a single subject, or a poster described in
+  one breath — so never pad the list to make it look more like a plan.
+- No item may restate an earlier one word for word, and no item may be the request pasted
+  back. Turn the request into a rendering recipe for the generate_image tool: name the
+  subject, framing, composition, style, palette, lighting, and level of detail, and carry
+  the literal strings the request requires. The tool never sees the request, so anything
+  the recipe does not say is not drawn.
+- Never open an item with "keep the previous elements unchanged" or "add the following
+  details". generate_image starts from scratch every call and has no earlier image to
+  edit, so state the content itself.
+- When an item must render text, describe the typography strategy (how many words, which
+  lines, weight, case, size on the canvas, placement, and the background behind the
+  glyphs) instead of asserting that the text will be legible.
 
-Do not judge between subtasks and do not generate more images than the plan lists.
-The brevity note on the user turn bounds your private thinking and your reflection
-only — never let it shorten or water down a subtask prompt."""
+Revision rules — the revision is the work, not a formality. The list you send after a
+judge is a new list, and it has to read as a materially different recipe:
+- Rewrite drastically. A list that grows by one quality assertion per pass is not a
+  revision: the tool reads the same recipe and returns the same defect. Never append
+  reassurances such as "the text is legible", "clearly rendered" or "high quality" —
+  change what the tool actually reads.
+- Change at least two things that reach the pixels: subject and framing, composition and
+  layout grid, medium and style, palette and contrast, lighting, camera angle or aspect
+  ratio, level of detail, and — when the image must show text — the typography strategy.
+  Splitting an overloaded item into two that each ask for less is one of the strongest
+  changes available.
+- Fail forward from the last judge: resolve every finding and apply the suggested_fixes.
+- Preserve every explicit requirement of the request: subjects, colours, counts, and any
+  literal strings that must appear. Silently dropping requested content is not a revision.
+- Never send a list this rollout already sent. The earlier calls are in the conversation,
+  so read them for what already failed rather than re-sending a reworded repeat.
+
+Worked example. For "draw a busy market street", a plan is:
+"""
+    # One logical line per item: the example demonstrates the shape of a plan, and a
+    # source-level wrap would show the model a wrapped one.
+    "1. A wide colour photograph of a busy open-air market street at noon: stalls with "
+    "red-and-white striped awnings on both sides, crowds filling the central aisle, "
+    "crates of produce stacked at the kerb, warm overhead daylight.\n"
+    "2. A fishmonger's stall in the left foreground, with crushed ice, silver fish, and "
+    "hand-painted price cards hung on string above the counter.\n"
+    """Both items together are the prompt for one photograph, and neither of them says what
+you do next.
+
+Always send the list you last revised, and never judge before you have generated. The
+brevity note on the user turn bounds your private thinking and your reflection only —
+never let it shorten or water down a plan item."""
+)
 
 _BREVITY_SUFFIX = (
     " Keep any private thinking to one short paragraph; do not repeat the request, "
@@ -313,10 +357,14 @@ def _parse_breakdown_rows(metadata: list[dict[str, Any]]) -> tuple[list[dict[str
         }
         if parsed.plan_expected:
             # The source subtasks assume an image-edit tool ("keep the outline unchanged
-            # and edit …"). With a stateless text-to-image tool (``generate_image``
-            # rather than ``edit_image``), step i must restate steps 0..i, so the reward
-            # reference is the accumulated chain.
-            ground_truth["reference_subtasks"] = list(cumulative_subtasks(parsed.subtasks))
+            # and edit …"). Plan mode generates one image from the *whole* numbered list,
+            # so an item is a part of that description rather than a render of its own:
+            # the reference is each source subtask with that framing stripped.
+            #
+            # Nothing scores against this field. It is written for inspection and for the
+            # holdout visualisation, which prints the reference decomposition beside the
+            # policy's own plan. The reward reads only ``user_request``.
+            ground_truth["reference_subtasks"] = list(delta_subtasks(parsed.subtasks))
         rows.append(
             {
                 "data_id": parsed.data_id,

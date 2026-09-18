@@ -11,24 +11,27 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Plan-mode protocol primitives shared by the reward, the builder, and the loop.
+"""Plan protocol primitives shared by the builder and the loop.
 
-Two unrelated problems live here because they are two halves of the same protocol.
+Two unrelated problems live here because they are two halves of the same shape.
 
-**Reading a plan.** ``plan`` rows ask the policy to write a numbered list of subtask
-prompts, and the ``plan`` reward dim grades those lines against reference subtasks. The
-loop also needs the same predicate to tell "the model wrote its plan" from "the model
-skipped straight to a tool call", so the line grammar has one definition here instead of
-one per consumer.
+**Reading a plan.** The plan data asks the policy to write a numbered list of subtask
+prompts before it starts generating. The loop needs a predicate to tell "the model wrote
+its plan" from "the model stopped talking", so the line grammar has one definition here
+instead of one per consumer.
 
-**Writing the reference.** UniCoT-Breakdown subtasks were authored for a *image edit*
+**Writing the reference.** UniCoT-Breakdown subtasks were authored for an *image edit*
 tool: from subtask 1 onward every row opens by asserting the previous render is preserved
-("Keep the outline of the image unchanged and edit with the following details. …"). This
-harness has no edit tool — ``generate_image`` is stateless text-to-image — so a subtask
-carried forward to step *i* must restate everything steps 0..*i* asked for, and the
-edit-tool lead-in is an instruction the tool cannot act on. :func:`cumulative_subtasks`
-therefore drops the lead-in and accumulates, which is what the reward should be measuring
-against and what the system prompt asks the policy to produce.
+("Keep the outline of the image unchanged and edit with the following details. …v"). This
+harness has no edit tool — ``generate_image`` is stateless text-to-image — and the plan is
+sent as the call's prompt, so an item is one part of a single description rather than a
+step rendered on its own. :func:`delta_subtasks` therefore drops the edit-tool lead-in and
+keeps the part, which is what the reference shown to the agent should be and what the
+system prompt asks the policy to produce.
+
+This module holds no reward and no scoring. Every data source is graded by the same
+formula in ``agentic_multidim_reward``; reflect and plan rollouts differ only in their
+system prompt.
 """
 
 from __future__ import annotations
@@ -38,7 +41,8 @@ from collections.abc import Sequence
 
 __all__ = [
     "MIN_PLAN_LINE_TOKENS",
-    "cumulative_subtasks",
+    "blank_tool_payloads",
+    "delta_subtasks",
     "plan_lines_from_prose",
     "strip_edit_lead_in",
 ]
@@ -46,19 +50,38 @@ __all__ = [
 #: A plan line needs enough distinct words to be a subtask prompt rather than a heading.
 MIN_PLAN_LINE_TOKENS = 4
 
-#: Word-ish tokens, matching ``agentic_multidim_reward._tokens`` so the "≥ 4 tokens"
+#: Word-ish tokens, matching ``agentic_multidim_reward._tokens`` so the ">= 4 tokens"
 #: filter here and the coverage metric there agree on what counts as content.
 _TOKEN_RE = re.compile(r"[a-z0-9_']+")
 _PLAN_HEADER_RE = re.compile(r"\bPlan\s*:", re.IGNORECASE)
 _PLAN_LINE_RE = re.compile(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+(.+)$")
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*.*?\s*</tool_call>", re.IGNORECASE | re.DOTALL)
+_THINK_TAG_RE = re.compile(r"</?think>", re.IGNORECASE)
+
+
+def blank_tool_payloads(text: str) -> str:
+    """Replace tool-call blocks and think tags with same-length blanks.
+
+    A plan is what the policy writes as *prose*. The plan is then copied into the
+    ``generate_image`` call's prompt, so a raw transcript contains it twice: once as the
+    plan turn and again inside the tool call. Reading the second copy would make a
+    call-only turn look like a plan turn. Length is preserved so a caller that needs
+    offsets can still compare them against the original text.
+    """
+
+    def blank(match: re.Match[str]) -> str:
+        return "\n" * (match.end() - match.start())
+
+    return _THINK_TAG_RE.sub(blank, _TOOL_CALL_BLOCK_RE.sub(blank, text or ""))
 
 
 def plan_lines_from_prose(prose: str) -> list[str]:
     """Extract the numbered/bulleted subtask prompts from already-stripped prose.
 
-    A ``Plan:`` header, when present, bounds where the list starts; otherwise the whole
-    text is scanned, because a policy that omits the header is still emitting a plan and
-    the reward should see it.
+    Tool-call and think markup is blanked first (see :func:`blank_tool_payloads`), so the
+    plan copied into a call's ``prompt`` is not read back as a second plan turn. A
+    ``Plan:`` header, when present, bounds where the list starts; otherwise the whole text
+    is scanned, because a policy that omits the header is still emitting a plan.
 
     Args:
         prose: Assistant text with tool-call payloads already removed, line breaks intact.
@@ -67,13 +90,14 @@ def plan_lines_from_prose(prose: str) -> list[str]:
         Plan item texts in order, each with at least :data:`MIN_PLAN_LINE_TOKENS`
         distinct word tokens. Empty when no plan is present.
     """
-    header = _PLAN_HEADER_RE.search(prose or "")
-    body = prose[header.end() :] if header else prose or ""
-    return [
-        line
-        for match in _PLAN_LINE_RE.finditer(body)
-        if len(set(_TOKEN_RE.findall((line := match.group(1).strip()).lower()))) >= MIN_PLAN_LINE_TOKENS
-    ]
+    text = blank_tool_payloads(prose)
+    header = _PLAN_HEADER_RE.search(text)
+    lines = []
+    for match in _PLAN_LINE_RE.finditer(text, header.end() if header else 0):
+        line = match.group(1).strip()
+        if len(set(_TOKEN_RE.findall(line.lower()))) >= MIN_PLAN_LINE_TOKENS:
+            lines.append(line)
+    return lines
 
 
 #: Words that open a "preserve the previous render, then edit it" clause.
@@ -145,24 +169,25 @@ def strip_edit_lead_in(subtask: str) -> str:
     return text
 
 
-def cumulative_subtasks(subtasks: Sequence[str]) -> tuple[str, ...]:
-    """Flatten edit-style subtasks into standing self-contained prompts.
+def delta_subtasks(subtasks: Sequence[str]) -> tuple[str, ...]:
+    """Drop the edit-tool framing from each source subtask, keeping the part itself.
 
-    The harness generates with a stateless text-to-image tool, so step *i* cannot be
-    conditioned on the render from step *i-1*. Each returned prompt therefore restates
-    every earlier subtask, which is the only way the accumulated plan survives to the
-    tool.
+    The plan is sent as one prompt, so what an item has to be is the *part of the
+    picture* it contributes, not a step that re-renders everything before it. The source
+    UniCoT-Breakdown items assert that the previous render is preserved before saying what
+    changes; a stateless text-to-image tool has no earlier render, so that clause asks for
+    something the tool cannot do and is dropped.
 
     Args:
         subtasks: Source subtasks in order, without any sentinel.
 
     Returns:
-        One prompt per source subtask, where element *i* is subtasks 0..*i* joined with
-        spaces and stripped of edit-tool lead-ins. Empty input returns ``()``.
+        One part per source subtask, with its lead-in stripped. Empty input returns
+        ``()``.
     """
-    cleaned = [str(subtask).strip() for subtask in subtasks if str(subtask).strip()]
-    if not cleaned:
-        return ()
-    for index in range(1, len(cleaned)):
-        cleaned[index] = strip_edit_lead_in(cleaned[index])
-    return tuple(" ".join(cleaned[: index + 1]) for index in range(len(cleaned)))
+    parts = []
+    for subtask in subtasks:
+        stripped = strip_edit_lead_in(str(subtask).strip())
+        if stripped.strip():
+            parts.append(stripped.strip())
+    return tuple(parts)

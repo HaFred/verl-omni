@@ -14,6 +14,7 @@
 """CPU tests for the UniCoT agentic RL parquet builder."""
 
 import json
+import re
 from pathlib import Path
 
 import pandas as pd
@@ -155,14 +156,14 @@ def test_references_and_weights_live_only_in_ground_truth(tmp_path):
             assert ground_truth.get("reference_subtasks") is None
 
 
-def test_plan_references_are_flattened_for_a_stateless_generate_tool(tmp_path):
-    """Plan references must restate 0..N, because ``generate_image`` cannot edit.
+def test_plan_references_keep_each_part_of_the_stateless_generate_prompt(tmp_path):
+    """Plan references must drop the edit framing, because the tool cannot edit.
 
     The hub subtasks are written for an image-edit tool ("keep the outline unchanged
     and edit with the following details"), and the harness has none. Scoring the
     policy against an edit instruction would reward text the tool cannot act on, so the
-    builder accumulates and drops the framing. ``expected_num_images`` still equals the
-    source slot count — only the reference text changes.
+    builder strips the framing and keeps the part. ``expected_num_images`` still equals
+    the source slot count.
     """
     output = _build(
         tmp_path,
@@ -179,16 +180,19 @@ def test_plan_references_are_flattened_for_a_stateless_generate_tool(tmp_path):
         assert ground_truth["task_type"] == "plan"
         assert ground_truth["expected_num_images"] == 3
         assert len(references) == 3
-        assert [len(reference) for reference in references] == sorted(len(reference) for reference in references)
-        assert references[0] in references[1] and references[0] in references[2]
+        # Each reference is its own part, not the accumulated chain up to it.
         assert "gold satin gown" in references[1]
+        assert references[0] not in references[1]
         assert "ethereal mood" in references[2]
+        assert references[0] not in references[2]
         assert not any("Keep the outline" in reference for reference in references)
         assert not any("Keep all previously rendered" in reference for reference in references)
 
     report = json.loads((output / "build_report.json").read_text())
     assert report["plan_reference_transform"] == builder.PLAN_REFERENCE_TRANSFORM
 
+
+def test_prompts_frame_the_agent_job_as_a_rendering_recipe():
     """Guard the rewrite contract against a silent rebase revert.
 
     The prompts are the only lever that makes GRPO explore prompt space, so both
@@ -210,26 +214,86 @@ def test_plan_references_are_flattened_for_a_stateless_generate_tool(tmp_path):
         # concrete guidance reverts to "make the text legible" restatements.
         assert "typography" in normalized, name
     assert "rewrite" in builder.REFLECT_SYSTEM_PROMPT
-    assert "standalone" in builder.PLAN_SYSTEM_PROMPT
+    assert "one complete diffusion prompt" in " ".join(builder.PLAN_SYSTEM_PROMPT.split())
     assert builder.REFLECT_SYSTEM_PROMPT != builder.PLAN_SYSTEM_PROMPT
 
 
-def test_plan_prompt_asks_for_an_own_turn_cumulative_plan():
+def test_plan_prompt_asks_for_an_own_turn_and_a_whole_plan_call():
     """Plan mode needs both halves of the protocol stated explicitly.
 
     The plan is a turn of its own (the loop only reopens a tool-call-free turn when it
-    carries a plan), and each subtask must restate its predecessors because
-    ``generate_image`` is stateless. Getting either wrong reproduces ``sample_9004``:
-    no plan written, then a reflect-style rewrite loop that the protocol forbids.
+    carries a plan), and every later ``generate_image`` carries the whole list, because
+    the items are parts of one prompt rather than one render each. Getting either wrong
+    reproduces ``sample_9004``: no plan written, then a reflect-style rewrite loop that
+    the protocol forbids.
     """
     normalized = " ".join(builder.PLAN_SYSTEM_PROMPT.split())
 
     assert "no tool call" in normalized
-    assert "cumulative" in normalized
-    assert "restate" in normalized
-    assert "cannot edit" in normalized
-    # Reflect mode must not inherit the plan-only turn contract.
+    assert "carries the whole plan" in normalized
+    assert "one item per line" in normalized
+    # The list is one image; a single item is not a call. Reflect mode must not inherit
+    # the plan-only turn contract.
+    assert "never call the tool with a single item" in normalized
     assert "no tool call on this turn" not in " ".join(builder.REFLECT_SYSTEM_PROMPT.split())
+
+
+def test_plan_prompt_forbids_meta_steps_in_the_plan():
+    """Every plan item must describe content, not a process step.
+
+    Observed failure (``sample_9004``): the model returned
+
+        1. Generate a vertical composition flat design poster ... (the request back)
+        2. Generate the image.
+        3. Judge the image.
+        4. Done.
+
+    Items 2-4 are the protocol read back, and ``generate_image`` would have tried to draw
+    those words. An earlier revision of this prompt named those exact lines as wrong and
+    the model emitted them anyway: quoting the forbidden sentence puts its tokens in
+    context, and the numbered protocol the prompt was explained by was itself a template
+    for the numbered list the reply had to be. So the rule is stated as a property of an
+    item, no procedure-shaped line is printed anywhere, and "one item is a complete plan"
+    is stated outright — a reply that must *look* like a list is what the padding served.
+    """
+    normalized = " ".join(builder.PLAN_SYSTEM_PROMPT.split())
+
+    # The list as a whole is what the tool receives.
+    assert "one complete diffusion prompt" in normalized
+    # The rule, stated as a property rather than as a phrase to copy.
+    assert "is a step and not an item" in normalized
+    assert "No item may restate an earlier one word for word" in normalized
+    # Nothing plan-shaped is printed: no numbered protocol, no sentence-final "Done.".
+    numbered = [line for line in builder.PLAN_SYSTEM_PROMPT.splitlines() if re.match(r"\s*\d+[.)]\s", line)]
+    assert len(numbered) == 2, numbered
+    assert all("market street" in line or "fishmonger" in line for line in numbered), numbered
+    assert "Done." not in builder.PLAN_SYSTEM_PROMPT
+    assert "Protocol" not in builder.PLAN_SYSTEM_PROMPT
+    # The worked example, and the count contract as a task-sized decomposition that allows
+    # one item.
+    assert "Both items together are the prompt for one photograph" in normalized
+    assert "Three is the ceiling, not a target" in normalized
+    assert "One item is a complete plan" in normalized
+    assert "never pad the list" in normalized
+
+
+def test_neither_system_prompt_prints_a_numbered_protocol_plan():
+    """The prompt must not hand the model a numbered list in the reply's own grammar.
+
+    The protocol used to be a numbered list — "1. Call generate_image. 2. Judge it." — in
+    the same grammar the plan had to be written in, and the model continued it. Reading
+    both prompts for numbered lines keeps the two from drifting back together: the reflect
+    prompt has none, and the plan prompt has only its worked example.
+    """
+    numbered = re.compile(r"(?m)^\s*\d+[.)]\s")
+
+    assert numbered.search(builder.REFLECT_SYSTEM_PROMPT) is None
+    # The plan prompt carries only the two items of its worked example.
+    assert len(numbered.findall(builder.PLAN_SYSTEM_PROMPT)) == 2
+    assert not re.search(
+        r"(?m)^\s*\d+[.)]\s+(?:Call|Generate the image|Judge the image|Reflect on)",
+        builder.PLAN_SYSTEM_PROMPT,
+    )
 
 
 def test_plan_and_reflect_rows_use_task_specific_system_prompts(tmp_path):

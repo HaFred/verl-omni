@@ -10,10 +10,12 @@ datasets. The trainable agent LLM calls two frozen services:
    `good_enough` decision.
 3. The agent stops or rewrites the image prompt.
 
-RPCO combines reflection, plan, format, tool, and result rewards from
+RPCO combines reflection, format, tool, result, and improve rewards from
 `verl_omni.utils.reward_score.agentic_multidim_reward` (PR #412). Trajectories
 come from `image_gen_tool_agent` + `OmniAgentLoopManager` (PR #409). Parquet
-rows are built by `build_unicot_agentic_rl` (PR #411).
+rows are built by `build_unicot_agentic_rl` (PR #411). Reflect and plan rows run
+the same loop and the same reward formula and differ only in their system
+prompt, so their reward curves are comparable.
 
 ## Start the frozen tools
 
@@ -55,7 +57,7 @@ fail closed if the mix cannot be met).
 Useful controls:
 
 - `RPCO_INIT_CKPT`: initialize from a stage-1 agent checkpoint.
-- `RPCO_W_REFLECT`, `RPCO_W_PLAN`, `RPCO_W_FORMAT`, `RPCO_W_TOOL`,
+- `RPCO_W_REFLECT`, `RPCO_W_FORMAT`, `RPCO_W_TOOL`,
   `RPCO_W_RESULT`, `RPCO_W_IMPROVE`: per-dimension weights baked into parquet
   ground truth (`RPCO_W_TOOL_CALL` is accepted as an alias for `RPCO_W_TOOL`).
   `RPCO_W_IMPROVE` scores the judge-outcome lift across a rewrite chain: the mean
@@ -64,6 +66,8 @@ Useful controls:
   its text changed. Set `RPCO_W_IMPROVE=0` to score without it.
   (Predecessor `RPCO_W_NOVELTY` and the baked `w_novelty` key still resolve as an
   alias, so parquet built before the swap keeps working without a rebuild.)
+  A stale `RPCO_W_PLAN` / `w_plan` key from an older parquet is inert: there is no
+  `plan` dimension any more, so it cannot shift the total.
 - `AGENTIC_VLLM_OMNI_URL` / `AGENTIC_VLLM_URL`: sidecar endpoints, forwarded
   to Hydra `agentic_image_gen.vllm_omni_url` / `vllm_url`.
 - `AGENTIC_E2E_ROOT`: dump root for traj / images (`agentic_image_gen.e2e_root`).

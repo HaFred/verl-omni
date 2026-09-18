@@ -38,7 +38,7 @@ from verl_omni.agent_loop.omni_agent_loop import OmniAgentLoopManager
 from verl_omni.tools import trajectory
 from verl_omni.tools.trajectory import build_trajectory_relpath, resolve_run_dir
 from verl_omni.tools.trajectory import locking as traj_locking
-from verl_omni.utils.agentic.image_gen_rollout_dump import dump_rollout_artifacts
+from verl_omni.utils.agentic.image_gen_rollout_dump import dump_raw_rollouts, dump_rollout_artifacts
 from verl_omni.utils.agentic_val_viz import resolve_agentic_val_viz_provider
 
 
@@ -291,6 +291,174 @@ def test_dumped_turns_expose_the_token_wise_advantage(tmp_path):
     assert [turn["turn_advantage"] for turn in row["rollout_turns"]] == ["policy", "policy+cue", "cue"]
 
 
+def _dump_raw_output(*, response_pieces, non_tensor):
+    """Minimal DataProto stand-in for ``dump_raw_rollouts`` (list-backed rows)."""
+
+    class _Row:
+        def __init__(self, values):
+            self._values = list(values)
+
+        def tolist(self):
+            return list(self._values)
+
+        def __iter__(self):
+            return iter(self._values)
+
+    ids = list(response_pieces)
+    return SimpleNamespace(
+        batch={"responses": [_Row(ids)], "response_mask": [_Row([1] * len(ids))]},
+        non_tensor_batch=non_tensor,
+    )
+
+
+def test_raw_dump_threads_task_type_into_the_turn_labels(tmp_path):
+    """``task_type`` rides into the dump as a label, not as a labelling rule.
+
+    The dump must report the row's ``task_type`` so a reader knows which corpus a
+    trajectory came from, while ``turn_kind`` classifies both corpora identically: a turn
+    whose decode carries a numbered plan is labelled as one whichever row it came from,
+    because that is what the loop's reopen checks.
+    """
+    _bind(tmp_path)
+    plan = "1. A librarian floats in an underwater cave library with fish nearby.\n"
+    gen = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "V1"}}\n</tool_call>'
+    judge = '<tool_call>\n{"name": "judge_image", "arguments": {"user_request": "x"}}\n</tool_call>'
+    tokenizer = _PieceTok({10: plan, 11: gen, 12: judge})
+    ids = [10, 11, 12]
+
+    def _dump(task_type):
+        dump_raw_rollouts(
+            tokenizer=tokenizer,
+            output=_dump_raw_output(
+                response_pieces=ids,
+                non_tensor={
+                    "raw_prompt": [{"role": "user", "content": "a poster"}],
+                    "trajectory_relpath": ["step_000000/sample_9004"],
+                    "agentic_task_type": [task_type],
+                },
+            ),
+            step=0,
+            validate=True,
+            write_monitor=False,
+        )
+        return json.loads(
+            (tmp_path / "layout_test" / "rollout_trajectories" / "step_000000" / "sample_9004.json").read_text()
+        )
+
+    plan_payload = _dump("plan")
+    assert plan_payload["task_type"] == "plan"
+    # The literal streams ride along in the JSON, so the payload is self-contained.
+    assert plan_payload["raw_response"] == f"{plan}{gen}{judge}"
+    labelled = ["plan_then_call_generate_image_then_call_judge_image"]
+
+    reflect_payload = _dump("reflect")
+    assert reflect_payload["task_type"] == "reflect"
+    # Same decode, same labels: the row's label does not change how the turn is read.
+    assert [turn["turn_kind"] for turn in plan_payload["rollout_turns"]] == labelled
+    assert [turn["turn_kind"] for turn in reflect_payload["rollout_turns"]] == labelled
+
+    # The text dump leads with the raw episode and labels the annotated section.
+    text_block = (tmp_path / "layout_test" / "rollout_trajectories" / "step_000000" / "sample_9004.txt").read_text()
+    raw_start = text_block.index("raw_response (decoded response tokens")
+    assert raw_start < text_block.index("annotated_turns:")
+    raw_section = text_block[raw_start : text_block.index("annotated_turns:")]
+    # The plan and the two calls are all still in the literal response, in order.
+    assert (
+        raw_section.index("A librarian floats")
+        < raw_section.index('{"name": "generate_image"')
+        < raw_section.index('{"name": "judge_image"')
+    )
+
+
+def test_raw_dump_prefers_the_relpath_index_over_the_batch_slot(tmp_path):
+    """``sample_index`` must name the sample, not the row's position in the batch.
+
+    ``output.non_tensor_batch["index"]`` disappears whenever the agent reward loop is
+    enabled — the parent forwards the input non-tensor batch only when
+    ``reward_loop_worker_handles`` is None — so the dump fell back to ``np.arange`` and
+    wrote ``sample_index`` 0..3 beside folders named 9001..9004.
+    """
+    _bind(tmp_path)
+    tokenizer = _PieceTok({10: "Done."})
+
+    for extra, expected in (({"index": [3]}, 9004), ({}, 9004), ({"index": [9004]}, 9004)):
+        non_tensor = {
+            "raw_prompt": [{"role": "user", "content": "a poster"}],
+            "trajectory_relpath": ["step_000000/sample_9004"],
+            "agentic_task_type": ["plan"],
+            **extra,
+        }
+        dump_raw_rollouts(
+            tokenizer=tokenizer,
+            output=_dump_raw_output(response_pieces=[10], non_tensor=non_tensor),
+            step=0,
+            validate=True,
+            write_monitor=False,
+        )
+        payload = json.loads(
+            (tmp_path / "layout_test" / "rollout_trajectories" / "step_000000" / "sample_9004.json").read_text()
+        )
+        assert payload["sample_index"] == expected
+
+
+def test_raw_dump_leads_with_the_literal_episode(tmp_path):
+    """``sample_*.txt`` opens with the raw token streams, not a paraphrase.
+
+    The dump is the only record of what the trainer optimised, so the literal prompt and
+    response tokens come first and the mask-annotated breakdown follows. The full
+    chat-templated input is deliberately not repeated per turn: it is the system prompt
+    plus every earlier turn, so printing it each time buried the episode under the same
+    ~40 lines per turn.
+    """
+    _bind(tmp_path)
+    gen = '<tool_call>\n{"name": "generate_image", "arguments": {"prompt": "V1"}}\n</tool_call>'
+    obs = "<tool_response>\npath=/tmp/a.png agentic_tool ok=1 images=1 backend=vllm_omni\n</tool_response>"
+    judge = '<tool_call>\n{"name": "judge_image", "arguments": {"user_request": "x"}}\n</tool_call>'
+    tokenizer = _PieceTok({10: gen, 11: obs, 12: judge})
+
+    dump_rollout_artifacts(
+        tokenizer=tokenizer,
+        step=0,
+        relpath="step_000000/sample_9004",
+        sample_index=9004,
+        raw_prompt=[{"role": "user", "content": "a poster"}],
+        outputs=SimpleNamespace(
+            prompt_ids=[10, 11, 12],
+            response_ids=[10, 11, 12],
+            response_mask=[1, 0, 1],
+            reward_score=0.1,
+            extra_fields={"agentic_task_type": "plan"},
+        ),
+    )
+
+    run_dir = tmp_path / "layout_test"
+    text_block = (run_dir / "rollout_trajectories" / "step_000000" / "sample_9004.txt").read_text()
+    assert "task_type=plan sample_index=9004 rollout_n=0" in text_block
+    assert "raw_prompt (decoded prompt tokens: the exact input):" in text_block
+    assert "raw_response (decoded response tokens: the exact episode output):" in text_block
+    assert "annotated_turns:" in text_block
+    # Inside the raw response, the call and its observation sit in literal order. The
+    # lines are indented by the renderer, so match single-line fragments.
+    raw_section = text_block[
+        text_block.index("raw_response (decoded response tokens") : text_block.index("annotated_turns:")
+    ]
+    gen_line = '{"name": "generate_image"'
+    obs_line = "path=/tmp/a.png agentic_tool ok=1 images=1 backend=vllm_omni"
+    judge_line = '{"name": "judge_image"'
+    assert raw_section.index(gen_line) < raw_section.index(obs_line) < raw_section.index(judge_line)
+    # The raw episode precedes the mask-annotated reading of it.
+    assert text_block.index("raw_response (decoded response tokens") < text_block.index("annotated_turns:")
+    # The turn block carries the observation delta, not the whole chat template.
+    assert "turn_1_obs:" in text_block
+    assert "turn_1_prompt:" not in text_block
+
+    payload = json.loads((run_dir / "rollout_trajectories" / "step_000000" / "sample_9004.json").read_text())
+    assert payload["task_type"] == "plan"
+    assert payload["raw_response"] == f"{gen}{obs}{judge}"
+    # The full templated input stays machine-readable, per turn, in the JSON.
+    assert payload["rollout_turns"][0]["turn_prompt"]
+
+
 def test_val_set_rows_never_touch_rollout_trajectories_or_monitor(monkeypatch):
     """A val-set batch is neither dumped nor mask-discarded (baseline contract).
 
@@ -453,10 +621,10 @@ def test_val_holdouts_split_reflect_from_plan(monkeypatch):
     """9001/9003 must run reflect and 9002/9004 plan, each with a usable reference.
 
     The holdout labels were always right, but the loop never read ``task_type``, so the
-    plan cases ran the reflect machinery. The plan references must also be cumulative —
-    with a stateless ``generate_image`` the last subtask has to restate the earlier ones
-    — and ``expected_num_images`` must match the plan length, because a plan's result
-    reward requires exactly one image per subtask.
+    plan cases ran the reflect machinery. The plan references must also be per-part —
+    plan mode sends the whole list as one prompt, so an item is a part of that
+    description rather than a render that restates the ones before it — and
+    ``expected_num_images`` still records the source slot count.
     """
     monkeypatch.setenv("AGENTIC_VAL_VIZ", "1")
     provider = resolve_agentic_val_viz_provider()
@@ -481,11 +649,8 @@ def test_val_holdouts_split_reflect_from_plan(monkeypatch):
             references = list(ground_truth["reference_subtasks"])
             assert len(references) >= 2, index
             assert ground_truth["expected_num_images"] == len(references), index
-            # Cumulative: each step restates the ones before it.
-            assert [len(reference) for reference in references] == sorted(len(reference) for reference in references), (
-                index
-            )
-            assert references[0] in references[-1], index
+            # Per-part: no reference repeats an earlier one.
+            assert references[0] not in references[-1], index
             assert system_prompt == build_unicot_agentic_rl.PLAN_SYSTEM_PROMPT, index
         else:
             assert "reference_subtasks" not in ground_truth, index

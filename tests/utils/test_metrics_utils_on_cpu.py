@@ -80,10 +80,12 @@ def test_agentic_reward_metrics_aggregate_mix_keys_only():
             "reward_tool_call": torch.tensor([1.0, 1.0]),
             "reward_correctness": torch.tensor([0.8, 0.6]),
             "reward_done": torch.tensor([]),
-            "reward_plan": torch.tensor([0.4]),
+            # A ``reward_*`` key outside ``MIX_KEYS`` — a stale dimension left in an older
+            # parquet, for instance — must not invent a metric of its own.
+            "reward_not_a_mix_dim": torch.tensor([0.4]),
         }
     )
     assert metrics["agentic_reward/tool_call/mean"] == pytest.approx(1.0)
     assert metrics["agentic_reward/correctness/min"] == pytest.approx(0.6)
     assert "agentic_reward/done/mean" not in metrics
-    assert "agentic_reward/plan/mean" not in metrics
+    assert "agentic_reward/not_a_mix_dim/mean" not in metrics
