@@ -74,11 +74,50 @@ Useful controls:
 - `TEST_FREQ` and `VAL_BEFORE_TRAIN`: periodic validation.
 - `VAL_ROLLOUT_N`: greedy validation rollout count; defaults to 1.
 - `REBUILD_UNICOT=0`: reuse existing train/val parquet.
+- `MLFLOW_TRACE_BACKEND`, `MLFLOW_TRACKING_URI`, `MLFLOW_TRACE_EXPERIMENT`,
+  `TRACE_MAX_SAMPLES_PER_STEP_PER_WORKER`: MLflow rollout traces, on by default
+  (see [Rollout tracing](#rollout-tracing) below).
 
 Reward wiring (required by PR #412):
 
 - `reward.reward_manager.name=naive` (text trajectory; not VisualRewardManager)
 - `reward.custom_reward_function` → `agentic_multidim_reward.compute_score`
+
+## Rollout tracing
+
+Rollout traces go to MLflow. The run script already sets
+`actor_rollout_ref.rollout.trace.backend=mlflow` plus `token2text=true`, appends
+`mlflow` to `trainer.logger` (so scalar metrics land in both WandB and MLflow),
+and builds the sqlite store under
+`outputs/e2e/mlflow/<experiment_name>.db` before the workers start — the
+first-writer race the [trace docs](https://verl.readthedocs.io/en/latest/advance/rollout_trace.html)
+warn about.
+
+```bash
+# Four slashes after ``sqlite:`` — ``sqlite:///`` + the absolute path. With only
+# three, SQLAlchemy treats the path as *relative* to your cwd and quietly opens a
+# brand-new empty database there, so the UI shows an empty "Default" experiment.
+mlflow ui --backend-store-uri "sqlite:///$PWD/outputs/e2e/mlflow/<experiment_name>.db"
+```
+
+Open the **`verl_omni_agentic`** experiment's Traces tab, not `Default`: traces
+are written under `trainer.project_name`, so experiment 0 is always empty.
+
+`trainer.project_name` is the MLflow experiment and `trainer.experiment_name` the
+run name; filter traces by `tags.step`, `tags.sample_index`, `tags.rollout_n`, and
+`tags.validate`. `TRACE_MAX_SAMPLES_PER_STEP_PER_WORKER` caps traces per worker
+per step (default 5, all `rollout.n` siblings of a selected sample are traced), so
+total traces per step is
+`cap * num_workers * rollout.n`.
+
+Two caveats worth knowing:
+
+- `rollout.trace.backend` is a single value, not a list: `RolloutTraceConfig` is a
+  first-init-wins singleton, so mlflow and WandB Weave are alternatives, never
+  both. Set `MLFLOW_TRACE_BACKEND=""` for a trace-free run.
+- Traces are exported asynchronously, so the UI can lag the newest step by a few
+  seconds. Spin the viewer up *after* launching training so it reads a store that
+  already has the sqlite schema.
 
 ## Scope note
 

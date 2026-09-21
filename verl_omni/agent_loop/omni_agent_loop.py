@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import copy
 import logging
-from pathlib import Path
 
 import ray
 from omegaconf import open_dict
@@ -27,6 +26,10 @@ from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
 from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
 from verl.utils import hf_tokenizer
 
+# Register ``image_gen_tool_agent`` and its config binder when this module is loaded.
+# The loop itself lives in the pipeline that owns the recipe, so nothing here names
+# the image-gen tools; the binder is resolved by loop name at bind time.
+from verl_omni.pipelines.agentllm_grpo import agent_loop as image_gen_tool_agent_loop  # noqa: F401
 from verl_omni.tools.trajectory import (
     active_user_prompt,
     bind_agentic_image_gen,
@@ -49,8 +52,7 @@ from verl_omni.utils.agentic.image_gen_rollout_parse import (
 from verl_omni.utils.agentic_val_viz import resolve_agentic_val_viz_provider
 from verl_omni.utils.metrics_utils import AgenticRewardMetrics
 
-# Register ``image_gen_tool_agent`` when this module is loaded.
-from . import tool_agent_loop as image_gen_tool_agent_loop  # noqa: F401
+from .agent_loop_config import AGENT_LOOP_CONFIG_BINDERS
 
 logger = logging.getLogger(__name__)
 
@@ -157,12 +159,12 @@ class OmniAgentLoopMixin:
     """Bind Hydra knobs and stamp trajectory kwargs shared by DataProto and TQ workers.
 
     Overrides must live on the Ray worker: ``generate_sequences`` dispatches
-    remotely. Hermes / ``image_gen.py`` bind is gated on
-    ``default_agent_loop == image_gen_tool_agent`` and only fills unset keys.
+    remotely. Recipe-specific tool plumbing is *not* filled here: a pipeline
+    registers a config binder for its loop name (see
+    ``verl_omni.agent_loop.agent_loop_config``), so this mixin stays free of any one
+    recipe's tools.
     """
 
-    _AGENTIC_TOOL_FORMAT = "hermes"
-    _AGENTIC_FUNCTION_TOOLS = Path(__file__).resolve().parents[1] / "tools" / "image_gen.py"
     # V1 TransferQueue expands ``rollout.n`` *inside* the worker, so the trajectory
     # metadata cannot carry the per-session index. See ``_agentic_rollout_n``.
     _AGENTIC_ROLLOUT_N_FROM_SESSION_ID = False
@@ -195,32 +197,24 @@ class OmniAgentLoopMixin:
         return int(trajectory["rollout_n"])
 
     def _bind_agentic_rollout_config(self, config) -> None:
-        from omegaconf import open_dict
-
         from verl_omni.tools.trajectory.hydra_env import merge_agentic_scorer_knobs
 
         # Bind by path string only — importing image_gen.py would double-register tools.
         bind_run_artifacts(config)
         bind_agentic_image_gen(config)
         self._agentic_scorer_bind = merge_agentic_scorer_knobs
+        # Hand off to whichever pipeline owns the selected loop, if any. The dict is
+        # filled by the pipeline modules imported for their ``@register`` side effect,
+        # so this lookup replaces what used to be a hardcoded image-gen branch here.
         default_loop = None
         try:
             default_loop = config.actor_rollout_ref.rollout.agent.get("default_agent_loop")
         except Exception:  # noqa: BLE001
             default_loop = None
-        if default_loop == "image_gen_tool_agent":
-            tool_path = self._AGENTIC_FUNCTION_TOOLS
-            if not tool_path.is_file():
-                raise FileNotFoundError(
-                    f"agentic function tools not found at {tool_path}. Expected verl_omni/tools/image_gen.py"
-                )
-            with open_dict(config.actor_rollout_ref.rollout.multi_turn):
-                mt = config.actor_rollout_ref.rollout.multi_turn
-                # Only fill unset keys so explicit Hydra overrides still win.
-                if not mt.get("function_tool_path"):
-                    mt.function_tool_path = str(tool_path)
-                if not mt.get("format"):
-                    mt.format = self._AGENTIC_TOOL_FORMAT
+        if default_loop:
+            binder = AGENT_LOOP_CONFIG_BINDERS.get(str(default_loop))
+            if binder is not None:
+                binder(config)
 
     async def _run_agent_loop(
         self,
@@ -246,7 +240,9 @@ class OmniAgentLoopMixin:
         kwargs["_agentic_validate"] = trajectory["validate"]
         kwargs["_agentic_trajectory_relpath"] = relpath
         extra = kwargs.get("extra_info")
-        # Selects the reflect vs plan protocol inside the loop, not just the prompt.
+        # Monitoring label only: the loop stamps it into extra_fields and the dump
+        # header. Reflect and plan rollouts run the same loop and reward formula, so
+        # nothing may branch on this value.
         kwargs["_agentic_task_type"] = (
             str(extra.get("task_type") or "").strip().lower() if isinstance(extra, dict) else ""
         )
@@ -285,7 +281,79 @@ class OmniAgentLoopWorkerTQImpl(OmniAgentLoopMixin, _AgentLoopWorkerTQImpl):
 
     def __init__(self, config, *args, **kwargs):
         self._bind_agentic_rollout_config(config)
+        #: Dataset indices this worker's current batch should trace. Set by
+        #: ``generate_sequences`` and read synchronously by ``_run_prompt``.
+        self._agentic_traced_samples = None
         super().__init__(config, *args, **kwargs)
+
+    def _agentic_select_traced_samples(self, batch):
+        """Select which sample indices this worker traces for the current batch.
+
+        Upstream's V1 worker hardcodes ``trace_this_sample = False`` behind a
+        ``TODO(wuxibin): add trace support``, and ``rollout_trace_attr(trace=False)``
+        switches the trace context off — so every ``rollout_trace_op`` span
+        (including this recipe's loop) is silently dropped on the TransferQueue
+        path. This mirrors the DataProto worker's selection so
+        ``rollout.trace.max_samples_per_step_per_worker`` means the same thing on
+        both paths: a random subset of the worker's unique sample indices, with all
+        ``rollout.n`` siblings of a selected sample traced.
+
+        Args:
+            batch: Inbound V1 ``TensorDict``; ``index`` carries the dataset index.
+
+        Returns:
+            The selected dataset indices as a ``set`` of ``int``, or ``None`` when
+            tracing is disabled or already covers the whole batch — ``None`` means
+            "leave the parent's ``trace`` flag alone", i.e. trace every row.
+        """
+        from verl.utils.rollout_trace import RolloutTraceConfig
+
+        if RolloutTraceConfig.get_backend() is None:
+            return None
+        max_samples_per_worker = RolloutTraceConfig.get_instance().max_samples_per_step_per_worker
+        if max_samples_per_worker is None:
+            return None
+        try:
+            index = batch["index"]
+        except Exception:  # noqa: BLE001 - batch without an index column
+            return None
+        import numpy as np
+
+        values = index.tolist() if hasattr(index, "tolist") else list(index)
+        unique_sample_indices = np.unique(values)
+        if max_samples_per_worker >= len(unique_sample_indices):
+            return None
+        selected = np.random.choice(unique_sample_indices, max_samples_per_worker, replace=False)
+        return {int(value) for value in selected}
+
+    async def generate_sequences(self, batch) -> None:
+        """Stash the traced-sample selection, then run the stock V1 dispatch.
+
+        ``_run_prompt`` reads the selection synchronously while the parent builds
+        its per-row tasks, so the stash only has to live for the duration of the
+        parent call.
+        """
+        self._agentic_traced_samples = self._agentic_select_traced_samples(batch)
+        try:
+            await super().generate_sequences(batch)
+        finally:
+            self._agentic_traced_samples = None
+
+    def _run_prompt(self, prompt, sampling_params, trajectory, trace=False):
+        """Thread the traced-sample selection into the parent's ``trace`` flag.
+
+        Deliberately a plain function rather than ``async``: the parent loops over
+        rows and wraps each ``self._run_prompt(...)`` call in
+        ``asyncio.create_task``, so a synchronous body captures the trace decision
+        at call time instead of whenever the task first gets scheduled.
+        """
+        selected = getattr(self, "_agentic_traced_samples", None)
+        if selected is not None:
+            try:
+                trace = int(trajectory["sample_index"]) in selected
+            except (KeyError, TypeError, ValueError):
+                trace = False
+        return super()._run_prompt(prompt, sampling_params, trajectory=trajectory, trace=trace)
 
     async def _agent_loop_postprocess(self, output, validate, **kwargs) -> None:
         """Put outputs into TransferQueue, then dump per-rollout monitoring files.

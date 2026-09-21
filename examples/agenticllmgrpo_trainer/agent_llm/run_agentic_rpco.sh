@@ -76,6 +76,58 @@ AGENTIC_VLLM_OMNI_URL="${AGENTIC_VLLM_OMNI_URL:-http://127.0.0.1:8092}"
 AGENTIC_VLLM_URL="${AGENTIC_VLLM_URL:-http://127.0.0.1:8093}"
 mkdir -p "${AGENTIC_E2E_RUN_DIR}"
 
+# --- MLflow rollout trace (PR #429) ------------------------------------------
+# ``rollout.trace.backend`` is a *single* value, not a list: RolloutTraceConfig is
+# a first-init-wins singleton, so this is mlflow *or* weave, never both. WandB is
+# untouched — ``trainer.logger`` is a list and logger/trace are separate
+# subsystems, so scalar metrics keep going to both and only traces go to mlflow.
+#
+# ``trainer.project_name`` doubles as the MLflow experiment (both Tracking and
+# RolloutTraceConfig call ``set_experiment(project_name)``) and
+# ``trainer.experiment_name`` as the run name, so MLFLOW_TRACE_EXPERIMENT must
+# stay in sync with the ``trainer.project_name`` default below. Set
+# MLFLOW_TRACE_BACKEND="" to turn tracing off (then also drop "mlflow" from
+# ``trainer.logger``, which imports the package unconditionally).
+MLFLOW_TRACE_BACKEND="${MLFLOW_TRACE_BACKEND:-mlflow}"
+MLFLOW_TRACE_EXPERIMENT="${MLFLOW_TRACE_EXPERIMENT:-${WANDB_PROJECT:-verl_omni_agentic}}"
+MLFLOW_TRACKING_URI="${MLFLOW_TRACKING_URI:-sqlite:///${AGENTIC_E2E_ROOT}/mlflow/${EXPERIMENT_NAME}.db}"
+# Traces are spans per LLM call, so an uncapped run costs tens of GB/day.
+TRACE_MAX_SAMPLES_PER_STEP_PER_WORKER="${TRACE_MAX_SAMPLES_PER_STEP_PER_WORKER:-5}"
+export MLFLOW_TRACE_BACKEND MLFLOW_TRACKING_URI
+
+# MLflow creates the store lazily, and the docs warn that letting several rollout
+# workers create the sqlite file at once can conflict. Build the schema (and the
+# experiment) once here — the throwaway-``mlflow ui`` step the docs ask for —
+# before the workers race to do it themselves. Exporting the URI above is enough
+# for the workers: get_ppo_ray_runtime_env only lists env vars it must *add*, so
+# anything already in this shell's environment reaches the actors by inheritance.
+if [[ "${MLFLOW_TRACE_BACKEND}" == "mlflow" ]]; then
+  MLFLOW_DB_PATH="${MLFLOW_TRACKING_URI#sqlite:///}"
+  MLFLOW_DB_DIR="$(dirname "${MLFLOW_DB_PATH}")"
+  mkdir -p "${MLFLOW_DB_DIR}"
+  # argparse-free: `python3 - a b` exposes "a b" as sys.argv[1:], so the heredoc
+  # stays free of shell interpolation.
+  python3 - "${MLFLOW_TRACKING_URI}" "${MLFLOW_TRACE_EXPERIMENT}" <<'PY'
+"""Create the MLflow sqlite store and its experiment once, before training."""
+import sys
+
+import mlflow
+
+tracking_uri, experiment = sys.argv[1], sys.argv[2]
+mlflow.set_tracking_uri(tracking_uri)
+mlflow.set_experiment(experiment)
+print(f"[INFO] MLflow trace store ready: {tracking_uri} (experiment={experiment})", flush=True)
+PY
+  # Quote the resolved URI verbatim: ``sqlite:///`` + a path starting with "/"
+  # makes the four slashes that keep the path absolute. Typing
+  # ``sqlite:///<abs path>`` by hand gives three, which SQLAlchemy reads as a
+  # *relative* path and silently opens an empty database there instead.
+  echo "[INFO] View traces with:"
+  echo "       mlflow ui --backend-store-uri \"${MLFLOW_TRACKING_URI}\""
+  echo "       then open the '${MLFLOW_TRACE_EXPERIMENT}' experiment's Traces tab"
+  echo "       (not 'Default' -- traces never land in experiment 0)"
+fi
+
 # Fixed val holdout (9001-9004) demo rollouts, dumped under
 # ``rollout_images/step_XXXXXX/sample_90xx/`` on every validation step.
 export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
@@ -175,6 +227,9 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.agent.default_agent_loop=image_gen_tool_agent \
   +actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_omni.agent_loop.omni_agent_loop.OmniAgentLoopManager \
   actor_rollout_ref.rollout.agent.num_workers="$AGENT_NUM_WORKERS" \
+  actor_rollout_ref.rollout.trace.backend="$MLFLOW_TRACE_BACKEND" \
+  actor_rollout_ref.rollout.trace.token2text=true \
+  actor_rollout_ref.rollout.trace.max_samples_per_step_per_worker="$TRACE_MAX_SAMPLES_PER_STEP_PER_WORKER" \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
   actor_rollout_ref.ref.fsdp_config.param_offload=true \
   actor_rollout_ref.ref.fsdp_config.model_dtype=bfloat16 \
@@ -196,7 +251,7 @@ python3 -m verl.trainer.main_ppo \
   trainer.total_epochs="$TOTAL_STEPS" \
   trainer.resume_mode="${RESUME_MODE:-disable}" \
   trainer.default_local_dir="$CKPT_DIR" \
-  trainer.logger='["console","wandb"]' \
+  trainer.logger='["console","wandb","mlflow"]' \
   trainer.project_name="${WANDB_PROJECT:-verl_omni_agentic}" \
   trainer.experiment_name="$EXPERIMENT_NAME" \
   "$@"

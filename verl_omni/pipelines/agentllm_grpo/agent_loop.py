@@ -16,6 +16,12 @@
 
 Teacher-forced Hermes tool tokens use ``response_mask=1``; injected Reflection
 uses ``response_mask=0``. Terminal ``Done.`` is policy-sampled.
+
+The loop lives in this pipeline, not in ``verl_omni.agent_loop``, because it is one
+recipe's tool agent rather than a generic capability: the concrete image-generate /
+judge harness, the Hydra binding its tools need, and the ``image_gen_tool_agent``
+registration name all belong to this recipe. The generic layer imports this module
+to fire the registration, exactly as it does for the MiniMax H3 loop.
 """
 
 from __future__ import annotations
@@ -23,12 +29,16 @@ from __future__ import annotations
 import json
 import logging
 import random
+from pathlib import Path
 from typing import Any
 
+from omegaconf import open_dict
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
 from verl.experimental.agent_loop.tool_agent_loop import AgentData, AgentState, ToolAgentLoop
 from verl.experimental.agent_loop.tool_parser import FunctionCall
+from verl.utils.rollout_trace import rollout_trace_op
 
+from verl_omni.agent_loop.agent_loop_config import register_agent_loop_config_binder
 from verl_omni.tools.agent_helper.image_gen_utils import (
     build_forced_reflection,
     count_executed_generates,
@@ -54,6 +64,14 @@ from verl_omni.utils.agentic.plan_protocol import plan_lines_from_prose
 
 logger = logging.getLogger(__name__)
 
+#: This recipe's tool bodies. Resolved by path, not by import: importing
+#: ``verl_omni.tools.image_gen`` would register the tools a second time, since the
+#: worker loads them from this same file.
+_IMAGE_GEN_FUNCTION_TOOLS = Path(__file__).resolve().parents[2] / "tools" / "image_gen.py"
+
+#: Tool-call format the reference Hermes trajectory speaks.
+_IMAGE_GEN_TOOL_FORMAT = "hermes"
+
 
 def _assistant_content_text(message: dict[str, Any]) -> str:
     """Return the plain text of an assistant message, tolerating multimodal content.
@@ -76,6 +94,7 @@ def _assistant_content_text(message: dict[str, Any]) -> str:
 class ImageGenToolAgentLoop(ToolAgentLoop):
     """Stock tool agent plus force-first curriculum and forced Reflection."""
 
+    @rollout_trace_op
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
         # Per-rollout latch reset: YES from sample N must not block sample N+1.
         self._agentic_step = kwargs.pop("_agentic_step", 0)
@@ -681,3 +700,30 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             force_reflection,
         )
         return AgentState.GENERATING
+
+
+@register_agent_loop_config_binder("image_gen_tool_agent")
+def bind_image_gen_tool_agent(config: Any) -> None:
+    """Fill the multi-turn tool plumbing this recipe's loop needs.
+
+    Runs before the worker builds the loop, and only fills keys the user left unset,
+    so an explicit Hydra override still wins. This used to live on
+    ``OmniAgentLoopMixin`` behind a ``default_agent_loop == "image_gen_tool_agent"``
+    comparison, which put the image-gen recipe inside the generic Omni worker.
+
+    Args:
+        config: The live trainer config, mutated in place.
+
+    Raises:
+        FileNotFoundError: If this recipe's function-tool module is missing.
+    """
+    if not _IMAGE_GEN_FUNCTION_TOOLS.is_file():
+        raise FileNotFoundError(
+            f"agentic function tools not found at {_IMAGE_GEN_FUNCTION_TOOLS}. Expected verl_omni/tools/image_gen.py"
+        )
+    with open_dict(config.actor_rollout_ref.rollout.multi_turn):
+        multi_turn = config.actor_rollout_ref.rollout.multi_turn
+        if not multi_turn.get("function_tool_path"):
+            multi_turn.function_tool_path = str(_IMAGE_GEN_FUNCTION_TOOLS)
+        if not multi_turn.get("format"):
+            multi_turn.format = _IMAGE_GEN_TOOL_FORMAT

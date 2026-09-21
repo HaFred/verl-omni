@@ -62,7 +62,9 @@ def test_worker_stamps_rollout_kwargs_and_resets_context(monkeypatch):
 
     monkeypatch.setattr(AgentLoopWorker, "_run_agent_loop", _parent_run)
     worker = OmniAgentLoopWorker.__new__(OmniAgentLoopWorker)
-    assert OmniAgentLoopWorker._AGENTIC_FUNCTION_TOOLS.is_file()
+    from verl_omni.pipelines.agentllm_grpo.agent_loop import _IMAGE_GEN_FUNCTION_TOOLS
+
+    assert _IMAGE_GEN_FUNCTION_TOOLS.is_file()
 
     prior_path = set_active_trajectory_relpath("prior/path")
     prior_prompt = active_user_prompt.set("prior prompt")
@@ -91,6 +93,66 @@ def test_worker_stamps_rollout_kwargs_and_resets_context(monkeypatch):
     assert captured["user_prompt_during_run"] == "draw a cafe poster"
     assert path_after == "prior/path"
     assert prompt_after == "prior prompt"
+
+
+def _binder_config(*, loop_name, tool_format=None, tool_path=None):
+    """Minimal config carrying only the keys a recipe config binder reads."""
+    from omegaconf import OmegaConf
+
+    multi_turn = {}
+    if tool_format is not None:
+        multi_turn["format"] = tool_format
+    if tool_path is not None:
+        multi_turn["function_tool_path"] = tool_path
+    return OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "agent": {"default_agent_loop": loop_name},
+                    "multi_turn": multi_turn,
+                }
+            }
+        }
+    )
+
+
+def test_recipe_config_binders_are_resolved_by_loop_name():
+    """The generic Omni worker must not name any one recipe's tools itself.
+
+    Regression: ``OmniAgentLoopMixin`` compared ``default_agent_loop`` against the
+    literal ``"image_gen_tool_agent"`` and set ``function_tool_path`` and
+    ``multi_turn.format`` inline, which put the image-gen recipe inside the shared
+    worker. The pipeline owns that binder now and the worker only looks it up.
+    """
+    import inspect
+
+    from verl_omni.agent_loop.agent_loop_config import AGENT_LOOP_CONFIG_BINDERS
+    from verl_omni.pipelines.agentllm_grpo.agent_loop import (
+        _IMAGE_GEN_FUNCTION_TOOLS,
+        _IMAGE_GEN_TOOL_FORMAT,
+        bind_image_gen_tool_agent,
+    )
+
+    assert AGENT_LOOP_CONFIG_BINDERS["image_gen_tool_agent"] is bind_image_gen_tool_agent
+
+    # Unset keys get this recipe's tools and tool-call format.
+    config = _binder_config(loop_name="image_gen_tool_agent")
+    bind_image_gen_tool_agent(config)
+    multi_turn = config.actor_rollout_ref.rollout.multi_turn
+    assert multi_turn.function_tool_path == str(_IMAGE_GEN_FUNCTION_TOOLS)
+    assert multi_turn.format == _IMAGE_GEN_TOOL_FORMAT
+
+    # An explicit Hydra override still wins.
+    config = _binder_config(loop_name="image_gen_tool_agent", tool_format="custom", tool_path="/tmp/other_tools.py")
+    bind_image_gen_tool_agent(config)
+    multi_turn = config.actor_rollout_ref.rollout.multi_turn
+    assert multi_turn.function_tool_path == "/tmp/other_tools.py"
+    assert multi_turn.format == "custom"
+
+    # The generic worker holds no recipe name, so nothing else can be specialised.
+    source = inspect.getsource(omni_agent_loop.OmniAgentLoopMixin)
+    assert "image_gen_tool_agent" not in source
+    assert "_AGENTIC_FUNCTION_TOOLS" not in source
 
 
 def test_manager_dumps_before_discarding_invalid_rollouts(monkeypatch):
@@ -573,13 +635,132 @@ def test_tq_run_agent_loop_wires_session_id_into_relpath(monkeypatch):
     assert captured == [f"step_000004/sample_2086.{n:02d}" for n in range(8)]
 
 
+def _set_trace_config(*, backend, max_samples_per_worker):
+    """Point the ``RolloutTraceConfig`` singleton at a backend without importing it.
+
+    Bypasses ``init`` on purpose: ``init`` would import weave/mlflow and open a
+    network client just to exercise the trace-selection arithmetic.
+    """
+    from verl.utils.rollout_trace import RolloutTraceConfig
+
+    config = RolloutTraceConfig.get_instance()
+    config.backend = backend
+    config.max_samples_per_step_per_worker = max_samples_per_worker
+    config._initialized = True
+
+    def restore():
+        # Drops the instance, so the class-level defaults (backend=None) come back.
+        RolloutTraceConfig.reset()
+
+    return restore
+
+
+def test_tq_trace_selection_mirrors_the_dataproto_rule():
+    """``max_samples_per_step_per_worker`` picks a subset of *unique* indices.
+
+    Regression: ``AgentLoopWorkerTQ.generate_sequences`` hardcoded
+    ``trace_this_sample = False`` behind a ``TODO(wuxibin)``, so
+    ``rollout.trace.backend`` silently produced no traces at all on the
+    V1/TransferQueue path even with a backend configured.
+    """
+    worker = omni_agent_loop.OmniAgentLoopWorkerTQImpl.__new__(omni_agent_loop.OmniAgentLoopWorkerTQImpl)
+    restore = _set_trace_config(backend="weave", max_samples_per_worker=2)
+    try:
+        selected = worker._agentic_select_traced_samples({"index": np.array([5, 5, 6, 7, 8])})
+    finally:
+        restore()
+
+    # 4 unique indices, cap 2: exactly two distinct indices, all python ints so
+    # ``trajectory["sample_index"]`` (a numpy/torch scalar) can match by value.
+    assert isinstance(selected, set)
+    assert len(selected) == 2
+    assert selected <= {5, 6, 7, 8}
+    assert all(type(value) is int for value in selected)
+
+
+@pytest.mark.parametrize(
+    ("backend", "max_samples_per_worker", "index"),
+    [
+        (None, 2, [1, 2, 3]),  # tracing off: nothing to select
+        ("weave", None, [1, 2, 3]),  # no cap: parent traces every row already
+        ("weave", 3, [1, 2, 3]),  # cap covers every unique index: same as no cap
+        ("weave", 9, [1, 2, 3]),
+    ],
+)
+def test_tq_trace_selection_leaves_the_parent_flag_alone(backend, max_samples_per_worker, index):
+    """``None`` means "trace every row", so the parent's flag must be untouched."""
+    worker = omni_agent_loop.OmniAgentLoopWorkerTQImpl.__new__(omni_agent_loop.OmniAgentLoopWorkerTQImpl)
+    restore = _set_trace_config(backend=backend, max_samples_per_worker=max_samples_per_worker)
+    try:
+        assert worker._agentic_select_traced_samples({"index": np.array(index)}) is None
+    finally:
+        restore()
+
+
+def test_tq_run_prompt_threads_the_selection_into_the_trace_flag(monkeypatch):
+    """Only the selected sample's rows are traced; its siblings all agree."""
+    seen: dict[int, bool] = {}
+
+    async def _parent_run_prompt(self, prompt, sampling_params, trajectory, trace=False):
+        del self, prompt, sampling_params
+        seen[int(trajectory["sample_index"])] = trace
+
+    monkeypatch.setattr(omni_agent_loop._AgentLoopWorkerTQImpl, "_run_prompt", _parent_run_prompt)
+    worker = omni_agent_loop.OmniAgentLoopWorkerTQImpl.__new__(omni_agent_loop.OmniAgentLoopWorkerTQImpl)
+    worker._agentic_traced_samples = {3}
+
+    for sample_index in (3, 3, 8, 9):
+        coroutine = omni_agent_loop.OmniAgentLoopWorkerTQImpl._run_prompt(
+            worker, {}, {}, trajectory={"sample_index": sample_index}
+        )
+        # The parent wraps this call in ``asyncio.create_task``, so it must stay
+        # awaitable while the decision is taken synchronously at call time.
+        assert asyncio.iscoroutine(coroutine)
+        asyncio.run(coroutine)
+
+    assert seen == {3: True, 8: False, 9: False}
+
+
+def test_tq_run_prompt_reads_the_selection_synchronously(monkeypatch):
+    """The trace decision must not be deferred to when the task first runs.
+
+    ``_run_prompt`` is intentionally a plain function: the parent creates one task
+    per row in a tight loop and then clears ``_agentic_traced_samples``, so an
+    ``async`` body would read the stash after it was already reset.
+    """
+    captured: list[bool] = []
+
+    async def _parent_run_prompt(self, prompt, sampling_params, trajectory, trace=False):
+        del self, prompt, sampling_params, trajectory
+        captured.append(trace)
+
+    monkeypatch.setattr(omni_agent_loop._AgentLoopWorkerTQImpl, "_run_prompt", _parent_run_prompt)
+    assert not asyncio.iscoroutinefunction(omni_agent_loop.OmniAgentLoopWorkerTQImpl._run_prompt)
+
+    worker = omni_agent_loop.OmniAgentLoopWorkerTQImpl.__new__(omni_agent_loop.OmniAgentLoopWorkerTQImpl)
+    worker._agentic_traced_samples = {4}
+
+    async def _dispatch_then_clear():
+        coroutines = [
+            omni_agent_loop.OmniAgentLoopWorkerTQImpl._run_prompt(
+                worker, {}, {}, trajectory={"sample_index": sample_index}
+            )
+            for sample_index in (4, 5)
+        ]
+        worker._agentic_traced_samples = None
+        await asyncio.gather(*coroutines)
+
+    asyncio.run(_dispatch_then_clear())
+    assert captured == [True, False]
+
+
 def _drop_notice_setup(monkeypatch, tool_names):
     """Build a loop whose parent executes only the first tool call of a turn."""
     from types import SimpleNamespace
 
     from verl.experimental.agent_loop.tool_parser import FunctionCall
 
-    from verl_omni.agent_loop import tool_agent_loop as mod
+    from verl_omni.pipelines.agentllm_grpo import agent_loop as mod
 
     async def _parent(self, agent_data):
         agent_data.messages.append(
@@ -693,7 +874,7 @@ def test_worker_stamps_task_type_from_extra_info(monkeypatch):
 
 
 def _bare_loop(*, task_type: str, validate: bool = False):
-    from verl_omni.agent_loop import tool_agent_loop as mod
+    from verl_omni.pipelines.agentllm_grpo import agent_loop as mod
 
     loop = mod.ImageGenToolAgentLoop.__new__(mod.ImageGenToolAgentLoop)
     loop._agentic_task_type = task_type
@@ -733,7 +914,7 @@ def test_the_loop_never_branches_on_task_type():
     """
     import inspect
 
-    from verl_omni.agent_loop import tool_agent_loop as mod
+    from verl_omni.pipelines.agentllm_grpo import agent_loop as mod
 
     source = inspect.getsource(mod)
     assert "_agentic_protocol" not in source
@@ -746,7 +927,7 @@ def _premature_judge_setup(monkeypatch, *, task_type: str = "reflect", validate:
     """Build a loop holding one ``judge_image`` call with no image behind it."""
     from verl.experimental.agent_loop.tool_parser import FunctionCall
 
-    from verl_omni.agent_loop import tool_agent_loop as mod
+    from verl_omni.pipelines.agentllm_grpo import agent_loop as mod
 
     async def _merge(self, previous_messages, updated_messages, token_ids, response_mask, *args, **kwargs):
         added = len(updated_messages) - len(previous_messages)
@@ -840,7 +1021,7 @@ def test_premature_judge_refusal_replaced_the_action_substitution():
     """
     import inspect
 
-    from verl_omni.agent_loop.tool_agent_loop import ImageGenToolAgentLoop
+    from verl_omni.pipelines.agentllm_grpo.agent_loop import ImageGenToolAgentLoop
 
     handler = inspect.getsource(ImageGenToolAgentLoop._handle_generating_state)
     refuse = inspect.getsource(ImageGenToolAgentLoop._agentic_refuse_tool_calls)

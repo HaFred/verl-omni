@@ -164,7 +164,7 @@ def init_config(tmp_path_factory) -> tuple[DictConfig, Path]:
         config.actor_rollout_ref.rollout.multi_turn.max_parallel_calls = 1
         config.actor_rollout_ref.rollout.multi_turn.max_tool_response_length = 512
         config.actor_rollout_ref.rollout.multi_turn.format = "hermes"
-        # Leave function_tool_path unset — OmniAgentLoopWorker fills it under the gate.
+        # Leave function_tool_path unset — the image_gen_tool_agent config binder fills it.
 
         config.actor_rollout_ref.rollout.agent.num_workers = 1
         config.actor_rollout_ref.rollout.agent.default_agent_loop = "image_gen_tool_agent"
