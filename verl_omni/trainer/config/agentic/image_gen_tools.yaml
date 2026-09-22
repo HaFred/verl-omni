@@ -88,3 +88,9 @@ rewrite_judge_before_generate: true
 
 # Optional dump root for traj / hermes / images (null → repo ``outputs/e2e``).
 e2e_root: null
+
+# Optional explicit run dir holding ``rollout_trajectories/``, ``rollout_images/`` and
+# ``hermes_actions/``. null → ``<e2e_root>/<experiment_name>/`` (runs that share an
+# experiment_name are namespaced apart). Set → used verbatim, with no experiment_name
+# appended, so a launcher can place the three trees directly in its own run dir.
+run_dir: null

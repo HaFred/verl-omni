@@ -284,3 +284,66 @@ def test_adapter_maps_per_sample_scores_by_path():
     out = asyncio.run(score_fn(samples))
     assert out[0].rm_score == pytest.approx(0.3)
     assert out[1].rm_score == pytest.approx(0.7)
+
+
+class _RayRefHandle:
+    """Handle whose ``compute_score`` is a Ray-style ``.remote()`` returning the given value."""
+
+    def __init__(self, returned):
+        self._returned = returned
+        self.calls: list = []
+
+        def _remote(data):
+            self.calls.append(data)
+            return self._returned
+
+        self.compute_score = types.SimpleNamespace(remote=_remote)
+
+
+def test_a_ray_result_is_resolved_even_without_a_timeout(monkeypatch):
+    """The ObjectRef is not the score.
+
+    ``_invoke`` used to resolve the ref only when the caller passed ``timeout_s``. The
+    in-loop caller passes no timeout, so ``parse_rm_result`` received the reference and died
+    on ``missing 'reward_score': <class 'ray.ObjectRef'>``, which aborted every episode and
+    starved the sync replay buffer until the whole run failed with "no materializable
+    trajectories" (measured 2026-09-22, ENABLE_RM=1).
+    """
+    import ray
+
+    class _Ref:
+        pass
+
+    sentinel = {"reward_score": 0.6, "reward_extra_info": {}}
+    seen: dict = {}
+
+    def _fake_get(ref, timeout=None):
+        seen["ref"] = ref
+        seen["timeout"] = timeout
+        return sentinel
+
+    monkeypatch.setattr(ray, "ObjectRef", _Ref, raising=False)
+    monkeypatch.setattr(ray, "get", _fake_get)
+
+    ref = _Ref()
+    handle = _RayRefHandle(ref)
+    score_fn = rm.make_rm_score_fn(handle, data_builder=lambda payload: payload)
+    out = asyncio.run(score_fn([_sample(0, path="/a.png")]))
+
+    assert seen["ref"] is ref, "the ref must be resolved, not passed through"
+    assert seen["timeout"] is None, "an absent timeout stays unbounded"
+    assert out[0].rm_score == pytest.approx(0.6)
+
+
+def test_a_plain_dict_result_is_not_mistaken_for_a_ref(monkeypatch):
+    """A dict answer also has a ``.get``; detection must be by type, not by attribute."""
+    import ray
+
+    def _explode(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("ray.get must not be called on a plain dict result")
+
+    monkeypatch.setattr(ray, "get", _explode)
+    handle = _RayRefHandle({"reward_score": 0.4, "reward_extra_info": {}})
+    score_fn = rm.make_rm_score_fn(handle, data_builder=lambda payload: payload)
+    out = asyncio.run(score_fn([_sample(0, path="/a.png")]))
+    assert out[0].rm_score == pytest.approx(0.4)

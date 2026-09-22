@@ -80,6 +80,49 @@ def test_build_gen_sampling_params_rejects_zero_noise():
         serve.build_gen_sampling_params(rollout)
 
 
+def test_build_gen_sampling_params_lets_val_kwargs_win_over_the_train_config():
+    """A validation batch must decode with the val knobs, not the training ones.
+
+    ``AgentLoopWorker.run`` overlays ``val_kwargs.pipeline``/``val_kwargs.algo``
+    onto ``base`` and sets ``logprobs=False``.  Stamping the train
+    ``pipeline``/``algo`` on top of that (the old layer order) discarded the
+    overlay, so ``VAL_GEN_STEPS``/``VAL_NOISE_LEVEL`` never reached the image
+    generator and validation images stayed stochastic.
+    """
+    rollout = SimpleNamespace(
+        pipeline=SimpleNamespace(num_inference_steps=10, height=256, width=256),
+        algo=SimpleNamespace(noise_level=0.7, sde_window_size=2, sde_window_range=[0, 7]),
+        calculate_log_probs=True,
+    )
+    params = serve.build_gen_sampling_params(
+        rollout,
+        base={
+            "logprobs": False,  # set by the worker for validation batches
+            "noise_level": 0.0,
+            "num_inference_steps": 50,
+            "sde_window_size": 2,
+            "sde_window_range": [0, 7],
+        },
+        seed=3,
+    )
+    assert params["num_inference_steps"] == 50, "VAL_GEN_STEPS must survive"
+    assert params["noise_level"] == 0.0, "VAL_NOISE_LEVEL must survive"
+    assert params["logprobs"] is False, "a val batch does not need SDE log-probs"
+    assert params["seed"] == 3
+
+
+def test_build_gen_sampling_params_still_rejects_zero_noise_when_training():
+    """The zero-noise guard exists to stop a *training* run from silently
+    emitting GEN rows with no log-probs; it must not be relaxed for training."""
+    rollout = SimpleNamespace(
+        pipeline={"num_inference_steps": 10},
+        algo={"noise_level": 0.0},
+        calculate_log_probs=True,
+    )
+    with pytest.raises(ValueError, match="noise_level"):
+        serve.build_gen_sampling_params(rollout, base={"logprobs": True, "global_steps": 1})
+
+
 def test_build_gen_sampling_params_rejects_missing_calculate_log_probs():
     rollout = SimpleNamespace(
         pipeline={"num_inference_steps": 4},

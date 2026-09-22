@@ -78,6 +78,35 @@ def _mid_loop_payload(extra_info: Any) -> dict[str, Any] | None:
     return payload
 
 
+def _resolve_judge_endpoint(knobs: dict[str, Any], manager_kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Point the judge at the reward pool's own router when the manager offers one.
+
+    ``VisualRewardManager`` passes ``reward_router_address`` (and ``model_name``)
+    whenever a reward model is deployed: the manager builds a router in front of the
+    RM replicas (``RewardModelManager._initialize_router`` -> a catch-all proxy) and
+    hands our function its ``host:port``. That router speaks OpenAI
+    ``/v1/chat/completions``, so the SAME scoring path the frozen sidecar served can be
+    served by the reward pool itself — no second model, no second process, and the
+    Yes/No (``good_enough``) flag comes back through the identical parse.
+
+    The router wins over the configured ``vllm_url`` on purpose: the config knob is the
+    external judge, and an operator who sets both has almost certainly left the knob
+    behind. Passing no router (no reward model enabled) leaves ``knobs`` untouched and
+    the configured sidecar, if any, keeps working as a fallback.
+    """
+    router = str(manager_kwargs.get("reward_router_address") or "").strip()
+    if not router:
+        return knobs
+    out = dict(knobs)
+    out["vllm_url"] = router if router.startswith(("http://", "https://")) else f"http://{router}"
+    model_name = str(manager_kwargs.get("model_name") or "").strip()
+    if model_name:
+        # vLLM serves the checkpoint path as its model id; an empty model id is rejected
+        # by the OpenAI route, so carry the RM's own path through.
+        out["vllm_model"] = model_name
+    return out
+
+
 def compute_score(
     data_source: str = "",
     solution_str: str = "",
@@ -89,11 +118,17 @@ def compute_score(
 
     Args:
         data_source: Unused; kept for the verl ``compute_score`` signature.
-        solution_str: Decoded trajectory text (``NaiveRewardManager``). Unused —
-            the in-loop payload carries image paths, not text.
+        solution_str: Decoded trajectory text. The reward managers pass this for a *token*
+            response: ``NaiveRewardManager`` from its own decode, and ``VisualRewardManager``
+            for the Bagel lane, whose episode is a Hermes text trajectory
+            (``_is_token_response``). Unused when the in-loop payload is present — that
+            carries image paths, not text.
         ground_truth: Episode ground truth, forwarded to the episode scorer.
         extra_info: Manager-forwarded metadata. Carries ``bagel_corl`` →
             mid-loop GEN scoring; absent → post-hoc episode scoring.
+        **kwargs: Manager-supplied scorer extras. ``reward_router_address`` and
+            ``model_name`` (``VisualRewardManager`` with a deployed reward model)
+            are consumed to scope the judge to the reward pool's own model.
 
     Returns:
         Flat dict with ``score`` plus metric keys (``sample_scores``,
@@ -131,6 +166,9 @@ def compute_score(
             "scorer_knobs/extra_info; the loop must stamp agentic scorer knobs"
         )
     knobs["good_enough_threshold"] = float(knobs["good_enough_threshold"])
+    # Route the judge at the reward pool when one is deployed (see
+    # ``_resolve_judge_endpoint``); falls back to the configured judge otherwise.
+    knobs = _resolve_judge_endpoint(knobs, kwargs)
     user_request = str(extra_info.get("user_prompt") or extra_info.get("raw_prompt") or "")
     image_prompt = str(payload.get("image_prompt") or "")
     reference_paths = [str(p) for p in payload.get("reference_paths") or []]

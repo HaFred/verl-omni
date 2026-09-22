@@ -35,6 +35,27 @@ from verl_omni.pipelines.bagel_flow_grpo.bagel_model import (
     _map_checkpoint_to_training,
 )
 
+# Vocab chunk for the UND infer-pass entropy reduction: bounds the ``exp()`` transient so the
+# ``(B, L-1, V)`` log-prob grid is never duplicated in full on these memory-tight cards.
+_ENTROPY_VOCAB_CHUNK = 8192
+
+
+def und_categorical_entropy(log_probs: Tensor) -> Tensor:
+    """Token-level entropy of the categorical the log-probs describe.
+
+    Matches ``entropy_from_logits`` in verl's AR engine (``verl/verl/workers/utils/losses.py:60``
+    feeds the same quantity to ``ppo_loss``'s entropy bonus and the trainer publishes it beside
+    ``log_probs``). The vocab is reduced in chunks of ``_ENTROPY_VOCAB_CHUNK``: ``exp()`` over the
+    full vocab at once would add another ``(B, L-1, V)`` float32 transient on top of ``log_probs``,
+    which is exactly the kind of allocation that OOMed these cards before.
+    """
+    total = torch.zeros(log_probs.shape[:-1], dtype=log_probs.dtype, device=log_probs.device)
+    for start in range(0, log_probs.shape[-1], _ENTROPY_VOCAB_CHUNK):
+        block = log_probs[..., start : start + _ENTROPY_VOCAB_CHUNK]
+        total += -(block.exp() * block).sum(dim=-1)
+    return total
+
+
 # Text-path UND LoRA (never ``*_moe_gen``).
 UND_LORA_TARGET_MODULES: tuple[str, ...] = (
     "q_proj",
@@ -70,8 +91,16 @@ def validate_disjoint_lora_targets(target_modules: Iterable[str]) -> tuple[set[s
         ``(und_selected, gen_selected)`` subsets of the known target lists.
 
     Raises:
-        ValueError: Overlap, or a name that is neither UND nor GEN.
+        ValueError: A non-sequence value, an overlap, or a name that is neither UND nor GEN.
     """
+    # A bare string is iterable, so "all-linear" (the shared model-config default) would
+    # be sliced into characters and reported as unknown names. The dual-lane split is
+    # only expressible as an explicit list, so reject the string up front.
+    if isinstance(target_modules, str):
+        raise ValueError(
+            "Bagel CoRL LoRA target_modules must be an explicit list of module names, got the "
+            f"string {target_modules!r} (RFC §4.0.2 dual-lane LoRA)"
+        )
     selected = [str(name) for name in target_modules]
     und = set(UND_LORA_TARGET_MODULES)
     gen = set(GEN_LORA_TARGET_MODULES)
@@ -203,17 +232,26 @@ class BagelForCoRL(BagelForTraining):
         input_ids: Tensor,
         attention_mask: Tensor,
         response_mask: Tensor,
-    ) -> Tensor:
+        *,
+        with_entropy: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor]:
         """Causal next-token log-probs on the text MoT path (no GEN / latent tokens).
 
         Args:
             input_ids: ``(B, L)`` token ids.
             attention_mask: ``(B, L)`` 1 = valid.
             response_mask: ``(B, L)`` 1 = policy tokens to score (forced reflection is 0).
+            with_entropy: also return the per-token policy entropy. The v1 trainer's
+                ``_compute_old_log_prob`` reads ``entropy`` off the TransferQueue right next to
+                ``log_probs`` (``trainer_base.py:1506,1513``), so the ``compute_log_prob`` path has
+                to publish it. The train path does not (``ppo_loss`` reads entropy from
+                ``model_output`` and we deliberately do not put it there), so it stays opt-in and
+                costs nothing on the hot path.
 
         Returns:
             ``(B, L-1)`` log-probs aligned with ``input_ids[:, 1:]``, zeroed where
-            ``response_mask[:, 1:]`` is 0.
+            ``response_mask[:, 1:]`` is 0. With ``with_entropy``, a ``(log_probs, entropy)`` pair
+            where ``entropy`` is the token-level policy entropy on the same grid and masking.
         """
         if input_ids.ndim != 2:
             raise ValueError("compute_und_log_prob expects input_ids of shape (B, L)")
@@ -244,4 +282,9 @@ class BagelForCoRL(BagelForTraining):
         labels = input_ids[:, 1:].unsqueeze(-1)
         token_logp = log_probs.gather(-1, labels).squeeze(-1)
         score_mask = response_mask[:, 1:].to(dtype=token_logp.dtype)
+        if with_entropy:
+            # Same convention as ``entropy_from_logits`` in verl's AR engine: Categorical entropy
+            # per token on the ``log_probs`` grid.
+            token_entropy = und_categorical_entropy(log_probs)
+            return token_logp * score_mask, token_entropy * score_mask
         return token_logp * score_mask

@@ -13,11 +13,15 @@
 # limitations under the License.
 
 from argparse import Namespace
+from collections.abc import Sequence
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
 import torch
+import yaml
 
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.workers.rollout.vllm_rollout import vllm_omni_ar_strategy as ar_strategy_module
@@ -346,14 +350,18 @@ def test_diffusion_strategy_omits_audio_sample_rate_without_declared_spec(monkey
 
 
 @pytest.mark.parametrize(
-    ("strategy_cls", "expected_extra_keys"),
+    ("strategy_cls", "expected_extra_keys", "sampling_kwarg"),
     [
-        (ARStrategy, {"lora_request", "priority"}),
-        (DiffusionStrategy, set()),
+        # The AR strategy hands the Thinker's single ``SamplingParams`` to the engine as the
+        # stage-0 ``sampling_params`` entry and pins the e2e final output to the text stage; the
+        # diffusion strategy has already expanded its own params into a full per-stage list in
+        # ``preprocess_input`` and passes that list.
+        (ARStrategy, {"lora_request", "priority", "output_modalities"}, "sampling_params"),
+        (DiffusionStrategy, set(), "sampling_params_list"),
     ],
 )
 @pytest.mark.asyncio
-async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, expected_extra_keys):
+async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, expected_extra_keys, sampling_kwarg):
     class _Engine:
         def generate(self, **kwargs):
             self.kwargs = kwargs
@@ -377,5 +385,178 @@ async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, expect
 
     assert result == "last"
     assert engine.kwargs["request_id"] == "request-1"
-    assert engine.kwargs["sampling_params_list"] == ["params"]
-    assert set(engine.kwargs) - {"prompt", "request_id", "sampling_params_list"} == expected_extra_keys
+    assert engine.kwargs[sampling_kwarg] == ["params"]
+    assert set(engine.kwargs) - {"prompt", "request_id", sampling_kwarg} == expected_extra_keys
+
+
+def _resolve_like_async_omni(
+    num_stages: int,
+    *,
+    sampling_params: Any = None,
+    sampling_params_list: Any = None,
+) -> list[Any]:
+    """Mirror the pinned engine's stage-0 splice plus ``resolve_sampling_params_list`` validation.
+
+    Transcribed from ``vllm_omni/entrypoints/async_omni.py`` (the ``sampling_params`` forward) and
+    ``vllm_omni/entrypoints/omni_base.py`` (the single-object rejection), so a candidate call shape
+    is judged by the same rule the server uses.
+    """
+    if sampling_params_list is None and sampling_params is not None:
+        if num_stages == 1:
+            sampling_params_list = [sampling_params]
+        else:
+            default = [f"stage{i}-default" for i in range(num_stages)]
+            default[0] = sampling_params
+            sampling_params_list = default
+    if sampling_params_list is None:
+        return [f"stage{i}-default" for i in range(num_stages)]
+    if isinstance(sampling_params_list, Sequence) and not isinstance(sampling_params_list, (str, bytes)):
+        resolved = list(sampling_params_list)
+    elif num_stages == 1:
+        resolved = [sampling_params_list]
+    else:
+        raise ValueError(f"Expected {num_stages} sampling params, got a single sampling params object")
+    if len(resolved) != num_stages:
+        raise ValueError(f"Expected {num_stages} sampling params, got {len(resolved)}")
+    return resolved
+
+
+def _und_ar_stage_count() -> int:
+    """Stages declared by the UND AR replica's deploy config, read from the recipe's own yaml."""
+    deploy = Path(__file__).resolve().parents[4] / "examples/agenticllmgrpo_trainer/bagel/bagel_corl_deploy_ar.yaml"
+    return len(yaml.safe_load(deploy.read_text())["stages"])
+
+
+@pytest.mark.asyncio
+async def test_ar_strategy_survives_the_multistage_und_ar_replica():
+    """The UND AR replica is multi-stage, and a single-object ``sampling_params_list`` breaks it.
+
+    ``bagel_corl_deploy_ar.yaml`` is ``pipeline: bagel_think`` -- a Thinker stage plus a DiT stage
+    on the replica's second card -- so the AR engine reports ``num_stages == 2``. Routing the
+    Thinker's single ``SamplingParams`` through ``sampling_params_list`` made the engine raise
+
+        ValueError: Expected 2 sampling params, got a single sampling params object
+
+    on every UND tool-call decode. That left each episode with no materializable trajectory and
+    aborted the step in the sync replay buffer with "selected terminal groups with no materializable
+    trajectories" -- a rollout-shaped failure that looks nothing like its sampling-params cause.
+    """
+    stages = _und_ar_stage_count()
+    assert stages > 1, (
+        "bagel_corl_deploy_ar.yaml is single-stage, so this guard's premise (a multi-stage AR "
+        "replica) no longer holds; re-check how the AR strategy hands params to the engine."
+    )
+
+    class _Engine:
+        num_stages = stages
+
+        def generate(self, **kwargs):
+            self.kwargs = kwargs
+            # Resolve exactly the way the engine does, so an unexpanded single object raises here
+            # the way it did on the real run instead of silently passing the guard.
+            self.resolved = _resolve_like_async_omni(
+                self.num_stages,
+                sampling_params=kwargs.get("sampling_params"),
+                sampling_params_list=kwargs.get("sampling_params_list"),
+            )
+
+            async def _outputs():
+                yield "last"
+
+            return _outputs()
+
+    engine = _Engine()
+    strategy = ARStrategy(SimpleNamespace(engine=engine))
+
+    result = await strategy.run_generation(
+        prompt={"prompt_token_ids": [1]},
+        params="THINKER-PARAMS",
+        request_id="request-1",
+        lora_request=None,
+        priority=0,
+    )
+
+    assert result == "last"
+    # Stage 0 is the Thinker and receives our params; the later stages keep the deploy config's
+    # own defaults rather than being forced to the Thinker's decode settings.
+    assert engine.resolved == ["THINKER-PARAMS", "stage1-default"]
+    assert "sampling_params_list" not in engine.kwargs
+    # ...and the e2e final stage is pinned to the Thinker, so the DiT output cannot become the
+    # request's "final" one (see the modality test below).
+    assert engine.kwargs["output_modalities"] == ["text"]
+
+    # The shape this test exists to forbid: the old single-object list is rejected even though it
+    # was a list-like payload, because one object is not one-params-per-stage.
+    with pytest.raises(ValueError, match="Expected 2 sampling params, got a single sampling params object"):
+        _resolve_like_async_omni(2, sampling_params_list="THINKER-PARAMS")
+
+
+def _think_final_output_types() -> list[str]:
+    """``final_output_type`` of each ``final_output`` stage of the AR replica's pipeline.
+
+    Preferred source is vLLM-Omni's own registry, so this guard breaks if the pipeline gains or
+    reorders stages. Falls back to the pair ``bagel_think`` is documented with (Thinker, then DiT)
+    when the registry cannot be imported.
+    """
+    try:
+        from vllm_omni.config.pipeline_registry import BAGEL_THINK_PIPELINE
+
+        types = [s.final_output_type for s in BAGEL_THINK_PIPELINE.stages if getattr(s, "final_output", False)]
+        if types:
+            return types
+    except Exception:  # pragma: no cover - registry unavailable in a stripped environment
+        pass
+    return ["text", "image"]
+
+
+def _final_stage_like_engine(final_output_types: list[str], output_modalities: list[str]) -> int:
+    """Mirror ``get_final_stage_id_for_e2e``: the *last* stage whose type was requested."""
+    for sid in range(len(final_output_types) - 1, -1, -1):
+        if final_output_types[sid] in output_modalities:
+            return sid
+    return len(final_output_types) - 1
+
+
+@pytest.mark.asyncio
+async def test_the_text_modality_pin_keeps_the_dit_output_out_of_the_und_lane():
+    """Without the modality pin the UND lane receives the DiT stage's token-less output.
+
+    ``bagel_think`` declares **both** stages ``final_output`` (stage 0 text, stage 1 image), and
+    the engine's default modality list is every stage's type. ``get_final_stage_id_for_e2e`` scans
+    backwards from the last stage, so the default lands on the DiT -- whose output carries no
+    ``outputs`` at all. ``ARStrategy.process_output`` then fails on
+
+        RuntimeError: AR mode expects outputs with token IDs, but got None or empty.
+
+    for every UND tool-call decode, which is why the UND lane produced no materializable
+    trajectory and the sync replay buffer aborted the step.
+    """
+    final_output_types = _think_final_output_types()
+    assert final_output_types[0] == "text" and final_output_types[-1] != "text", (
+        "this guard assumes the AR replica's pipeline ends in a non-text (DiT) final stage; "
+        f"got {final_output_types}. Re-derive the failure mode before trusting it."
+    )
+
+    # The default (no modality requested) is every final-output type -> the DiT wins.
+    assert _final_stage_like_engine(final_output_types, final_output_types) != 0
+    # Pinning text is what makes the Thinker the e2e final stage and its tokens the delivered.
+    assert _final_stage_like_engine(final_output_types, ["text"]) == 0
+
+    class _Engine:
+        def generate(self, **kwargs):
+            self.kwargs = kwargs
+
+            async def _outputs():
+                yield "output"
+
+            return _outputs()
+
+    engine = _Engine()
+    await ARStrategy(SimpleNamespace(engine=engine)).run_generation(
+        prompt={"prompt_token_ids": [1]},
+        params="THINKER-PARAMS",
+        request_id="request-1",
+        lora_request=None,
+        priority=0,
+    )
+    assert engine.kwargs["output_modalities"] == ["text"]

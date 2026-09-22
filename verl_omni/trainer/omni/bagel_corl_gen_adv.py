@@ -20,6 +20,7 @@ slice: same ``compute_advantage`` helper the diffusion trainers use, grouped by
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Mapping
 
 import numpy as np
@@ -28,6 +29,8 @@ from tensordict import TensorDict
 from verl import DataProto
 
 from verl_omni.trainer.diffusion.ray_diffusion_trainer import compute_advantage
+
+logger = logging.getLogger(__name__)
 
 __all__ = ["apply_gen_flowgrpo_advantage", "build_gen_flowgrpo_proto", "select_gen_advantages_for_step"]
 
@@ -97,6 +100,12 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
     """
     usable: list[tuple[Mapping[str, Any], torch.Tensor, float, str, torch.Tensor, torch.Tensor]] = []
     missing_traj = 0
+    # Reason counters for the "rows arrived but none are trainable" case. It is a *silent* skip in
+    # the original FlowGRPO port and is the single most re-debugged symptom of this lane: with
+    # ``ENABLE_RM=0`` every row carries ``rm_score=None``, so a step's ``gen/skipped_no_groups: 1``
+    # and ``has_complete_gen_groups: 0`` are correct-but-opaque. Naming the missing column here
+    # turns "GEN never trains" into one readable line.
+    missing_score = missing_logprob = missing_uid = 0
     for row in gen_batch:
         logprob = _logprob_1d(row.get("rollout_log_probs"))
         score = row.get("rm_score")
@@ -108,6 +117,12 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
                 missing_traj += 1
             continue
         if logprob is None or score is None or uid is None:
+            if score is None:
+                missing_score += 1
+            if logprob is None:
+                missing_logprob += 1
+            if uid is None:
+                missing_uid += 1
             continue
         usable.append((row, logprob, float(score), str(uid), latents, timesteps))
     if not usable:
@@ -116,6 +131,23 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
                 "bagel_corl: GEN batch lacks all_latents/timesteps for FlowGRPO "
                 f"({missing_traj} row(s)); refuse soft-fallback to rollout_log_probs / skip GEN loss. "
                 "Fix live GEN traj stash (calculate_log_probs + algo.noise_level>0)."
+            )
+        if gen_batch:
+            logger.warning(
+                "bagel_corl: %d GEN row(s) arrived but none are trainable "
+                "(rm_score missing=%d, rollout_log_probs missing=%d, gen_group_uid missing=%d). "
+                "FlowGRPO needs all three and this step trains UND only. Read the counts, not "
+                "an assumption: with the reward lane ON, 'rm_score missing=0' means the reward "
+                "is fine and the row died on a different column. 'rollout_log_probs missing' "
+                "with latents/timesteps present is the one to chase -- the SDE sampler returned "
+                "no per-step log-probs (an EMPTY vector counts here, and the upstream stash "
+                "checks only `is None`, so emptiness reaches this line). Check "
+                "rollout.calculate_log_probs, algo.noise_level>0, the SDE window, and the GEN "
+                "request's `logprobs` value in build_gen_sampling_params.",
+                len(gen_batch),
+                missing_score,
+                missing_logprob,
+                missing_uid,
             )
         return None
 

@@ -38,10 +38,13 @@ from verl_omni.agent_loop.bagel_corl_lib import (
     EpisodeRollout,
     GenSample,
     _as_gen_sample,
+    episode_und_reward,
     strip_pixels_for_actor,
+    und_episode_rm_scores,
 )
 from verl_omni.agent_loop.bagel_corl_rm import bind_bagel_rm_handles
 from verl_omni.tools.trajectory.hydra_env import bind_agentic_image_gen
+from verl_omni.tools.trajectory.paths import bind_run_artifacts
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -59,8 +62,10 @@ __all__ = [
     "gate_episode_jk",
     "gen_tq_key",
     "pack_dual_lane_episode",
+    "put_dual_lane_rows",
     "split_und_gen_from_und_records",
     "split_und_gen_metas",
+    "und_row_reward",
     "und_tq_key",
 ]
 
@@ -181,11 +186,29 @@ def pack_dual_lane_episode(
                     "call_role": sample.call_role,
                     "good_enough": sample.good_enough,
                     "image_path": sample.image_path,
+                    # RFC §4.4.2a: the reuse identity, per GEN row.
+                    "cond_uid": sample.cond_uid,
+                    "cond_len": int(sample.cond_len or 0),
                 }
             )
-            gen_records.append({"key": key, "fields": row, "tag": {"bagel_role": "gen", "status": "success"}})
+            gen_records.append(
+                {
+                    "key": key,
+                    "fields": row,
+                    # ``is_auxiliary`` keeps the replay buffer from sampling this seed row into a
+                    # training batch: it shares the UND episode's uid but has no token sequence for
+                    # the UND pass. The GEN lane reaches the trainer through the UND row's
+                    # ``child_gen_keys`` instead.
+                    "tag": {"bagel_role": "gen", "is_auxiliary": True, "status": "success"},
+                }
+            )
 
     task_uid = dataset_task_uid or episode.und_group_uid
+    # Distinct conditionings this episode encoded. R2's win is "S seeds share one
+    # conditioning", so the count of *distinct* uids is what the per-call ratio is
+    # measured against — a bare per-row ``cond_uid`` cannot distinguish that from
+    # S independent conditionings.
+    cond_uids = sorted({str(s.cond_uid) for s in episode.gen_samples if s.valid and s.cond_uid})
     und_fields = {
         "bagel_role": "und",
         "episode_uid": episode.episode_uid,
@@ -196,6 +219,7 @@ def pack_dual_lane_episode(
         "prompt_ids": list(episode.prompt_ids),
         "response_ids": list(episode.response_ids),
         "response_mask": list(episode.response_mask),
+        "rollout_log_probs": list(episode.rollout_log_probs),
         "child_gen_keys": list(child_keys),
         "episode_J": j,
         "episode_K": k,
@@ -204,6 +228,8 @@ def pack_dual_lane_episode(
         "token_level_scores": float(episode.und_reward),
         "num_gen_calls": k,
         "policy_version": int(episode.policy_version),
+        "gen_cond_uids": cond_uids,
+        "gen_cond_len": int(max((s.cond_len for s in episode.gen_samples if s.valid), default=0)),
     }
     metrics = {
         "episode/J": float(j),
@@ -221,6 +247,9 @@ def pack_dual_lane_episode(
         "episode/pattern_paired": 1.0 if pattern == "paired" else 0.0,
         "episode/pattern_mixed": 1.0 if pattern == "mixed" else 0.0,
         "episode/pattern_gen_off": 1.0 if pattern == "gen_off" else 0.0,
+        # RFC §4.4.4 R2, measured from the engine's cache counters (absent when
+        # the engine exposed none — never a fabricated value).
+        **dict(episode.r2_metrics or {}),
     }
     return DualLanePack(
         und_key=und_key,
@@ -232,6 +261,28 @@ def pack_dual_lane_episode(
         pattern=pattern,
         metrics=metrics,
     )
+
+
+def und_row_reward(episode: EpisodeRollout, response_mask: Any) -> torch.Tensor:
+    """Build the ``rm_scores`` column for a UND row from the episode's RFC reward.
+
+    Two details have to line up, which is why this is one helper rather than two lines at the
+    call site:
+
+    * the column must exist at all -- ``AgentLoopOutput.as_dict`` only publishes ``rm_scores``
+      when ``reward_score`` is set (``verl/experimental/agent_loop/agent_loop.py:143``), and the
+      v1 UND advantage reads it unconditionally (``trainer_base.py:1595``). The UND ingest
+      therefore writes this column itself instead of relying on the optional ``as_dict`` path;
+    * the score itself must land on the last *trainable* token (see
+      ``bagel_corl_lib.und_episode_rm_scores`` for why ``as_dict``'s ``[-1]`` is wrong here).
+
+    With the served RM disabled (``ENABLE_RM=0`` in the recipe, until Hermes + composite step are
+    green) the reward is the RFC ``und/no_image_credit`` scalar: the mean of the valid GEN seeds'
+    RM scores when the RM ran, else the non-image UND scalar -- exactly the value
+    ``flatten_multiturn_rollouts`` writes to ``token_level_scores``.
+    """
+    reward, _ = episode_und_reward(episode)
+    return torch.tensor(und_episode_rm_scores(response_mask, reward), dtype=torch.float32)
 
 
 def split_und_gen_from_und_records(
@@ -266,8 +317,14 @@ def episode_from_agent_extra(
     extra: Mapping[str, Any],
     und_group_uid: str,
     reward_score: float | None = None,
+    rollout_log_probs: list[float] | None = None,
 ) -> EpisodeRollout:
-    """Rebuild ``EpisodeRollout`` from ``AgentLoopOutput`` fields / extra_fields."""
+    """Rebuild ``EpisodeRollout`` from ``AgentLoopOutput`` fields / extra_fields.
+
+    ``rollout_log_probs`` rides on ``AgentLoopOutput.response_logprobs`` (it is not part of
+    ``extra_fields``), so the caller has to hand it over explicitly; falling back to
+    ``extra["response_logprobs"]`` keeps the ``extra``-only rebuild path faithful too.
+    """
     raw_samples = extra.get("gen_samples") or []
     samples: list[GenSample] = []
     for item in raw_samples:
@@ -285,11 +342,15 @@ def episode_from_agent_extra(
         prompt_ids=list(prompt_ids),
         response_ids=list(response_ids),
         response_mask=list(response_mask),
+        rollout_log_probs=list(
+            rollout_log_probs if rollout_log_probs is not None else (extra.get("response_logprobs") or [])
+        ),
         turns=turns,
         gen_samples=samples,
         used_image_credit=bool(extra.get("used_image_credit", False)),
         und_reward=float(reward_score if reward_score is not None else extra.get("und_reward") or 0.0),
         num_gen_calls=int(num_gen),
+        r2_metrics=dict(extra.get("bagel_corl_r2") or {}),
     )
 
 
@@ -322,6 +383,12 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
         # Bind before anything reads agentic knobs: ``BagelMultiturnAgentLoop.run``
         # calls ``agentic_get("good_enough_threshold")``, which raises while unbound.
         bind_agentic_image_gen(config)
+        # Bind the per-run artifact dir (``trainer.experiment_name`` → run name) so the
+        # episode trajectory dumps land in ``<e2e_root>/<experiment_name>/`` -- for this
+        # recipe ``outputs/e2e/bagel_corl_pr1/`` -- instead of the ``agentic_run`` default.
+        # Without it ``resolve_run_dir()`` falls back to that placeholder name because this
+        # recipe never set ``agentic_image_gen.e2e_root``.
+        bind_run_artifacts(config)
         super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
         handles = list(reward_loop_worker_handles) if reward_loop_worker_handles else None
         if handles is not None and not hasattr(self, "reward_loop_worker_handles"):
@@ -382,6 +449,7 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
             extra=episode_output.extra_fields or {},
             und_group_uid=str(uid),
             reward_score=episode_output.reward_score,
+            rollout_log_probs=list(episode_output.response_logprobs or []),
         )
         pack = pack_dual_lane_episode(
             episode,
@@ -436,6 +504,10 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
         und_field["extra_fields"] = und_extra
         und_field["child_gen_keys"] = list(pack.child_gen_keys)
         und_field["bagel_role"] = "und"
+        # The v1 UND advantage reads ``rm_scores`` off the TQ (``trainer_base.py:1595`` copies it
+        # into ``token_level_scores``). It is the RFC ``und/no_image_credit`` episode reward; see
+        # ``und_row_reward`` for why the ingest writes the column itself and where it lands.
+        und_field["rm_scores"] = und_row_reward(episode, und_field["response_mask"])
 
         keys = [und_key]
         fields = [und_field]
@@ -472,6 +544,9 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
                 {
                     "status": "success",
                     "bagel_role": "gen",
+                    # See ``DualLanePack.gen_records``: auxiliary rows are stored for the GEN lane
+                    # (fetched by ``child_gen_keys``) and must never enter a sampled batch.
+                    "is_auxiliary": True,
                     "parent_und_key": und_key,
                     "global_steps": kwargs["global_steps"],
                     "min_global_steps": kwargs.get("global_steps"),
@@ -482,12 +557,68 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
                 }
             )
 
-        await tq.async_kv_batch_put(
+        await put_dual_lane_rows(
+            tq,
             keys=keys,
-            fields=list_of_dict_to_tensordict(fields),
+            field_dicts=fields,
             tags=tags,
             partition_id="train" if not validate else "val",
         )
+
+
+async def put_dual_lane_rows(
+    tq: Any,
+    *,
+    keys: list[str],
+    field_dicts: list[dict[str, Any]],
+    tags: list[dict[str, Any]],
+    partition_id: str,
+    und_row_count: int = 1,
+) -> int:
+    """Write one episode's dual-lane rows, one ``kv_batch_put`` **per lane**. Returns the put count.
+
+    The UND row and the GEN rows have disjoint schemas — UND carries ``prompts``/``responses``/
+    ``input_ids``/``position_ids``/``multi_modal_inputs``, GEN carries ``prompt_token_ids``/
+    ``all_latents``/``timesteps``/``seed_index``/``cond_uid`` — and
+    ``list_of_dict_to_tensordict`` builds its column dict from the **first** row's keys
+    (``verl/utils/tensordict_utils.py:929``):
+
+        keys = list_of_dicts[0].keys()
+        dict_of_lists = {key: [d[key] for d in list_of_dicts] for key in keys}
+
+    so packing both lanes into one call dies with ``KeyError: 'prompts'`` on the GEN rows. That
+    is not an edge case: it fires on the first episode that actually calls ``generate_image``
+    (K >= 1) — precisely the episodes this trainer exists to learn from. Pattern-3 (K = 0)
+    episodes hid it, because then the list is a single UND row and the schema is trivially
+    uniform. Verified on CPU 2026-09-18:
+
+        pack([{"prompts": ..., "responses": ...}, {"all_latents": ...}])
+        -> KeyError: 'prompts'
+
+    ``kv_batch_put`` is per key set (``transfer_queue/interface.py:768``), so splitting by lane
+    is a contract-preserving change: both lanes land in the same partition with the same tags,
+    and consumers already fetch them by their own keys (UND by ``batch.keys``, GEN by
+    ``child_gen_keys``).
+    """
+    if not (len(keys) == len(field_dicts) == len(tags)):
+        raise ValueError(
+            f"dual-lane put needs aligned keys/fields/tags, got {len(keys)}/{len(field_dicts)}/{len(tags)}"
+        )
+    if und_row_count < 0 or und_row_count > len(keys):
+        raise ValueError(f"und_row_count={und_row_count} is out of range for {len(keys)} rows")
+
+    puts = 0
+    for start, stop in ((0, und_row_count), (und_row_count, len(keys))):
+        if start >= stop:
+            continue
+        await tq.async_kv_batch_put(
+            keys=list(keys[start:stop]),
+            fields=list_of_dict_to_tensordict(list(field_dicts[start:stop])),
+            tags=list(tags[start:stop]),
+            partition_id=partition_id,
+        )
+        puts += 1
+    return puts
 
 
 class BagelCorlAgentLoopManagerTQ(AgentLoopManager):

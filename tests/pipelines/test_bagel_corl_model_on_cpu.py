@@ -81,3 +81,43 @@ def test_dual_lora_param_groups_split_moe_gen():
     groups = dual_lora_param_groups(model)
     names = {g["name"] for g in groups}
     assert names == {"gen_lora"}
+
+
+def test_und_categorical_entropy_matches_the_closed_form():
+    """Entropy must be the Categorical entropy the AR engine reports for the same logits."""
+    import torch.nn.functional as F
+
+    from verl_omni.pipelines.bagel_flow_grpo.bagel_corl import und_categorical_entropy
+
+    logits = torch.randn(2, 5, 7)
+    log_probs = F.log_softmax(logits.float(), dim=-1)
+
+    expected = torch.distributions.Categorical(logits=logits.float()).entropy()
+
+    assert torch.allclose(und_categorical_entropy(log_probs), expected, atol=1e-6)
+
+
+def test_und_categorical_entropy_is_vocab_chunk_invariant(monkeypatch):
+    """Chunking the vocab reduction must not change the value (it exists to bound the transient)."""
+    import torch.nn.functional as F
+
+    from verl_omni.pipelines.bagel_flow_grpo import bagel_corl
+
+    log_probs = F.log_softmax(torch.randn(2, 3, 40).float(), dim=-1)
+    whole = bagel_corl.und_categorical_entropy(log_probs)
+
+    monkeypatch.setattr(bagel_corl, "_ENTROPY_VOCAB_CHUNK", 7)
+    chunked = bagel_corl.und_categorical_entropy(log_probs)
+
+    assert torch.allclose(whole, chunked, atol=1e-6)
+
+
+def test_und_infer_entropy_is_opt_in_so_the_train_path_does_not_pay_for_it():
+    """``with_entropy`` defaults off: the train pass must not duplicate the (B, L-1, V) grid."""
+    import inspect
+
+    from verl_omni.pipelines.bagel_flow_grpo.bagel_corl import BagelForCoRL
+
+    signature = inspect.signature(BagelForCoRL.compute_und_log_prob)
+    assert signature.parameters["with_entropy"].default is False
+    assert signature.parameters["with_entropy"].kind is inspect.Parameter.KEYWORD_ONLY

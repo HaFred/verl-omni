@@ -245,10 +245,18 @@ def make_rm_score_fn(
         else:
             result = method(data)
         result = await result if asyncio.iscoroutine(result) else result
-        if timeout_s is not None and hasattr(result, "get") and not asyncio.iscoroutine(result):
-            # Ray ObjectRef path: enforce the timeout via ray.get when available.
-            import ray
+        # A Ray actor call hands back an ObjectRef, and the ref is not a score: if it is
+        # returned unresolved, ``parse_rm_result`` dies on
+        # ``missing 'reward_score': <class 'ray.ObjectRef'>``, which aborts the episode and
+        # -- measured 2026-09-22 with ENABLE_RM=1 -- starves the sync replay buffer until
+        # the whole run fails with "no materializable trajectories". Resolve it always;
+        # ``timeout_s`` is only a bound on the wait.
+        #
+        # Detected by type, not by ``hasattr(result, 'get')``: a dict answer also has a
+        # ``get`` attribute, and ``ray.get`` on a dict is a TypeError.
+        import ray
 
+        if isinstance(result, ray.ObjectRef):
             return ray.get(result, timeout=timeout_s)
         return result
 

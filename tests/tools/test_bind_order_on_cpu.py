@@ -153,3 +153,69 @@ def test_bind_none_fails_loud():
     with pytest.raises(ValueError, match="silently serve yaml"):
         hydra_env.bind_agentic_image_gen(None)
     hydra_env.clear_agentic_image_gen()
+
+
+def test_explicit_run_dir_is_used_verbatim_without_the_experiment_name():
+    """``run_dir`` names the run dir itself; appending ``experiment_name`` would nest a
+    run inside the folder the caller just asked for.
+
+    The bagel recipes pin ``agentic_image_gen.run_dir=$RUN_DIR`` so the three artifact
+    trees land beside ``.hydra/`` and ``main_omni.log`` instead of under an extra
+    ``e2e/<experiment_name>/``. Measured 2026-09-22 on ``bagel_corl_20260922_002349``:
+    dumps landed at ``<run>/e2e/bagel_corl_pr1/rollout_images/...``.
+    """
+    hydra_env.clear_agentic_image_gen()
+    cfg = OmegaConf.merge(_default_config(), {"agentic_image_gen": {"run_dir": "/tmp/run_20260922"}})
+    hydra_env.bind_agentic_image_gen(cfg)
+    paths.bind_run_artifacts(cfg)
+
+    run_dir = paths.resolve_run_dir()
+    assert str(run_dir) == str(Path("/tmp/run_20260922").resolve())
+    assert "bind-order" not in str(run_dir), "experiment_name must not be appended to an explicit run_dir"
+    assert str(paths.resolve_rollout_images_root()) == str(Path("/tmp/run_20260922").resolve() / "rollout_images")
+    hydra_env.clear_agentic_image_gen()
+
+
+def test_absent_run_dir_keeps_the_experiment_name_namespacing():
+    """The default path is unchanged, so every caller relying on
+    ``<e2e_root>/<experiment_name>/`` (and its per-run isolation) still gets it."""
+    hydra_env.clear_agentic_image_gen()
+    cfg = _default_config()
+    hydra_env.bind_agentic_image_gen(cfg)
+    paths.bind_run_artifacts(cfg)
+
+    run_dir = paths.resolve_run_dir()
+    assert run_dir.name == "bind-order"
+    assert run_dir.parent == paths.resolve_e2e_root()
+    hydra_env.clear_agentic_image_gen()
+
+
+def test_run_dir_wins_over_e2e_root():
+    """Both knobs may be set; the run dir is the more specific one and takes precedence,
+    while ``e2e_root`` keeps its own value for anything reading it directly."""
+    hydra_env.clear_agentic_image_gen()
+    cfg = OmegaConf.merge(
+        _default_config(),
+        {"agentic_image_gen": {"e2e_root": "/tmp/custom_e2e", "run_dir": "/tmp/explicit_run"}},
+    )
+    hydra_env.bind_agentic_image_gen(cfg)
+    paths.bind_run_artifacts(cfg)
+
+    assert str(paths.resolve_run_dir()) == str(Path("/tmp/explicit_run").resolve())
+    assert str(paths._e2e_root) == str(Path("/tmp/custom_e2e").resolve())
+    hydra_env.clear_agentic_image_gen()
+
+
+def test_clear_run_artifacts_drops_the_run_dir_override():
+    """A stale override must not survive into the next bind (same class of leak the
+    ``_diffusion_image_dir`` reset guards against)."""
+    hydra_env.clear_agentic_image_gen()
+    cfg = OmegaConf.merge(_default_config(), {"agentic_image_gen": {"run_dir": "/tmp/stale_run"}})
+    hydra_env.bind_agentic_image_gen(cfg)
+    paths.bind_run_artifacts(cfg)
+    assert str(paths.resolve_run_dir()) == str(Path("/tmp/stale_run").resolve())
+
+    paths.clear_run_artifacts()
+    assert paths._run_dir_override is None
+    assert paths.resolve_run_dir() == paths.resolve_e2e_root() / "agentic_run"
+    hydra_env.clear_agentic_image_gen()

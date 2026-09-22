@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import logging
 import os
@@ -35,6 +36,31 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 _WORKER_EXTENSION = "verl_omni.workers.rollout.vllm_rollout.utils.vLLMOmniColocateWorkerExtension"
+
+
+def _ar_drain_timeout_s() -> float:
+    """Seconds to wait for an AR request's terminal output before giving up.
+
+    The drain below (``_collect_last_output``) ends only when the orchestrator
+    delivers the request's *terminal* output. Measured 2026-09-20 18:42:58: two
+    admitted requests on a live AR replica never produced one, and because the
+    client awaits the actor call with no timeout, those two coroutines held the
+    actor's ``generate`` slots forever -- every later decode of that lane queued
+    behind them and the whole step stalled with ``pending: 0, running: 2`` for
+    16 minutes while the engine's worker held ~33% SM.
+
+    Bounding the drain turns that silent deadlock into an actor-side error: the
+    engine request is aborted, the coroutine finishes, the concurrency slot frees
+    and the caller (``BagelDualRoleLLMServerClient``) can abort/resume/retry. Keep
+    this *below* the client's ``BAGEL_CORL_DECODE_TIMEOUT_S`` so the diagnostic
+    lands here first (it knows the request id and engine state).
+    ``BAGEL_CORL_AR_DRAIN_TIMEOUT_S=0`` disables the bound.
+    """
+    try:
+        return float(os.getenv("BAGEL_CORL_AR_DRAIN_TIMEOUT_S", "600") or 0)
+    except ValueError:
+        logger.warning("ignoring non-numeric BAGEL_CORL_AR_DRAIN_TIMEOUT_S")
+        return 600.0
 
 
 def _drop_none_mapping_values(value: Any) -> Any:
@@ -218,15 +244,96 @@ class ARStrategy(OmniStrategyBase):
         lora_request: Optional[LoRARequest],
         priority: int,
     ) -> Any:
-        return await self._collect_last_output(
-            self.server.engine.generate(
-                prompt=prompt,
-                sampling_params_list=params,
-                request_id=request_id,
-                lora_request=lora_request,
-                priority=priority,
-            )
+        # Pass the AR decode params as ``sampling_params`` (singular, the stage-0 entry), NOT as
+        # ``sampling_params_list``. ``preprocess_input`` builds one ``SamplingParams`` for the
+        # *Thinker* stage, and ``sampling_params_list`` is a per-stage *sequence*: feeding it a
+        # single object only works on a one-stage server, because
+        # ``AsyncOmni.resolve_sampling_params_list`` wraps a bare object into a list just for
+        # ``num_stages == 1`` and otherwise raises
+        #   ValueError: Expected <num_stages> sampling params, got a single sampling params object
+        #
+        # That is exactly the AR replica's shape whenever the deploy config is a multi-stage
+        # pipeline -- ``bagel_corl_deploy_ar.yaml`` is ``pipeline: bagel_think`` with a Thinker
+        # stage plus a DiT stage on the replica's second card -- so every UND tool-call decode
+        # died there, the episodes produced no materializable trajectories, and the sync replay
+        # buffer aborted the step with "selected terminal groups with no materializable
+        # trajectories".
+        #
+        # ``sampling_params`` takes the other branch: for ``num_stages > 1`` ``AsyncOmni`` copies
+        # ``default_sampling_params_list`` and overwrites entry 0, so the Thinker gets these params
+        # and later stages keep the deploy config's own defaults. This is also the interface the
+        # AR replica is proven against -- ``run_bagel_und_ar_serve.sh`` + ``spike_und_hermes.py``
+        # reach it over HTTP, which sends the bare ``sampling_params``. Equivalent for a one-stage
+        # server (``[sampling_params]``).
+        #
+        # The diffusion strategy does the per-stage equivalent in ``preprocess_input``: it returns
+        # ``default_params_list[:-1] + [diffusion_sampling_params]`` rather than a bare object.
+        #
+        # ``output_modalities=["text"]`` pins the request's e2e final stage to the AR/Thinker
+        # stage. Both stages of a ``bagel_think`` replica declare ``final_output=True`` -- stage 0
+        # is ``final_output_type="text"`` and stage 1 (DiT) is ``"image"`` -- and when no modality
+        # is requested the default is *every* stage's type, i.e. ``["text", "image"]``. The
+        # selector then scans backwards from the last stage
+        # (``get_final_stage_id_for_e2e``), so it lands on stage 1 and the request's
+        # ``final_stage_id_for_e2e``/``final_output_stage_ids`` are the DiT's.
+        #
+        # This method can only ever return token ids -- ``process_output`` immediately does
+        # ``req_output.outputs[0].token_ids`` and builds a ``TokenOutput`` -- so a DiT output is
+        # never usable here. It is truthy-but-empty, which is why the failure surfaced as
+        #   RuntimeError: AR mode expects outputs with token IDs, but got None or empty.
+        # on every UND tool-call decode, leaving the episodes with no materializable trajectories
+        # and aborting the step in the sync replay buffer.
+        #
+        # Asking for text also stops the orchestrator at stage 0 instead of running a full DiT
+        # diffusion generation on the AR replica for every UND turn -- the replica's second card
+        # exists to hold that stage's weights, not to generate an image the UND lane discards.
+        #
+        # The drain is bounded (see ``_ar_drain_timeout_s``): an AR request that the engine
+        # admits but never finishes would otherwise hold this coroutine -- and therefore one of
+        # the actor's ``generate`` slots -- until the process dies.
+        timeout_s = _ar_drain_timeout_s()
+        generator = self.server.engine.generate(
+            prompt=prompt,
+            sampling_params=params,
+            request_id=request_id,
+            lora_request=lora_request,
+            priority=priority,
+            output_modalities=["text"],
         )
+        if timeout_s <= 0:
+            return await self._collect_last_output(generator)
+        try:
+            return await asyncio.wait_for(self._collect_last_output(generator), timeout=timeout_s)
+        except (asyncio.TimeoutError, TimeoutError) as exc:
+            in_flight = len(getattr(self.server.engine, "request_states", {}) or {})
+            prompt_tokens = len((prompt or {}).get("prompt_token_ids") or [])
+            logger.error(
+                "bagel_ar_drain_stalled request_id=%s prompt_tokens=%d max_tokens=%s waited_s=%.0f "
+                "engine_in_flight=%d: engine yielded no terminal output; aborting the request",
+                request_id,
+                prompt_tokens,
+                getattr(params, "max_tokens", None),
+                timeout_s,
+                in_flight,
+            )
+            await self._abort_engine_request(request_id)
+            raise RuntimeError(
+                f"Bagel Co-RL (Joint-Training) AR decode stalled: no terminal output after {timeout_s:.0f}s "
+                f"(request_id={request_id}, prompt_tokens={prompt_tokens}, engine_in_flight={in_flight}). "
+                "The request was aborted; see bagel_ar_drain_stalled above."
+            ) from exc
+
+    async def _abort_engine_request(self, request_id: str) -> None:
+        """Best-effort abort of one stalled request so the scheduler stops holding it.
+
+        ``engine.abort`` takes the *external* request id, which is what the caller
+        passed in; failures degrade to a warning because the caller is already
+        reporting a stall and the client-side valve aborts the whole lane anyway.
+        """
+        try:
+            await asyncio.wait_for(self.server.engine.abort([request_id]), timeout=30)
+        except Exception as exc:  # noqa: BLE001 — diagnostics path
+            logger.warning("bagel_ar_drain_stalled abort failed for request_id=%s: %s", request_id, exc)
 
     def process_output(self, final_res: Any, params: SamplingParams, sampling_params: dict[str, Any]) -> TokenOutput:
         if final_res is None:

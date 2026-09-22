@@ -204,6 +204,72 @@ def test_compute_score_fails_loud_when_any_image_unscored(monkeypatch):
         scorer.compute_score(**_kwargs(_payload()))
 
 
+def test_the_reward_pool_router_wins_over_the_configured_judge_url(monkeypatch):
+    """``ENABLE_RM=1`` scores through the reward pool, not a second judge process.
+
+    ``VisualRewardManager`` hands our function the router it built in front of the RM
+    replicas. That router is the whole point of the internal design: the reward model
+    itself produces the C/A numbers and the Yes/No flag, so the frozen sidecar (and its
+    extra ~26 GiB process) is not needed.
+    """
+    knobs_seen: list[dict] = []
+
+    def fake_judge(**kwargs):
+        knobs_seen.append(dict(kwargs["extra_info"]))
+        return {"ok": True, "correctness": 0.9, "aesthetics": 0.9, "good_enough": True}
+
+    monkeypatch.setattr(client, "call_reflect_vlm", fake_judge)
+    result = scorer.compute_score(
+        **_kwargs(_payload(), reward_router_address="10.0.0.5:9000", model_name="/ckpt/qwen3-vl-2b")
+    )
+    # The pool's router replaced the configured external judge...
+    assert knobs_seen[0]["vllm_url"] == "http://10.0.0.5:9000"
+    # ...and carries the RM's own model id, which the OpenAI route requires.
+    assert knobs_seen[0]["vllm_model"] == "/ckpt/qwen3-vl-2b"
+    # Yes/No turn signals still come back through the identical parse.
+    assert result["sample_good_enough"] == [True, True]
+    assert result["good_enough"] is True
+
+
+def test_an_http_router_address_is_not_double_prefixed(monkeypatch):
+    knobs_seen: list[dict] = []
+
+    def fake_judge(**kwargs):
+        knobs_seen.append(dict(kwargs["extra_info"]))
+        return {"ok": True, "correctness": 0.5, "aesthetics": 0.5, "good_enough": False}
+
+    monkeypatch.setattr(client, "call_reflect_vlm", fake_judge)
+    scorer.compute_score(**_kwargs(_payload(), reward_router_address="http://10.0.0.7:1234"))
+    assert knobs_seen[0]["vllm_url"] == "http://10.0.0.7:1234"
+
+
+def test_without_a_router_the_configured_judge_url_is_untouched(monkeypatch):
+    """No reward model deployed → the configured judge stays the fallback (no regression)."""
+    knobs_seen: list[dict] = []
+
+    def fake_judge(**kwargs):
+        knobs_seen.append(dict(kwargs["extra_info"]))
+        return {"ok": True, "correctness": 0.5, "aesthetics": 0.5, "good_enough": False}
+
+    monkeypatch.setattr(client, "call_reflect_vlm", fake_judge)
+    scorer.compute_score(**_kwargs(_payload()))
+    assert knobs_seen[0]["vllm_url"] == "http://rm:8000"
+    assert "vllm_model" not in knobs_seen[0]
+
+
+def test_a_blank_router_does_not_disable_a_configured_judge(monkeypatch):
+    """An empty/whitespace ``reward_router_address`` must not shadow the configured URL."""
+    knobs_seen: list[dict] = []
+
+    def fake_judge(**kwargs):
+        knobs_seen.append(dict(kwargs["extra_info"]))
+        return {"ok": True, "correctness": 0.5, "aesthetics": 0.5, "good_enough": False}
+
+    monkeypatch.setattr(client, "call_reflect_vlm", fake_judge)
+    scorer.compute_score(**_kwargs(_payload(), reward_router_address="   "))
+    assert knobs_seen[0]["vllm_url"] == "http://rm:8000"
+
+
 def test_compute_score_requires_threshold(monkeypatch):
     payload = _payload(scorer_knobs={"vllm_url": "http://rm:8000"})
     payload["extra_info"].pop("good_enough_threshold", None)

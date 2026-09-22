@@ -478,7 +478,24 @@ def dump_bagel_corl_episode_images(
         extras = non_tensor.get("gen_samples") or meta.get("gen_samples")
         if extras is None and hasattr(output_or_episodes, "extra_fields"):
             extras = (output_or_episodes.extra_fields or {}).get("gen_samples")
-        if extras is not None:
+        if extras is None and non_tensor.get("extra_fields") is not None:
+            # Bagel Co-RL (Joint-Training) shape: ``bagel_corl`` emits one
+            # ``extra_fields`` row per episode and each row carries its OWN
+            # ``gen_samples`` list -- the samples are nested inside the rows and are
+            # never hoisted to a top-level ``gen_samples`` column.
+            #
+            # Only the top-level column and the ``extra_fields`` *attribute* used to
+            # be inspected. On the driver ``extra_fields`` is a batch column, not an
+            # attribute, so both lookups missed and this function fell through to an
+            # empty ``episodes`` and returned ``[]`` WITHOUT raising -- no log line,
+            # no ``rollout_images/`` directory, and the ``gen_call`` trajectory rows
+            # kept pointing at the scratch dir. Measured 2026-09-21 on hk01dgx039:
+            # ``outputs/e2e/bagel_corl_pr1/`` held ``rollout_trajectories/`` but
+            # neither ``rollout_images/`` nor ``hermes_actions/``, while 42 PNGs sat
+            # in ``/tmp/bagel_corl_gen/`` and every ``gen_call`` row read
+            # ``image_paths: ["/tmp/bagel_corl_gen/gen_*.png"]``.
+            episodes = list(non_tensor["extra_fields"])
+        elif extras is not None:
             episodes = [{"gen_samples": extras}]
 
     root = resolve_rollout_images_root()
@@ -490,14 +507,28 @@ def dump_bagel_corl_episode_images(
         samples = list(samples or [])
         if not samples:
             continue
-        idx = sample_index if len(episodes) == 1 else ep_i
-        relpath = build_trajectory_relpath(
-            step=step,
-            sample_index=idx,
-            rollout_n=rollout_n,
-        )
+        # Prefer the relpath the episode was actually dumped under, so its image
+        # folder lands beside its trajectory (``step_000001/sample_0.01``). The
+        # ``sample_index``/``rollout_n`` derivation is only a fallback: it cannot
+        # reconstruct the live ``sample_<id>.01`` naming on its own, so relying on it
+        # would scatter images into ``sample_0.00`` folders that match no trajectory.
+        relpath = None
+        if isinstance(episode, dict):
+            relpath = episode.get("trajectory_relpath") or None
+        if not relpath:
+            relpath = getattr(episode, "trajectory_relpath", None) or None
+        if not relpath:
+            idx = sample_index if len(episodes) == 1 else ep_i
+            relpath = build_trajectory_relpath(
+                step=step,
+                sample_index=idx,
+                rollout_n=rollout_n,
+            )
         target_dir = root / relpath
-        target_dir.mkdir(parents=True, exist_ok=True)
+        # Resolve the copies first and create the folder only if something will land in
+        # it. A missing source file (or a stub-only / K=0 episode) must not leave an
+        # empty ``rollout_images/<relpath>/`` behind for every rollout.
+        copies: list[tuple[Path, Path]] = []
         for sample in samples:
             src = getattr(sample, "image_path", None)
             if src is None and isinstance(sample, dict):
@@ -507,11 +538,17 @@ def dump_bagel_corl_episode_images(
             src_path = Path(str(src))
             if not src_path.is_file():
                 continue
-            dest = target_dir / src_path.name
+            copies.append((src_path, target_dir / src_path.name))
+        if not copies:
+            continue
+        target_dir.mkdir(parents=True, exist_ok=True)
+        ep_written: list[str] = []
+        for src_path, dest in copies:
             if src_path.resolve() != dest.resolve():
                 shutil.copy2(src_path, dest)
-            written.append(str(dest))
-        if written:
+            ep_written.append(str(dest))
+        written.extend(ep_written)
+        if ep_written:
             meta_path = target_dir / "meta.json"
             try:
                 meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
@@ -520,7 +557,10 @@ def dump_bagel_corl_episode_images(
             meta.update(
                 {
                     "trajectory_relpath": relpath,
-                    "image_paths": written,
+                    # Per-episode: ``written`` accumulates across episodes, so using
+                    # it here listed every earlier episode's images in each folder's
+                    # meta.json.
+                    "image_paths": ep_written,
                     "source": "bagel_corl_gen_samples",
                 }
             )

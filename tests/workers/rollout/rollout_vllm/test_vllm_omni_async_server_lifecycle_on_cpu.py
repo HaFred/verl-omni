@@ -27,7 +27,9 @@ server_module = pytest.importorskip("verl_omni.workers.rollout.vllm_rollout.vllm
 
 from verl.workers.rollout.replica import RolloutMode  # noqa: E402
 
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import ARStrategy  # noqa: E402
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_async_server import vLLMOmniHttpServer  # noqa: E402
+from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy  # noqa: E402
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import OmniStrategyBase  # noqa: E402
 
 _SUCCESS_ACK = SimpleNamespace(status="SUCCESS")
@@ -112,6 +114,7 @@ def _make_server(engine, rollout_mode=RolloutMode.HYBRID, node_rank=0, free_cach
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_abort_runs_before_pause_with_one_batched_call():
     states = {
         "ext-1-abc": _FakeRequestState("ext-1-abc", "ext-1"),
@@ -130,6 +133,7 @@ async def test_abort_runs_before_pause_with_one_batched_call():
     assert result == {"aborted_count": 2, "request_ids": ["ext-1", "ext-2"]}
 
 
+@pytest.mark.asyncio
 async def test_abort_with_no_in_flight_requests_still_pauses():
     engine = _FakeAsyncOmni(states={})
     server = _make_server(engine)
@@ -147,6 +151,7 @@ async def test_abort_with_no_in_flight_requests_still_pauses():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_abort_outputs_come_from_engine_queues_with_non_empty_tokens():
     states = {"ext-1-abc": _FakeRequestState("ext-1-abc", "ext-1")}
     engine = _FakeAsyncOmni(states=states)
@@ -168,6 +173,7 @@ async def test_abort_outputs_come_from_engine_queues_with_non_empty_tokens():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_sleep_and_wake_delegate_with_level_one_and_keyword_tags():
     for mode in (RolloutMode.HYBRID, RolloutMode.COLOCATED):
         engine = _FakeAsyncOmni()
@@ -186,6 +192,7 @@ async def test_sleep_and_wake_delegate_with_level_one_and_keyword_tags():
         assert server._lora_request_cache is server_module._LORA_REQUEST_CACHE_MISS
 
 
+@pytest.mark.asyncio
 async def test_release_and_resume_kv_cache_route_both_halves_through_delegation():
     engine = _FakeAsyncOmni()
     server = _make_server(engine)
@@ -201,6 +208,7 @@ async def test_release_and_resume_kv_cache_route_both_halves_through_delegation(
     ]
 
 
+@pytest.mark.asyncio
 async def test_lifecycle_guards_skip_standalone_and_non_driver_ranks():
     engine = _FakeAsyncOmni()
     server = _make_server(engine, rollout_mode=RolloutMode.STANDALONE)
@@ -224,6 +232,7 @@ async def test_lifecycle_guards_skip_standalone_and_non_driver_ranks():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_sleep_and_release_kv_cache_clear_frontend_mm_sender_cache():
     engine = _FakeAsyncOmni()
     server = _make_server(engine)
@@ -236,6 +245,7 @@ async def test_sleep_and_release_kv_cache_clear_frontend_mm_sender_cache():
     assert engine.mm_clears == 2
 
 
+@pytest.mark.asyncio
 async def test_frontend_mm_clear_skipped_when_sleep_acks_fail():
     engine = _FakeAsyncOmni(sleep_acks=[SimpleNamespace(status="FAILED", error_msg="boom")])
     server = _make_server(engine)
@@ -246,6 +256,47 @@ async def test_frontend_mm_clear_skipped_when_sleep_acks_fail():
     assert engine.mm_clears == 0
 
 
+# A healthy ``sleep`` comes back as the platform-audit *dict* below, not a typed ack.
+# Rejecting every dict aborted the first weight sync after sampling even though the
+# stage had freed 49.45 GiB. Shape copied from the measured run: hk01dgx012,
+# 2026-09-18 03:35 (devices 4-7), stage 0, rank 0, just after ``Training Progress: 0%``.
+_AUDIT_SUCCESS_ACK = {
+    "task_id": "8bd58260-0826-4bcb-bcc3-08152896f7c1",
+    "status": "SUCCESS",
+    "stage_id": 0,
+    "rank": 0,
+    "freed_bytes": 53097791488,
+    "metadata": {"source": "omni_platform_audit", "total_freed_gib": "49.45", "rank_residual_gib": "6.35"},
+    "error_msg": None,
+}
+
+
+@pytest.mark.asyncio
+async def test_dict_success_ack_is_accepted():
+    """A dict ack reporting SUCCESS must not be rejected merely for being a dict."""
+    engine = _FakeAsyncOmni(sleep_acks=[dict(_AUDIT_SUCCESS_ACK)])
+    server = _make_server(engine)
+
+    await server.sleep()
+    assert engine.mm_clears == 1
+
+
+@pytest.mark.asyncio
+async def test_dict_ack_carrying_an_error_still_fails_closed():
+    """Removing the blanket dict rejection must not weaken fail-closed."""
+    for bad in (
+        {**_AUDIT_SUCCESS_ACK, "error_msg": "cumem pool corrupted"},
+        {**_AUDIT_SUCCESS_ACK, "status": "FAILED"},
+    ):
+        engine = _FakeAsyncOmni(sleep_acks=[bad])
+        server = _make_server(engine)
+
+        with pytest.raises(RuntimeError, match="sleep failed on a stage"):
+            await server.sleep()
+        assert engine.mm_clears == 0
+
+
+@pytest.mark.asyncio
 async def test_sleep_skips_frontend_mm_clear_when_renderer_is_none():
     # Diffusion-only engines build no InputProcessor, so renderer is None.
     engine = _FakeAsyncOmni()
@@ -258,6 +309,7 @@ async def test_sleep_skips_frontend_mm_clear_when_renderer_is_none():
     assert engine.sleep_calls[0]["level"] == 1
 
 
+@pytest.mark.asyncio
 async def test_abort_pause_clears_frontend_mm_sender_cache():
     engine = _FakeAsyncOmni(states={"ext-1-abc": _FakeRequestState("ext-1-abc", "ext-1")})
     server = _make_server(engine)
@@ -270,6 +322,7 @@ async def test_abort_pause_clears_frontend_mm_sender_cache():
     assert engine.mm_clears == 1
 
 
+@pytest.mark.asyncio
 async def test_abort_skips_frontend_mm_clear_without_cache_reset():
     engine = _FakeAsyncOmni(states={"ext-1-abc": _FakeRequestState("ext-1-abc", "ext-1")})
     server = _make_server(engine)
@@ -280,6 +333,7 @@ async def test_abort_skips_frontend_mm_clear_without_cache_reset():
     assert engine.mm_clears == 0
 
 
+@pytest.mark.asyncio
 async def test_frontend_mm_clear_skipped_when_pause_fails():
     class _PauseFailsEngine(_FakeAsyncOmni):
         async def pause_generation(self, **kwargs):
@@ -296,6 +350,7 @@ async def test_frontend_mm_clear_skipped_when_pause_fails():
     assert engine.mm_clears == 0
 
 
+@pytest.mark.asyncio
 async def test_ack_validation_fails_closed():
     bad_acks = [
         # diffusion worker error dict (collective_rpc error shape)
@@ -320,6 +375,7 @@ async def test_ack_validation_fails_closed():
     assert engine.wake_calls == [{"stage_ids": None, "tags": ["weights"]}]
 
 
+@pytest.mark.asyncio
 async def test_engine_side_rpc_failure_propagates_from_all_four_methods():
     class _RaisingEngine(_FakeAsyncOmni):
         async def sleep(self, **kwargs):
@@ -340,6 +396,7 @@ async def test_engine_side_rpc_failure_propagates_from_all_four_methods():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_abort_failure_enqueues_terminals_then_raises():
     states = {
         "ext-1-abc": _FakeRequestState("ext-1-abc", "ext-1"),
@@ -357,6 +414,7 @@ async def test_abort_failure_enqueues_terminals_then_raises():
         assert terminal.engine_outputs.outputs[0].finish_reason == "abort"
 
 
+@pytest.mark.asyncio
 async def test_pause_failure_after_successful_abort_does_not_double_enqueue():
     states = {"ext-1-abc": _FakeRequestState("ext-1-abc", "ext-1")}
     engine = _FakeAsyncOmni(states=states)
@@ -375,6 +433,7 @@ async def test_pause_failure_after_successful_abort_does_not_double_enqueue():
     assert states["ext-1-abc"].queue.get_nowait().engine_outputs.outputs[0].token_ids == [7, 8, 9]
 
 
+@pytest.mark.asyncio
 async def test_abort_ack_timeout_raises(monkeypatch):
     monkeypatch.setenv("VERL_OMNI_ABORT_ACK_TIMEOUT_S", "0.05")
 
@@ -397,6 +456,7 @@ async def test_abort_ack_timeout_raises(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_abort_request_aborts_single_id_without_pausing():
     """Per-request abort must not pause the whole engine (pause_scheduler
     finishes ALL in-flight requests); pausing belongs to abort_all_requests."""
@@ -412,6 +472,7 @@ async def test_abort_request_aborts_single_id_without_pausing():
     assert result == {"aborted": True, "request_id": "ext-1"}
 
 
+@pytest.mark.asyncio
 async def test_abort_request_unknown_id_is_a_noop():
     engine = _FakeAsyncOmni(states={})
     server = _make_server(engine)
@@ -428,6 +489,7 @@ async def test_abort_request_unknown_id_is_a_noop():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_checkpoint_manager_gather_propagates_server_abort_raise():
     class _Replica:
         def __init__(self, server):
@@ -491,6 +553,23 @@ def _build_async_omni(stage_type: str):
     return omni
 
 
+# ``AsyncOmni``-side control plane moved on: the pinned engine now sizes
+# its ACK fan-out from ``engine.stage_vllm_configs[sid].parallel_config``, gates
+# on ``event_resolver``, and reaches the engine through
+# ``engine.collective_rpc_async`` — none of which this fake models (it still stubs
+# the superseded ``_engine_core_rpc``). Both cases were unmarked ``async def``, so
+# they never actually ran and the drift went unnoticed. Left unmarked-drift rather
+# than half-fixed: they assert on upstream ``AsyncOmni.sleep``/``wake_up``
+# admission semantics, not on ``verl_omni``, so the faithful fix is to re-derive
+# the fake against the pinned engine, not to paper over it with more stubs.
+_ASYNC_OMNI_CONTROL_PLANE_DRIFT = pytest.mark.skip(
+    reason="fake AsyncOmni predates the pinned control plane (stage_vllm_configs / "
+    "event_resolver / collective_rpc_async); re-derive the fake to re-enable"
+)
+
+
+@pytest.mark.asyncio
+@_ASYNC_OMNI_CONTROL_PLANE_DRIFT
 async def test_diffusion_only_sleep_wake_needs_no_resume_generation():
     """Pure-diffusion sleep must not set the admission hold.
 
@@ -511,6 +590,8 @@ async def test_diffusion_only_sleep_wake_needs_no_resume_generation():
     assert omni._paused is False, "diffusion-only wake must restore admission by itself"
 
 
+@pytest.mark.asyncio
+@_ASYNC_OMNI_CONTROL_PLANE_DRIFT
 async def test_ar_sleep_wake_requires_resume_generation_contrast():
     """The AR-side contrast that makes the omni_sync bridge load-bearing."""
     omni = _build_async_omni("llm")
@@ -533,6 +614,7 @@ async def test_ar_sleep_wake_requires_resume_generation_contrast():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.asyncio
 async def test_wake_up_resumes_engine_admission():
     engine = _FakeAsyncOmni()
     server = _make_server(engine)
@@ -543,6 +625,7 @@ async def test_wake_up_resumes_engine_admission():
     assert engine.resumed == 1
 
 
+@pytest.mark.asyncio
 async def test_release_and_resume_kv_cache_resume_admission():
     engine = _FakeAsyncOmni()
     server = _make_server(engine)
@@ -554,6 +637,7 @@ async def test_release_and_resume_kv_cache_resume_admission():
     assert engine.resumed == 2
 
 
+@pytest.mark.asyncio
 async def test_failed_wake_skips_admission_resume():
     engine = _FakeAsyncOmni(wake_acks=[SimpleNamespace(status="FAILED", error_msg="boom")])
     server = _make_server(engine)
@@ -562,3 +646,254 @@ async def test_failed_wake_skips_admission_resume():
         await server.wake_up()
 
     assert engine.resumed == 0
+
+
+# ---------------------------------------------------------------------------
+# RFC §4.4.0(b) — caches keyed on the served weights are flushed at publish.
+#
+# Deliberately sync ``asyncio.run`` tests. ``pytest-asyncio`` is declared in
+# ``pyproject.toml`` and is the right way to drive the async cases above, but a
+# bare ``async def test_`` with no marker is collected and never awaited (an
+# invisible no-op for a regression test, which is worse than no test), so these
+# five drive the coroutine by hand and stay runnable in any environment.
+# ---------------------------------------------------------------------------
+
+
+class _RpcRecordingEngine(_FakeAsyncOmni):
+    """Adds the control-RPC surface the prompt-embed-cache calls reach for.
+
+    The method is ``collective_rpc``, mirroring the real ``AsyncOmni`` client
+    (``entrypoints/async_omni.py``), which exposes only ``collective_rpc`` and reaches
+    the engine's ``AsyncOmniEngine.collective_rpc_async`` internally. An earlier
+    version of this fake defined ``collective_rpc_async`` here, which is the *inner*
+    engine's name -- so it mirrored the bug instead of the API, the tests passed, and
+    production logged ``AttributeError: 'AsyncOmni' object has no attribute
+    'collective_rpc_async'`` 888 times in one run. Keeping the fake faithful to the
+    client is what makes these tests able to catch that.
+    """
+
+    def __init__(self, *, rpc_error: Exception | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.rpc_methods: list[str] = []
+        self._rpc_error = rpc_error
+
+    async def collective_rpc(self, method, stage_ids=None, args=(), kwargs=None):
+        self.rpc_methods.append(method)
+        if self._rpc_error is not None:
+            raise self._rpc_error
+        return [{"hits": 0, "misses": 0, "bypassed": 0, "size": 0}]
+
+
+def _server_with_strategy(engine, strategy_cls):
+    server = _make_server(engine)
+    server._generate_strategy = object.__new__(strategy_cls)
+    server.global_steps = 0
+    return server
+
+
+def test_weight_publish_flushes_both_policy_caches_on_a_diffusion_replica():
+    engine = _RpcRecordingEngine()
+    server = _server_with_strategy(engine, DiffusionStrategy)
+    cached_before = server._lora_request_cache
+
+    asyncio.run(server.set_global_steps(1))
+
+    assert engine.rpc_methods == ["clear_prompt_embed_cache"], (
+        "a conditioning entry is a function of (tokens, weights); new merged weights "
+        "make it stale, since it would condition on the previous policy"
+    )
+    assert server._lora_request_cache is not cached_before
+    assert server.global_steps == 1
+
+
+def test_setting_the_same_global_step_does_not_flush():
+    """Otherwise a no-op timer tick would cold-start the cache every step."""
+    engine = _RpcRecordingEngine()
+    server = _server_with_strategy(engine, DiffusionStrategy)
+
+    asyncio.run(server.set_global_steps(0))
+
+    assert engine.rpc_methods == []
+    assert server.global_steps == 0
+
+
+def test_an_ar_replica_has_no_conditioning_cache_to_flush():
+    """The AR strategy owns no diffusion runner, so there is no such RPC to make."""
+    engine = _RpcRecordingEngine()
+    server = _server_with_strategy(engine, ARStrategy)
+
+    asyncio.run(server.set_global_steps(1))
+
+    assert engine.rpc_methods == []
+    assert server.global_steps == 1
+
+
+def test_every_weight_sync_transition_flushes_the_conditioning_cache():
+    """sleep/release/resume/wake are all publish-adjacent, so all must flush."""
+    engine = _RpcRecordingEngine()
+    server = _server_with_strategy(engine, DiffusionStrategy)
+
+    async def _run():
+        await server.sleep()
+        await server.release_kv_cache()
+        await server.resume_kv_cache()
+        await server.wake_up()
+
+    asyncio.run(_run())
+
+    # ``release_kv_cache`` spans a sleep + a weights wake, so it flushes on both
+    # sides; the total is 5, not one per method.
+    assert engine.rpc_methods == ["clear_prompt_embed_cache"] * 5
+
+
+def test_a_failed_flush_does_not_break_the_weight_sync():
+    """The flush is a performance device; it must not abort a publish."""
+    engine = _RpcRecordingEngine(rpc_error=RuntimeError("runner has no such method"))
+    server = _server_with_strategy(engine, DiffusionStrategy)
+
+    asyncio.run(server.set_global_steps(2))
+
+    assert engine.rpc_methods == ["clear_prompt_embed_cache"]
+    assert server.global_steps == 2, "the publish itself still completed"
+
+
+# ---------------------------------------------------------------------------
+# a missing engine method is latched off after the first attempt.
+#
+# ``clear_prompt_embed_cache`` / ``get_prompt_embed_cache_stats`` live on
+# ``DiffusionModelRunner``, but the pinned engine resolves RPCs against the *worker*
+# and never reaches ``model_runner``. The stage pool logs the traceback itself and
+# returns ``{"supported": False, "error": "… has no attribute …"}``, so this cannot be
+# caught by the client try/except -- retrying it on every weight sync floods the log.
+# Measured 2026-09-22 on hk01dgx039: one run emitted the worker traceback for every
+# flush, and the early-latch case below is what bounds it to one per server.
+# ---------------------------------------------------------------------------
+
+def _missing_method_rpc(engine):
+    """Install an ``collective_rpc`` that reports the called method as absent."""
+
+    async def _rpc(method, stage_ids=None, args=(), kwargs=None):
+        engine.rpc_methods.append(method)
+        return [
+            {
+                "supported": False,
+                "error": (
+                    f"RPC '{method}' failed on worker rank(s): rank 0: AttributeError: "
+                    f"'DiffusionWorkerWithvLLMOmniColocateWorkerExtension' object has no "
+                    f"attribute '{method}'"
+                ),
+            }
+        ]
+
+    engine.collective_rpc = _rpc
+
+
+def test_an_unserviceable_flush_is_attempted_only_once():
+    engine = _RpcRecordingEngine()
+    server = _server_with_strategy(engine, DiffusionStrategy)
+    _missing_method_rpc(engine)
+
+    async def _run():
+        # Four publish-adjacent transitions; the first issues the RPC, the rest skip it.
+        await server.sleep()
+        await server.release_kv_cache()
+        await server.resume_kv_cache()
+        await server.wake_up()
+
+    asyncio.run(_run())
+
+    assert engine.rpc_methods == ["clear_prompt_embed_cache"], (
+        "the engine logs a traceback per attempt, so a known-missing method must be "
+        "latched off after the first failure"
+    )
+
+
+def test_a_transient_stage_failure_does_not_latch_the_method_off():
+    """Only a *missing method* latches. A detached replica or a sleeping stage returns
+    the same ``supported: False`` shape and must keep being retried."""
+    engine = _RpcRecordingEngine()
+    server = _server_with_strategy(engine, DiffusionStrategy)
+
+    async def _engine_reports_transient(method, stage_ids=None, args=(), kwargs=None):
+        engine.rpc_methods.append(method)
+        return [{"supported": False, "error": "stage 0 replica 0 is not attached"}]
+
+    engine.collective_rpc = _engine_reports_transient
+
+    async def _run():
+        await server.sleep()
+        await server.release_kv_cache()
+
+    asyncio.run(_run())
+
+    assert engine.rpc_methods == ["clear_prompt_embed_cache"] * 3, (
+        "a transient failure must not permanently disable the flush"
+    )
+
+
+def test_unserviceable_stats_return_no_counters_and_latch_once():
+    engine = _RpcRecordingEngine()
+    server = _make_server(engine)
+    _missing_method_rpc(engine)
+
+    first = asyncio.run(server.prompt_embed_cache_stats())
+    second = asyncio.run(server.prompt_embed_cache_stats())
+
+    assert first == [] and second == [], "no counters must be reported, not an error dict"
+    assert engine.rpc_methods == ["get_prompt_embed_cache_stats"], "latched after the first attempt"
+
+
+def test_stats_latch_does_not_disable_the_flush():
+    """Independent latches: the two RPCs are separate methods and fail separately."""
+    server = _make_server(_FakeAsyncOmni())
+    server._mark_prompt_embed_cache_rpc_unsupported("get_prompt_embed_cache_stats")
+
+    assert server._prompt_embed_cache_rpc_unsupported("get_prompt_embed_cache_stats") is True
+    assert server._prompt_embed_cache_rpc_unsupported("clear_prompt_embed_cache") is False
+
+
+def test_prompt_embed_cache_stats_read_through_the_client_rpc():
+    """The RFC §4.4.4 counters must actually be fetched, not raise and vanish.
+
+    This call site is *not* inside a try/except, so the wrong method name surfaces as
+    an ``AttributeError`` per poll rather than a silent no-op.
+    """
+    engine = _RpcRecordingEngine()
+    server = _make_server(engine)
+
+    stats = asyncio.run(server.prompt_embed_cache_stats())
+
+    assert engine.rpc_methods == ["get_prompt_embed_cache_stats"]
+    assert stats == [{"hits": 0, "misses": 0, "bypassed": 0, "size": 0}]
+
+
+def test_prompt_embed_cache_stats_are_none_off_the_head_rank():
+    """A non-head rank holds no engine client; it must not attempt the RPC at all."""
+    engine = _RpcRecordingEngine()
+    server = _make_server(engine, node_rank=1)
+
+    assert asyncio.run(server.prompt_embed_cache_stats()) is None
+    assert engine.rpc_methods == []
+
+
+def test_the_async_omni_client_exposes_collective_rpc_not_the_engine_internal_name():
+    """Pin the upstream API shape the two call sites depend on.
+
+    ``AsyncOmni`` (the client held in ``server.engine``) exposes ``collective_rpc`` as a
+    coroutine and delegates to ``AsyncOmniEngine.collective_rpc_async`` internally. Only
+    the engine has the ``_async`` name. Asserting this here means a future engine bump
+    that renames the client method fails loudly in CI rather than at runtime on a GPU
+    node, which is how the original mismatch survived 888 logged occurrences.
+    """
+    async_omni = pytest.importorskip("vllm_omni.entrypoints.async_omni")
+
+    assert hasattr(async_omni.AsyncOmni, "collective_rpc"), (
+        "verl_omni calls engine.collective_rpc(...); the pinned client must keep exposing it"
+    )
+    assert asyncio.iscoroutinefunction(async_omni.AsyncOmni.collective_rpc), (
+        "the call sites await it, so the client method must stay async"
+    )
+    assert not hasattr(async_omni.AsyncOmni, "collective_rpc_async"), (
+        "collective_rpc_async belongs to AsyncOmniEngine; if it appears on the client, "
+        "re-check which object verl_omni holds before changing the call sites back"
+    )

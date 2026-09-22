@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import inspect
+import logging
 
 import torch
 from verl import DataProto
@@ -20,6 +21,29 @@ from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score as _upstream_default_compute_score
 
 from verl_omni.utils.reward_score import default_compute_score_image
+
+logger = logging.getLogger(__name__)
+
+
+def _optional_row_field(data_item, key: str, default):
+    """Read a ``non_tensor_batch`` field that not every lane populates.
+
+    The episode batch is assembled by ``agent_loop._compute_score``, which only
+    guarantees ``__num_turns__`` plus whatever the agent loop itself attached. A
+    Hermes-tool-call lane (Bagel Co-RL) carries neither ``data_source`` nor
+    ``reward_model``, and indexing them directly killed the run with
+    ``KeyError: 'data_source'`` *inside the reward worker* -- after the rollout had
+    already produced its artifacts, so the whole step was lost and the trainer died
+    (measured 2026-09-22, ``ENABLE_RM=1``, ``outputs/bagel_corl_20260922_084240``).
+
+    Reading them optionally is safe for the pixel lanes too: they always supply the
+    fields, so this only changes behaviour where the old code would have crashed.
+    The episode scorer discards ``data_source`` outright (``del data_source`` in
+    ``agentic_multidim_reward.compute_score``), so a default cannot misroute it.
+    """
+    batch = getattr(data_item, "non_tensor_batch", None) or {}
+    value = batch.get(key, default)
+    return default if value is None else value
 
 
 def _validate_visual_response(response_visual, config, *, is_validate: bool) -> None:
@@ -34,6 +58,27 @@ def _validate_visual_response(response_visual, config, *, is_validate: bool) -> 
     elif not isinstance(response_visual, torch.Tensor) or response_visual.dtype != torch.uint8:
         dtype = getattr(response_visual, "dtype", type(response_visual))
         raise ValueError(f"Expected uint8 pixel responses for output_type={output_type!r}, got {dtype}.")
+
+
+def _is_token_response(response) -> bool:
+    """True for a token-id trajectory, as opposed to pixels or a latent.
+
+    The omni tree feeds this manager two different kinds of ``responses``:
+
+    * **pixels** — ``uint8`` for ``output_type="image"``, floating point for ``"latent"``.
+      That is what ``_validate_visual_response`` describes, and what pure image-output
+      lanes (Qwen-Image FlowGRPO and friends) produce.
+    * **token ids** — ``int32``/``int64``. The Bagel Joint-Training lane's episode is a
+      Hermes *text* trajectory whose images live in the trajectory artifacts, so its
+      ``responses`` are ids.
+
+    Only the first kind is a picture to dtype-check; the second is a trajectory to decode.
+    Treating an id tensor as pixels raised
+    ``Expected uint8 pixel responses for output_type='image', got torch.int64`` inside the
+    reward worker (measured 2026-09-22 with ``ENABLE_RM=1``), which failed every episode
+    and took the run down through the sync replay buffer.
+    """
+    return isinstance(response, torch.Tensor) and response.dtype in (torch.int32, torch.int64)
 
 
 class VisualRewardManager(RewardManagerBase):
@@ -59,10 +104,17 @@ class VisualRewardManager(RewardManagerBase):
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
         data_item = data[0]
-        response_visual = data_item.batch["responses"]
-        _validate_visual_response(response_visual, self.config, is_validate=data_item.meta_info.get("validate", False))
-        data_source = data_item.non_tensor_batch["data_source"]
-        ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+        response = data_item.batch["responses"]
+        # Hand the scorer whichever input its branch expects. A token trajectory is decoded
+        # into ``solution_str`` (the branch this manager historically could not reach); a
+        # pixel/latent response keeps riding ``solution_image`` under the dtype guard.
+        if _is_token_response(response):
+            score_input = {"solution_str": self.tokenizer.decode(response.reshape(-1).tolist(), skip_special_tokens=True)}
+        else:
+            _validate_visual_response(response, self.config, is_validate=data_item.meta_info.get("validate", False))
+            score_input = {"solution_image": response}
+        data_source = _optional_row_field(data_item, "data_source", "")
+        ground_truth = _optional_row_field(data_item, "reward_model", {}).get("ground_truth", "")
         extra_info = data_item.non_tensor_batch.get("extra_info", {})
         tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
         if tool_extra_fields is not None:
@@ -72,6 +124,21 @@ class VisualRewardManager(RewardManagerBase):
         rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
         extra_info["num_turns"] = num_turns
         extra_info["rollout_reward_scores"] = rollout_reward_scores
+        if not ground_truth and "bagel_corl" not in (extra_info or {}):
+            # Not fatal (the episode scorer returns a zero result for a missing
+            # ``task_type``), but a fleet of silent zeros looks exactly like a model that
+            # never learns, so say it once and let the metric surface it.
+            #
+            # Scoped on purpose: the mid-loop scoring row is built by
+            # ``bagel_corl_rm._default_data_builder``, which carries the images in
+            # ``extra_info['bagel_corl']`` and *deliberately* leaves ``ground_truth``
+            # empty, so warning there fired on every scored image (11 times per poll,
+            # measured 2026-09-22) and buried the real signal.
+            logger.warning(
+                "VisualRewardManager: episode row carries no reward_model.ground_truth "
+                "(data_source=%r); the episode scorer will return a zero reward for it.",
+                data_source,
+            )
 
         extra_reward_kwargs = (
             {
@@ -85,9 +152,9 @@ class VisualRewardManager(RewardManagerBase):
         if self.is_async_reward_score:
             result = await self.compute_score(
                 data_source=data_source,
-                solution_image=response_visual,
                 ground_truth=ground_truth,
                 extra_info=extra_info,
+                **score_input,
                 **extra_reward_kwargs,
             )
         else:
@@ -95,9 +162,9 @@ class VisualRewardManager(RewardManagerBase):
                 None,
                 lambda: self.compute_score(
                     data_source=data_source,
-                    solution_image=response_visual,
                     ground_truth=ground_truth,
                     extra_info=extra_info,
+                    **score_input,
                     **extra_reward_kwargs,
                 ),
             )

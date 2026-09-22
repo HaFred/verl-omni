@@ -135,3 +135,6 @@ tensorboard_log
 # locally downloaded reward weights (ImageBind / CLAP)
 .checkpoints
 .tools/trace_processor
+
+# NFS silly-rename artifacts (deleted-but-open files on network mounts)
+.nfs*

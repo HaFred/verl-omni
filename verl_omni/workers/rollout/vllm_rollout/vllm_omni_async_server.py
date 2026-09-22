@@ -48,6 +48,48 @@ logger.setLevel(logging.INFO)
 # Sentinel: ``None`` is a valid cached value (LoRA not loaded).
 _LORA_REQUEST_CACHE_MISS = object()
 
+# Control RPCs the diffusion worker cannot serve in the pinned vllm_omni.
+#
+# ``clear_prompt_embed_cache`` / ``get_prompt_embed_cache_stats`` live on
+# ``DiffusionModelRunner``, but ``collective_rpc`` resolves
+# ``getattr(self.worker, method)`` against the *worker*
+# (``DiffusionWorkerWithvLLMOmniColocateWorkerExtension``) and nothing bridges worker →
+# ``model_runner``, so the engine answers ``{"supported": False, "error": "… has no
+# attribute 'clear_prompt_embed_cache'"}`. The engine logs a full traceback per attempt
+# **before** returning that dict, so this is not catchable client-side — the only way to
+# stop the log spam is to stop issuing the call once it is known to be unserviceable.
+#
+# Latched per method so a transient stage failure (engine asleep, replica detached) does
+# not permanently disable a method that works; only a *missing-method* error latches.
+
+
+def _rpc_reports_missing_method(results: Any, method: str) -> bool:
+    """Whether an engine control RPC failed because the target lacks ``method``.
+
+    Matches only the missing-attribute failure. Other failures (a detached replica, a
+    sleeping stage) return the same ``{"supported": False}`` shape from the stage pool
+    and must *not* latch the method off.
+
+    Args:
+        results: Per-stage results returned by ``AsyncOmni.collective_rpc``.
+        method: RPC method name that was called.
+
+    Returns:
+        True when some stage reported the method as a missing attribute.
+    """
+    if not isinstance(results, list | tuple):
+        results = [results]
+    for item in results:
+        if not isinstance(item, dict) or item.get("supported") is not False:
+            continue
+        error = str(item.get("error") or "")
+        # e.g. "RPC 'clear_prompt_embed_cache' failed on worker rank(s): rank 0:
+        #       AttributeError: 'DiffusionWorker…Extension' object has no attribute
+        #       'clear_prompt_embed_cache'"
+        if "has no attribute" in error and method in error:
+            return True
+    return False
+
 
 class vLLMOmniHttpServer(vLLMHttpServer):
     """vLLM-Omni http server in single node, this is equivalent to launch server with command line:
@@ -215,12 +257,40 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         acks = await self.engine.wake_up(tags=resolved_tags)
         self._validate_acks("wake_up", acks)
         await self.engine.resume_generation()
-        self._invalidate_lora_request_cache()
+        await self._invalidate_policy_caches()
 
     async def set_global_steps(self, global_steps: int):
         if global_steps != self.global_steps:
-            self._invalidate_lora_request_cache()
+            await self._invalidate_policy_caches()
         await super().set_global_steps(global_steps)
+
+    async def prompt_embed_cache_stats(self) -> list[Any] | None:
+        """Conditioning-cache counters from the GEN engine (RFC §4.4.4, R2).
+
+        ``DiffusionModelRunner.get_prompt_embed_cache_stats`` owns the counters —
+        each runner process holds its own cache, so there is no engine-level
+        aggregate to read instead. The control RPC fans out per stage so a
+        multi-stage deploy reports every cache rather than one silently-partial
+        number. Returns ``None`` on non-head ranks.
+        """
+        if self.node_rank != 0:
+            return None
+        if self._prompt_embed_cache_rpc_unsupported("get_prompt_embed_cache_stats"):
+            return []
+        # ``self.engine`` is the ``AsyncOmni`` *client* (vllm_omni
+        # ``entrypoints/async_omni.py``), whose control-plane entry point is
+        # ``collective_rpc`` -- itself already a coroutine that delegates to the inner
+        # ``AsyncOmniEngine.collective_rpc_async``. Calling ``_async`` here reaches
+        # for the engine-internal method on the client object, which has no such
+        # attribute: measured 2026-09-22, ``bagel_fix2.log`` logged
+        # ``AttributeError: 'AsyncOmni' object has no attribute 'collective_rpc_async'``
+        # 888 times over one run (1776 mentions of the symbol), once per stats poll, so
+        # the PEC counters the RFC §4.4.4 metrics read were never reported at all.
+        results = list(await self.engine.collective_rpc(method="get_prompt_embed_cache_stats"))
+        if _rpc_reports_missing_method(results, "get_prompt_embed_cache_stats"):
+            self._mark_prompt_embed_cache_rpc_unsupported("get_prompt_embed_cache_stats")
+            return []
+        return results
 
     async def _reset_frontend_mm_cache(self) -> None:
         """Clear the frontend multimodal cache; EngineCore.sleep wipes only the engine-side copy."""
@@ -239,7 +309,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         acks = await self.engine.sleep(level=self._resolve_sleep_level())
         self._validate_acks("sleep", acks)
         await self._reset_frontend_mm_cache()
-        self._invalidate_lora_request_cache()
+        await self._invalidate_policy_caches()
 
     async def release_kv_cache(self):
         """Free cache around a weight sync without discarding Omni weights."""
@@ -250,11 +320,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         acks = await self.engine.sleep(level=self._resolve_sleep_level())
         self._validate_acks("sleep", acks)
         await self._reset_frontend_mm_cache()
-        self._invalidate_lora_request_cache()
+        await self._invalidate_policy_caches()
         acks = await self.engine.wake_up(tags=["weights"])
         self._validate_acks("wake_up", acks)
         await self.engine.resume_generation()
-        self._invalidate_lora_request_cache()
+        await self._invalidate_policy_caches()
 
     async def resume_kv_cache(self):
         """Restore after a weight sync."""
@@ -265,19 +335,42 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         acks = await self.engine.wake_up(tags=["kv_cache"])
         self._validate_acks("wake_up", acks)
         await self.engine.resume_generation()
-        self._invalidate_lora_request_cache()
+        await self._invalidate_policy_caches()
 
     async def resume_generation(self):
         if self.node_rank == 0:
             await self.engine.resume_generation()
 
     def _validate_acks(self, method: str, acks: Any) -> None:
-        """Fail closed on any non-success sleep/wake handshake."""
+        """Fail closed on any non-success sleep/wake handshake.
+
+        Acks reach us in two shapes: vLLM's typed ``SleepAck`` objects, which carry
+        ``status``/``error_msg`` attributes, and plain ``dict``s once the orchestrator
+        has serialized them. Both therefore have to be judged on their ``status``.
+        Treating *any* ``dict`` as a failure was wrong, because a healthy sleep's
+        platform-audit ack is itself a dict:
+
+            {'task_id': '8bd58260-...', 'status': 'SUCCESS', 'stage_id': 0, 'rank': 0,
+             'freed_bytes': 53097791488,
+             'metadata': {'source': 'omni_platform_audit', 'total_freed_gib': '49.45',
+                          'rank_residual_gib': '6.35'},
+             'error_msg': None}
+
+        so the first ``checkpoint_manager.sleep_replicas()`` after sampling aborted with
+        ``RuntimeError: sleep failed on a stage: {...}`` even though the stage had freed
+        49.45 GiB. Measured 2026-09-18 03:35 on hk01dgx012 (devices 4-7), stage 0, rank 0,
+        right after ``Training Progress: 0%``.
+        """
         for ack in acks or []:
             if isinstance(ack, dict):
-                raise RuntimeError(f"{method} failed on a stage: {ack.get('error', ack)}")
-            elif ack.status != "SUCCESS":
-                raise RuntimeError(f"{method} failed on a stage: {getattr(ack, 'error_msg', None) or ack!r}")
+                status = ack.get("status")
+                error = ack.get("error_msg") or ack.get("error")
+            else:
+                status = getattr(ack, "status", None)
+                error = getattr(ack, "error_msg", None)
+            if status == "SUCCESS" and not error:
+                continue
+            raise RuntimeError(f"{method} failed on a stage: {error or ack!r}")
 
     # -----------------------------------------------------------------------
     # Generation delegates mode-specific behavior to the selected strategy.
@@ -320,6 +413,85 @@ class vLLMOmniHttpServer(vLLMHttpServer):
     def _invalidate_lora_request_cache(self) -> None:
         """Drop cached LoRA state after weight sync or engine sleep/wake."""
         self._lora_request_cache = _LORA_REQUEST_CACHE_MISS
+
+    async def _clear_prompt_embed_cache(self) -> None:
+        """Flush the diffusion conditioning cache (RFC §4.4.0(b), R2).
+
+        ``PromptEmbedCache`` holds **text-encoder outputs**, i.e. a function of
+        ``(conditioning tokens, weights)``. §4.11 publishes new merged weights to
+        both replicas every composite step, so an entry computed under
+        ``policy_version = v-1`` conditions on a *different policy* than the one
+        being trained at ``v``. Serving it would mix policies mid-episode and
+        silently bias the importance ratio — the entries are exact within a weight
+        version, which is why the rule is "tag and flush on publish" rather than
+        "disable".
+
+        Only the diffusion strategy owns such a cache; on an AR replica there is
+        nothing to flush and no such runner method, so this is a no-op there.
+        Failures degrade to a warning rather than breaking the weight-sync path:
+        the cache is a performance device, and the worst case of a missed flush is
+        a stale *conditioning*, which the §4.4.4 hit-rate metrics surface.
+        """
+        if self.node_rank != 0 or not isinstance(getattr(self, "_generate_strategy", None), DiffusionStrategy):
+            return
+        if self._prompt_embed_cache_rpc_unsupported("clear_prompt_embed_cache"):
+            return
+        try:
+            # ``collective_rpc`` (not ``collective_rpc_async``): see
+            # ``prompt_embed_cache_stats`` -- the latter exists only on the inner
+            # ``AsyncOmniEngine``, not on the ``AsyncOmni`` client held here. This call
+            # is inside a try/except that degrades to a warning, so the wrong name used
+            # to fail silently on every weight sync: the cache was never flushed, and
+            # the only trace was a warning about stale entries.
+            results = await self.engine.collective_rpc(method="clear_prompt_embed_cache")
+        except Exception as exc:  # noqa: BLE001 — must not break weight sync
+            logger.warning("prompt-embed cache flush failed; entries may be stale: %s", exc)
+            return
+        # The engine logs the traceback itself before returning this shape, so a missing
+        # method cannot be caught above; latch it off so we issue it only once per server
+        # rather than on every weight sync.
+        if _rpc_reports_missing_method(results, "clear_prompt_embed_cache"):
+            self._mark_prompt_embed_cache_rpc_unsupported("clear_prompt_embed_cache")
+
+    def _prompt_embed_cache_rpc_unsupported(self, method: str) -> bool:
+        """Whether ``method`` is already known to be unserviceable by this engine.
+
+        Args:
+            method: Control RPC name.
+
+        Returns:
+            True when a previous call reported the method as a missing attribute.
+        """
+        return method in getattr(self, "_pec_rpc_unsupported", frozenset())
+
+    def _mark_prompt_embed_cache_rpc_unsupported(self, method: str) -> None:
+        """Latch ``method`` off and explain it once.
+
+        Args:
+            method: Control RPC name that the engine reported as missing.
+        """
+        known = set(getattr(self, "_pec_rpc_unsupported", frozenset()))
+        known.add(method)
+        self._pec_rpc_unsupported = frozenset(known)
+        logger.warning(
+            "prompt-embed cache RPC %r is not serviceable by this engine: the diffusion "
+            "worker does not expose the runner's method, so the RFC §4.4.4 counters stay "
+            "empty and the conditioning cache is not flushed. Skipping further calls "
+            "(this warning appears once per method).",
+            method,
+        )
+
+    async def _invalidate_policy_caches(self) -> None:
+        """Invalidate everything keyed on the served weights.
+
+        The LoRA request cache is version-keyed on the *adapter*; the
+        conditioning cache is version-keyed on the *text encoder*. Both are
+        functions of the published weights, so both move together — which is why
+        this wraps the two rather than leaving each call site to remember the pair
+        (RFC §4.4.0: "the tag makes the invariant checkable rather than assumed").
+        """
+        self._invalidate_lora_request_cache()
+        await self._clear_prompt_embed_cache()
 
     async def _resolve_lora_request(self) -> Optional[LoRARequest]:
         """Return the actor LoRA request when a LoRA adapter is loaded.

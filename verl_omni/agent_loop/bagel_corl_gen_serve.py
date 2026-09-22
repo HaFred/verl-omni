@@ -75,11 +75,6 @@ def build_gen_sampling_params(
     must also carry ``num_inference_steps``, ``noise_level``, ``sde_window_*``, or
     Bagel FlowGRPO will not stash ``trajectory_latents`` / logprobs for training.
     """
-    params: dict[str, Any] = {}
-    if base:
-        # Keep non-AR keys (e.g. global_steps) from the worker; drop text-decoding knobs.
-        params.update({k: v for k, v in base.items() if k not in _AR_ONLY_SAMPLING_KEYS})
-
     pipeline = getattr(rollout_config, "pipeline", None)
     if pipeline is None and isinstance(rollout_config, dict):
         pipeline = rollout_config.get("pipeline")
@@ -87,8 +82,20 @@ def build_gen_sampling_params(
     if algo is None and isinstance(rollout_config, dict):
         algo = rollout_config.get("algo")
 
+    params: dict[str, Any] = {}
     params.update(config_to_sampling_dict(pipeline))
     params.update(config_to_sampling_dict(algo))
+    if base:
+        # ``base`` is the worker's per-phase sampling params.  On a validation
+        # batch ``AgentLoopWorker.run`` has already overlaid
+        # ``val_kwargs.pipeline`` / ``val_kwargs.algo`` onto them, so the train
+        # ``pipeline``/``algo`` above may only supply keys ``base`` lacks.
+        # Applying them *last* silently stamped the training
+        # ``num_inference_steps`` / ``noise_level`` over the validation ones, so
+        # ``VAL_GEN_STEPS``/``VAL_NOISE_LEVEL`` never reached image generation
+        # and validation images stayed as stochastic as the training rollout.
+        # Keep non-AR keys (e.g. global_steps) from the worker; drop text-decoding knobs.
+        params.update({k: v for k, v in base.items() if k not in _AR_ONLY_SAMPLING_KEYS})
 
     calculate = getattr(rollout_config, "calculate_log_probs", None)
     if calculate is None and isinstance(rollout_config, dict):
@@ -98,20 +105,26 @@ def build_gen_sampling_params(
             "bagel_corl GEN requires actor_rollout_ref.rollout.calculate_log_probs=True "
             "(do not default it on; missing config hides ODE rollouts)."
         )
-    params["logprobs"] = bool(calculate)
-    if not params["logprobs"]:
+    if not bool(calculate):
         raise ValueError(
             "bagel_corl GEN requires actor_rollout_ref.rollout.calculate_log_probs=True "
             "(refuse soft-skip of GEN diffusion_loss)."
         )
+    # ``base["logprobs"]`` is the per-phase answer: the worker sets it False for
+    # validation batches (``AgentLoopWorker.run``) and leaves it True for
+    # training.  A validation batch legitimately asks for a deterministic ODE
+    # decode with no SDE log-probs, so it must not trip the checks below; a
+    # training batch with ``noise_level <= 0`` still must.
+    wants_logprobs = (base or {}).get("logprobs") is not False
+    params["logprobs"] = wants_logprobs
 
     noise_level = float(params.get("noise_level", 0.0) or 0.0)
-    if noise_level <= 0.0:
+    if wants_logprobs and noise_level <= 0.0:
         raise ValueError(
             "bagel_corl GEN requires rollout.algo.noise_level > 0 so the SDE window "
             f"records latents/logprobs (got noise_level={noise_level})."
         )
-    if params.get("num_inference_steps") is None:
+    if wants_logprobs and params.get("num_inference_steps") is None:
         raise ValueError("bagel_corl GEN requires rollout.pipeline.num_inference_steps")
     if seed is not None:
         params["seed"] = int(seed)

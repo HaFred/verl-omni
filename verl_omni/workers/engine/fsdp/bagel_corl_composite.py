@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from tensordict import TensorDict
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id
+from verl.utils.py_functional import append_to_dict
 from verl.workers.engine.utils import prepare_micro_batches
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,48 @@ def unwrap_bagel_module(module: torch.nn.Module) -> torch.nn.Module:
     )
 
 
+def register_und_forward_method(engine: Any, module: torch.nn.Module) -> None:
+    """Make FSDP2 treat ``compute_und_log_prob`` like ``forward``.
+
+    FSDP2 all-gathers parameters and converts activations only for ``nn.Module.forward``
+    and for methods registered with ``register_fsdp_forward_method``. This composite
+    reaches the model through a *custom* method, so without registration the call runs
+    against sharded ``DTensor`` parameters while the activations stay plain, and the first
+    elementwise op dies with
+
+        RuntimeError: aten.mul.Tensor got mixed torch.Tensor and DTensor, need to convert
+        all torch.Tensor to DTensor before calling distributed operators!
+
+    raised from ``RMSNorm.forward`` (``bagel_model.py:153``, ``self.weight * x``) via
+    ``bagel_corl.py:249`` (``hidden[text_idx] = self.norm(sequence[text_idx])``).
+
+    The identical idiom in ``BagelForTraining.forward`` (``bagel_model.py:589``) works
+    precisely because it runs inside the FSDP-managed ``forward``; registering the method
+    gives this path the same parameter/activation treatment. Idempotent: registration is
+    skipped once the module has been marked.
+
+    Measured 2026-09-18 on hk01dgx012 (devices 4-7), in the first ``compute_log_prob``
+    after sampling.
+    """
+    try:
+        from torch.distributed.fsdp import FSDPModule, register_fsdp_forward_method
+    except ImportError:  # pragma: no cover - torch without the FSDP2 registration API
+        return
+
+    # ``unwrap_bagel_module`` may have peeled a PEFT wrapper; registration has to land on
+    # the object FSDP2 actually manages, so prefer the engine's own module.
+    for candidate in (getattr(engine, "module", None), module):
+        if candidate is None or not isinstance(candidate, FSDPModule):
+            continue
+        if not hasattr(candidate, "compute_und_log_prob"):
+            continue
+        if getattr(candidate, "_bagel_corl_und_forward_registered", False):
+            return
+        register_fsdp_forward_method(candidate, "compute_und_log_prob")
+        candidate._bagel_corl_und_forward_registered = True
+        return
+
+
 def composite_forward_mode(data: TensorDict, *, forward_only: bool) -> str:
     """Select UND infer / GEN-only diffusion / composite train / empty.
 
@@ -82,9 +125,7 @@ def composite_forward_mode(data: TensorDict, *, forward_only: bool) -> str:
     ``infer_actor_batch`` old-logprob path and must use the vanilla timestep loop.
     """
     has_und = "input_ids" in data.keys()
-    has_latents = "all_latents" in data.keys() and (
-        "all_timesteps" in data.keys() or "timesteps" in data.keys()
-    )
+    has_latents = "all_latents" in data.keys() and ("all_timesteps" in data.keys() or "timesteps" in data.keys())
     gen_view = tu.get_non_tensor_data(data, "bagel_corl_gen", default=None)
     has_complete = bool(tu.get_non_tensor_data(data, "has_complete_gen_groups", default=False))
     skip_gen = bool(tu.get_non_tensor_data(data, "skip_gen", default=not has_complete))
@@ -139,19 +180,115 @@ def _pad_left_response_mask(response_mask: torch.Tensor, seq_len: int) -> torch.
     return F.pad(response_mask, (pad, 0))
 
 
-def response_aligned_und_log_probs(
-    token_logp: torch.Tensor,
+def und_jagged_rows(values: torch.Tensor, attention_mask: torch.Tensor) -> list[torch.Tensor]:
+    """Pad a ``(B, L-1)`` UND grid to ``prompt + response`` rows for the trainer's nested contract.
+
+    ``response_from_nested`` (``verl/verl/workers/utils/padding.py:196``) walks a jagged tensor
+    whose row length is ``prompt + response`` and keeps ``values[offset - resp_len - 1 : offset - 1]``
+    from each row. ``compute_und_log_prob`` already uses the matching convention -- entry ``j`` is
+    the log-prob of token ``j + 1`` -- but only has ``L - 1`` entries, so the tensor is one slot
+    short of the length the contract assumes.
+
+    That missing slot is the *unused trailing* one: entry ``L - 1`` would describe the log-prob of
+    token ``L``, which does not exist, and the slice's exclusive stop drops it anyway. Appending
+    zeros there keeps entry ``j`` on token ``j + 1`` and makes the slice land exactly on the
+    response tokens ``[prompt, prompt + response)``::
+
+        row = [lp(1), lp(2), ..., lp(L-1), unused]      # length L
+        keep = row[L - R - 1 : L - 1] = [lp(L-R), ..., lp(L-1)]
+
+    Prepending the pad instead would shift every row by one -- silently scoring the last prompt
+    token and dropping the last response token -- so the ordering here is the whole point.
+    """
+    lengths = attention_mask.to(dtype=torch.long).sum(dim=-1).tolist()
+    rows: list[torch.Tensor] = []
+    for i, length in enumerate(lengths):
+        if length < 1:
+            raise ValueError("Bagel Co-RL UND pass: attention_mask reports an empty sequence")
+        # ``values`` was built on the padded width; a valid row always exceeds its response, since a
+        # scored row has at least one prompt token (``response_len == L`` would make
+        # ``response_from_nested`` reach back into the previous row).
+        rows.append(torch.cat([values[i, : length - 1], values.new_zeros(1)]))
+    return rows
+
+
+def postprocess_und_batch(
+    output_lst: list[dict],
+    indices: Any,
+    data: TensorDict,
     *,
-    response_len: int,
-) -> torch.Tensor:
-    """Slice ``compute_und_log_prob`` ``(B, L-1)`` down to response-length ``(B, R)``."""
-    if response_len <= 0:
-        raise ValueError("response_len must be positive")
-    if token_logp.shape[-1] < response_len:
-        raise ValueError(
-            f"UND log_probs width {token_logp.shape[-1]} < response_len {response_len}"
+    forward_only: bool,
+) -> dict | TensorDict:
+    """Merge UND micro-batch blobs *without* the diffusion postprocessor's step dimension.
+
+    ``OmniFSDPEngine.postprocess_batch_func`` (``diffusers_impl.py:572``) is shaped for the GEN
+    lane: it walks a list of *per-timestep* flat dicts and stacks every key into
+    ``(bsz, steps, ...)``. The UND payload is one flat blob per micro-batch
+
+        {"und": {"log_probs": (B, R)}, "modality": "und", "log_probs": (B, R)}
+
+    so that contract died on the first ``compute_log_prob`` after sampling with
+
+        TypeError: expected Tensor as element 0 in argument 0, but got dict
+
+    -- the ``"und"`` value is a dict (and ``"modality"`` a str) handed straight to ``torch.stack``.
+
+    UND has no step dimension, so the lane needs its own postprocessor:
+
+    * train (``forward_only=False``): the token loss already ran per micro-batch, so only
+      ``loss``/``metrics`` survive and ``model_output`` is dropped, mirroring the transformer
+      engine (``verl/verl/workers/engine/fsdp/transformer_impl.py:710``). The diffusers one has no
+      such pop, which is why the train path would hit the same ``torch.stack`` error.
+    * infer (``compute_log_prob``): the trainer wants a ``TensorDict`` whose ``log_probs`` and
+      ``entropy`` are *jagged nested* tensors over ``prompt + response``.
+      ``_async_update_meta_with_output`` only writes ``torch.Tensor``/``NonTensorStack`` fields to
+      the TransferQueue (``transferqueue_utils.py:184``) and ``_compute_old_log_prob`` then runs
+      ``response_from_nested`` over them (``trainer_base.py:1512``). A plain dict would also die at
+      ``output.cpu()`` in ``infer_actor_batch`` (``engine_workers.py:863``).
+
+    Measured 2026-09-18 on hk01dgx012 (devices 4-7), first ``compute_log_prob`` after sampling.
+    """
+    if tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=False):
+        raise NotImplementedError(
+            "Bagel Co-RL UND postprocess cannot reorder micro-batches for dynamic bsz; the UND "
+            "pass pins use_dynamic_bsz=False. Drop the override or reorder before publishing."
         )
-    return token_logp[:, -response_len:]
+
+    losses: list = []
+    aggregated_metrics: dict = {}
+    nested_log_probs: list[torch.Tensor] = []
+    nested_entropy: list[torch.Tensor] = []
+    for output in output_lst:
+        losses.extend(output.get("loss") or [])
+        for metrics in output.get("metrics") or []:
+            append_to_dict(aggregated_metrics, metrics)
+        nested = output.get("und_nested") or {}
+        nested_log_probs.extend(nested.get("log_probs") or [])
+        nested_entropy.extend(nested.get("entropy") or [])
+
+    if not forward_only:
+        return {"model_output": {}, "loss": losses, "metrics": aggregated_metrics}
+
+    if not nested_log_probs:
+        raise RuntimeError(
+            "Bagel Co-RL UND infer pass produced no per-row log-probs; nothing to publish to the "
+            "TransferQueue for the trainer's old_log_probs."
+        )
+    # Same outer shape every other engine's postprocess returns -- ``_postprocess_output`` pops
+    # ``metrics`` and ``loss`` and then folds the leftover ``model_output`` into the published
+    # TensorDict (``engine_workers.py:243,249,298``, reaching ``tu.get_tensordict`` at :300), and
+    # ``infer_actor_batch`` calls ``.cpu()`` on that result. Returning a bare TensorDict of
+    # log_probs/entropy instead died at ``output.pop("metrics")`` with
+    # ``KeyError: 'metrics'``. Over the wire the trainer only ever sees the flat
+    # ``log_probs``/``entropy`` fields, which is exactly what ``response_from_nested`` reads.
+    return {
+        "model_output": {
+            "log_probs": torch.nested.as_nested_tensor(nested_log_probs, layout=torch.jagged),
+            "entropy": torch.nested.as_nested_tensor(nested_entropy, layout=torch.jagged),
+        },
+        "loss": losses,
+        "metrics": aggregated_metrics,
+    }
 
 
 def run_und_token_forward_backward(
@@ -167,18 +304,57 @@ def run_und_token_forward_backward(
     if "input_ids" not in und.keys():
         raise KeyError("Bagel Co-RL (Joint-Training) UND phase requires input_ids on the actor batch")
     if not forward_only and ("old_log_probs" not in und.keys() or "advantages" not in und.keys()):
-        raise KeyError("Bagel Co-RL (Joint-Training) UND train phase requires old_log_probs and advantages (token GRPO)")
+        raise KeyError(
+            "Bagel Co-RL (Joint-Training) UND train phase requires old_log_probs and advantages (token GRPO)"
+        )
 
     tu.assign_non_tensor(und, sp_size=engine.ulysses_sequence_parallel_size)
     tu.assign_non_tensor(und, use_dynamic_bsz=False)
+
+    # ``data.select`` above drops non-tensor metadata, but on the ``use_dynamic_bsz=False``
+    # branch ``prepare_micro_batches`` reads ``micro_batch_size_per_gpu`` straight off the
+    # batch (verl/verl/workers/engine/utils.py:89). The worker injects that key onto the
+    # *parent* batch -- train from ``engine_config.micro_batch_size_per_gpu``, infer from
+    # ``infer_micro_batch_size_per_gpu`` (verl_omni/workers/engine_workers.py:412/473) --
+    # so forcing ``use_dynamic_bsz=False`` here without carrying the key across the select
+    # killed the first ``compute_log_prob`` after sampling with
+    #
+    #   KeyError: 'key "micro_batch_size_per_gpu" not found in TensorDict with keys
+    #   ['input_ids', 'position_ids', 'prompts', 'response_mask', 'responses', 'sp_size',
+    #    'use_dynamic_bsz', ...]'
+    #
+    # Measured 2026-09-18 on hk01dgx012 (devices 4-7), right after ``Training Progress: 0%``.
+    micro_batch_size_per_gpu = tu.get_non_tensor_data(data=data, key="micro_batch_size_per_gpu", default=None)
+    if micro_batch_size_per_gpu is None:
+        config_key = "infer_micro_batch_size_per_gpu" if forward_only else "micro_batch_size_per_gpu"
+        micro_batch_size_per_gpu = getattr(getattr(engine, "engine_config", None), config_key, None)
+    if micro_batch_size_per_gpu is None:
+        raise KeyError(
+            "Bagel Co-RL (Joint-Training) UND pass requires micro_batch_size_per_gpu: this composite "
+            "forces use_dynamic_bsz=False, so prepare_micro_batches reads it from the batch. Set "
+            "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu for the train pass, and "
+            "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu (or "
+            "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu) for the infer pass."
+        )
+    tu.assign_non_tensor(und, micro_batch_size_per_gpu=int(micro_batch_size_per_gpu))
 
     micro_batches, indices = prepare_micro_batches(
         data=und, dp_group=engine.get_data_parallel_group(), same_micro_num_in_dp=True
     )
     gradient_accumulation_steps = max(len(micro_batches), 1)
+    # Train mode drops ``model_output`` after the per-micro-batch token loss has run (same policy as
+    # the transformer engine); only the infer path keeps it, since that is what its postprocessor
+    # turns into the published ``log_probs``/``entropy``.
+    return_model_output = forward_only or bool(
+        tu.get_non_tensor_data(data=data, key="return_model_output", default=False)
+    )
     output_lst = []
     ctx = torch.no_grad() if forward_only else nullcontext()
     module = unwrap_bagel_module(engine.module)
+    # FSDP2 has to know that ``compute_und_log_prob`` is a forward-shaped entry point,
+    # otherwise it runs against sharded parameters with plain activations and raises
+    # ``aten.mul.Tensor got mixed torch.Tensor and DTensor`` inside ``RMSNorm.forward``.
+    register_und_forward_method(engine, module)
 
     for micro_batch in micro_batches:
         micro_batch = micro_batch.to(get_device_id())
@@ -188,7 +364,11 @@ def run_und_token_forward_backward(
         tu.assign_non_tensor(micro_batch, num_gen_rows=0)
 
         padded = micro_batch
-        pad_keys = [k for k in ("input_ids", "attention_mask", "response_mask", "old_log_probs", "advantages") if k in micro_batch.keys()]
+        pad_keys = [
+            k
+            for k in ("input_ids", "attention_mask", "response_mask", "old_log_probs", "advantages")
+            if k in micro_batch.keys()
+        ]
         if hasattr(micro_batch, "to_padded_tensor"):
             padded = micro_batch.select(*pad_keys).to_padded_tensor()
 
@@ -208,21 +388,44 @@ def run_und_token_forward_backward(
             resp_len = int(response_mask.shape[-1])
 
         with ctx:
-            token_logp = module.compute_und_log_prob(input_ids, attention_mask, full_response_mask)
-            log_probs = response_aligned_und_log_probs(token_logp, response_len=resp_len)
-            model_output = {"und": {"log_probs": log_probs}, "modality": "und", "log_probs": log_probs}
+            # Entropy is only needed on the infer pass: ``_compute_old_log_prob`` reads it off the
+            # TransferQueue alongside ``log_probs`` (``trainer_base.py:1506,1513``). The train pass
+            # deliberately leaves it out so ``ppo_loss`` keeps skipping the entropy term, and so
+            # the log-prob grid is not duplicated on the hot path.
+            if forward_only:
+                token_logp, token_entropy = module.compute_und_log_prob(
+                    input_ids, attention_mask, full_response_mask, with_entropy=True
+                )
+                und_rows = und_jagged_rows(token_logp, attention_mask)
+                und_nested = {
+                    "log_probs": und_rows,
+                    "entropy": und_jagged_rows(token_entropy, attention_mask),
+                }
+            else:
+                token_logp = module.compute_und_log_prob(input_ids, attention_mask, full_response_mask)
+                und_rows = und_jagged_rows(token_logp, attention_mask)
+                und_nested = None
+            # ``model_output["log_probs"]`` must be the *full-sequence* grid, not the response-only
+            # slice: ``ppo_loss`` re-derives the response slice itself by calling
+            # ``no_padding_2_padding`` first (``verl/workers/utils/losses.py:59`` ->
+            # ``workers/utils/padding.py:99``), which walks ``values[offset - resp_len - 1 :
+            # offset - 1]`` per row and therefore needs each row to span ``prompt + response``.
+            # ``und_jagged_rows`` is exactly that grid (entry ``j`` = log-prob of token ``j + 1``,
+            # plus the unused trailing slot the slice's exclusive stop drops), so the train and
+            # infer lanes now share one convention. Handing ``ppo_loss`` the response-only
+            # ``(B, R)`` slice is what made it die on ``data["prompts"]``
+            # (``KeyError: 'key "prompts" not found in TensorDict``, measured 2026-09-18 on
+            # hk01dgx012, devices 4-7, the first time the UND *train* pass became reachable).
+            und_grid = torch.nested.as_nested_tensor(und_rows, layout=torch.jagged)
+            model_output = {"und": {"log_probs": und_grid}, "modality": "und", "log_probs": und_grid}
 
             # Infer (old log-prob): no token-GRPO fields yet — return log_probs only.
-            infer_only = forward_only and (
-                "old_log_probs" not in padded.keys() or "advantages" not in padded.keys()
-            )
+            infer_only = forward_only and ("old_log_probs" not in padded.keys() or "advantages" not in padded.keys())
             if infer_only or loss_function is None:
                 loss = torch.tensor(1.0, device=get_device_id())
                 metrics = {}
             else:
-                resp_mask_loss = (
-                    response_mask if response_mask.shape[-1] == resp_len else response_mask[:, -resp_len:]
-                )
+                resp_mask_loss = response_mask if response_mask.shape[-1] == resp_len else response_mask[:, -resp_len:]
                 loss_data = TensorDict(
                     {
                         "response_mask": resp_mask_loss,
@@ -231,20 +434,84 @@ def run_und_token_forward_backward(
                     },
                     batch_size=padded["old_log_probs"].shape[:1],
                 )
+                # ``no_padding_2_padding`` also reads the per-row ``prompts``/``responses`` to locate
+                # each response inside the grid. They go in *nested* (as the TQ delivers them, the
+                # same shape ``response_from_nested`` consumes: ``padding.py:196``), which is the
+                # branch that derives lengths from the offsets. The padded branch reads
+                # ``attention_mask[:, :prompts.shape[1]]`` (``padding.py:130-131``) and would count
+                # part of a shorter row's response as prompt whenever a micro-batch mixes prompt
+                # lengths -- silently scoring the wrong tokens.
+                for key in ("prompts", "responses"):
+                    if key not in micro_batch.keys():
+                        raise KeyError(
+                            f"Bagel Co-RL UND train loss needs '{key}' on the micro-batch: ppo_loss "
+                            "locates each response inside the full-sequence log-prob grid with it "
+                            "(workers/utils/padding.py:127). Check the UND row's TQ fields."
+                        )
+                    value = micro_batch[key]
+                    # A padded 2-D pair is only read correctly when every row shares one prompt
+                    # length -- the padded branch takes ``attention_mask[:, :prompt_ids.shape[1]]``
+                    # (``padding.py:130``) as the prompt, so on a batch that mixes prompt lengths it
+                    # counts response tokens as prompt and scores the wrong entries. Measured with
+                    # the guard test's rows (3+1 and 2+2) flattened to right-padded 2-D:
+                    # ``[[3.0, 0.0], [7.0, 0.0]]`` instead of ``[[3.0, 0.0], [6.0, 7.0]]`` -- a
+                    # silent mis-scoring, since the shapes still line up. The TQ fetch delivers these
+                    # jagged (``response_from_nested`` is built for it, ``padding.py:196``), so a
+                    # padded pair here means an upstream change, not an acceptable layout.
+                    if value.is_nested is False and micro_batch.batch_size[0] > 1:
+                        raise ValueError(
+                            f"Bagel Co-RL UND train loss: '{key}' arrived padded "
+                            f"(shape {tuple(value.shape)}) for a {micro_batch.batch_size[0]}-row "
+                            "micro-batch. ppo_loss can only locate responses from jagged per-row "
+                            "lengths; a padded pair would score the wrong tokens whenever the rows "
+                            "mix prompt lengths. Keep the UND row's 'prompts'/'responses' nested."
+                        )
+                    loss_data[key] = value
+                # Pin the grid's right-pad target to the width the rest of ``ppo_loss`` pads
+                # ``response_mask``/``old_log_probs`` to (``padding.py:116,119``). Left at its
+                # default it is recomputed as ``max(response_lens)``, which must equal ``resp_len``
+                # anyway -- pinning turns a width mismatch into an obvious error instead of a
+                # broadcast failure further down.
+                tu.assign_non_tensor(loss_data, max_response_len=resp_len)
                 for opt in ("ref_log_prob", "rollout_is_weights"):
                     if opt in padded.keys():
                         loss_data[opt] = padded[opt]
-                for key in ("dp_size", "batch_num_tokens", "global_batch_size"):
-                    if key in micro_batch.keys():
-                        loss_data[key] = micro_batch[key]
-                    elif key in data.keys():
-                        loss_data[key] = data[key]
-                if "dp_size" not in loss_data.keys():
-                    loss_data["dp_size"] = engine.get_data_parallel_size()
-                if "batch_num_tokens" not in loss_data.keys():
-                    loss_data["batch_num_tokens"] = None
-                if "global_batch_size" not in loss_data.keys():
-                    loss_data["global_batch_size"] = None
+                # Loss units (RFC §4.4 + §4.10): "both branches normalize by their own micro-batch
+                # counts ... each branch is a mean over its own loss units; relative scale is
+                # governed by the lane weights". ``bagel_composite_loss`` holds up the UND half by
+                # dividing the term by ``gradient_accumulation_steps`` and GEN by
+                # ``len(micro_batches) * num_timesteps`` (``diffusers_impl.py:893``), so the term
+                # ``ppo_loss`` returns here has to be the mean over **this micro-batch**, which is
+                # the branch ``agg_loss`` takes when ``dp_size == 1`` and ``batch_num_tokens`` is
+                # ``None``: ``masked_sum(loss_mat, loss_mask) / loss_mask.sum()``
+                # (``core_algos.py:1169-1173``). Do not feed it the DP-reduced global token count
+                # the way the pinned AR engine does (``transformer_impl.py:675-681`` all-reduces
+                # the loss mask): that is a different normalization -- the mean over the *global*
+                # batch -- which would then be divided by ``gradient_accumulation_steps`` a second
+                # time and would make the lane weights scale with ``dp_size`` and the micro-batch
+                # count. It also requires a token count to exist at all, which the composite cannot
+                # supply (it micro-batches itself), so the first UND train step above a single DP
+                # rank died with
+                #
+                #   ValueError: (global) batch_num_tokens is required when dp_size > 1
+                #
+                # (measured 2026-09-18 on hk01dgx012, devices 4-7, the first step that got past
+                # ``no_padding_2_padding``; dp_size came from the fallback below, not from any
+                # writer, because the composite never runs the engine method that assigns it).
+                #
+                # Scalars must go through ``assign_non_tensor``: a plain ``loss_data[key] = <int>``
+                # raises "batch dimension mismatch, got self.batch_size=[B] and value.shape=[]" on a
+                # batched TensorDict (only a bare ``None`` is accepted as a plain assignment), which
+                # killed the UND *train* pass the first time that path became reachable.
+                # ``ppo_loss`` reads all three with ``data[...]`` and compares against ``None``
+                # (``verl/verl/workers/utils/losses.py:65-67,75-76``), so it has to be the
+                # non-tensor idiom that returns the raw value, not a ``NonTensorData`` wrapper.
+                # ``global_batch_size`` stays ``None``: the recipe's ``token-mean`` mode never reads
+                # it, and on the ``seq-mean-*`` modes ``agg_loss`` then falls back to this
+                # micro-batch's own sequence count, which is the same local convention.
+                tu.assign_non_tensor(loss_data, dp_size=1)
+                tu.assign_non_tensor(loss_data, batch_num_tokens=None)
+                tu.assign_non_tensor(loss_data, global_batch_size=None)
 
                 tu.assign_non_tensor(loss_data, bagel_corl_und=loss_data)
                 tu.assign_non_tensor(loss_data, skip_gen=True)
@@ -266,22 +533,41 @@ def run_und_token_forward_backward(
             if not forward_only:
                 loss.backward()
 
+        # ``model_output`` only survives on the lanes that need it: the transformer engine drops it
+        # for plain training (``transformer_impl.py:710``), and the diffusion postprocessor has no
+        # equivalent pop, so carrying the nested UND blob through train-mode postprocessing is what
+        # fed a dict to ``torch.stack``. On infer the payload is not ``model_output`` at all but the
+        # jagged rows the trainer's ``response_from_nested`` consumes.
         meta_info_lst = {
-            "model_output": [model_output],
+            "model_output": [model_output] if return_model_output else [],
             "loss": [loss.detach().item()],
             "metrics": [metrics],
         }
+        if und_nested is not None:
+            meta_info_lst["und_nested"] = und_nested
         output_lst.append(meta_info_lst)
 
-    return engine.postprocess_batch_func(output_lst=output_lst, indices=indices, data=und)
+    return postprocess_und_batch(output_lst=output_lst, indices=indices, data=und, forward_only=forward_only)
 
 
 def merge_composite_outputs(parts: list[dict]) -> dict:
-    """Merge UND + GEN ``postprocess_batch_func`` dicts for one train_batch metrics blob."""
+    """Merge UND + GEN ``postprocess_batch_func`` dicts for one train_batch metrics blob.
+
+    A single part is returned untouched, which is what carries the UND infer pass's published
+    ``log_probs``/``entropy`` up to ``infer_actor_batch``. Merging is only valid for the two
+    train-mode dicts, because the merge keeps just ``parts[-1]``'s ``model_output``.
+    """
     if not parts:
         return {"model_output": {}, "loss": [], "metrics": {}}
     if len(parts) == 1:
         return parts[0]
+    shadowed = [part.get("model_output") for part in parts[:-1] if part.get("model_output")]
+    if shadowed:
+        raise RuntimeError(
+            "Bagel Co-RL: a non-final lane produced model_output "
+            f"({[sorted(blob) for blob in shadowed]}) that merge_composite_outputs would drop by "
+            "keeping only the last part's. Refusing rather than silently losing log-probs."
+        )
 
     merged_loss: list = []
     merged_metrics: dict = {}

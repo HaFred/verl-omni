@@ -38,6 +38,9 @@ __all__ = [
 run_name: str = "agentic_run"
 _e2e_root: Path | None = None
 _diffusion_image_dir: Path | None = None
+# Explicit ``agentic_image_gen.run_dir``: used verbatim as the run dir, so a caller who
+# names the folder has chosen the layout and nothing is appended to it.
+_run_dir_override: Path | None = None
 
 
 def default_e2e_root() -> Path:
@@ -59,10 +62,11 @@ def clear_run_artifacts() -> None:
     Returns:
         None.
     """
-    global run_name, _e2e_root, _diffusion_image_dir
+    global run_name, _e2e_root, _diffusion_image_dir, _run_dir_override
     run_name = "agentic_run"
     _e2e_root = None
     _diffusion_image_dir = None
+    _run_dir_override = None
 
 
 def resolve_e2e_root() -> Path:
@@ -77,11 +81,23 @@ def resolve_e2e_root() -> Path:
 
 
 def resolve_run_dir() -> Path:
-    """Return the per-run directory.
+    """Return the directory that holds the three per-run artifact trees.
+
+    This is the root of ``rollout_trajectories/``, ``rollout_images/`` and
+    ``hermes_actions/``. Resolution order:
+
+    1. An explicit ``agentic_image_gen.run_dir``, returned verbatim. The caller has
+       named the folder, so appending ``experiment_name`` would nest a run inside the
+       directory it just asked for.
+    2. ``<e2e_root>/<experiment_name>/`` (the default). Namespacing by experiment name
+       is what keeps two runs that share an ``experiment_name`` from overwriting each
+       other's ``step_*`` dumps in place.
 
     Returns:
-        ``<e2e_root>/<experiment_name>/``.
+        Absolute run dir.
     """
+    if _run_dir_override is not None:
+        return _run_dir_override
     if _diffusion_image_dir is not None:
         return _diffusion_image_dir.parent
     return resolve_e2e_root() / (run_name or "agentic_run")
@@ -98,19 +114,42 @@ def resolve_rollout_images_root() -> Path:
     return resolve_run_dir() / "rollout_images"
 
 
+def _node_get(node: Any, key: str) -> Any:
+    """Read one ``agentic_image_gen`` key from a Hydra node.
+
+    Handles both the dict-style (``OmegaConf``) and attribute-style objects that
+    ``config.get("agentic_image_gen")`` can hand back.
+
+    Args:
+        node: The ``agentic_image_gen`` config node, or ``None``.
+        key: Field name.
+
+    Returns:
+        The value, or ``None`` when the node or key is absent.
+    """
+    if node is None:
+        return None
+    try:
+        return node.get(key)
+    except Exception:  # noqa: BLE001 — a plain object has no ``.get``
+        return getattr(node, key, None)
+
+
 def bind_run_artifacts(config: Any) -> None:
     """Bind run-dir knobs from Hydra so driver and Ray workers share one layout.
 
     Args:
         config: Hydra config. ``trainer.experiment_name`` sets the run name;
+            ``agentic_image_gen.run_dir`` sets the run dir verbatim;
             ``agentic_image_gen.e2e_root`` overrides the default ``outputs/e2e``.
 
     Returns:
         None.
     """
-    global run_name, _e2e_root, _diffusion_image_dir
-    # Drop stale explicit image-dir overrides from a previous bind/test.
+    global run_name, _e2e_root, _diffusion_image_dir, _run_dir_override
+    # Drop stale explicit overrides from a previous bind/test.
     _diffusion_image_dir = None
+    _run_dir_override = None
     if config is None:
         _e2e_root = default_e2e_root()
         return
@@ -127,11 +166,25 @@ def bind_run_artifacts(config: Any) -> None:
         node = config.get("agentic_image_gen")
     except Exception:  # noqa: BLE001
         node = getattr(config, "agentic_image_gen", None)
-    if node is not None:
+
+    # ``run_dir`` is authoritative when set: it is the run dir itself, not a root to
+    # append ``experiment_name`` to. The bagel recipes set it to ``$RUN_DIR`` so the
+    # three artifact trees land beside ``.hydra/`` and ``main_omni.log`` instead of
+    # under the extra ``e2e/<experiment_name>/`` nesting. Reading it here (rather than
+    # reusing ``e2e_root``) leaves ``e2e_root``'s namespacing semantics intact for
+    # every caller that relies on ``<e2e_root>/<experiment_name>/``.
+    run_dir = _node_get(node, "run_dir")
+    if run_dir is None:
         try:
-            e2e_root = node.get("e2e_root")
-        except Exception:  # noqa: BLE001
-            e2e_root = getattr(node, "e2e_root", None)
+            run_dir = agentic_get("run_dir", None)
+        except RuntimeError:
+            # Mirror the e2e_root fallback: bind_agentic_image_gen may not have run yet.
+            run_dir = None
+    if run_dir:
+        _run_dir_override = Path(str(run_dir)).expanduser().resolve()
+
+    if node is not None:
+        e2e_root = _node_get(node, "e2e_root")
     if e2e_root is None:
         try:
             e2e_root = agentic_get("e2e_root")

@@ -30,7 +30,7 @@ from verl_omni.trainer.omni.bagel_corl_diff_v1 import DiffusionV1GenLane
 from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage, build_gen_flowgrpo_proto
 from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
 from verl_omni.workers.config import DiffusionModelConfig
-from verl_omni.workers.config.diffusion import DiffusionRolloutConfig
+from verl_omni.workers.config.diffusion import DiffusionRolloutConfig, DiffusionSamplingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,23 @@ _DIFFUSION_MODEL_KEYS = {
     "config_path",
     "transformer_subfolder",
 }
+
+
+def _bagel_role_histogram(tags) -> dict[str, int]:
+    """Count a ``KVBatchMeta`` row-tag list by ``bagel_role`` (+ padding), for step diagnostics.
+
+    A GEN stale in a sampled batch is invisible in the training metrics but fatal a few frames
+    later (``assert len(output) == len(batch)``), so the batch's own composition is worth a line.
+    """
+    counts: dict[str, int] = {}
+    for tag in tags or []:
+        if not isinstance(tag, dict):
+            continue
+        role = str(tag.get("bagel_role") or "untagged")
+        if tag.get("is_padding"):
+            role += ":pad"
+        counts[role] = counts.get(role, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 def _normalize_tq_kv_get_result(data, keys: list[str]) -> dict[str, dict]:
@@ -188,6 +205,27 @@ def _index_column(col, i: int):
     return value
 
 
+def _actor_merges_lora(model) -> bool:
+    """True when the recipe asks the *actor* to merge LoRA into the base weights.
+
+    ``actor_rollout_ref.model.lora.merge=True`` (required on vllm-omni >= 0.24, see
+    ``run_agentic_bagel_rpco_lora.sh``) makes the trainer publish **merged** full weights:
+    ``EngineWorker._update_weights`` reports ``peft_config=None``
+    (``self.peft_merge = model_config.lora.get("merge", False)`` in
+    ``verl/workers/engine_workers.py``), so every rollout replica takes the standard
+    full-weight update and **no adapter is ever added engine-side**.
+
+    Tolerates both shapes this codebase hands around: the resolved ``DictConfig``
+    (``.get``) and the converted dataclass (attribute access).
+    """
+    lora_cfg = model.get("lora") if hasattr(model, "get") else getattr(model, "lora", None)
+    if lora_cfg is None:
+        return False
+    if hasattr(lora_cfg, "get"):
+        return bool(lora_cfg.get("merge", False))
+    return bool(getattr(lora_cfg, "merge", False))
+
+
 @register_trainer("bagel_corl_sync")
 class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     """Synchronous Bagel Co-RL (Joint-Training): serial J-episode gather, then one UND+GEN optimizer step.
@@ -236,6 +274,18 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         # own LR; UND keeps the base actor.optim.lr. Recipe-visible, configurable.
         filtered.setdefault("lr_gen", 3e-5)
         filtered.setdefault("trust_remote_code", True)
+        # Bagel Co-RL is defined by the *disjoint* UND/GEN LoRA split (RFC §4.0.2), so the
+        # target list must be explicit. The omni model yaml default is the string
+        # ``all-linear``; ``validate_disjoint_lora_targets`` would iterate it character by
+        # character and abort model construction with the useless
+        # "unknown names: ['-', 'a', 'e', 'i', 'l', 'n', 'r']". Fail loud here instead,
+        # where the recipe author can act on it.
+        lora_targets = filtered.get("target_modules")
+        if not isinstance(lora_targets, (list, tuple)):
+            raise ValueError(
+                "bagel_corl_sync requires actor_rollout_ref.model.target_modules as an explicit "
+                f"list of UND/GEN LoRA module names, got {lora_targets!r} (RFC §4.0.2 dual-lane LoRA)"
+            )
 
         # Strip omni-only rollout keys (do_sample, over_sample_rate, …) before Hydra instantiate.
         # Keep agent / multi_turn / trace / response_length: AgentLoopWorker requires them.
@@ -283,7 +333,37 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         # the rollout graph — prohibitive for multi-turn episodes. Joint-Training runs
         # CFG-free on BOTH sides; the recipe's eval block re-enables CFG if desired.
         pipeline["cfg_text_scale"] = 1.0
+        # Neither the omni rollout config nor its yaml declares a ``pipeline`` node —
+        # the recipe reaches it with ``+actor_rollout_ref.rollout.pipeline.*`` — so the
+        # dict built here must carry ``_target_`` exactly like ``diffusion_rollout.yaml``
+        # does. Without it Hydra hands a plain mapping to the typed
+        # ``pipeline: DiffusionPipelineConfig`` field, and every ``pipeline.<attr>``
+        # read (``diffusion_agent_loop``, ``VisualRewardManager``) breaks afterwards.
+        pipeline["_target_"] = "verl_omni.workers.config.diffusion.DiffusionPipelineConfig"
         rollout_filtered["pipeline"] = pipeline
+
+        # ``val_kwargs`` needs the same retarget for a different reason: unlike ``pipeline``,
+        # the omni schema *does* declare this node -- but with the AR ``_target_``
+        # ``verl.workers.config.SamplingConfig``, while ``DiffusionRolloutConfig`` types the
+        # field as ``DiffusionSamplingConfig``. SamplingConfig has no ``pipeline``/``algo``
+        # subtree, so the recipe's ``+…val_kwargs.pipeline.num_inference_steps=50`` (and the
+        # ``algo.noise_level`` beside it) compose fine as new keys and then kill the first
+        # ``init_model`` on every actor rank:
+        #   InstantiationException: Error in call to target
+        #   'verl.workers.config.rollout.SamplingConfig':
+        #   TypeError("SamplingConfig.__init__() got an unexpected keyword argument 'pipeline'")
+        #   full_key: actor_rollout_ref.rollout.val_kwargs
+        # ``do_sample`` is AR-only and has to go with the target, so filter as well as retarget
+        # -- exactly what the parent node above does. This is also what makes the validate
+        # branch of ``composite_agent_loop`` work at all: it reads
+        # ``config.val_kwargs.pipeline`` / ``.algo`` / ``.seed``, none of which exist on the
+        # AR SamplingConfig.
+        val_allowed = {f.name for f in fields(DiffusionSamplingConfig)}
+        val_kwargs = {
+            k: v for k, v in (rollout_filtered.get("val_kwargs") or {}).items() if k in val_allowed and k != "_target_"
+        }
+        val_kwargs["_target_"] = "verl_omni.workers.config.diffusion.DiffusionSamplingConfig"
+        rollout_filtered["val_kwargs"] = val_kwargs
 
         # ``cfg_text_scale`` is a transition-kernel knob, not a style knob: the
         # GEN importance ratio is only unbiased when training and rollout use the
@@ -292,9 +372,17 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         # ``BagelDiffusion._get_cfg_params``, which falls back to
         # ``BAGEL_FLOWGRPO_CFG_DEFAULTS`` = 4.0 — so leaving it unset here silently
         # trained with CFG while rollout ran CFG-free.
-        model_pipeline = dict(filtered.get("pipeline") or {})
-        model_pipeline["cfg_text_scale"] = pipeline["cfg_text_scale"]
-        filtered["pipeline"] = model_pipeline
+        #
+        # ``omni_model.yaml`` declares no ``pipeline`` node at all, so anything set
+        # here has to be the whole node, not a patch onto an existing one. Mirror what
+        # ``diffusion_model.yaml`` does for the stock diffusion path and make the model
+        # node the rollout pipeline itself (rollout is the knob SoT, RFC §5): that keeps
+        # ``num_inference_steps`` / ``height`` / ``width`` — used by the training adapter
+        # for the sigma schedule and latent position ids — in lockstep with rollout, and
+        # carries the ``_target_`` that turns this into a real ``DiffusionPipelineConfig``.
+        # A bare ``{"cfg_text_scale": 1.0}`` dict here would instead replace the dataclass
+        # default and then fail every ``model_config.pipeline.<attr>`` read.
+        filtered["pipeline"] = dict(pipeline)
 
         with open_dict(self.config):
             self.config.actor_rollout_ref.model = OmegaConf.create(filtered)
@@ -420,7 +508,14 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     def _compute_old_log_prob(self, batch, metrics: dict):
         """UND: PPO V1 token old-logprob. GEN: diffusion V1 ``infer_actor_batch`` (required when K>0)."""
         extra = self._extra_info(batch)
-        proto = build_gen_flowgrpo_proto(self._gen_batch_from_step(batch))
+        gen_rows = self._gen_batch_from_step(batch)
+        logger.info(
+            "bagel_corl old_log_prob batch_rows=%d roles=%s gen_rows=%d",
+            len(batch),
+            _bagel_role_histogram(getattr(batch, "tags", None)),
+            len(gen_rows),
+        )
+        proto = build_gen_flowgrpo_proto(gen_rows)
         if proto is None:
             return super()._compute_old_log_prob(batch, metrics)
         if "all_latents" not in proto.batch.keys():
@@ -466,6 +561,18 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 "bagel_corl: GEN rows found only on nested bagel_corl.gen_batch / meta_info; "
                 "dual-lane extra['gen_batch'] or child_gen_keys is required (legacy nested path removed)."
             )
+        # Loud on the driver side (Ray only forwards WARNING+ from the agent-loop workers, so the
+        # worker's own dual-lane pack log never reaches this log). Without it a skipped GEN lane and
+        # a genuinely empty one are indistinguishable in the step metrics.
+        logger.info(
+            "bagel_corl gen_batch empty (GEN lane will skip): und_records=%d has_child_gen_keys=%s "
+            "has_tq_handle=%s ntb_keys=%s batch=%s",
+            len(und_records),
+            bool(und_records) and any("child_gen_keys" in (r.get("fields") or {}) for r in und_records),
+            hasattr(batch, "keys") and hasattr(batch, "partition_id"),
+            sorted((getattr(batch, "non_tensor_batch", None) or {}).keys()),
+            type(batch).__name__,
+        )
         return []
 
     def _und_records_from_batch(self, batch) -> list[dict]:
@@ -485,11 +592,55 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                         continue
                 records.append({"fields": fields})
             return records
+        # TensorDict carriers (the replay-buffer / balanced-batch shape) keep the dual-lane
+        # bookkeeping in ``extra_fields`` instead of ``child_gen_keys``: the v1 advantage phase can
+        # be handed a TensorDict rather than the rollout ``KVBatchMeta``, and ``_extra_fields_from_tq``
+        # returns ``None`` for it (no ``partition_id``). Without this branch the UND records came
+        # back with no ``child_gen_keys``, ``_gen_batch_from_step`` returned ``[]``, and the GEN lane
+        # was skipped for the whole step even though every episode had a complete S-group.
+        if ntb.get("extra_fields") is not None:
+            extras = list(ntb["extra_fields"])
+            child_col = ntb.get("child_gen_keys")
+            child_col = list(child_col) if child_col is not None else None
+            tags = list(getattr(batch, "tags", None) or [])
+            indices = (
+                [i for i, tag in enumerate(tags) if not tag.get("is_padding", False)]
+                if len(tags) == len(extras)
+                else range(len(extras))
+            )
+            records = []
+            for idx in indices:
+                mapping = extras[idx] if isinstance(extras[idx], dict) else {}
+                fields = dict(mapping)
+                if "child_gen_keys" not in fields and isinstance(mapping.get("extra_fields"), dict):
+                    fields.update(mapping["extra_fields"])
+                if child_col is not None and idx < len(child_col):
+                    fields = self._merge_child_gen_keys(fields, child_col[idx])
+                records.append({"fields": fields})
+            return records
         extras = self._extra_fields_from_tq(batch)
         if extras is None:
             return []
+        keys = list(getattr(batch, "keys", []) or [])
+        if keys and len(extras) != len(keys):
+            raise RuntimeError(
+                f"bagel_corl UND extra_fields fetch returned {len(extras)} row(s) for {len(keys)} key(s); "
+                "row↔key alignment is what the GEN gather and the J/K aggregation rely on"
+            )
+        # ``upsample_batch_to_divisible_size`` builds its synthetic rows by deep-copying the first
+        # row's fields *and* tag, so a padding row still carries its template's ``child_gen_keys``,
+        # ``extra_fields`` and J/K. Counting it as an episode would fetch the template's GEN rows
+        # twice and fold its J/K into the batch mean a second time, so drop it here. The tags live
+        # on the KVBatchMeta in key order, which is exactly the fetch order.
+        tags = list(getattr(batch, "tags", None) or [])
+        indices = (
+            [i for i, tag in enumerate(tags) if not tag.get("is_padding", False)]
+            if len(tags) == len(extras)
+            else range(len(extras))
+        )
         records = []
-        for extra_row in extras:
+        for idx in indices:
+            extra_row = extras[idx]
             mapping = extra_row if isinstance(extra_row, dict) else {}
             fields = dict(mapping)
             if "child_gen_keys" not in fields and isinstance(mapping.get("extra_fields"), dict):
@@ -513,7 +664,11 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         keys: list[str] = []
         for rec in und_records:
             fields = rec.get("fields") or rec
-            keys.extend(str(k) for k in (fields.get("child_gen_keys") or []))
+            for child in fields.get("child_gen_keys") or []:
+                # Order-preserving dedupe: TQ's KVBatchMeta rejects duplicate keys, and a batch
+                # may legitimately point at the same seed row from more than one gather path.
+                if str(child) not in keys:
+                    keys.append(str(child))
         if not keys:
             return {}
         if not hasattr(batch, "partition_id"):
@@ -541,13 +696,58 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             import transfer_queue as tq
 
             data = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields", "child_gen_keys"]
+                keys=list(batch.keys), partition_id=batch.partition_id, select_fields=["extra_fields", "child_gen_keys"]
             )
-            if isinstance(data, dict) and "extra_fields" in data:
-                return data["extra_fields"]
-            return data
         except (KeyError, AttributeError, RuntimeError, TypeError, ValueError) as exc:
             raise RuntimeError("bagel_corl UND extra_fields TQ fetch failed") from exc
+        if isinstance(data, dict):
+            if "extra_fields" in data:
+                return data["extra_fields"]
+            return self._rows_in_batch_key_order(batch, data)
+        # ``kv_batch_get`` hands back a **columnar TensorDict** (one entry per requested key, in
+        # request order), not a dict and not a keyed mapping. Iterating it yields *field names*, so
+        # the old ``return data`` made ``_und_records_from_batch`` build one empty record per
+        # *field* -- no ``child_gen_keys`` anywhere, PROTO None, and the GEN lane silently vanished
+        # (``gen/num_rows`` > 0 at pack time, GEN never trained). Read the column instead, exactly
+        # like ``ReplayBuffer._dapo_filtered_keys`` does.
+        if "extra_fields" in data.keys():
+            rows = list(data["extra_fields"])
+            # ``extra_fields`` and ``child_gen_keys`` come back as **sibling columns**, and the
+            # dual-lane put writes ``child_gen_keys`` both inside the ``extra_fields`` blob and as
+            # its own column. Returning only the first column silently dropped the second for any
+            # row whose blob did not repeat it -- the same "GEN lane vanishes" failure the comment
+            # above documents, one layer deeper. Re-attach the column before handing rows back.
+            if "child_gen_keys" in data.keys():
+                child_col = list(data["child_gen_keys"])
+                rows = [
+                    OmniBagelCoRLTrainerSync._merge_child_gen_keys(
+                        row, child_col[i] if i < len(child_col) else None
+                    )
+                    for i, row in enumerate(rows)
+                ]
+            return rows
+        if "child_gen_keys" in data.keys():
+            return list(data["child_gen_keys"])
+        return data
+
+    @staticmethod
+    def _rows_in_batch_key_order(batch, data: dict):
+        """Normalize a per-key mapping (``{tq_key: row}``) into batch-key order."""
+        keys = [str(k) for k in (getattr(batch, "keys", None) or [])]
+        if keys and all(k in data for k in keys):
+            return [data[k] for k in keys]
+        return list(data.values())
+
+    @staticmethod
+    def _merge_child_gen_keys(row, child_keys):
+        """Give a fetched row the ``child_gen_keys`` column when its own blob omitted it."""
+        if not isinstance(row, dict) or not child_keys:
+            return row
+        if row.get("child_gen_keys"):
+            return row
+        merged = dict(row)
+        merged["child_gen_keys"] = list(child_keys)
+        return merged
 
     def _compute_advantage(self, batch, metrics: dict):
         """Same step, separate tensors: GEN FlowGRPO → ``bagel_corl_gen``; UND token GRPO → TQ via ``super``.
@@ -556,15 +756,12 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         Do **not** pass ``algorithm.adv_estimator`` (omni default ``grpo``) into GEN.
         """
         extra = self._extra_info(batch)
-        for metric_key in (
-            "und/no_image_credit",
-            "gen/dropped_incomplete_groups",
-            "episode/J",
-            "episode/K",
-            "gen/skipped_no_groups",
-        ):
-            if extra.get(metric_key) is not None:
-                metrics[metric_key] = extra[metric_key]
+        # NOTE: the dual-lane metrics (``episode/J``, ``episode/K``, ``gen/dropped_incomplete_groups``,
+        # ``und/no_image_credit``) do not exist on ``extra`` yet -- ``_gen_batch_from_step`` below is
+        # what runs ``aggregate_episode_metrics`` and populates them. The copy therefore has to happen
+        # *after* the gather, otherwise every one of them stays absent from the step log (measured:
+        # ``advantage ... J=None K=None`` on every step of the 20260922 runs, which is what made the
+        # GEN lane look like it had no data at all).
 
         algo = self.config.algorithm
         gen_estimator = self._gen_adv_estimator()
@@ -610,6 +807,16 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     algo_config=algo,
                 )
         metrics.update(gen_metrics)
+        # Now that the gather has run, the dual-lane bookkeeping is on ``extra`` (see the note at the
+        # top of this method); publish it so a skipped GEN lane is attributable from the step log.
+        for metric_key in (
+            "und/no_image_credit",
+            "gen/dropped_incomplete_groups",
+            "episode/J",
+            "episode/K",
+        ):
+            if extra.get(metric_key) is not None:
+                metrics.setdefault(metric_key, extra[metric_key])
         has_complete = bool(gen_metrics.get("has_complete_gen_groups"))
         extra["has_complete_gen_groups"] = has_complete
         extra["skip_gen"] = not has_complete
@@ -642,8 +849,19 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         for key in ("episode/J", "episode/K", "und/no_image_credit"):
             if extra.get(key) is not None:
                 metrics[key] = extra[key]
-        # Ensure GEN FlowGRPO view + skip flags ride on the actor TensorDict / extra_info.
-        if hasattr(batch, "keys") and callable(getattr(tu, "assign_non_tensor_data", None)):
+        # The flags have to ride on whatever carrier this trainer's bus uses, and ``_extra_info``
+        # above already put them where the actor will look: the v1 bus hands us a ``KVBatchMeta``,
+        # whose ``extra_info`` dict the TQ dispatch layer copies onto the actor's TensorDict as
+        # non-tensor data (``verl/utils/transferqueue_utils.py:160-177``) -- which is exactly where
+        # the composite reads them back (``bagel_corl_composite.py:129,131`` and
+        # ``diffusers_impl.py:954,956``). ``tu.assign_non_tensor_data`` is only valid for a real
+        # TensorDict; calling it on the meta asserts (``tensordict_utils.py:44``), and
+        # ``hasattr(batch, "keys")`` is *not* a TensorDict test -- ``KVBatchMeta.keys`` is its list
+        # of TQ keys. Measured 2026-09-18 on `hk01dgx012` (devices 4-7), the first step that
+        # reached the actor: ``AssertionError: input dict must be a TensorDict``.
+        from tensordict import TensorDict
+
+        if isinstance(batch, TensorDict):
             tu.assign_non_tensor_data(batch, "skip_gen", extra["skip_gen"])
             tu.assign_non_tensor_data(batch, "has_complete_gen_groups", has_complete)
             tu.assign_non_tensor_data(batch, "num_gen_rows", int(extra.get("num_gen_rows") or 0))
@@ -667,6 +885,84 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         vo = (ek.get("vllm_omni") or {}) if hasattr(ek, "get") else {}
         path = vo.get("und_deploy_config") if hasattr(vo, "get") else None
         return str(path) if path else None
+
+    @staticmethod
+    def _und_ar_stage_ids(deploy_config: str) -> tuple[int, ...]:
+        """Stage ids declared by the UND AR deploy config (``bagel_think``: 0 + 1).
+
+        The UND AR replica declares its width through
+        ``tensor_model_parallel_size`` (see ``_build_und_ar_entrypoint_config``),
+        and a plain top-level engine arg is copied into *every* stage by the
+        deploy-config path (``build_stage_runtime_overrides`` applies non-
+        orchestrator keys to each stage; for the DiT stage it is then folded into
+        ``parallel_config``). Each stage therefore has to be pinned back to one
+        rank, or a stage holding a single ``devices`` entry is asked for two.
+        Read the ids from the deploy config instead of hard-coding them so a stage
+        added or collapsed upstream cannot silently lose the pin.
+        """
+        if not os.path.isfile(deploy_config):
+            raise ValueError(
+                f"bagel_corl_sync cannot read agent.und_deploy_config={deploy_config!r} to derive the "
+                "UND AR stage ids. Without them the per-stage tensor_parallel_size pin cannot be "
+                "emitted, and every stage would inherit the replica-width value."
+            )
+        stages = OmegaConf.load(deploy_config).get("stages") or []
+        stage_ids = tuple(int(stage["stage_id"]) for stage in stages if "stage_id" in stage)
+        if not stage_ids:
+            raise ValueError(f"bagel_corl_sync: {deploy_config!r} declares no stages to pin")
+        return stage_ids
+
+    @staticmethod
+    def _und_stage_device_indices(deploy_config: str) -> dict[int, int]:
+        """Highest logical device index each stage of the UND AR deploy config asks for.
+
+        Stage ``devices`` are logical indices into the replica's own
+        ``CUDA_VISIBLE_DEVICES`` (``run_bagel_und_ar_serve.sh`` relies on the same
+        convention), so the pool width has to cover the widest one or the stage's
+        engine core dies during init with an unrelated-looking error.
+        """
+        stages = OmegaConf.load(deploy_config).get("stages") or []
+        widest: dict[int, int] = {}
+        for stage in stages:
+            if "stage_id" not in stage:
+                continue
+            runtime = stage.get("runtime") or {}
+            raw = runtime.get("devices", stage.get("devices"))
+            if raw is None:
+                continue
+            indices = [int(token) for token in str(raw).replace(",", " ").split() if token.strip()]
+            if indices:
+                widest[int(stage["stage_id"])] = max(indices)
+        return widest
+
+    @staticmethod
+    def _und_stage_max_model_len(deploy_config: str) -> int | None:
+        """Widest ``max_model_len`` the UND AR deploy config declares across its stages.
+
+        The entrypoint's ``max_model_len`` is a plain (non-orchestrator) engine arg, so
+        the deploy-config path copies it into *every* stage and it therefore **wins**
+        over each stage's own value. The builder is thus the single source of truth for
+        the AR replica's context, and its value has to cover what ``_und_decode``
+        actually feeds the engine: the decode prompt of UND turn ``j`` is
+        ``prompt_ids + response_ids``, i.e. the *whole episode so far*.
+
+        Sizing it as ``max_prompt + max_resp`` leaves exactly zero headroom for the
+        turn being generated once the episode's response budget is spent, which is the
+        measured failure:
+
+            ValueError: Prompt length (2048) meets or exceeds the model's maximum
+            context length (2048), leaving no space for generation.
+
+        Read the value back instead of hard-coding it, so the yaml's documented budget
+        (16384: the ~8625-token-per-image MM-encoder floor, sized so
+        ``max_num_batched_tokens == max_num_seqs * max_model_len``) is what the engine
+        actually gets and the two cannot drift.
+        """
+        if not os.path.isfile(deploy_config):
+            return None
+        stages = OmegaConf.load(deploy_config).get("stages") or []
+        declared = [int(stage["max_model_len"]) for stage in stages if stage.get("max_model_len") is not None]
+        return max(declared) if declared else None
 
     # Bagel publishes weights only: its top-level ``config.json`` is
     # ``model_type: bagel`` with no ``auto_map`` and no modeling code, so
@@ -722,8 +1018,60 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         und_util = float(agent.get("und_gpu_memory_utilization") or 0.40)
         max_prompt = int(self.config.data.get("max_prompt_length") or rollout.get("prompt_length") or 1024)
         max_resp = int(self.config.data.get("max_response_length") or rollout.get("response_length") or max_prompt)
+        # The AR replica's context has to be able to serve any turn the UND loop is
+        # allowed to start. ``run_serial_episode`` stops at ``max_prompt + max_resp``
+        # (the episode's whole context: ``_und_decode`` passes ``prompt_ids +
+        # response_ids`` as the decode prompt), so an engine context below that asks for
+        # a decode with no room for even one token, which the AR strategy refuses:
+        #   ValueError: Prompt length (2048) meets or exceeds the model's maximum
+        #   context length (2048), leaving no space for generation.
+        # Measured 2026-09-17 09:30 on a 1024+1024 episode budget, where this line used to
+        # say ``max_prompt + max_resp`` (2048) and contradicted both the deploy config
+        # it ships and the RFC's stated 16384.
+        # Prefer ``agent.und_max_model_len``, else the deploy config's own declared
+        # budget (``bagel_corl_deploy_ar.yaml``: 16384), else the bare episode size.
+        und_max_model_len = int(
+            agent.get("und_max_model_len") or self._und_stage_max_model_len(und_deploy) or (max_prompt + max_resp)
+        )
+        if und_max_model_len < max_prompt + max_resp:
+            raise ValueError(
+                f"bagel_corl_sync: UND AR max_model_len={und_max_model_len} is smaller than the episode "
+                f"context the loop has to serve (max_prompt_length={max_prompt} + "
+                f"max_response_length={max_resp} = {max_prompt + max_resp}). The loop starts a turn while "
+                "len(prompt_ids)+len(response_ids) is still below that budget, and the AR strategy rejects "
+                "a prompt that leaves no room for generation ('Prompt length (...) meets or exceeds the "
+                "model's maximum context length'). Lower data.max_prompt_length/data.max_response_length, "
+                "or raise agent.und_max_model_len / the deploy config's max_model_len."
+            )
 
         und_cfg = OmegaConf.create(OmegaConf.to_container(self.config, resolve=True))
+        # ``actor_rollout_ref.model`` is the *actor's* config, and the recipe runs it with
+        # ``lora.merge=True`` (mandatory on vllm-omni >= 0.24) -- i.e. the UND replica below
+        # receives merged full weights and never an adapter. Its engine is launched by
+        # ``verl/workers/rollout/vllm_rollout/vllm_async_server.py``, which enables LoRA
+        # whenever the *effective* rank is > 0: it reads ``model.lora.rank``, falls back to
+        # the top-level ``model.lora_rank`` ("FIXME: fallback to lora_rank for now") and only
+        # zeroes that fallback when ``model.lora.merge`` is set. This builder copies
+        # ``lora_rank``/``lora_alpha`` but not ``lora.merge``, so the AR engine used to be
+        # launched with ``enable_lora=True, max_loras=1`` with nothing to apply.
+        #
+        # Measured 2026-09-20 19:44:45 on hk01dgx039 (devices 3,5,6,7): the *first* UND decode
+        # of step 0 never returned. The AR worker's main thread (pid 1458872) sat in
+        # ``vllm/lora/punica_wrapper/punica_gpu.py:add_lora_linear`` / ``add_shrink``, reached
+        # from ``RowParallelLinear.forward -> LoRA apply`` of ``qwen2.py`` -- the Punica
+        # kernels were launched for a model whose ``lora_a_stacked`` was never populated (no
+        # ``add_lora`` ever ran, because the actor syncs merged weights) and never finished,
+        # so the stage-0 engine core blocked on that forward forever and the two in-flight
+        # requests were only failed 8 minutes later when the worker was killed. The
+        # step-0 rollout, the whole training step and the validation that followed all
+        # produced no rows, i.e. it surfaced as ``ValueError: Received an empty list as
+        # keys.`` from the trainer's TQ read.
+        #
+        # Pinning the AR replica's declared rank to 0 restores the intended "full weights, no
+        # engine-side adapter" state -- the same state the GEN replica reaches through
+        # ``lora_as_adapter=False`` in ``vllm_omni_async_server.py`` -- and keeps the AR engine
+        # on the plain ``load_weights`` path that the merged sync uses.
+        und_lora_rank = 0 if _actor_merges_lora(model) else int(model.get("lora_rank") or 0)
         with open_dict(und_cfg):
             und_cfg.actor_rollout_ref.model = OmegaConf.create(
                 {
@@ -734,7 +1082,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     "architecture": model.get("architecture") or "OmniBagelForConditionalGeneration",
                     "trust_remote_code": bool(model.get("trust_remote_code", True)),
                     "composite_mode": "bagel_corl",
-                    "lora_rank": int(model.get("lora_rank") or 0),
+                    "lora_rank": und_lora_rank,
                     "lora_alpha": int(model.get("lora_alpha") or 0),
                     # OmniModelConfig.__post_init__ runs AutoConfig.from_pretrained on
                     # hf_config_path (falling back to ``path``). Bagel publishes weights
@@ -751,21 +1099,61 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     "load_tokenizer": False,
                 }
             )
-            ckpt_engine = OmegaConf.to_container(rollout.get("checkpoint_engine"), resolve=True) or {
-                "backend": "naive"
-            }
+            # ``to_container`` raises on ``None``, so the fallback has to be applied first --
+            # otherwise a config without ``checkpoint_engine`` (the documented "naive"
+            # default the ``or`` implies) dies here with "Input cfg is not an OmegaConf
+            # config object (NoneType)".
+            _ckpt = rollout.get("checkpoint_engine")
+            ckpt_engine = OmegaConf.to_container(_ckpt, resolve=True) if _ckpt is not None else None
+            ckpt_engine = ckpt_engine or {"backend": "naive"}
             und_cfg.actor_rollout_ref.rollout = OmegaConf.create(
                 {
                     "_target_": "verl.workers.config.RolloutConfig",
                     "name": "vllm_omni",
-                    "tensor_model_parallel_size": 1,
+                    # ``tensor_model_parallel_size`` here is the replica's *width
+                    # declaration*, not a stage-level parallelism knob. It is what makes
+                    # the colocated server see more than one card:
+                    # ``RolloutReplica.__init__`` derives ``world_size = TP * DP * PP``,
+                    # slices ``gpus_per_replica_node = min(n_gpus_per_node, world_size)``
+                    # workers out of the pool ``_ensure_dual_role_rollout`` hands to
+                    # ``init_colocated`` (one worker per ``und_n_gpus``-wide slice), and
+                    # ``vLLMReplica.launch_servers`` builds the server's
+                    # ``CUDA_VISIBLE_DEVICES`` from exactly ``gpus_per_replica_node``
+                    # workers (``assert len(self.workers) == world_size``). Declare a
+                    # width of 1 and the server gets ``CUDA_VISIBLE_DEVICES=0`` only, and
+                    # stage devices are *logical* indices into that string -- which is how
+                    # both ``bagel_think`` stages silently ended up on GPU 0. Each stage
+                    # loads its own ~28.2GiB copy of the checkpoint, so that card then
+                    # held 73.6GiB (measured: AR Thinker 32.96 + AR DiT 28.86 + GEN
+                    # residual 2.15 + actor) and the first ``update_weights`` died in
+                    # ``cumem create_and_map`` when the GEN rank tried to re-map its
+                    # 28.56GiB level-1 sleep ("Wake-up failed on Rank 0").
+                    #
+                    # Declaring the width as TP (rather than data_parallel_size) keeps the
+                    # launch free of extra engine args: the DP path makes
+                    # ``launch_servers`` inject ``data_parallel_size_local`` alongside DP,
+                    # and that key is *not* in vLLM-Omni's ``OrchestratorArgs`` (so it is
+                    # not filtered as an orchestrator field) while DP *is* a pipeline-wide
+                    # field that reaches every stage -- a stage pinned back to DP=1 would
+                    # then abort with "data_parallel_size_local (2) must be <=
+                    # data_parallel_size (1)". TP alone carries no such companion arg.
+                    # ``bagel_corl_deploy_ar.yaml`` then spreads the stages over the two
+                    # cards; ``stage_overrides`` below pins both stages back to TP=1 (a
+                    # plain top-level engine arg reaches every stage through the deploy
+                    # config path, and a TP=2 stage with one ``devices`` entry cannot
+                    # start). Mirrors the Qwen3-Omni AR recipe, which also declares its
+                    # replica width through ``tensor_model_parallel_size`` and leaves the
+                    # per-stage engine args to the stage config.
+                    "tensor_model_parallel_size": und_n_gpus,
                     "data_parallel_size": 1,
                     "pipeline_model_parallel_size": 1,
                     "n_gpus_per_node": und_n_gpus,
                     "nnodes": 1,
                     "prompt_length": max_prompt,
                     "response_length": max_resp,
-                    "max_model_len": max_prompt + max_resp,
+                    # From the deploy config, never ``max_prompt + max_resp`` -- see
+                    # ``_und_stage_max_model_len`` and the invariant check above.
+                    "max_model_len": und_max_model_len,
                     # Bagel registers as encoder-decoder in vLLM-Omni, which disables
                     # chunked MM input and pins the MM encoder budget to
                     # max_num_batched_tokens. One image is ~8625 tokens, so the
@@ -790,12 +1178,104 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                         "vllm_omni": {
                             "output_mode": "ar",
                             "deploy_config": und_deploy,
+                            # ``tensor_model_parallel_size`` above only declares how wide
+                            # the colocated replica is; ``--stage-overrides`` is the
+                            # per-stage mechanism run_bagel_und_ar_serve.sh already uses
+                            # for its two-card Thinker/DiT split. Verified against vLLM-Omni:
+                            # a plain top-level engine arg reaches every stage through the
+                            # deploy-config path, so both ``bagel_think`` stages would
+                            # otherwise be asked for two ranks while
+                            # ``bagel_corl_deploy_ar.yaml`` gives each of them a single
+                            # ``devices`` entry (the DiT stage even folds it into its
+                            # diffusion ``parallel_config``). Stage-scoped keys are applied
+                            # after the plain ones, so these win, and the deploy yaml's
+                            # per-stage ``devices`` stay authoritative.
+                            "stage_overrides": {
+                                str(stage_id): {"tensor_parallel_size": 1}
+                                for stage_id in self._und_ar_stage_ids(und_deploy)
+                            },
                         }
                     },
                     "agent": OmegaConf.to_container(agent, resolve=True) or {},
                 }
             )
         return und_cfg
+
+    @staticmethod
+    def _validate_und_ar_pool(
+        und_rollout, und_n_gpus: int, deploy_config: str, actor_world_size: int | None = None
+    ) -> None:
+        """Fail loud when the AR replica's pool and its deploy config cannot agree.
+
+        Three invariants, all otherwise surfacing as unrelated deep-stack failures:
+
+        * ``world_size = TP * DP * PP`` (declared in ``_build_und_ar_entrypoint_config``)
+          must equal the ``und_n_gpus``-wide actor-pool slice handed to ``init_colocated``,
+          or ``vLLMReplica.launch_servers`` trips ``assert len(self.workers) == world_size``.
+        * the pool must be at least as wide as the widest logical stage device. Stage
+          ``devices`` are indices into the replica's own ``CUDA_VISIBLE_DEVICES``, so a
+          1-wide pool cannot resolve ``devices: "1"`` (the layout the AR deploy yaml
+          ships); a run configured that way died as
+          ``StageEngineCoreProc_stage0_replica0 ... ValueError: No available memory for the
+          cache blocks`` -> ``Orchestrator initialization failed: ... Failed core proc(s): {}``.
+        * the pool must **divide** the actor pool, because that is how it is carved out:
+          ``_ensure_dual_role_rollout`` takes the first slice with
+          ``split_resource_pool(actor_pool, split_size=und_n_gpus)``, which cannot return a
+          ragged split. On a 4-card pool the valid widths are therefore {1, 2, 4}; a 3-wide
+          AR window -- what an offset stage layout would need to dodge a co-tenant on the
+          first card -- is not expressible there. Measured 2026-09-18 10:36 on ``hk01dgx012``
+          (devices 4-7): a run with ``agent.und_n_gpus=3`` against a 4-card pool died ~8
+          minutes in as ``AssertionError: split_size must be a divisor of world_size``.
+
+        ``actor_world_size`` is the actor PG width when the caller can resolve it; ``None``
+        (e.g. from a unit test that only exercises the config consistency) skips the
+        divisibility check rather than guessing.
+        """
+        declared_world_size = (
+            int(und_rollout.get("tensor_model_parallel_size") or 1)
+            * int(und_rollout.get("data_parallel_size") or 1)
+            * int(und_rollout.get("pipeline_model_parallel_size") or 1)
+        )
+        if declared_world_size != und_n_gpus:
+            raise ValueError(
+                f"bagel_corl_sync: the UND AR replica declares world_size={declared_world_size} "
+                f"(TP*DP*PP) but agent.und_n_gpus={und_n_gpus} workers are handed to it. "
+                "The replica's width declaration and the actor-pool slice must match."
+            )
+        if actor_world_size is not None and actor_world_size % und_n_gpus:
+            raise ValueError(
+                f"bagel_corl_sync: agent.und_n_gpus={und_n_gpus} does not divide the actor pool "
+                f"(n_gpus_per_node={actor_world_size}). The UND AR slice is taken with "
+                "split_resource_pool, which requires an exact split, so this would otherwise die "
+                "as 'split_size must be a divisor of world_size'. Pick a divisor of the pool "
+                "(on a 4-card pool: UND_N_GPUS in {1, 2, 4})."
+            )
+        stage_devices = OmniBagelCoRLTrainerSync._und_stage_device_indices(deploy_config)
+        widest_stage_device = 1 + max(stage_devices.values(), default=0)
+        if und_n_gpus < widest_stage_device:
+            raise ValueError(
+                f"bagel_corl_sync: agent.und_n_gpus={und_n_gpus} cannot cover the stage devices in "
+                f"{deploy_config!r} (needs >= {widest_stage_device}). Stage devices are logical "
+                "indices into the replica's CUDA_VISIBLE_DEVICES; either raise UND_N_GPUS or put "
+                "every stage back on logical device 0 (1-GPU smoke test)."
+            )
+
+    def _und_actor_pool_size(self) -> int | None:
+        """Width of the actor pool the UND AR replica is carved out of, or ``None``.
+
+        Used only to feed ``_validate_und_ar_pool``'s divisibility check. Returns ``None``
+        rather than raising when the pool cannot be resolved -- this is a pre-flight check,
+        and ``_ensure_dual_role_rollout`` reports a missing pool itself.
+        """
+        try:
+            actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
+            actor_pool = self.resource_pool_manager.get_resource_pool(actor_role)
+        except Exception:  # noqa: BLE001 - a missing pool is reported by _ensure_dual_role_rollout
+            return None
+        # ``split_resource_pool`` reads exactly this attribute, so validating against it
+        # checks the same quantity the assert that failed would have.
+        world_size = getattr(actor_pool, "world_size", None)
+        return int(world_size) if world_size else None
 
     def _ensure_dual_role_rollout(self) -> None:
         """Start UND AR colocated on the actor GPU pool; wrap GEN+UND behind one client.
@@ -836,7 +1316,13 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
 
         actor_role = Role.ActorRolloutRef if Role.ActorRolloutRef in self.role_worker_mapping else Role.ActorRollout
         actor_pool = self.resource_pool_manager.get_resource_pool(actor_role)
-        # One UND AR replica (TP=1): take the first ``und_n_gpus``-wide slice of the actor PG.
+        # One UND AR replica: take the first ``und_n_gpus``-wide slice of the actor PG. Both
+        # the declared width and the stage devices are validated against it first (see
+        # ``_validate_und_ar_pool``), so a stale ``UND_N_GPUS`` reports itself here instead
+        # of dying inside vLLM's engine core. ``und_deploy`` is non-``None`` because
+        # ``_build_und_ar_entrypoint_config`` above already failed loud without it.
+        und_deploy = self._und_deploy_config_path()
+        self._validate_und_ar_pool(und_rollout, und_n_gpus, und_deploy, self._und_actor_pool_size())
         split_pools = split_resource_pool(actor_pool, split_size=und_n_gpus)
         if not split_pools:
             raise RuntimeError("bagel_corl_sync: actor resource pool is empty; cannot colocate UND AR")
@@ -855,7 +1341,18 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             "bagel_corl_sync colocating UND AR on actor pool start_rank=%s und_n_gpus=%s und_deploy=%s",
             hybrid_n,
             und_n_gpus,
-            self._und_deploy_config_path(),
+            und_deploy,
+        )
+        # ``vllm_async_server`` turns a nonzero ``model_config.lora_rank`` into
+        # ``enable_lora=True`` for this engine. With the actor merging its LoRA the AR
+        # replica must stay at 0 (see ``_build_und_ar_entrypoint_config``): a nonzero rank
+        # here means the AR engine was launched with Punica LoRA layers and *no* adapter,
+        # which hung the first decode of step 0 inside ``punica_gpu.add_lora_linear``.
+        logger.info(
+            "bagel_corl_sync UND AR engine lora_rank=%s actor_lora_merge=%s "
+            "(0 => plain full-weight sync, no engine-side adapter)",
+            int(und_model.get("lora_rank", 0) or 0),
+            _actor_merges_lora(self.config.actor_rollout_ref.model),
         )
 
         @auto_await
@@ -899,6 +1396,62 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         self._ensure_dual_role_rollout()
         return self._bagel_dual_client
 
+    def _wake_und_rollout_replicas(self) -> None:
+        """Wake the colocated UND AR replica(s) after ``on_sample_end`` slept them.
+
+        ``checkpoint_manager.sleep_replicas()`` sleeps *every* registered replica,
+        and ``_ensure_dual_role_rollout`` registers the UND AR replica there. Nothing
+        in the naive sync path wakes it again: ``CheckpointEngineManager.update_weights``
+        short-circuits for ``backend='naive'`` without touching ``self.replicas``, and the
+        actor-side ``EngineWorker.update_weights`` only resumes its *own* colocated server
+        (``self.rollout``, the GEN engine). The AR engine therefore stayed asleep with
+        **both** tags still set and the first UND decode of the next rollout died in
+        ``AsyncOmni.generate``:
+
+            RuntimeError: Generation rejected: Engine is partially or fully asleep.
+            Currently sleeping tags: ['weights', 'kv_cache'].
+            Please perform a full wake_up before generating.
+
+        measured 2026-09-20 16:19:54 on hk01dgx039, which is the step-0 **validation**
+        rollout: step 0's training rollout ran before any sleep, then ``on_sample_end``
+        slept both pools, ``on_step_end`` published weights and woke only GEN, and
+        every validation episode failed at its first ``_und_decode``. Validation then
+        materialized no TQ rows and ``_validate`` died on the follow-on
+        ``ValueError: Received an empty list as keys.`` from ``tq.kv_batch_get`` --
+        i.e. the opaque second error is only a symptom of this one.
+
+        Both tags are requested on purpose. ``vLLMOmniHttpServer.wake_up`` defaults to
+        ``_get_wake_up_tags() == ["weights"]``, while ``AsyncOmni`` keeps its own
+        ``_sleeping_tags`` and rejects generation while *any* tag is still sleeping;
+        that is why the actor-side naive sync resumes weights and kv_cache in two
+        separate calls. Asking for both in one wake clears the tag set outright, and is
+        a no-op (``wake_up`` returns early on an already-warm engine) when the replica is
+        awake, e.g. at ``on_init_end`` where ``init_colocated`` created it after
+        ``_setup``'s sleep.
+        """
+        replicas = getattr(self, "und_rollout_replicas", None) or []
+        if not replicas:
+            return
+        import asyncio
+
+        from verl.utils.ray_utils import auto_await
+
+        @auto_await
+        async def _wake_all() -> None:
+            await asyncio.gather(
+                *(
+                    server.wake_up.remote(tags=["weights", "kv_cache"])
+                    for replica in replicas
+                    for server in replica.servers
+                )
+            )
+
+        _wake_all()
+        logger.info(
+            "bagel_corl_sync woke %s UND AR replica(s) (weights+kv_cache) after sleep",
+            len(replicas),
+        )
+
     def _bagel_rm_enabled(self) -> bool:
         reward_cfg = getattr(self.config, "reward", None)
         if reward_cfg is None:
@@ -932,6 +1485,20 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
 
         The manager passes them to every ``BagelCorlAgentLoopWorkerTQ``, which
         binds the GEN-side handle for in-loop GEN scoring.
+
+        Normalised to ``None`` when there are none. ``RewardLoopManager.
+        reward_loop_worker_handles`` returns ``self.reward_loop_workers`` -- an *empty
+        list*, not ``None`` -- whenever ``reward_model.enable=False``, which the Co-RL
+        recipe sets alongside ``reward.num_workers=0`` (the in-loop Bagel reward is the
+        only scorer). The agent loop then tests ``is not None`` and calls
+        ``random.choice(...)`` on it, so any episode that finishes with
+        ``reward_score is None`` kills the worker with
+
+            IndexError: Cannot choose from an empty sequence
+
+        which masks the real failure. Measured 2026-09-17 09:30, 29 ms behind the AR
+        context-length ``ValueError`` in the same worker. Returning ``None`` makes the
+        agent loop skip that branch and lets the genuine error surface.
         """
         manager = getattr(self, "reward_loop_manager", None)
         if manager is not None:
@@ -939,7 +1506,8 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             if workers:
                 return workers
         getter = getattr(super(), "get_reward_handles", None)
-        return getter() if callable(getter) else None
+        handles = getter() if callable(getter) else None
+        return list(handles) if handles else None
 
     def on_init_end(self):
         # Build UND AR before the first weight publish so both pools see step-0 weights.
@@ -947,6 +1515,10 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         if self._bagel_rm_enabled():
             self._ensure_reward_loop_manager()
         super().on_init_end()
+        # ``_setup`` slept the GEN replica(s) to load the checkpoint and the parent hook
+        # woke them through the actor; the AR replica is created after that sleep, so this
+        # is a no-op today and a guard if the creation order ever moves.
+        self._wake_und_rollout_replicas()
 
     def on_step_end(self):
         # Parent updates weights for every replica registered on checkpoint_manager
@@ -963,10 +1535,33 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     "checkpoint_manager; they would keep step-0 weights (RFC §4.11)"
                 )
             logger.info(
-                "bagel_corl_sync published weights step=%s to %s rollout replica(s) incl. UND AR",
+                "bagel_corl_sync step=%s: %s rollout replica(s) registered incl. UND AR "
+                "(naive backend publishes through the actor to its own GEN server only)",
                 getattr(self, "global_steps", None),
                 len(registered),
             )
+        # The parent hook's naive publish only resumed the actor's own GEN server, so the
+        # AR engine is still asleep here and every rollout since would fail on its first
+        # UND decode. See ``_wake_und_rollout_replicas``.
+        self._wake_und_rollout_replicas()
+
+    def on_validate_end(self):
+        """Re-wake the AR replica after ``_validate``'s colocated-reward sleep.
+
+        ``_validate`` sleeps **all** replicas when ``reward_loop_manager.
+        reward_loop_worker_handles is None`` (a colocated RM). Today's recipe runs with
+        ``reward.reward_model.enable=False`` + ``num_workers=0``, whose handle list is empty
+        -- not ``None`` -- so that branch is skipped; ``ENABLE_RM=1`` flips it on. Its
+        follow-up ``update_weights()`` is the naive short-circuit that only wakes the actor's
+        GEN server, so without this the AR engine would be asleep for the *next* step's
+        rollout: the same failure ``_wake_und_rollout_replicas`` fixes, one step later. Also
+        covers ``val_before_train=True``, where ``on_step_end`` has not run yet.
+
+        Harmless when nothing slept: ``AsyncOmni.wake_up`` logs "already warm" and returns
+        without touching the engine.
+        """
+        super().on_validate_end()
+        self._wake_und_rollout_replicas()
 
     def _validate(self):
         """V1 validation, plus the RFC §8.2 evidence record.

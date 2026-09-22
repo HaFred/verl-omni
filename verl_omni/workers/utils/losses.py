@@ -163,10 +163,16 @@ def bagel_composite_loss(config, model_output, data, dp_group=None):
     num_gen_rows = tu.get_non_tensor_data(data, "num_gen_rows", default=0) or 0
     # RFC §4.4: each branch is a mean over its own loss units, and the relative
     # scale is governed solely by the lane weights. GEN's ``diffusion_loss``
-    # divides by this same non-tensor internally; ``ppo_loss`` does not (its
-    # ``agg_loss`` normalizes over the *local* micro-batch token count), so the
-    # UND term must be divided here or the accumulator sums G undivided UND terms
-    # and the lane weights silently drift by G.
+    # divides by ``len(micro_batches) * num_timesteps`` internally
+    # (``diffusers_impl.py:893``); ``ppo_loss`` does not, because the UND pass hands
+    # ``agg_loss`` ``dp_size=1`` and ``batch_num_tokens=None`` so its term is the
+    # mean over *that micro-batch* (``core_algos.py:1169-1173``). The UND term
+    # therefore has to be divided by ``len(micro_batches)`` here, or the
+    # accumulator sums G undivided UND terms and the lane weights silently drift
+    # by G. Feed ``ppo_loss`` the DP-reduced global token count instead and the
+    # division is wrong by another factor of ``dp_size`` -- see
+    # ``run_und_token_forward_backward`` for the full derivation and the failure
+    # that pins it.
     gradient_accumulation_steps = tu.get_non_tensor_data(data, "gradient_accumulation_steps", default=None)
 
     loss_value = None
