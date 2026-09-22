@@ -846,11 +846,34 @@ class DiffusionNFTLoss(DiffusionLossFn):
         loss = policy_loss + loss_cfg.ref_kl_coef * ref_kl_loss
 
         with torch.no_grad():
+            # `dL/dv_theta` decomposes into exactly two parts, because `old` is detached and only
+            # `v_theta` moves both x0 estimates (with `dx0_pos/dv_theta = -t*beta` and
+            # `dx0_neg/dv_theta = +t*beta`, which cancels the `1/beta` in the loss):
+            #
+            #     dL/dv_theta  ~  A*2/w * ( [ beta * t * (v_theta - v_old) ]  -  [ 2*(r-0.5) * (x0_old - x0) ] )
+            #                              \____________ A * beta ____________/     \_______ adv, no A _______/
+            #
+            # where `A = adv_clip_max`. The first term carries no reward at all: it is a plain
+            # contraction of the current policy onto the frozen old policy, and it is the *only*
+            # part of the objective that grows with `A * beta`. The second is the entire learning
+            # signal, and `A` cancels out of it because `r - 0.5 = adv / (2*A)`. Reporting the loss
+            # *values* hides this (the `1/beta` scaling inflates the floor while the gradient it
+            # produces is `beta`-proportional), so report the two gradient scale terms.
+            x0_old = xt - t_expanded * old_prediction
+            reward_weight_col = reward_weight.view(-1, *([1] * (x0.ndim - 1)))
+            contraction = loss_cfg.adv_clip_max * beta * t_expanded * (forward_prediction - old_prediction)
+            reward_term = loss_cfg.adv_clip_max * 2.0 * (reward_weight_col - 0.5) * (x0_old - x0)
+            contraction_scale = contraction.abs().mean()
+            reward_term_scale = reward_term.abs().mean()
             metrics = {
                 "actor/policy_loss": policy_loss.detach().item(),
                 "actor/positive_loss": positive_loss.mean().detach().item(),
                 "actor/negative_loss": negative_loss.mean().detach().item(),
+                "actor/contraction_scale": contraction_scale.detach().item(),
+                "actor/reward_term_scale": reward_term_scale.detach().item(),
+                "actor/signal_ratio": ((reward_term_scale / contraction_scale.clamp(min=1e-12)).detach().item()),
                 "actor/ref_kl_loss": ref_kl_loss.detach().item(),
+                "actor/ref_kl_contribution": (loss_cfg.ref_kl_coef * ref_kl_loss).detach().item(),
                 "actor/old_deviate": ((forward_prediction - old_prediction) ** 2).mean().detach().item(),
                 "actor/reward_prob_mean": reward_weight.mean().detach().item(),
                 "actor/total_loss": loss.detach().item(),

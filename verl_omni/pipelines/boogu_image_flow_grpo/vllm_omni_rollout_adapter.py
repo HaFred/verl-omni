@@ -51,7 +51,11 @@ from .common import (
     boogu_timestep_from_scheduler,
     configure_boogu_sde_timesteps,
     get_boogu_freqs_cis,
+    lora_engine_module_names,
+    lora_module_name,
     rename_boogu_lora_name,
+    unbindable_boogu_lora_module_names,
+    unwrappable_boogu_lora_module_names,
     validate_boogu_lora_targets,
 )
 
@@ -129,15 +133,21 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
     ) -> tuple[dict[str, torch.Tensor], dict]:
         """Translate Boogu LoRA deltas to the vllm-omni transformer layout.
 
-        The actor exports PEFT names verbatim, so the attention output
-        projection arrives as ``...attn.to_out.0`` (diffusers wraps it in an
-        ``nn.Sequential``) while this transformer exposes a direct
-        ``...attn.to_out``. Every other Boogu target matches verbatim, which is
-        why the mismatch is invisible: the adapter binds 17 of 18 targets and
-        nothing warns. Left untranslated, the o-proj delta is trained on the
-        actor and silently dropped on the rollout, so the rollout keeps
-        sampling from a policy that diverges in that subspace
-        (https://github.com/verl-project/verl-omni/issues/658).
+        The actor exports PEFT names verbatim, so two families of targets arrive
+        spelled differently from this transformer:
+
+        * the attention output projection, which diffusers wraps in an
+          ``nn.Sequential`` (``...attn.to_out.0`` vs a direct ``...attn.to_out``), and
+        * the joint attention's per-stream projections, which the actor owns under
+          a custom attention processor (``...img_instruct_attn.processor.img_to_q``)
+          while this transformer holds them directly (``...img_instruct_attn.img_to_q``).
+
+        Both mismatches are invisible on their own: vllm-omni binds a delta by name
+        and only complains when *nothing* binds, so a partial miss drops deltas on
+        the rollout that the actor keeps training
+        (https://github.com/verl-project/verl-omni/issues/658). The rename table
+        below fixes the names, and the binding guard fails loudly if it ever misses
+        one.
         """
         mapped_config = dict(peft_config) if peft_config is not None else {}
         mapped_config["target_modules"] = validate_boogu_lora_targets(mapped_config.get("target_modules"))
@@ -150,6 +160,33 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
                 "Boogu-Image LoRA name translation collapsed distinct tensors into one key; "
                 "refusing to sync an adapter whose deltas would be silently overwritten "
                 "(is the pushed state dict already partially renamed?)."
+            )
+
+        # A rename table is only as good as the engine key space it targets.
+        # vllm-omni binds a delta by name and stays quiet about the ones that match
+        # nothing, so a missed mismatch is invisible: resolve every mapped *LoRA*
+        # key against the live engine tree and fail here instead of sampling from a
+        # rollout that is missing part of the actor's update. Non-LoRA keys are
+        # excluded -- the manager cannot bind them either, so they are not a drop.
+        mapped_modules = [module for name in mapped if (module := lora_module_name(name)) != name]
+        unbindable = unbindable_boogu_lora_module_names(mapped_modules, lora_engine_module_names(self))
+        if unbindable:
+            raise ValueError(
+                "Boogu-Image LoRA deltas would bind no vllm-omni module and be silently dropped: "
+                f"{unbindable}. Extend `_BOOGU_LORA_NAME_RENAMES` in "
+                "verl_omni/pipelines/boogu_image_flow_grpo/common.py to translate them."
+            )
+
+        # A delta also has to land inside the layer set the manager actually
+        # wrapped: it registers LoRA layers only for modules matching
+        # `target_modules`, so a correctly-named key outside that set is dropped
+        # just as quietly as a mis-named one.
+        unwrappable = unwrappable_boogu_lora_module_names(mapped_modules, mapped_config["target_modules"])
+        if unwrappable:
+            raise ValueError(
+                "Boogu-Image LoRA deltas target modules vllm-omni would not wrap and would be "
+                f"silently dropped: {unwrappable}. Add them to the recipe's `target_modules` "
+                "and to `BOOGU_LORA_TARGETS`."
             )
         return mapped, mapped_config
 

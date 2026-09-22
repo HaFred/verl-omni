@@ -440,12 +440,121 @@ def test_compute_policy_loss_diffusion_nft() -> None:
         "actor/policy_loss",
         "actor/positive_loss",
         "actor/negative_loss",
+        "actor/contraction_scale",
+        "actor/reward_term_scale",
+        "actor/signal_ratio",
         "actor/ref_kl_loss",
+        "actor/ref_kl_contribution",
         "actor/old_deviate",
         "actor/reward_prob_mean",
         "actor/total_loss",
     ):
         assert key in metrics, key
+
+
+def test_diffusion_nft_reward_signal_scaling() -> None:
+    """Pin the gradient decomposition that the DiffusionNFT recipe knobs trade against.
+
+    Because `old_prediction` is detached, `dL/dv_theta` splits into exactly two parts (with
+    `A = adv_clip_max` and `w` the per-branch adaptive weight):
+
+        dL/dv_theta  ~  A*2/w * ( [ beta * t * (v_theta - v_old) ]  -  [ 2*(r-0.5) * (x0_old - x0) ] )
+                                 \\____________ A * beta ____________/     \\_______ adv, no A _______/
+
+    The `1/beta` in `policy_loss_per_sample` is cancelled by `dx0/dv_theta = -+t*beta`, so the
+    contraction scales with `A * beta` while the reward term scales with neither: it reduces to
+    `adv * (x0_old - x0)` because `r - 0.5 = adv / (2*A)` and the loss then multiplies by `A`. That
+    asymmetry is the whole basis for what the shipped recipe changes: lowering `adv_clip_max` from
+    5.0 to 1.0 cuts the reward-free contraction 5x while leaving the learning signal intact,
+    whereas *raising* `mix_beta` does the opposite -- it strengthens the contraction, so it is a
+    signal-to-noise trade rather than a free win.
+
+    The reported loss values hide all of this: `positive_loss`/`negative_loss` are dominated by a
+    `1/beta` term whose gradient is `beta`-proportional, which is why the collapsed run showed
+    `positive_loss` steadily *improving* while the graded reward fell.
+    """
+    from hydra import compose, initialize_config_dir
+    from verl.utils.config import omega_conf_to_dataclass
+
+    from verl_omni.workers.config.diffusion.actor import FSDPDiffusionActorConfig
+
+    torch.manual_seed(0)
+    B, C, H, W = 8, 4, 8, 8
+    x0 = torch.randn(B, C, H, W)
+    xt = torch.randn(B, C, H, W)
+    t_expanded = torch.full((B, C, H, W), 0.5)
+    # A small `v_theta - v_old` keeps the branches close, which is the collapsing-run regime that
+    # motivated the instrumented metrics.
+    old_prediction = torch.randn(B, C, H, W)
+    forward_prediction = old_prediction + 0.02 * torch.randn(B, C, H, W)
+    ref_forward_prediction = torch.zeros_like(old_prediction)
+    # Advantages kept inside +-1 (max |adv| ~= 0.75 here) so neither setting clips: that is the
+    # regime where the `adv_clip_max` cancellation is exact, and it isolates it from the probability
+    # map's saturation. At `adv_clip_max=1.0` the ~1/3 of *unit*-normalised advantages beyond +-1 do
+    # saturate -- the documented `clip(., -1, 1)` behaviour -- which damps those samples' weight; the
+    # second half of this test covers that case.
+    advantages = 0.3 * torch.randn(B)
+
+    def metrics_for(mix_beta: float, adv_clip_max: float, adv_raw: torch.Tensor | None = None) -> dict:
+        reward_prob = diffusion_algos.DiffusionNFTLoss._advantage_to_reward_prob(
+            (advantages if adv_raw is None else adv_raw).clone(), adv_clip_max, "continuous"
+        )
+        with initialize_config_dir(
+            config_dir=os.path.abspath("verl_omni/trainer/config/diffusion/actor"), version_base=None
+        ):
+            cfg = compose(
+                config_name="dp_diffusion_actor",
+                overrides=[
+                    "strategy=fsdp",
+                    "diffusion_loss.loss_mode=diffusion_nft",
+                    f"diffusion_loss.mix_beta={mix_beta}",
+                    f"diffusion_loss.adv_clip_max={adv_clip_max}",
+                    "ppo_micro_batch_size_per_gpu=4",
+                ],
+            )
+        actor_config: FSDPDiffusionActorConfig = omega_conf_to_dataclass(cfg)
+        nft_loss = diffusion_algos.get_diffusion_loss_fn("diffusion_nft")
+        _, metrics = nft_loss.compute_loss(
+            forward_prediction=forward_prediction,
+            old_prediction=old_prediction,
+            ref_forward_prediction=ref_forward_prediction,
+            x0=x0,
+            xt=xt,
+            t_expanded=t_expanded,
+            reward_prob=reward_prob,
+            config=actor_config,
+        )
+        return metrics
+
+    inherited = metrics_for(mix_beta=0.1, adv_clip_max=5.0)
+    rebalanced = metrics_for(mix_beta=0.1, adv_clip_max=1.0)
+
+    # Lowering `adv_clip_max` must cut the reward-free contraction by the same factor it cuts the
+    # floor, while leaving the learning signal untouched -- that is the cancellation above.
+    assert rebalanced["actor/contraction_scale"] < inherited["actor/contraction_scale"] / 4.0
+    assert rebalanced["actor/signal_ratio"] > inherited["actor/signal_ratio"] * 4.0
+    assert rebalanced["actor/reward_term_scale"] == pytest.approx(inherited["actor/reward_term_scale"], rel=0.05)
+
+    # `mix_beta` moves the other way: it scales the contraction and leaves the reward term alone, so
+    # raising it is *not* a free reduction of the reward-free floor. Pinned here so the recipe's 0.1
+    # is not "fixed" upward later on the mistaken belief that it buys signal-to-noise.
+    raised_beta = metrics_for(mix_beta=1.0, adv_clip_max=5.0)
+    assert raised_beta["actor/contraction_scale"] > inherited["actor/contraction_scale"] * 8.0
+    assert raised_beta["actor/reward_term_scale"] == pytest.approx(inherited["actor/reward_term_scale"], rel=0.05)
+
+    # With realistically-scaled advantages, `adv_clip_max=1.0` does saturate the samples beyond +-1
+    # and so damps their reward weight. That is the intended `clip(., -1, 1)` map, and it must cost
+    # a bounded amount -- the signal may not collapse back toward the 1/5 with which the inherited
+    # 5.0 compresses the map.
+    raw_advantages = torch.randn(B)
+    unit_inherited = metrics_for(mix_beta=0.1, adv_clip_max=5.0, adv_raw=raw_advantages)
+    unit_rebalanced = metrics_for(mix_beta=0.1, adv_clip_max=1.0, adv_raw=raw_advantages)
+    assert unit_rebalanced["actor/reward_term_scale"] > 0.5 * unit_inherited["actor/reward_term_scale"]
+    assert unit_rebalanced["actor/signal_ratio"] > unit_inherited["actor/signal_ratio"] * 2.0
+
+    # The KL anchor must be a non-trivial share of the reported loss, not the ~1e-5 rounding error
+    # that a `1e-4` coefficient produces against a loss of magnitude ~30.
+    assert inherited["actor/ref_kl_contribution"] < 1e-4
 
 
 def test_compute_policy_loss_grpo_guard() -> None:

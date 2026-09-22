@@ -41,7 +41,8 @@ ascending timesteps are bridged to the SDE scheduler with ``sigma = 1 - t``;
 the latter then only supplies stochastic sampling and log probabilities.
 """
 
-from typing import Any, Optional
+import re
+from typing import Any, Iterable, Optional
 
 import torch
 
@@ -131,21 +132,42 @@ def resolve_text_guidance_scale(guidance_scale: Optional[float]) -> float:
 # LoRA name translation (diffusers -> vllm-omni)
 # ---------------------------------------------------------------------------
 
-# The actor trains against the diffusers naming, where the attention output
-# projection lives inside an ``nn.Sequential`` (``attn.to_out.0``); the
-# vllm-omni Boogu transformer exposes a direct ``attn.to_out``. That single
-# target is the *only* divergence: the q/k/v projections, the joint
-# attention's per-stream outputs and both feed-forward stacks all match
-# verbatim. Because they match, the adapter is never dropped wholesale --
-# vllm-omni only warns when *nothing* binds -- so the o-proj delta used to be
-# exported, bound to zero rollout modules and silently ignored, leaving the
-# rollout policy divergent in exactly the subspace the actor keeps training.
+# The actor builds its LoRA against the diffusers Boogu model, whose module
+# tree differs from the vllm-omni Boogu transformer in two places. Both have
+# to be translated, because the vLLM manager matches ``target_modules`` against
+# the model's module names independently of the tensor keys -- renaming the
+# keys alone would still wrap no layer, and renaming the targets alone would
+# still bind no tensor.
 #
-# Both halves of the mismatch have to be translated: the vLLM manager matches
-# ``target_modules`` against the model's module names independently of the
-# tensor keys, so renaming the keys alone would still wrap no layer.
+# 1. ``to_out``. Diffusers keeps the attention output projection inside an
+#    ``nn.Sequential`` (``attn.to_out.0``); the vllm-omni transformer exposes a
+#    direct ``attn.to_out``. This applies to every self-attention block *and*
+#    to the double-stream joint attention, where ``img_instruct_attn.to_out[0]``
+#    is the projection that merges the image and instruction streams.
+#
+# 2. ``.processor.``. The joint attention's per-stream projections are owned by
+#    the custom attention *processor* on the trainer side, so they are named
+#    ``img_instruct_attn.processor.{img_to_q,img_to_k,img_to_v,instruct_to_q,
+#    instruct_to_k,instruct_to_v,img_out,instruct_out}``. ``Attention`` deletes
+#    its own ``to_q``/``to_k``/``to_v`` in that block (the processor owns them),
+#    which is why only ``to_out`` remains a direct child. The vllm-omni
+#    ``BooguImageJointAttention`` holds all nine as direct attributes, so the
+#    ``.processor.`` infix has to be dropped.
+#
+# Neither mismatch is self-announcing: every other target matches verbatim, so
+# vllm-omni binds a large majority of the deltas and never warns -- it only
+# complains when *nothing* binds. Left untranslated, those deltas are trained
+# on the actor, bind zero rollout modules and vanish, leaving the rollout
+# sampling from a policy that diverges in exactly the subspace the actor keeps
+# training. Measured against the shipped OCR recipe's own checkpoint, 118 of its
+# 394 pushed module paths bind nothing without a translation, and the ``to_out``
+# rule alone still leaves 64 of them (8 joint-attention projections x 8 layers)
+# unbound.
 # See https://github.com/verl-project/verl-omni/issues/658.
-_BOOGU_LORA_NAME_RENAMES: tuple[tuple[str, str], ...] = (("to_out.0", "to_out"),)
+_BOOGU_LORA_NAME_RENAMES: tuple[tuple[str, str], ...] = (
+    ("to_out.0", "to_out"),
+    ("img_instruct_attn.processor.", "img_instruct_attn."),
+)
 
 #: LoRA targets the vllm-omni Boogu transformer can actually bind, mirroring
 #: ``boogu_image_transformer.py``: the self-attention projections, the joint
@@ -215,3 +237,91 @@ def validate_boogu_lora_targets(target_modules) -> list[str]:
             "(FSDP layered-summon does not transport them)."
         )
     return translated
+
+
+_LORA_WEIGHT_SUFFIX = re.compile(r"\.lora_[AB](\.[^.]+)?\.weight$")
+
+
+def lora_module_name(tensor_name: str) -> str:
+    """Strip PEFT's ``.lora_A.weight`` / ``.lora_A.default.weight`` suffix."""
+    return _LORA_WEIGHT_SUFFIX.sub("", tensor_name)
+
+
+#: Denoiser components ``DiffusionLoRAManager._replace_layers_with_lora`` scans.
+#: Mirrors ``vllm_omni.diffusion.lora.manager``; a LoRA layer is keyed
+#: ``f"{component}.{module_name}"``, so the engine key space is
+#: component-qualified even though ``component.named_modules()`` is not.
+_LORA_COMPONENT_NAMES: tuple[str, ...] = ("transformer", "transformer_2", "dit", "bagel", "unet")
+
+
+def lora_engine_module_names(pipeline) -> list[str]:
+    """Engine-side module names a vllm-omni LoRA delta can be looked up by.
+
+    The pushed tensor keys carry the component prefix (``diffusers_impl`` pushes
+    ``f"transformer.{name}"``), and the manager registers its wrappable layers as
+    ``f"{component}.{module_name}"``, so candidates have to be built the same way.
+    Reading ``pipeline.transformer.named_modules()`` instead yields prefix-less
+    names and would report every correctly-renamed delta as unbindable.
+
+    The scan mirrors the manager's component list but not its layer filtering, so
+    the result is a superset of the manager's key space. That is deliberate: it
+    can under-report a miss, never invent one.
+    """
+    names: list[str] = []
+    for component_name in _LORA_COMPONENT_NAMES:
+        component = getattr(pipeline, component_name, None)
+        if not isinstance(component, torch.nn.Module):
+            continue
+        for module_name, _ in component.named_modules(remove_duplicate=False):
+            names.append(f"{component_name}.{module_name}" if module_name else component_name)
+    return names
+
+
+def unbindable_boogu_lora_module_names(
+    lora_module_names: Iterable[str],
+    engine_module_names: Iterable[str],
+) -> list[str]:
+    """Return pushed delta module paths that no engine module can bind.
+
+    Mirrors ``DiffusionLoRAManager._get_lora_weights``, which looks a pushed
+    delta up by the engine module's full name, that name without its top-level
+    component, and that name's last component. A pushed key that matches none of
+    those binds nothing and is dropped without a warning.
+
+    ``engine_module_names`` must be the manager's key space -- component-qualified,
+    i.e. what ``lora_engine_module_names`` returns -- because the pushed keys are
+    component-qualified too.
+
+    The target whitelist cannot catch this: a *target* can be bindable while the
+    *key* the actor exports is not, which is exactly how the joint attention's
+    ``.processor.`` projections went missing.
+    """
+    candidates: set[str] = set()
+    for name in engine_module_names:
+        candidates.add(name)
+        candidates.add(name.split(".", 1)[-1])
+        candidates.add(name.split(".")[-1])
+    return sorted({name for name in lora_module_names if name not in candidates})
+
+
+def unwrappable_boogu_lora_module_names(
+    lora_module_names: Iterable[str],
+    target_modules: Iterable[str],
+) -> list[str]:
+    """Return pushed delta module paths the manager would never wrap.
+
+    ``_replace_layers_with_lora`` only registers a LoRA layer for a module whose
+    full name matches ``target_modules`` (``_match_target_modules``: the name
+    equals a target or ends with ``.<target>``), and ``_get_lora_weights`` searches
+    nothing but that key space. A pushed key that maps onto a real engine module
+    but misses the target list binds nothing anyway, so the rename table and the
+    target list have to agree at both ends as well.
+    """
+    targets = tuple(str(target) for target in target_modules)
+    return sorted(
+        {
+            name
+            for name in lora_module_names
+            if not any(name == target or name.endswith(f".{target}") for target in targets)
+        }
+    )

@@ -13,18 +13,29 @@
 # limitations under the License.
 """CPU tests for Boogu-Image LoRA rollout name mapping.
 
-Regression cover for https://github.com/verl-project/verl-omni/issues/658: the
-attention output projection used to be trained on the actor and silently
-dropped on the rollout, because diffusers names it ``attn.to_out.0`` while the
-vllm-omni transformer exposes ``attn.to_out``.
+Regression cover for https://github.com/verl-project/verl-omni/issues/658. The
+actor's diffusers module tree and the vllm-omni Boogu transformer disagree in
+two places, and either one silently drops deltas on the rollout:
+
+- the attention output projection (``attn.to_out.0`` vs ``attn.to_out``), and
+- the joint attention's per-stream projections, which the actor owns under
+  ``img_instruct_attn.processor.*`` and the transformer exposes directly.
+
+vllm-omni only warns when *nothing* binds, so a partial miss is invisible:
+``TestBindingCompleteness`` is what catches it.
 """
 
 import pytest
 import torch
+from torch import nn
 
 from verl_omni.pipelines.boogu_image_flow_grpo.common import (
     BOOGU_LORA_TARGETS,
+    lora_engine_module_names,
+    lora_module_name,
     rename_boogu_lora_name,
+    unbindable_boogu_lora_module_names,
+    unwrappable_boogu_lora_module_names,
     validate_boogu_lora_targets,
 )
 
@@ -55,23 +66,109 @@ RECIPE_TARGETS = [
     "img_feed_forward.linear_3",
 ]
 
+#: Projections ``BooguImageJointAttention`` exposes as direct children, mirroring
+#: ``boogu_image_transformer.py``. The trainer keeps the same eight on a custom
+#: attention processor, which is the mismatch the rename table has to bridge.
+JOINT_ATTENTION_ENGINE_LEAVES = (
+    "img_to_q",
+    "img_to_k",
+    "img_to_v",
+    "instruct_to_q",
+    "instruct_to_k",
+    "instruct_to_v",
+    "img_out",
+    "instruct_out",
+)
+_SELF_ATTENTION_ENGINE_LEAVES = ("to_q", "to_k", "to_v", "to_out")
+_FEED_FORWARD_ENGINE_LEAVES = ("linear_1", "linear_2", "linear_3")
 
-def _mapper():
-    """The mapper is a pure function of (tensors, config); no engine state is read."""
+
+def _engine_leaf_modules(leaves) -> nn.Module:
+    module = nn.Module()
+    for leaf in leaves:
+        setattr(module, leaf, nn.Linear(HIDDEN, HIDDEN, bias=False))
+    return module
+
+
+def _engine_base_block() -> nn.Module:
+    block = nn.Module()
+    block.attn = _engine_leaf_modules(_SELF_ATTENTION_ENGINE_LEAVES)
+    block.feed_forward = _engine_leaf_modules(_FEED_FORWARD_ENGINE_LEAVES)
+    return block
+
+
+def _engine_double_stream_block() -> nn.Module:
+    block = nn.Module()
+    block.img_self_attn = _engine_leaf_modules(_SELF_ATTENTION_ENGINE_LEAVES)
+    block.img_instruct_attn = _engine_leaf_modules((*JOINT_ATTENTION_ENGINE_LEAVES, "to_out"))
+    block.img_feed_forward = _engine_leaf_modules(_FEED_FORWARD_ENGINE_LEAVES)
+    return block
+
+
+def _engine_transformer(blocks_per_group: int = 2) -> nn.Module:
+    """A stand-in whose module *names* mirror the vllm-omni Boogu transformer."""
+    transformer = nn.Module()
+    for group in (
+        "double_stream_layers",
+        "single_stream_layers",
+        "context_refiner",
+        "noise_refiner",
+        "ref_image_refiner",
+    ):
+        builder = _engine_double_stream_block if group == "double_stream_layers" else _engine_base_block
+        setattr(transformer, group, nn.ModuleList([builder() for _ in range(blocks_per_group)]))
+    return transformer
+
+
+class _StubPipeline:
+    """Carries the component attribute ``lora_engine_module_names`` scans for."""
+
+    def __init__(self, transformer: nn.Module):
+        self.transformer = transformer
+
+
+def _mapper(pipeline_cls=None, transformer: nn.Module | None = None):
+    """Bind a real Boogu mapper onto a stand-in pipeline holding an engine tree.
+
+    ``map_lora_update_to_engine`` reads instance state (the engine tree it validates
+    the pushed keys against), so the tests must supply one: a bare ``__new__``
+    instance would silently skip the binding check and let a regression through.
+    """
     pytest.importorskip("vllm_omni")
-    from verl_omni.pipelines.boogu_image_flow_grpo.vllm_omni_rollout_adapter import (
-        BooguImagePipelineWithLogProb,
-    )
+    if pipeline_cls is None:
+        from verl_omni.pipelines.boogu_image_flow_grpo.vllm_omni_rollout_adapter import (
+            BooguImagePipelineWithLogProb as pipeline_cls,
+        )
 
-    return BooguImagePipelineWithLogProb.__new__(BooguImagePipelineWithLogProb)
+    stub = _StubPipeline(transformer if transformer is not None else _engine_transformer())
+    stub.map_lora_update_to_engine = pipeline_cls.map_lora_update_to_engine.__get__(stub)
+    return stub
 
 
 # Block-local module names as the actor holds them, taken from the FSDP shard keys
 # of this recipe's own checkpoint (e.g.
 # ``double_stream_layers.0.img_instruct_attn.to_out.0.lora_A.default.weight``).
+#
+# The joint attention is the one block whose projections are *not* direct
+# children: ``BooguImageTransformerBlock`` hands them to a custom processor and
+# deletes ``Attention``'s own ``to_q``/``to_k``/``to_v``, so the actor names them
+# ``img_instruct_attn.processor.*`` while the vllm-omni
+# ``BooguImageJointAttention`` holds all nine directly. Spelling these names
+# without the ``.processor.`` step is what let the original o-proj fix ship
+# "complete" while eight of the nine projections still bound nothing.
+JOINT_ATTENTION_PROCESSOR_MODULES = (
+    "img_instruct_attn.processor.img_to_q",
+    "img_instruct_attn.processor.img_to_k",
+    "img_instruct_attn.processor.img_to_v",
+    "img_instruct_attn.processor.instruct_to_q",
+    "img_instruct_attn.processor.instruct_to_k",
+    "img_instruct_attn.processor.instruct_to_v",
+    "img_instruct_attn.processor.img_out",
+    "img_instruct_attn.processor.instruct_out",
+)
 DOUBLE_STREAM_MODULES = (
     "img_instruct_attn.to_out.0",
-    "img_instruct_attn.instruct_out",
+    *JOINT_ATTENTION_PROCESSOR_MODULES,
     "img_self_attn.to_q",
     "img_feed_forward.linear_3",
 )
@@ -81,11 +178,16 @@ BASE_BLOCK_MODULES = ("attn.to_q", "attn.to_out.0", "feed_forward.linear_1")
 def _trainer_lora_tensors(
     block: str = "double_stream_layers.0", modules=DOUBLE_STREAM_MODULES
 ) -> dict[str, torch.Tensor]:
-    """Build a PEFT-style Boogu LoRA state dict as the actor exports it."""
+    """Build a PEFT-style Boogu LoRA state dict as the actor exports it.
+
+    Keys carry the ``transformer.`` component prefix, because the actor's weight
+    sync pushes ``f"transformer.{name}"`` and the engine keys its wrappable layers
+    the same way.
+    """
     tensors = {}
     for module in modules:
-        tensors[f"{block}.{module}.lora_A.weight"] = torch.randn(RANK, HIDDEN)
-        tensors[f"{block}.{module}.lora_B.weight"] = torch.randn(HIDDEN, RANK)
+        tensors[f"transformer.{block}.{module}.lora_A.weight"] = torch.randn(RANK, HIDDEN)
+        tensors[f"transformer.{block}.{module}.lora_B.weight"] = torch.randn(HIDDEN, RANK)
     return tensors
 
 
@@ -104,6 +206,24 @@ class TestNameTranslation:
     def test_output_projection_is_unwrapped(self, diffusers_name, vllm_name):
         assert rename_boogu_lora_name(diffusers_name) == vllm_name
 
+    @pytest.mark.parametrize("module", JOINT_ATTENTION_PROCESSOR_MODULES)
+    def test_joint_attention_processor_prefix_is_dropped(self, module):
+        """``.processor.`` is the second mismatch; without it eight deltas vanish.
+
+        The joint attention's projections are owned by a custom processor on the
+        trainer side and are direct children on the vllm-omni side, so the infix
+        has to come out of both the tensor keys and nothing else.
+        """
+        trainer_name = f"double_stream_layers.0.{module}"
+        vllm_name = f"double_stream_layers.0.{module.replace('.processor.', '.')}"
+        assert rename_boogu_lora_name(trainer_name) == vllm_name
+
+    def test_processor_rename_keeps_the_lora_weight_suffix(self):
+        trainer_name = "double_stream_layers.0.img_instruct_attn.processor.img_to_q.lora_A.default.weight"
+        assert rename_boogu_lora_name(trainer_name) == (
+            "double_stream_layers.0.img_instruct_attn.img_to_q.lora_A.default.weight"
+        )
+
     def test_verbatim_targets_are_untouched(self):
         # Everything except the o-proj already matches, so the mapper must not
         # disturb it -- a broad rewrite is how the q/k/v half got broken before.
@@ -113,18 +233,20 @@ class TestNameTranslation:
 
     def test_lora_tensor_keys_are_renamed(self):
         mapped, _ = _mapper().map_lora_update_to_engine(_trainer_lora_tensors(), _peft_config())
-        modules = {name.rsplit(".lora_", 1)[0] for name in mapped}
-        assert "double_stream_layers.0.img_instruct_attn.to_out" in modules
-        assert "double_stream_layers.0.img_self_attn.to_q" in modules
+        modules = {lora_module_name(name) for name in mapped}
+        assert "transformer.double_stream_layers.0.img_instruct_attn.to_out" in modules
+        assert "transformer.double_stream_layers.0.img_instruct_attn.img_to_q" in modules
+        assert "transformer.double_stream_layers.0.img_self_attn.to_q" in modules
         assert not any(".to_out.0" in module for module in modules)
+        assert not any(".processor." in module for module in modules)
 
     def test_base_block_output_projection_is_renamed_too(self):
         mapped, _ = _mapper().map_lora_update_to_engine(
             _trainer_lora_tensors("context_refiner.1", BASE_BLOCK_MODULES), _peft_config()
         )
         modules = {name.rsplit(".lora_", 1)[0] for name in mapped}
-        assert "context_refiner.1.attn.to_out" in modules
-        assert "context_refiner.1.attn.to_q" in modules
+        assert "transformer.context_refiner.1.attn.to_out" in modules
+        assert "transformer.context_refiner.1.attn.to_q" in modules
 
     def test_component_prefix_is_preserved(self):
         # Pushed keys may or may not carry a component prefix; the rename is a leaf
@@ -261,6 +383,146 @@ class TestVllmManagerInterplay:
         assert {rename_boogu_lora_name(target) for target in RECIPE_TARGETS} <= BOOGU_LORA_TARGETS
 
 
+class TestBindingCompleteness:
+    """Every delta the actor exports must be bindable, or it vanishes silently.
+
+    ``TestVllmManagerInterplay`` checks *targets*; this checks the *keys* the
+    mapper actually pushes. The two are not equivalent, which is exactly how the
+    o-proj fix shipped "complete" while eight joint-attention projections still
+    bound nothing: ``img_to_q`` is a bindable target, but the actor exports it as
+    ``...img_instruct_attn.processor.img_to_q``, which binds no engine module.
+
+    The engine names come from ``lora_engine_module_names`` on a stand-in tree, so
+    these tests pin the same component-qualified key space the manager uses --
+    building them from ``pipeline.transformer.named_modules()`` would drop the
+    ``transformer.`` prefix and report every correct delta as unbindable.
+    """
+
+    @staticmethod
+    def _unbindable(mapped: dict[str, torch.Tensor]) -> list[str]:
+        return unbindable_boogu_lora_module_names(
+            (lora_module_name(name) for name in mapped),
+            lora_engine_module_names(_StubPipeline(_engine_transformer())),
+        )
+
+    @staticmethod
+    def _unwrappable(mapped: dict[str, torch.Tensor], config: dict) -> list[str]:
+        """Uses the mapper's own translated `target_modules`, as the manager would."""
+        return unwrappable_boogu_lora_module_names(
+            (lora_module_name(name) for name in mapped), config["target_modules"]
+        )
+
+    def test_every_pushed_delta_is_bindable(self):
+        mapped, _ = _mapper().map_lora_update_to_engine(_trainer_lora_tensors(), _peft_config())
+        assert self._unbindable(mapped) == []
+
+    def test_every_pushed_delta_is_wrappable(self):
+        """Bindable is not enough: the manager must also have wrapped the module.
+
+        `_replace_layers_with_lora` registers LoRA layers only for modules matching
+        `target_modules`, so a correctly-renamed key outside that set is dropped
+        just as silently as a mis-named one. The `to_out.0` -> `to_out` translation
+        matters here too: an untranslated target list matches no engine module and
+        would leave every o-proj wrapper unbuilt.
+        """
+        for block, modules in (
+            ("double_stream_layers.0", DOUBLE_STREAM_MODULES),
+            ("context_refiner.1", BASE_BLOCK_MODULES),
+        ):
+            mapped, config = _mapper().map_lora_update_to_engine(_trainer_lora_tensors(block, modules), _peft_config())
+            assert self._unwrappable(mapped, config) == []
+
+    def test_base_block_deltas_are_bindable(self):
+        mapped, _ = _mapper().map_lora_update_to_engine(
+            _trainer_lora_tensors("context_refiner.1", BASE_BLOCK_MODULES), _peft_config()
+        )
+        assert self._unbindable(mapped) == []
+
+    def test_untranslated_processor_keys_are_reported(self):
+        """The pre-fix spelling must be caught, not merely tolerated."""
+        stale = [f"transformer.double_stream_layers.0.{module}" for module in JOINT_ATTENTION_PROCESSOR_MODULES]
+        assert unbindable_boogu_lora_module_names(
+            stale, lora_engine_module_names(_StubPipeline(_engine_transformer()))
+        ) == sorted(stale)
+
+    def test_lora_weight_suffix_is_stripped(self):
+        assert lora_module_name("a.b.to_q.lora_A.default.weight") == "a.b.to_q"
+        assert lora_module_name("a.b.to_q.lora_B.weight") == "a.b.to_q"
+        assert lora_module_name("a.b.to_q.lora_A.weight") == "a.b.to_q"
+        assert lora_module_name("not_a_lora.weight") == "not_a_lora.weight"
+
+
+class TestEngineKeySpace:
+    """The guard is only as good as the key space it validates against."""
+
+    def test_engine_names_are_component_qualified(self):
+        names = lora_engine_module_names(_StubPipeline(_engine_transformer()))
+        assert "transformer.double_stream_layers.0.img_instruct_attn.img_to_q" in names
+        assert "transformer.context_refiner.1.attn.to_out" in names
+
+    def test_prefix_less_engine_names_would_report_correct_deltas(self):
+        """Regression: an unprefixed basis reports every correct delta as unbindable.
+
+        ``pipeline.transformer.named_modules()`` yields ``double_stream_layers.0...``
+        while the pushed keys carry ``transformer.``, so using it as the guard's
+        basis aborts the LoRA sync on a perfectly translated state dict.
+        """
+        transformer = _engine_transformer()
+        mapped, _ = _mapper(transformer=transformer).map_lora_update_to_engine(_trainer_lora_tensors(), _peft_config())
+        pushed = [lora_module_name(name) for name in mapped]
+        prefix_less = [name for name, _ in transformer.named_modules() if name]
+        assert prefix_less, "the stand-in tree must be non-empty for this regression to mean anything"
+        assert unbindable_boogu_lora_module_names(pushed, prefix_less) != []
+        assert unbindable_boogu_lora_module_names(pushed, lora_engine_module_names(_StubPipeline(transformer))) == []
+
+    def test_guard_rejects_deltas_the_rename_table_cannot_place(self):
+        tensors = {
+            "transformer.double_stream_layers.0.img_instruct_attn.bogus_proj.lora_A.weight": torch.randn(RANK, HIDDEN)
+        }
+        with pytest.raises(ValueError, match="bind no vllm-omni module"):
+            _mapper().map_lora_update_to_engine(tensors, _peft_config())
+
+    def test_guard_catches_the_processor_rule_being_reverted(self, monkeypatch):
+        """The original defect, replayed through the mapper rather than the helper."""
+        from verl_omni.pipelines.boogu_image_flow_grpo import common
+
+        monkeypatch.setattr(common, "_BOOGU_LORA_NAME_RENAMES", (("to_out.0", "to_out"),))
+        with pytest.raises(ValueError, match="bind no vllm-omni module"):
+            _mapper().map_lora_update_to_engine(_trainer_lora_tensors(), _peft_config())
+
+    def test_guard_ignores_non_lora_keys(self):
+        tensors = {"some_unrelated.weight": torch.randn(2, 2), **_trainer_lora_tensors()}
+        mapped, _ = _mapper().map_lora_update_to_engine(tensors, _peft_config())
+        assert "some_unrelated.weight" in mapped
+
+    def test_guard_refuses_a_pipeline_with_no_engine_tree(self):
+        """A pipeline the guard cannot inspect must fail loudly, not pass vacuously."""
+        with pytest.raises(ValueError, match="bind no vllm-omni module"):
+            _mapper(transformer=nn.Module()).map_lora_update_to_engine(_trainer_lora_tensors(), _peft_config())
+
+    def test_guard_rejects_keys_outside_the_target_list(self):
+        """A correctly-named delta outside `target_modules` is dropped just as quietly.
+
+        The manager registers LoRA layers only for modules matching
+        `target_modules`, and `_get_lora_weights` searches nothing else, so a key
+        that names a real engine module still binds nothing if the recipe never
+        asked for it. `img_self_attn.to_q` is that case here.
+        """
+        config = _peft_config()
+        config["target_modules"] = ["img_to_q"]
+        with pytest.raises(ValueError, match="would not wrap"):
+            _mapper().map_lora_update_to_engine(_trainer_lora_tensors(), config)
+
+    def test_guard_accepts_two_component_targets(self):
+        """`feed_forward.linear_1` is a bindable target, so it must not be refused."""
+        config = _peft_config()
+        config["target_modules"] = ["feed_forward.linear_1", "img_feed_forward.linear_1"]
+        mapped, _ = _mapper().map_lora_update_to_engine(
+            _trainer_lora_tensors("context_refiner.1", ("feed_forward.linear_1",)), config
+        )
+        assert "transformer.context_refiner.1.feed_forward.linear_1.lora_A.weight" in mapped
+
+
 class TestRegisteredPipelinesExposeTheMapper:
     """The hijack only calls the mapper when the *registered* pipeline class defines it.
 
@@ -293,10 +555,9 @@ class TestRegisteredPipelinesExposeTheMapper:
         from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 
         pipeline_cls = VllmOmniPipelineBase.get_class("BooguImagePipeline", algorithm)
-        # The mapper reads no instance state, so it is callable without an engine.
-        mapped, config = pipeline_cls.__new__(pipeline_cls).map_lora_update_to_engine(
-            _trainer_lora_tensors(), _peft_config()
-        )
-        assert "double_stream_layers.0.img_instruct_attn.to_out.lora_A.weight" in mapped
+        # The mapper validates against the engine tree it is bound to, so bind the
+        # registered class's own method onto a stand-in carrying a real one.
+        mapped, config = _mapper(pipeline_cls).map_lora_update_to_engine(_trainer_lora_tensors(), _peft_config())
+        assert "transformer.double_stream_layers.0.img_instruct_attn.to_out.lora_A.weight" in mapped
         assert "to_out" in config["target_modules"]
         assert "to_out.0" not in config["target_modules"]

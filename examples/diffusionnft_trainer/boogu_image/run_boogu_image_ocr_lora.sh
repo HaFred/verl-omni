@@ -1,4 +1,29 @@
 # Boogu-Image DiffusionNFT LoRA RL, vllm_omni rollout
+#
+# A Boogu sibling of examples/diffusionnft_trainer/qwen_image/run_qwen_image_ocr_lora.sh,
+# differing in model path, LoRA targets / fsdp_layer_prefixes, the Boogu guidance knob
+# (`pipeline.guidance_scale`, vs Qwen's `true_cfg_scale`), rollout TP=1, and the dataset.
+#
+# Loss/optimizer knobs are deliberately NOT the Qwen recipe's. That recipe runs
+# `pipeline.true_cfg_scale=1.0` (unguided) while Boogu must run guided
+# (`guidance_scale=4.0`), and a 20-step pretrained, baseline-anchored run with the
+# inherited values collapsed val OCR 0.898 -> 0.603 while `actor/positive_loss` fell
+# monotonically -- the objective improved while the graded reward got worse. Three
+# deviations, each independently justified:
+#   - `ref_kl_coef` 1e-4 -> 10.0. At 1e-4 the documented prediction-space anchor
+#     contributes ~1e-5 against a loss of magnitude ~30, so `actor/ref_kl_loss` climbs
+#     unopposed (0.05 -> 0.114 over 20 steps) and the regulariser is decorative.
+#   - `adv_clip_max` 5.0 -> 1.0. The documented map is
+#     `r = 1/2 + 1/2*clip((raw - mean)/Z, -1, 1)`, which needs the clip bound to be 1x
+#     the normalising std; 5.0 never clips and compresses `r` into [0.4, 0.6], so the
+#     objective barely distinguishes good from bad samples. It also cuts the reward-free
+#     contraction of `v_theta` onto the frozen `v_old` -- gradient proportional to
+#     `adv_clip_max * mix_beta` -- by 5x without weakening the reward term (see
+#     tests/trainer/diffusion/test_diffusion_core_algos_on_cpu.py::test_diffusion_nft_reward_signal_scaling).
+#   - `lr` 3e-4 -> 1e-4, matching this PR's own Boogu DiffusionNFT convergence script
+#     (tests/special_e2e/run_diffusionnft_boogu_image_aligned.sh).
+# `mix_beta` stays at 0.1: the contraction above scales with it, so raising it trades
+# stability for contrast rather than being a free win.
 set -x
 
 # Set WORKSPACE to any writable directory; defaults to $HOME.
@@ -97,15 +122,15 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.model.policy_state_adapters='["default","old"]' \
     actor_rollout_ref.model.target_modules="['to_q','to_k','to_v','to_out.0','img_to_q','img_to_k','img_to_v','img_out','instruct_to_q','instruct_to_k','instruct_to_v','instruct_out','feed_forward.linear_1','feed_forward.linear_2','feed_forward.linear_3','img_feed_forward.linear_1','img_feed_forward.linear_2','img_feed_forward.linear_3']" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['double_stream_layers.','single_stream_layers.','context_refiner.','noise_refiner.','ref_image_refiner.']" \
-    actor_rollout_ref.actor.optim.lr=3e-4 \
+    actor_rollout_ref.actor.optim.lr=1e-4 \
     actor_rollout_ref.actor.optim.weight_decay=0.0001 \
     actor_rollout_ref.actor.ppo_mini_batch_size=12 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=12 \
     actor_rollout_ref.actor.diffusion_loss.loss_mode=diffusion_nft \
     actor_rollout_ref.actor.diffusion_loss.clip_ratio=1e-5 \
     actor_rollout_ref.actor.diffusion_loss.mix_beta=0.1 \
-    actor_rollout_ref.actor.diffusion_loss.ref_kl_coef=0.0001 \
-    actor_rollout_ref.actor.diffusion_loss.adv_clip_max=5.0 \
+    actor_rollout_ref.actor.diffusion_loss.ref_kl_coef=10.0 \
+    actor_rollout_ref.actor.diffusion_loss.adv_clip_max=1.0 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
