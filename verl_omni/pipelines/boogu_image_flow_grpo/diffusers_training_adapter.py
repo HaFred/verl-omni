@@ -227,9 +227,20 @@ class BooguImage(DiffusionModelBase):
 
 @lru_cache(maxsize=8)
 def _scheduler_num_train_timesteps(model_path: str) -> int:
+    """Read the checkpoint's own timestep scale.
+
+    This is required to map scheduler timesteps onto Boogu's ``[0, 1]`` flow time,
+    so a missing or unreadable value is an error rather than something to guess:
+    the previous ``1000`` fallback silently matched the one value in use today and
+    would have corrupted every sample for any checkpoint that differs.
+    """
     config_path = os.path.join(model_path, "scheduler", "scheduler_config.json")
-    try:
-        with open(config_path) as f:
-            return int(json.load(f).get("num_train_timesteps", 1000))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
-        return 1000
+    with open(config_path) as f:
+        config = json.load(f)
+    num_train_timesteps = config.get("num_train_timesteps")
+    if num_train_timesteps is None:
+        raise ValueError(
+            f"{config_path} does not define `num_train_timesteps`, which is required to map "
+            "scheduler timesteps onto Boogu's [0, 1] flow time."
+        )
+    return int(num_train_timesteps)

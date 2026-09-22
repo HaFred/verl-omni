@@ -32,7 +32,7 @@ from verl_omni.pipelines.boogu_image_flow_grpo.vllm_omni_rollout_adapter import 
 from verl_omni.pipelines.diffusion_rollout_output import rollout_output
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.request_batch import split_diffusion_output_by_request as _split_diffusion_output_by_request
-from verl_omni.pipelines.utils import ImageGenerationRequest
+from verl_omni.pipelines.rollout_request import condition_images_from_payload
 
 __all__ = ["BooguImageDiffusionNFTPipeline"]
 
@@ -68,8 +68,7 @@ class BooguImageDiffusionNFTPipeline(BooguImagePipelineWithLogProb):
         custom_prompt = prompts[0] if prompts else {}
         condition_images: list = []
         if isinstance(custom_prompt, dict):
-            generation_request = ImageGenerationRequest.from_request_payload(custom_prompt)
-            condition_images = list(generation_request.images or [])
+            condition_images = list(condition_images_from_payload(custom_prompt))
         if len(condition_images) > 1:
             raise ValueError(
                 f"Boogu-Image editing supports a single reference image; received {len(condition_images)}."

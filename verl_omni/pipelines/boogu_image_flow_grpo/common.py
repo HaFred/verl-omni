@@ -125,3 +125,93 @@ def get_boogu_freqs_cis(axes_dim_rope, axes_lens, theta: int = 10000):
 def resolve_text_guidance_scale(guidance_scale: Optional[float]) -> float:
     """Map a possibly-unset config guidance scale to Boogu's default (4.0)."""
     return 4.0 if guidance_scale is None else float(guidance_scale)
+
+
+# ---------------------------------------------------------------------------
+# LoRA name translation (diffusers -> vllm-omni)
+# ---------------------------------------------------------------------------
+
+# The actor trains against the diffusers naming, where the attention output
+# projection lives inside an ``nn.Sequential`` (``attn.to_out.0``); the
+# vllm-omni Boogu transformer exposes a direct ``attn.to_out``. That single
+# target is the *only* divergence: the q/k/v projections, the joint
+# attention's per-stream outputs and both feed-forward stacks all match
+# verbatim. Because they match, the adapter is never dropped wholesale --
+# vllm-omni only warns when *nothing* binds -- so the o-proj delta used to be
+# exported, bound to zero rollout modules and silently ignored, leaving the
+# rollout policy divergent in exactly the subspace the actor keeps training.
+#
+# Both halves of the mismatch have to be translated: the vLLM manager matches
+# ``target_modules`` against the model's module names independently of the
+# tensor keys, so renaming the keys alone would still wrap no layer.
+# See https://github.com/verl-project/verl-omni/issues/658.
+_BOOGU_LORA_NAME_RENAMES: tuple[tuple[str, str], ...] = (("to_out.0", "to_out"),)
+
+#: LoRA targets the vllm-omni Boogu transformer can actually bind, mirroring
+#: ``boogu_image_transformer.py``: the self-attention projections, the joint
+#: attention's per-stream and merge projections, and the GEGLU halves of both
+#: feed-forward stacks (``LuminaFeedForward`` exposes ``linear_1``/``linear_3``
+#: as the gate/input halves and ``linear_2`` as the output).
+BOOGU_LORA_TARGETS: frozenset[str] = frozenset(
+    {
+        "to_q",
+        "to_k",
+        "to_v",
+        "to_out",
+        "img_to_q",
+        "img_to_k",
+        "img_to_v",
+        "img_out",
+        "instruct_to_q",
+        "instruct_to_k",
+        "instruct_to_v",
+        "instruct_out",
+        "feed_forward.linear_1",
+        "feed_forward.linear_2",
+        "feed_forward.linear_3",
+        "img_feed_forward.linear_1",
+        "img_feed_forward.linear_2",
+        "img_feed_forward.linear_3",
+    }
+)
+
+
+def rename_boogu_lora_name(name: str) -> str:
+    """Translate a diffusers Boogu LoRA tensor name or target to the vllm-omni layout."""
+    for diffusers_name, vllm_name in _BOOGU_LORA_NAME_RENAMES:
+        name = name.replace(diffusers_name, vllm_name)
+    return name
+
+
+def _boogu_lora_target_is_supported(target: str) -> bool:
+    return any(target == known or target.endswith("." + known) for known in BOOGU_LORA_TARGETS)
+
+
+def validate_boogu_lora_targets(target_modules) -> list[str]:
+    """Return the translated, validated Boogu LoRA target list.
+
+    Mirrors the MiniMax H3 whitelist so an unbindable target fails loudly here
+    instead of vanishing during binding. Accepting one would reproduce the very
+    bug this guards: a partial miss stays silent because vllm-omni only raises
+    when *no* target binds.
+    """
+    if isinstance(target_modules, str):
+        requested = [target_modules]
+    elif isinstance(target_modules, list | tuple | set | frozenset):
+        requested = [str(target) for target in target_modules]
+    else:
+        raise ValueError(f"Boogu-Image LoRA requires an explicit target_modules list; got {target_modules!r}.")
+
+    translated = [rename_boogu_lora_name(target) for target in requested]
+    if not translated:
+        raise ValueError("Boogu-Image LoRA requires a non-empty target_modules list.")
+
+    unsupported = sorted(target for target in translated if not _boogu_lora_target_is_supported(target))
+    if unsupported:
+        raise ValueError(
+            "Boogu-Image LoRA supports only attention projections and feed-forward halves "
+            f"{sorted(BOOGU_LORA_TARGETS)}; unsupported targets: {unsupported}. "
+            "`all-linear` and other top-level modules are not synced to rollout "
+            "(FSDP layered-summon does not transport them)."
+        )
+    return translated

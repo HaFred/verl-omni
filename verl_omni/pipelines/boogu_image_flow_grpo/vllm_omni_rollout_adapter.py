@@ -51,6 +51,8 @@ from .common import (
     boogu_timestep_from_scheduler,
     configure_boogu_sde_timesteps,
     get_boogu_freqs_cis,
+    rename_boogu_lora_name,
+    validate_boogu_lora_targets,
 )
 
 __all__ = ["BooguImagePipelineWithLogProb"]
@@ -115,6 +117,41 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
             subfolder="scheduler",
             local_files_only=local_files_only,
         )
+
+    # ------------------------------------------------------------------
+    # LoRA rollout sync
+    # ------------------------------------------------------------------
+
+    def map_lora_update_to_engine(
+        self,
+        tensors: dict[str, torch.Tensor],
+        peft_config: dict,
+    ) -> tuple[dict[str, torch.Tensor], dict]:
+        """Translate Boogu LoRA deltas to the vllm-omni transformer layout.
+
+        The actor exports PEFT names verbatim, so the attention output
+        projection arrives as ``...attn.to_out.0`` (diffusers wraps it in an
+        ``nn.Sequential``) while this transformer exposes a direct
+        ``...attn.to_out``. Every other Boogu target matches verbatim, which is
+        why the mismatch is invisible: the adapter binds 17 of 18 targets and
+        nothing warns. Left untranslated, the o-proj delta is trained on the
+        actor and silently dropped on the rollout, so the rollout keeps
+        sampling from a policy that diverges in that subspace
+        (https://github.com/verl-project/verl-omni/issues/658).
+        """
+        mapped_config = dict(peft_config) if peft_config is not None else {}
+        mapped_config["target_modules"] = validate_boogu_lora_targets(mapped_config.get("target_modules"))
+
+        # Boogu's vllm-omni layout keeps every target as its own module, so only
+        # the naming changes -- no tensor is reshaped, fused or split.
+        mapped = {rename_boogu_lora_name(name): tensor for name, tensor in tensors.items()}
+        if len(mapped) != len(tensors):
+            raise ValueError(
+                "Boogu-Image LoRA name translation collapsed distinct tensors into one key; "
+                "refusing to sync an adapter whose deltas would be silently overwritten "
+                "(is the pushed state dict already partially renamed?)."
+            )
+        return mapped, mapped_config
 
     # ------------------------------------------------------------------
     # Prompt encoding from pre-tokenised IDs
