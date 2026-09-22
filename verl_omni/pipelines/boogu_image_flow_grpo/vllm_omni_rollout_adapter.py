@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any, Literal
 
@@ -61,6 +62,15 @@ from .common import (
 
 __all__ = ["BooguImagePipelineWithLogProb"]
 
+logger = logging.getLogger(__name__)
+
+#: The engine pins `VLLM_LOGGING_LEVEL=WARN`, so the INFO line vllm-omni prints for
+#: each loaded adapter is invisible in a training log. Report the binding outcome
+#: once per engine process at WARNING level instead: for a full run this is the only
+#: positive evidence that the actor's deltas reached the rollout, as opposed to being
+#: silently dropped by a name mismatch.
+_BIND_REPORT_EMITTED = False
+
 _BOOGU_POST_PROCESS_FACTORY = pipeline_boogu_image.get_boogu_image_post_process_func
 
 
@@ -71,6 +81,20 @@ def get_rollout_post_process_func(od_config):
 
 # vllm-omni resolves the built-in architecture's factory in the engine process.
 pipeline_boogu_image.get_boogu_image_post_process_func = get_rollout_post_process_func
+
+
+def _report_first_bind(module_count: int, target_count: int) -> None:
+    """Log the LoRA binding outcome once per engine process (see ``_BIND_REPORT_EMITTED``)."""
+    global _BIND_REPORT_EMITTED
+    if _BIND_REPORT_EMITTED:
+        return
+    _BIND_REPORT_EMITTED = True
+    logger.warning(
+        "Boogu-Image LoRA sync: bound %d actor delta modules to vllm-omni, 0 dropped "
+        "(%d wrapped target modules). Every pushed delta resolved to a live, wrapped module.",
+        module_count,
+        target_count,
+    )
 
 
 @VllmOmniPipelineBase.register("BooguImagePipeline", algorithm="flow_grpo")
@@ -188,6 +212,8 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
                 f"silently dropped: {unwrappable}. Add them to the recipe's `target_modules` "
                 "and to `BOOGU_LORA_TARGETS`."
             )
+
+        _report_first_bind(module_count=len(mapped_modules), target_count=len(mapped_config["target_modules"]))
         return mapped, mapped_config
 
     # ------------------------------------------------------------------

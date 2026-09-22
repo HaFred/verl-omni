@@ -871,7 +871,18 @@ class DiffusionNFTLoss(DiffusionLossFn):
                 "actor/negative_loss": negative_loss.mean().detach().item(),
                 "actor/contraction_scale": contraction_scale.detach().item(),
                 "actor/reward_term_scale": reward_term_scale.detach().item(),
-                "actor/signal_ratio": ((reward_term_scale / contraction_scale.clamp(min=1e-12)).detach().item()),
+                # Reported in log space on purpose. The trainer means each metric over the
+                # micro-batches, and `contraction` is exactly 0 on a micro-batch whose
+                # `v_theta - v_old` rounds to zero (it is ~0 right after a LoRA re-init), so a
+                # raw ratio of the two scales is a mean of (finite, ~1e12) and reports ~1e11
+                # for what is really a ratio of order 1e2. Averaging two log10 terms keeps the
+                # micro-batches on the same footing, and `signal_ratio` stays recoverable as
+                # `10**log10_signal_ratio`.
+                "actor/log10_signal_ratio": (
+                    (torch.log10(reward_term_scale.clamp(min=1e-30)) - torch.log10(contraction_scale.clamp(min=1e-30)))
+                    .detach()
+                    .item()
+                ),
                 "actor/ref_kl_loss": ref_kl_loss.detach().item(),
                 "actor/ref_kl_contribution": (loss_cfg.ref_kl_coef * ref_kl_loss).detach().item(),
                 "actor/old_deviate": ((forward_prediction - old_prediction) ** 2).mean().detach().item(),

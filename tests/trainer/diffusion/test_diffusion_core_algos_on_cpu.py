@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 
 import numpy as np
@@ -442,7 +443,7 @@ def test_compute_policy_loss_diffusion_nft() -> None:
         "actor/negative_loss",
         "actor/contraction_scale",
         "actor/reward_term_scale",
-        "actor/signal_ratio",
+        "actor/log10_signal_ratio",
         "actor/ref_kl_loss",
         "actor/ref_kl_contribution",
         "actor/old_deviate",
@@ -529,11 +530,20 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
     inherited = metrics_for(mix_beta=0.1, adv_clip_max=5.0)
     rebalanced = metrics_for(mix_beta=0.1, adv_clip_max=1.0)
 
-    # Lowering `adv_clip_max` must cut the reward-free contraction by the same factor it cuts the
-    # floor, while leaving the learning signal untouched -- that is the cancellation above.
+    # Lowering `adv_clip_max` cuts the reward-free contraction by that factor while leaving the
+    # learning signal untouched -- that is the cancellation above. Concretely, `A` cancels out of
+    # `reward_term` exactly (`reward_weight - 0.5 = clamp(adv,-A,A)/(2A)`), so halving `A` leaves the
+    # reward term alone and the reward-to-contraction ratio grows by `1/A`. That is the entire
+    # justification for the recipe's 5.0 -> 1.0.
     assert rebalanced["actor/contraction_scale"] < inherited["actor/contraction_scale"] / 4.0
-    assert rebalanced["actor/signal_ratio"] > inherited["actor/signal_ratio"] * 4.0
     assert rebalanced["actor/reward_term_scale"] == pytest.approx(inherited["actor/reward_term_scale"], rel=0.05)
+    # Assert the gain exactly, in log space: the raw ratio cannot be used here because the trainer
+    # means metrics over micro-batches, and a micro-batch whose `v_theta - v_old` rounds to zero
+    # contributes a clamped ~1e12 to a mean-of-ratios. `advantages` above keeps every |adv| < 1, so
+    # neither setting clips and the factor is exactly `adv_clip_max`.
+    assert rebalanced["actor/log10_signal_ratio"] == pytest.approx(
+        inherited["actor/log10_signal_ratio"] + math.log10(5.0), abs=0.05
+    )
 
     # `mix_beta` moves the other way: it scales the contraction and leaves the reward term alone, so
     # raising it is *not* a free reduction of the reward-free floor. Pinned here so the recipe's 0.1
@@ -550,7 +560,9 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
     unit_inherited = metrics_for(mix_beta=0.1, adv_clip_max=5.0, adv_raw=raw_advantages)
     unit_rebalanced = metrics_for(mix_beta=0.1, adv_clip_max=1.0, adv_raw=raw_advantages)
     assert unit_rebalanced["actor/reward_term_scale"] > 0.5 * unit_inherited["actor/reward_term_scale"]
-    assert unit_rebalanced["actor/signal_ratio"] > unit_inherited["actor/signal_ratio"] * 2.0
+    # Clipping damps the reward weight of the saturated samples, so the ratio gain is smaller than
+    # the unclipped 5x -- but it still has to improve substantially, not collapse.
+    assert unit_rebalanced["actor/log10_signal_ratio"] > unit_inherited["actor/log10_signal_ratio"] + 0.4
 
     # The KL anchor must be a non-trivial share of the reported loss, not the ~1e-5 rounding error
     # that a `1e-4` coefficient produces against a loss of magnitude ~30.
