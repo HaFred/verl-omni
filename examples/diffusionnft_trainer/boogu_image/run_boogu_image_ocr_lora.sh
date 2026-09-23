@@ -3,27 +3,6 @@
 # A Boogu sibling of examples/diffusionnft_trainer/qwen_image/run_qwen_image_ocr_lora.sh,
 # differing in model path, LoRA targets / fsdp_layer_prefixes, the Boogu guidance knob
 # (`pipeline.guidance_scale`, vs Qwen's `true_cfg_scale`), rollout TP=1, and the dataset.
-#
-# Loss/optimizer knobs are deliberately NOT the Qwen recipe's. That recipe runs
-# `pipeline.true_cfg_scale=1.0` (unguided) while Boogu must run guided
-# (`guidance_scale=4.0`), and a 20-step pretrained, baseline-anchored run with the
-# inherited values collapsed val OCR 0.898 -> 0.603 while `actor/positive_loss` fell
-# monotonically -- the objective improved while the graded reward got worse. Three
-# deviations, each independently justified:
-#   - `ref_kl_coef` 1e-4 -> 10.0. At 1e-4 the documented prediction-space anchor
-#     contributes ~1e-5 against a loss of magnitude ~30, so `actor/ref_kl_loss` climbs
-#     unopposed (0.05 -> 0.114 over 20 steps) and the regulariser is decorative.
-#   - `adv_clip_max` 5.0 -> 1.0. The documented map is
-#     `r = 1/2 + 1/2*clip((raw - mean)/Z, -1, 1)`, which needs the clip bound to be 1x
-#     the normalising std; 5.0 never clips and compresses `r` into [0.4, 0.6], so the
-#     objective barely distinguishes good from bad samples. It also cuts the reward-free
-#     contraction of `v_theta` onto the frozen `v_old` -- gradient proportional to
-#     `adv_clip_max * mix_beta` -- by 5x without weakening the reward term (see
-#     tests/trainer/diffusion/test_diffusion_core_algos_on_cpu.py::test_diffusion_nft_reward_signal_scaling).
-#   - `lr` 3e-4 -> 1e-4, matching this PR's own Boogu DiffusionNFT convergence script
-#     (tests/special_e2e/run_diffusionnft_boogu_image_aligned.sh).
-# `mix_beta` stays at 0.1: the contraction above scales with it, so raising it trades
-# stability for contrast rather than being a free win.
 set -x
 
 # Set WORKSPACE to any writable directory; defaults to $HOME.
@@ -94,7 +73,7 @@ fi
 
 IMAGE_RESOLUTION=${IMAGE_RESOLUTION:-512}
 ROLLOUT_STEPS=${ROLLOUT_STEPS:-10}
-VAL_STEPS=${VAL_STEPS:-20}
+VAL_STEPS=${VAL_STEPS:-40}
 GUIDANCE_SCALE=${GUIDANCE_SCALE:-4.0}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-8}
 REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
@@ -102,7 +81,7 @@ REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-24}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-7200}
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-256}
-TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-20}
+TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-30}
 
 python3 -m verl_omni.trainer.main_diffusion \
     data.train_files=$ocr_train_path \
@@ -178,10 +157,10 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.project_name=diffusion_nft \
     trainer.experiment_name=boogu_image_ocr_lora \
     trainer.log_val_generations=8 \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
     trainer.nnodes=1 \
-    trainer.save_freq=60 \
-    trainer.test_freq=20 \
+    trainer.save_freq=20 \
+    trainer.test_freq=5 \
     trainer.total_epochs=1 \
     trainer.total_training_steps=$TOTAL_TRAIN_STEPS "$@"

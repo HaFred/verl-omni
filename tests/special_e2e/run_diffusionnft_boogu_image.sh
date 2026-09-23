@@ -55,12 +55,13 @@ except ImportError as exc:
 PY
 
 # Override via env: MODE, NUM_GPUS, MODEL_PATH, SOURCE_MODEL, DATA_DIR,
-#                   TOTAL_TRAIN_STEPS, TRAIN_FILES, VAL_FILES
+#                   TOTAL_TRAIN_STEPS, TOTAL_EPOCHS, TRAIN_FILES, VAL_FILES
 MODE=${MODE:-t2i}
 NUM_GPUS=${NUM_GPUS:-4}
 MODEL_PATH=${MODEL_PATH:-${HOME}/models/tiny-random/Boogu-Image}
 SOURCE_MODEL=${SOURCE_MODEL:-Boogu/Boogu-Image-0.1-Base}
 TOKENIZER_PATH=${TOKENIZER_PATH:-${MODEL_PATH}/processor}
+TOTAL_EPOCHS=${TOTAL_EPOCHS:-2}
 
 case "${MODE}" in
     t2i)
@@ -104,6 +105,10 @@ micro_bsz_per_gpu=1
 micro_bsz=$((micro_bsz_per_gpu * NUM_GPUS))
 mini_bsz=${micro_bsz}
 train_batch_size=$((mini_bsz * n_resp_per_prompt))
+# Size the dummy set for the requested epochs, as the QwenImage smoke test does:
+# `train_batch_size` alone only yields one epoch's worth of prompts.
+steps_per_epoch=$(((TOTAL_TRAIN_STEPS + TOTAL_EPOCHS - 1) / TOTAL_EPOCHS))
+synthetic_train_size=$((train_batch_size * steps_per_epoch))
 
 # Idempotent: a no-op when the tiny checkpoint is already present.
 python3 tests/special_e2e/build_boogu_image_tiny_random.py \
@@ -113,14 +118,14 @@ python3 tests/special_e2e/build_boogu_image_tiny_random.py \
 if [[ "${MODE}" == "edit" ]]; then
     python3 tests/special_e2e/create_dummy_image_edit_data.py \
         --local_save_dir "${DATA_DIR}" \
-        --train_size "${train_batch_size}" \
+        --train_size "${synthetic_train_size}" \
         --val_size 4 \
         --image-width 256 \
         --image-height 256
 else
     python3 tests/special_e2e/create_dummy_diffusion_data.py \
         --local_save_dir "${DATA_DIR}" \
-        --train_size "${train_batch_size}" \
+        --train_size "${synthetic_train_size}" \
         --val_size 4
 fi
 
@@ -189,6 +194,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.test_freq=-1 \
     trainer.save_freq=-1 \
     trainer.resume_mode=disable \
+    trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.total_training_steps=${TOTAL_TRAIN_STEPS} \
     "$@"
 
