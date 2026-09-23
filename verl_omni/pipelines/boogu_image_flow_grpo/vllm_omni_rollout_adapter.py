@@ -149,6 +149,13 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
     # ------------------------------------------------------------------
     # LoRA rollout sync
     # ------------------------------------------------------------------
+    #
+    # Upstream #661 added these same renames as a ``@staticmethod`` on this class
+    # (https://github.com/verl-project/verl-omni/pull/661). This tree keeps a single
+    # *instance* method instead, because the binding guard below resolves the renamed
+    # keys against ``self.transformer``. The renames and the guard's key space agree
+    # with #661's mapper; do not re-add the ``@staticmethod`` on a future merge --
+    # both definitions would coexist and the later one would silently win.
 
     def map_lora_update_to_engine(
         self,

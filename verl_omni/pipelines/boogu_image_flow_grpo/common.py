@@ -165,6 +165,12 @@ def resolve_text_guidance_scale(guidance_scale: Optional[float]) -> float:
 # unbound.
 # See https://github.com/verl-project/verl-omni/issues/658.
 _BOOGU_LORA_NAME_RENAMES: tuple[tuple[str, str], ...] = (
+    # The actor exports PEFT keys, which carry the PEFT wrapper in the name
+    # (``fsdp_utils.py`` builds them as ``base_model.model.<module>``). Strip it
+    # so the mapped keys land in the rollout's component-qualified key space;
+    # otherwise the binding guard rejects every delta. Upstream #661 performs the
+    # same strip in its per-pipeline mappers, so this keeps Boogu aligned with it.
+    ("transformer.base_model.model.", "transformer."),
     ("to_out.0", "to_out"),
     ("img_instruct_attn.processor.", "img_instruct_attn."),
 )
