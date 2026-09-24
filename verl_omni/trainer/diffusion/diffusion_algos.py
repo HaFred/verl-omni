@@ -814,12 +814,9 @@ class DiffusionNFTLoss(DiffusionLossFn):
             dL/dv_theta  ~  A*2/w * ( [ beta * t * (v_theta - v_old) ]  -  [ 2*(r-0.5) * (x0_old - x0) ] )
                                       \\____________ A * beta ____________/     \\_______ adv, no A _______/
 
-        where `A = adv_clip_max`. The first term carries no reward at all: it is a plain
-        contraction of the current policy onto the frozen old policy, and it is the *only* part
-        of the objective that grows with `A * beta`. The second is the entire learning signal,
-        and `A` cancels out of it because `r - 0.5 = adv / (2*A)`. Clearing the `1/beta` factor
-        from the reported values is what keeps the two scales comparable, so they are reported
-        separately rather than through the loss.
+        Only the first term grows with `A * beta`; the second is the whole learning signal, and
+        `A` cancels out of it because `r - 0.5 = adv / (2*A)`. `log10_signal_ratio` reports the
+        two scales separately, since the `1/beta` scaling of the loss values hides that balance.
         """
         loss_cfg = config.diffusion_loss
         beta = loss_cfg.mix_beta
@@ -875,13 +872,6 @@ class DiffusionNFTLoss(DiffusionLossFn):
                 "actor/negative_loss": negative_loss.mean().detach().item(),
                 "actor/contraction_scale": contraction_scale.detach().item(),
                 "actor/reward_term_scale": reward_term_scale.detach().item(),
-                # Reported in log space on purpose. The trainer means each metric over the
-                # micro-batches, and `contraction` is exactly 0 on a micro-batch whose
-                # `v_theta - v_old` rounds to zero (it is ~0 right after a LoRA re-init), so a
-                # raw ratio of the two scales is a mean of (finite, ~1e12) and reports ~1e11
-                # for what is really a ratio of order 1e2. Averaging two log10 terms keeps the
-                # micro-batches on the same footing, and `signal_ratio` stays recoverable as
-                # `10**log10_signal_ratio`.
                 "actor/log10_signal_ratio": (
                     (torch.log10(reward_term_scale.clamp(min=1e-30)) - torch.log10(contraction_scale.clamp(min=1e-30)))
                     .detach()
