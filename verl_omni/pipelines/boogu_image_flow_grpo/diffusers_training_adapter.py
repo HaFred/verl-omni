@@ -27,6 +27,7 @@ from verl.utils.device import get_device_name
 
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
+from verl_omni.pipelines.utils import scheduler_num_train_timesteps
 from verl_omni.workers.config import DiffusionModelConfig
 
 from .common import (
@@ -225,22 +226,7 @@ class BooguImage(DiffusionModelBase):
         return log_prob, prev_sample_mean, std_dev_t, sqrt_dt
 
 
-@lru_cache(maxsize=8)
-def _scheduler_num_train_timesteps(model_path: str) -> int:
-    """Read the checkpoint's own timestep scale.
-
-    This is required to map scheduler timesteps onto Boogu's ``[0, 1]`` flow time,
-    so a missing or unreadable value is an error rather than something to guess:
-    the previous ``1000`` fallback silently matched the one value in use today and
-    would have corrupted every sample for any checkpoint that differs.
-    """
-    config_path = os.path.join(model_path, "scheduler", "scheduler_config.json")
-    with open(config_path) as f:
-        config = json.load(f)
-    num_train_timesteps = config.get("num_train_timesteps")
-    if num_train_timesteps is None:
-        raise ValueError(
-            f"{config_path} does not define `num_train_timesteps`, which is required to map "
-            "scheduler timesteps onto Boogu's [0, 1] flow time."
-        )
-    return int(num_train_timesteps)
+# The engine's `xt` divisor, the Qwen NFT adapter and Boogu all map `sigma -> timestep` with
+# this one value, read from the checkpoint by `pipelines.utils` (see #666 review). Kept under
+# the private name because that is what the Boogu DiffusionNFT adapter imports.
+_scheduler_num_train_timesteps = scheduler_num_train_timesteps

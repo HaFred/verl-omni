@@ -1374,12 +1374,13 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
         x0 = micro_batch["latents_clean"]
         timestep = micro_batch["train_timesteps"][:, step]
-        # `train_timesteps` arrive as `sigma * scheduler.config.num_train_timesteps`
-        # (see the per-pipeline rollout adapters), so divide by the scheduler's own
-        # scale to recover flow time in [0, 1]. This divisor was the literal 1000.0,
-        # which silently produced a wrong `xt` for any checkpoint whose scheduler
-        # config disagrees -- the bug was invisible only because every in-tree
-        # checkpoint happens to ship num_train_timesteps=1000.
+        # `train_timesteps` are emitted as `sigma * N`, so recovering flow time in [0, 1] means
+        # dividing by the same `N`: the divisor has to match whatever the emitter used. Boogu and
+        # Qwen take `N` from the checkpoint (see `pipelines.utils.scheduler_num_train_timesteps`);
+        # the MiniMax H3 NFT emitter and its `h3_dit_timestep` mapper still hardcode 1000, so H3
+        # stays self-consistent only while its scheduler keeps the 1000 default. This divisor used
+        # to be the literal 1000.0, which silently produced a wrong `xt` for any checkpoint whose
+        # scheduler disagrees -- invisible only because every in-tree checkpoint ships 1000.
         num_train_timesteps = getattr(self.scheduler.config, "num_train_timesteps", None)
         if num_train_timesteps is None:
             raise ValueError(

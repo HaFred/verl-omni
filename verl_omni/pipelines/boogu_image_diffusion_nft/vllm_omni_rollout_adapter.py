@@ -127,7 +127,17 @@ class BooguImageDiffusionNFTPipeline(BooguImagePipelineWithLogProb):
             max_sequence_length=max_sequence_length,
             condition_images=condition_images or None,
         )
-        do_cfg = guidance_scale > 1.0 and negative_prompt_ids is not None
+        # Fail closed: an active guidance_scale with no negative prompt would sample
+        # unguided while the config still claims guidance, so the rollout would silently
+        # disagree with the actor's reconstruction. Every in-tree dataset (including the
+        # OCR recipe and the smoke-test generators) carries a negative_prompt.
+        if guidance_scale > 1.0 and negative_prompt_ids is None:
+            raise ValueError(
+                "Boogu-Image text CFG is active (guidance_scale > 1) but the request "
+                "carried no negative_prompt_ids. Provide a negative_prompt in the "
+                "dataset or set pipeline.guidance_scale=1.0."
+            )
+        do_cfg = guidance_scale > 1.0
         if do_cfg:
             # Upstream default use_input_images_4_neg_instruct=False: the
             # negative instruction is encoded text-only.

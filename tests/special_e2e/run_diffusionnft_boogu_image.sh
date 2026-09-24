@@ -164,9 +164,10 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.actor.optim.weight_decay=0.0001 \
     actor_rollout_ref.actor.ppo_mini_batch_size=${mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
-    actor_rollout_ref.actor.diffusion_loss.mix_beta=0.5 \
-    actor_rollout_ref.actor.diffusion_loss.ref_kl_coef=0.001 \
-    actor_rollout_ref.actor.diffusion_loss.adv_clip_max=5.0 \
+    actor_rollout_ref.actor.diffusion_loss.clip_ratio=1e-5 \
+    actor_rollout_ref.actor.diffusion_loss.mix_beta=0.1 \
+    actor_rollout_ref.actor.diffusion_loss.ref_kl_coef=10.0 \
+    actor_rollout_ref.actor.diffusion_loss.adv_clip_max=1.0 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
@@ -211,6 +212,18 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.total_training_steps=${TOTAL_TRAIN_STEPS} \
     "$@" 2>&1 | tee "${TRAIN_LOG}"
+
+# Guard the argument-list contract above. If a comment is ever added inside that
+# backslash-continued list, the command terminates at the comment and every later
+# override is silently dropped -- surfacing much later as a confusing resource error.
+# `experiment_name` is the last `trainer.*` argument, so it is the cheapest witness that
+# the whole list was parsed.
+if ! grep -q "'experiment_name': '${experiment_name}'" "${TRAIN_LOG}"; then
+    echo "FAIL: the trailing Hydra overrides never reached the trainer (its resolved config"
+    echo "      does not report experiment_name='${experiment_name}'). The argument list was"
+    echo "      truncated -- look for a comment line inside the backslash-continued list."
+    exit 1
+fi
 
 # Training exiting 0 is not evidence that the actor's deltas reached the rollout.
 # vllm-omni only raises when *no* target binds, so a partial name/target miss

@@ -52,7 +52,6 @@ class BooguImageDiffusionNFT(BooguImage):
         micro_batch: TensorDict,
         step: int,
     ) -> tuple[dict, Optional[dict]]:
-        """Use the NFT engine's single-step latents (B, C, H, W) and timesteps (B,)."""
         hidden_states = latents
         num_train_timesteps = _scheduler_num_train_timesteps(model_config.local_path)
         timestep = boogu_timestep_from_scheduler(timesteps, num_train_timesteps).to(hidden_states.dtype)
@@ -99,7 +98,13 @@ class BooguImageDiffusionNFT(BooguImage):
         """Apply text CFG and return velocity in the Diffusers convention."""
         prediction = super().forward(module, model_config, model_inputs)
         guidance_scale = resolve_text_guidance_scale(model_config.pipeline.guidance_scale)
-        if guidance_scale > 1.0 and negative_model_inputs is not None:
+        if guidance_scale > 1.0:
+            if negative_model_inputs is None:
+                raise ValueError(
+                    "Boogu-Image text CFG is active (guidance_scale > 1) but the rollout "
+                    "shipped no negative prompt embeddings. Provide a negative_prompt in "
+                    "the dataset or set pipeline.guidance_scale=1.0."
+                )
             negative_prediction = super().forward(module, model_config, negative_model_inputs)
             prediction = apply_boogu_text_cfg(prediction, negative_prediction, guidance_scale)
         return prediction.neg()

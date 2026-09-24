@@ -164,6 +164,58 @@ def test_rollout_returns_clean_latents_with_deterministic_cfg_steps(adapters, pa
     assert times == ([0.25, 0.25, 0.75, 0.75] if guidance_scale > 1 else [0.25, 0.75])
 
 
+def test_rollout_raises_when_cfg_active_without_negative_prompt_ids(adapters):
+    """A guided rollout with no negative prompt must error, not sample unguided.
+
+    `do_cfg` used to fold the negative-prompt check into the guidance check, so a dataset
+    without `negative_prompt` silently produced unguided samples while the config still
+    said `guidance_scale=4.0`.
+    """
+    from vllm_omni.diffusion.request import OmniDiffusionRequest
+    from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+    rollout_module = importlib.import_module(adapters.rollout.__module__)
+    pipeline = object.__new__(adapters.rollout)
+    pipeline.device = torch.device("cpu")
+    pipeline.transformer = SimpleNamespace(in_channels=3, axes_dim_rope=[4, 2, 2], axes_lens=[8, 8, 8])
+    pipeline._boogu_scheduler = None
+    pipeline._extract_reference_images = lambda prompts: (None, [None] * len(prompts))
+    pipeline._resolve_output_size = lambda height, width: (height, width, height, width)
+    embeds = torch.ones(1, 3, 8, dtype=torch.bfloat16)
+    mask = torch.ones(1, 3, dtype=torch.bool)
+    pipeline.encode_prompt = MagicMock(return_value=(embeds, mask))
+    pipeline.prepare_latents = MagicMock(return_value=torch.zeros(1, 3, 2, 2))
+    pipeline.predict = MagicMock(return_value=torch.ones(1, 3, 2, 2, dtype=torch.bfloat16))
+    pipeline.scheduler = SimpleNamespace(
+        timesteps=torch.tensor([750.0, 250.0]),
+        config=SimpleNamespace(num_train_timesteps=1000),
+        set_begin_index=MagicMock(),
+        step=MagicMock(return_value=(torch.zeros(1, 3, 2, 2), None, None, None)),
+    )
+    request = OmniDiffusionRequest(
+        request_id="0",
+        # No `negative_prompt_ids`: this is the dataset shape that used to fail silently.
+        prompt={"prompt_token_ids": [1, 2, 3]},
+        sampling_params=OmniDiffusionSamplingParams(
+            height=16,
+            width=16,
+            num_inference_steps=2,
+            guidance_scale=4.0,
+            output_type="latent",
+            seed=0,
+        ),
+    )
+    with (
+        patch.object(rollout_module, "configure_boogu_sde_timesteps"),
+        patch.object(rollout_module, "get_boogu_freqs_cis", return_value=None),
+        pytest.raises(ValueError, match="negative_prompt_ids"),
+    ):
+        pipeline.forward(request)
+
+    # The guard fires before any denoise step, so no unguided sample is produced.
+    pipeline.scheduler.step.assert_not_called()
+
+
 @pytest.mark.parametrize("has_condition", [False, True])
 @pytest.mark.parametrize("has_negative", [False, True])
 def test_prepare_model_inputs_accepts_single_step_tensors(adapters, tmp_path, has_condition, has_negative):
@@ -250,8 +302,8 @@ def test_forward_applies_text_cfg_before_negation(adapters, guidance_scale, expe
     torch.testing.assert_close(prediction, expected)
 
 
-@pytest.mark.parametrize(("guidance_scale", "has_negative"), [(0.5, True), (1.0, True), (4.0, False)])
-def test_forward_skips_cfg_without_active_guidance_or_negative_inputs(adapters, guidance_scale, has_negative):
+@pytest.mark.parametrize(("guidance_scale", "has_negative"), [(0.5, True), (1.0, True)])
+def test_forward_skips_cfg_without_active_guidance(adapters, guidance_scale, has_negative):
     velocity = torch.ones(2, 3, 2, 2)
     module = MagicMock(return_value=(velocity,))
     model_inputs = {"instruction_hidden_states": torch.ones(2, 5, 8)}
@@ -263,3 +315,23 @@ def test_forward_skips_cfg_without_active_guidance_or_negative_inputs(adapters, 
 
     module.assert_called_once_with(**model_inputs)
     torch.testing.assert_close(prediction, -velocity)
+
+
+@pytest.mark.parametrize("guidance_scale", [4.0, None])
+def test_forward_raises_when_cfg_active_without_negative_inputs(adapters, guidance_scale):
+    """An active guidance scale with no negatives must fail loudly, not run unguided.
+
+    Failure to do so trains against an unguided velocity while the config still claims
+    guidance -- invisible, and the same silent-miss class as the LoRA-sync gap (#658).
+    `None` resolves to Boogu's guided default (4.0), so it is the same regression.
+    """
+    velocity = torch.ones(2, 3, 2, 2)
+    module = MagicMock(return_value=(velocity,))
+    model_inputs = {"instruction_hidden_states": torch.ones(2, 5, 8)}
+
+    with pytest.raises(ValueError, match="text CFG is active"):
+        adapters.adapter.forward(module, _model_config(adapters, guidance_scale), model_inputs, None)
+
+    # The positive pass is still computed before the guard fires, so the caller sees
+    # exactly one model call rather than a half-applied CFG blend.
+    module.assert_called_once_with(**model_inputs)

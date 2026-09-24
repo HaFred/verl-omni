@@ -558,7 +558,9 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
     # second half of this test covers that case.
     advantages = 0.3 * torch.randn(B)
 
-    def metrics_for(mix_beta: float, adv_clip_max: float, adv_raw: torch.Tensor | None = None) -> dict:
+    def metrics_for(
+        mix_beta: float, adv_clip_max: float, adv_raw: torch.Tensor | None = None, ref_kl_coef: float | None = None
+    ) -> dict:
         reward_prob = diffusion_algos.DiffusionNFTLoss._advantage_to_reward_prob(
             (advantages if adv_raw is None else adv_raw).clone(), adv_clip_max, "continuous"
         )
@@ -572,6 +574,9 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
                     "diffusion_loss.loss_mode=diffusion_nft",
                     f"diffusion_loss.mix_beta={mix_beta}",
                     f"diffusion_loss.adv_clip_max={adv_clip_max}",
+                    # Left at the config default when unset, which is how the audit below detects
+                    # that `ref_kl_coef` contributes nothing out of the box.
+                    *([f"diffusion_loss.ref_kl_coef={ref_kl_coef}"] if ref_kl_coef is not None else []),
                     "ppo_micro_batch_size_per_gpu=4",
                 ],
             )
@@ -626,9 +631,25 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
     # the unclipped 5x -- but it still has to improve substantially, not collapse.
     assert unit_rebalanced["actor/log10_signal_ratio"] > unit_inherited["actor/log10_signal_ratio"] + 0.4
 
-    # The KL anchor must be a non-trivial share of the reported loss, not the ~1e-5 rounding error
-    # that a `1e-4` coefficient produces against a loss of magnitude ~30.
-    assert inherited["actor/ref_kl_contribution"] < 1e-4
+    # The KL anchor ships at `ref_kl_coef=0.0`, so the inherited term contributes exactly
+    # nothing and `adv_clip_max` is the only knob doing work. Pinned so that a future default
+    # change cannot quietly make the anchor load-bearing without the audit below being revisited.
+    assert inherited["actor/ref_kl_contribution"] == pytest.approx(0.0, abs=1e-12)
+
+    # The other half of the recipe change: `ref_kl_coef` 0.0 -> 10.0. `adv_clip_max` is load-bearing
+    # above; nothing forced `ref_kl_coef` to be a real term rather than a decorative one. Build the
+    # recipe's value and require a substantial share of the reported loss -- orders of magnitude
+    # above the zero floor, yet still inside `total_loss` rather than swamping `policy_loss`: the
+    # anchor has to shape the update, not replace the reward signal.
+    anchored = metrics_for(mix_beta=0.1, adv_clip_max=1.0, ref_kl_coef=10.0)
+    assert anchored["actor/ref_kl_contribution"] > 1.0
+    assert anchored["actor/ref_kl_contribution"] < anchored["actor/total_loss"]
+    # ~0.36 of the reported loss at these fixtures.
+    assert 0.2 < anchored["actor/ref_kl_contribution"] / anchored["actor/total_loss"] < 0.6
+    # The anchor is additive: on the identical policy objective it must leave `policy_loss` and the
+    # reward decomposition untouched, otherwise `ref_kl_coef` would be re-scaling the reward signal.
+    assert anchored["actor/policy_loss"] == pytest.approx(rebalanced["actor/policy_loss"], rel=1e-6)
+    assert anchored["actor/log10_signal_ratio"] == pytest.approx(rebalanced["actor/log10_signal_ratio"], rel=1e-6)
 
 
 def test_compute_policy_loss_grpo_guard() -> None:

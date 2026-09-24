@@ -22,6 +22,7 @@ from verl.utils import tensordict_utils as tu
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.qwen_image_flow_grpo.common import apply_true_cfg, build_img_shapes
 from verl_omni.pipelines.qwen_image_flow_grpo.diffusers_training_adapter import QwenImage
+from verl_omni.pipelines.utils import scheduler_num_train_timesteps
 from verl_omni.workers.config import DiffusionModelConfig
 
 __all__ = ["QwenImageDiffusionNFT"]
@@ -61,7 +62,11 @@ class QwenImageDiffusionNFT(QwenImage):
 
         model_inputs = {
             "hidden_states": xt,
-            "timestep": timestep / 1000.0,
+            # Use the checkpoint's own scale, not a literal. `NFTDiffusersFSDPEngine` mixes `xt`
+            # with `timesteps / num_train_timesteps`; conditioning the DiT with a different
+            # divisor would feed it a timestep that disagrees with its own noisy input. The
+            # literal `1000.0` matched only because every in-tree checkpoint ships 1000.
+            "timestep": timestep / scheduler_num_train_timesteps(model_config.local_path),
             "guidance": guidance,
             "encoder_hidden_states_mask": prompt_embeds_mask,
             "encoder_hidden_states": prompt_embeds,
