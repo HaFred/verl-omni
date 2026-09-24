@@ -100,6 +100,19 @@ fi
 ATTN_BACKEND=native
 ROLLOUT_ATTN_BACKEND=TORCH_SDPA
 
+# Boogu's rollout transformer carries only the attention projections and the
+# feed-forward halves. FSDP layered-summon does not transport top-level modules
+# (`x_embedder`, `caption_embedder`, the patch embedders) to the rollout, so
+# `all-linear` names targets that can never bind -- and the adapter's
+# validate_boogu_lora_targets() rejects such a list outright, which is how this
+# harness came to report success while every weight sync failed. Same list as the
+# recipe: examples/diffusionnft_trainer/boogu_image/run_boogu_image_ocr_lora.sh.
+BOOGU_LORA_TARGETS="['to_q','to_k','to_v','to_out.0','img_to_q','img_to_k','img_to_v','img_out','instruct_to_q','instruct_to_k','instruct_to_v','instruct_out','feed_forward.linear_1','feed_forward.linear_2','feed_forward.linear_3','img_feed_forward.linear_1','img_feed_forward.linear_2','img_feed_forward.linear_3']"
+
+# Training stdout is tee'd here so the LoRA sync can be asserted afterwards.
+TRAIN_LOG="$(mktemp "${TMPDIR:-/tmp}/boogu_nft_e2e.XXXXXX.log")"
+trap 'rm -f "${TRAIN_LOG}"' EXIT
+
 n_resp_per_prompt=2
 micro_bsz_per_gpu=1
 micro_bsz=$((micro_bsz_per_gpu * NUM_GPUS))
@@ -144,7 +157,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.model.lora_rank=8 \
     actor_rollout_ref.model.lora_alpha=16 \
     actor_rollout_ref.model.policy_state_adapters='["default","old"]' \
-    actor_rollout_ref.model.target_modules=all-linear \
+    actor_rollout_ref.model.target_modules="${BOOGU_LORA_TARGETS}" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['double_stream_layers.','single_stream_layers.','context_refiner.','noise_refiner.','ref_image_refiner.']" \
     actor_rollout_ref.actor.optim.lr=1e-4 \
     actor_rollout_ref.actor.optim.weight_decay=0.0001 \
@@ -196,6 +209,23 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.resume_mode=disable \
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.total_training_steps=${TOTAL_TRAIN_STEPS} \
-    "$@"
+    "$@" 2>&1 | tee "${TRAIN_LOG}"
+
+# Training exiting 0 is not evidence that the actor's deltas reached the rollout.
+# vllm-omni only raises when *no* target binds, so a partial name/target miss
+# stays silent while the actor keeps training modules the rollout never receives
+# (issue #658) -- and the engine pins VLLM_LOGGING_LEVEL=WARN, so vllm-omni's own
+# INFO line about a loaded adapter never reaches this output. The mapper therefore
+# reports its binding outcome once per engine process at WARNING level; assert
+# that positive evidence rather than trusting the exit code.
+if ! grep -qE "Boogu-Image LoRA sync: bound [1-9][0-9]* actor delta modules to vllm-omni, 0 dropped" "${TRAIN_LOG}"; then
+    echo "FAIL: the rollout engine never reported a successful LoRA sync."
+    echo "      Expected one line per engine process of the form:"
+    echo "        Boogu-Image LoRA sync: bound <N> actor delta modules to vllm-omni, 0 dropped (<M> wrapped target modules)."
+    echo "      Look above for \"unsupported targets\" or \"update_weights_from_ipc' failed\":"
+    echo "      the actor's deltas did not reach the rollout, so this run never"
+    echo "      exercised the DiffusionNFT update path and its pass would be vacuous."
+    exit 1
+fi
 
 echo "DiffusionNFT Boogu-Image (MODE=${MODE}) e2e test passed (training completed successfully)."
