@@ -551,11 +551,8 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
     old_prediction = torch.randn(B, C, H, W)
     forward_prediction = old_prediction + 0.02 * torch.randn(B, C, H, W)
     ref_forward_prediction = torch.zeros_like(old_prediction)
-    # Advantages kept inside +-1 (max |adv| ~= 0.75 here) so neither setting clips: that is the
-    # regime where the `adv_clip_max` cancellation is exact, and it isolates it from the probability
-    # map's saturation. At `adv_clip_max=1.0` the ~1/3 of *unit*-normalised advantages beyond +-1 do
-    # saturate -- the documented `clip(., -1, 1)` behaviour -- which damps those samples' weight; the
-    # second half of this test covers that case.
+    # Keep |adv| < 1 so neither setting clips: that is where the `adv_clip_max` cancellation is
+    # exact, isolated from the probability map's saturation (covered by the second half below).
     advantages = 0.3 * torch.randn(B)
 
     def metrics_for(
@@ -597,17 +594,12 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
     inherited = metrics_for(mix_beta=0.1, adv_clip_max=5.0)
     rebalanced = metrics_for(mix_beta=0.1, adv_clip_max=1.0)
 
-    # Lowering `adv_clip_max` cuts the reward-free contraction by that factor while leaving the
-    # learning signal untouched -- that is the cancellation above. Concretely, `A` cancels out of
-    # `reward_term` exactly (`reward_weight - 0.5 = clamp(adv,-A,A)/(2A)`), so halving `A` leaves the
-    # reward term alone and the reward-to-contraction ratio grows by `1/A`. That is the entire
-    # justification for the recipe's 5.0 -> 1.0.
+    # `A` cancels out of `reward_term` exactly (`reward_weight - 0.5 = clamp(adv,-A,A)/(2A)`), so
+    # lowering `A` cuts only the reward-free contraction: this is the recipe's 5.0 -> 1.0.
     assert rebalanced["actor/contraction_scale"] < inherited["actor/contraction_scale"] / 4.0
     assert rebalanced["actor/reward_term_scale"] == pytest.approx(inherited["actor/reward_term_scale"], rel=0.05)
-    # Assert the gain exactly, in log space: the raw ratio cannot be used here because the trainer
-    # means metrics over micro-batches, and a micro-batch whose `v_theta - v_old` rounds to zero
-    # contributes a clamped ~1e12 to a mean-of-ratios. `advantages` above keeps every |adv| < 1, so
-    # neither setting clips and the factor is exactly `adv_clip_max`.
+    # The gain is exact in log space; the raw ratio is a mean-of-ratios that a rounded-to-zero
+    # micro-batch would blow up. Every |adv| < 1 here, so neither setting clips.
     assert rebalanced["actor/log10_signal_ratio"] == pytest.approx(
         inherited["actor/log10_signal_ratio"] + math.log10(5.0), abs=0.05
     )
@@ -619,10 +611,8 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
     assert raised_beta["actor/contraction_scale"] > inherited["actor/contraction_scale"] * 8.0
     assert raised_beta["actor/reward_term_scale"] == pytest.approx(inherited["actor/reward_term_scale"], rel=0.05)
 
-    # With realistically-scaled advantages, `adv_clip_max=1.0` does saturate the samples beyond +-1
-    # and so damps their reward weight. That is the intended `clip(., -1, 1)` map, and it must cost
-    # a bounded amount -- the signal may not collapse back toward the 1/5 with which the inherited
-    # 5.0 compresses the map.
+    # With realistically-scaled advantages, `adv_clip_max=1.0` does clip beyond +-1 and so damps
+    # those samples' weight -- the intended map, and it must cost only a bounded amount.
     raw_advantages = torch.randn(B)
     unit_inherited = metrics_for(mix_beta=0.1, adv_clip_max=5.0, adv_raw=raw_advantages)
     unit_rebalanced = metrics_for(mix_beta=0.1, adv_clip_max=1.0, adv_raw=raw_advantages)
@@ -636,11 +626,8 @@ def test_diffusion_nft_reward_signal_scaling() -> None:
     # change cannot quietly make the anchor load-bearing without the audit below being revisited.
     assert inherited["actor/ref_kl_contribution"] == pytest.approx(0.0, abs=1e-12)
 
-    # The other half of the recipe change: `ref_kl_coef` 0.0 -> 10.0. `adv_clip_max` is load-bearing
-    # above; nothing forced `ref_kl_coef` to be a real term rather than a decorative one. Build the
-    # recipe's value and require a substantial share of the reported loss -- orders of magnitude
-    # above the zero floor, yet still inside `total_loss` rather than swamping `policy_loss`: the
-    # anchor has to shape the update, not replace the reward signal.
+    # The other half of the recipe: `ref_kl_coef` 0.0 -> 10.0 must be a real term shaping the
+    # update, not a decorative one -- substantial, yet not swamping `policy_loss`.
     anchored = metrics_for(mix_beta=0.1, adv_clip_max=1.0, ref_kl_coef=10.0)
     assert anchored["actor/ref_kl_contribution"] > 1.0
     assert anchored["actor/ref_kl_contribution"] < anchored["actor/total_loss"]

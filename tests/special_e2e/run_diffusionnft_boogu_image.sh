@@ -116,6 +116,17 @@ trap 'rm -f "${TRAIN_LOG}"' EXIT
 n_resp_per_prompt=2
 micro_bsz_per_gpu=1
 rollout_tp=1
+# Validate before the arithmetic below: `expected_engine_workers` divides by `rollout_tp`,
+# so a non-dividing override would truncate and the sync assertion would check the wrong
+# worker count instead of failing.
+if (( NUM_GPUS < 1 || micro_bsz_per_gpu < 1 )); then
+    echo "FAIL: NUM_GPUS (${NUM_GPUS}) and micro_bsz_per_gpu (${micro_bsz_per_gpu}) must be positive."
+    exit 1
+fi
+if (( NUM_GPUS % rollout_tp != 0 )); then
+    echo "FAIL: NUM_GPUS (${NUM_GPUS}) must be divisible by rollout_tp (${rollout_tp})."
+    exit 1
+fi
 micro_bsz=$((micro_bsz_per_gpu * NUM_GPUS))
 mini_bsz=${micro_bsz}
 train_batch_size=$((mini_bsz * n_resp_per_prompt))

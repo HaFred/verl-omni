@@ -152,7 +152,7 @@ class BooguImage(DiffusionModelBase):
     ) -> tuple[dict, Optional[dict]]:
         """Build one step's inputs, mapping scheduler sigma to Boogu ``t=1-sigma``."""
         hidden_states = latents[:, step]
-        num_train_timesteps = _scheduler_num_train_timesteps(model_config.local_path)
+        num_train_timesteps = scheduler_num_train_timesteps(model_config.local_path)
         timestep = boogu_timestep_from_scheduler(timesteps[:, step], num_train_timesteps).to(hidden_states.dtype)
         freqs_cis = get_boogu_freqs_cis(module.config.axes_dim_rope, module.config.axes_lens)
         image_latents = micro_batch.get("condition_image_latents", None)
@@ -224,9 +224,3 @@ class BooguImage(DiffusionModelBase):
             return_sqrt_dt=True,
         )
         return log_prob, prev_sample_mean, std_dev_t, sqrt_dt
-
-
-# The engine's `xt` divisor, the Qwen NFT adapter and Boogu all map `sigma -> timestep` with
-# this one value, read from the checkpoint by `pipelines.utils` (see #666 review). Kept under
-# the private name because that is what the Boogu DiffusionNFT adapter imports.
-_scheduler_num_train_timesteps = scheduler_num_train_timesteps

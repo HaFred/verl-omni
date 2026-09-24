@@ -120,15 +120,20 @@ def prepare_model_inputs(
 def scheduler_num_train_timesteps(model_path: str) -> int:
     """Read a checkpoint's own timestep scale from ``scheduler/scheduler_config.json``.
 
-    This is the single source of truth for the ``sigma -> timestep`` scale used by the NFT
-    training path. The engine divides ``train_timesteps`` by this value to recover flow time
-    in ``[0, 1]`` when it mixes ``xt``, and each per-pipeline adapter uses it to condition
-    its DiT. Both have to read the same number: if they disagree, the sample is noised at
-    one scale and conditioned at another, which trains the model on inconsistent targets.
+    The per-pipeline adapters use this to condition their DiT, and the engine derives the same
+    number from its in-memory ``scheduler.config`` when it recovers flow time as
+    ``train_timesteps / N``. Both have to agree: a disagreement noises the sample at one scale
+    and conditions it at another, which trains the model on inconsistent targets. Reading the
+    checkpoint keeps the two in step for every scheduler rather than only those shipping 1000.
 
-    The value is read from the checkpoint rather than hardcoded because a literal only ever
-    agreed while every in-tree checkpoint happened to ship ``1000``. A missing or unreadable
-    value is an error, never a silent default.
+    Args:
+        model_path: Checkpoint directory holding ``scheduler/scheduler_config.json``.
+
+    Returns:
+        The checkpoint's ``num_train_timesteps``.
+
+    Raises:
+        ValueError: If the config does not define ``num_train_timesteps``.
     """
     config_path = os.path.join(model_path, "scheduler", "scheduler_config.json")
     with open(config_path) as f:

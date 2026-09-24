@@ -1,9 +1,12 @@
-# Boogu-Image DiffusionNFT LoRA RL, vllm_omni rollout
+#!/usr/bin/env bash
+# Boogu-Image DiffusionNFT LoRA RL, vllm_omni rollout.
 #
 # A Boogu sibling of examples/diffusionnft_trainer/qwen_image/run_qwen_image_ocr_lora.sh,
 # differing in model path, LoRA targets / fsdp_layer_prefixes, the Boogu guidance knob
 # (`pipeline.guidance_scale`, vs Qwen's `true_cfg_scale`), rollout TP=1, and the dataset.
-set -x
+#
+# Run from the repo root: `reward.custom_reward_function.path` is repo-relative.
+set -euo pipefail
 
 # Set WORKSPACE to any writable directory; defaults to $HOME.
 WORKSPACE=${WORKSPACE:-$HOME}

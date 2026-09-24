@@ -128,9 +128,6 @@ def resolve_text_guidance_scale(guidance_scale: Optional[float]) -> float:
     return 4.0 if guidance_scale is None else float(guidance_scale)
 
 
-# ---------------------------------------------------------------------------
-# LoRA name translation (diffusers -> vllm-omni)
-# ---------------------------------------------------------------------------
 # The diffusers actor and the vllm-omni rollout name two module sets differently. ``to_out.0`` (the attention output
 # projection) vs ``to_out``, and the joint attention's ``.processor.`` infix (8 projections x 8 layers). Both the
 # tensor keys and ``target_modules`` need renaming, else deltas bind nothing and vanish silently (118/394; #658).

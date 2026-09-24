@@ -805,7 +805,22 @@ class DiffusionNFTLoss(DiffusionLossFn):
         reward_prob: torch.Tensor,
         config: DiffusionActorConfig,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute the DiffusionNFT policy loss and auxiliary metrics."""
+        """Compute the DiffusionNFT policy loss and auxiliary metrics.
+
+        `dL/dv_theta` decomposes into exactly two parts, because `old` is detached and only
+        `v_theta` moves both x0 estimates (with `dx0_pos/dv_theta = -t*beta` and
+        `dx0_neg/dv_theta = +t*beta`, which cancels the `1/beta` in the loss):
+
+            dL/dv_theta  ~  A*2/w * ( [ beta * t * (v_theta - v_old) ]  -  [ 2*(r-0.5) * (x0_old - x0) ] )
+                                      \\____________ A * beta ____________/     \\_______ adv, no A _______/
+
+        where `A = adv_clip_max`. The first term carries no reward at all: it is a plain
+        contraction of the current policy onto the frozen old policy, and it is the *only* part
+        of the objective that grows with `A * beta`. The second is the entire learning signal,
+        and `A` cancels out of it because `r - 0.5 = adv / (2*A)`. Clearing the `1/beta` factor
+        from the reported values is what keeps the two scales comparable, so they are reported
+        separately rather than through the loss.
+        """
         loss_cfg = config.diffusion_loss
         beta = loss_cfg.mix_beta
 
@@ -846,19 +861,8 @@ class DiffusionNFTLoss(DiffusionLossFn):
         loss = policy_loss + loss_cfg.ref_kl_coef * ref_kl_loss
 
         with torch.no_grad():
-            # `dL/dv_theta` decomposes into exactly two parts, because `old` is detached and only
-            # `v_theta` moves both x0 estimates (with `dx0_pos/dv_theta = -t*beta` and
-            # `dx0_neg/dv_theta = +t*beta`, which cancels the `1/beta` in the loss):
-            #
-            #     dL/dv_theta  ~  A*2/w * ( [ beta * t * (v_theta - v_old) ]  -  [ 2*(r-0.5) * (x0_old - x0) ] )
-            #                              \____________ A * beta ____________/     \_______ adv, no A _______/
-            #
-            # where `A = adv_clip_max`. The first term carries no reward at all: it is a plain
-            # contraction of the current policy onto the frozen old policy, and it is the *only*
-            # part of the objective that grows with `A * beta`. The second is the entire learning
-            # signal, and `A` cancels out of it because `r - 0.5 = adv / (2*A)`. Reporting the loss
-            # *values* hides this (the `1/beta` scaling inflates the floor while the gradient it
-            # produces is `beta`-proportional), so report the two gradient scale terms.
+            # The two gradient-scale terms of the decomposition in the docstring: the reward-free
+            # contraction onto `v_old`, and the reward term, from which `adv_clip_max` cancels.
             x0_old = xt - t_expanded * old_prediction
             reward_weight_col = reward_weight.view(-1, *([1] * (x0.ndim - 1)))
             contraction = loss_cfg.adv_clip_max * beta * t_expanded * (forward_prediction - old_prediction)

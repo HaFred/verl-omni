@@ -24,11 +24,9 @@ from verl_omni.pipelines.boogu_image_flow_grpo.common import (
     get_boogu_freqs_cis,
     resolve_text_guidance_scale,
 )
-from verl_omni.pipelines.boogu_image_flow_grpo.diffusers_training_adapter import (
-    BooguImage,
-    _scheduler_num_train_timesteps,
-)
+from verl_omni.pipelines.boogu_image_flow_grpo.diffusers_training_adapter import BooguImage
 from verl_omni.pipelines.model_base import DiffusionModelBase
+from verl_omni.pipelines.utils import scheduler_num_train_timesteps
 from verl_omni.workers.config import DiffusionModelConfig
 
 __all__ = ["BooguImageDiffusionNFT"]
@@ -53,7 +51,7 @@ class BooguImageDiffusionNFT(BooguImage):
         step: int,
     ) -> tuple[dict, Optional[dict]]:
         hidden_states = latents
-        num_train_timesteps = _scheduler_num_train_timesteps(model_config.local_path)
+        num_train_timesteps = scheduler_num_train_timesteps(model_config.local_path)
         timestep = boogu_timestep_from_scheduler(timesteps, num_train_timesteps).to(hidden_states.dtype)
         freqs_cis = get_boogu_freqs_cis(module.config.axes_dim_rope, module.config.axes_lens)
         image_latents = micro_batch.get("condition_image_latents", None)
