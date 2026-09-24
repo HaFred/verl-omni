@@ -131,39 +131,9 @@ def resolve_text_guidance_scale(guidance_scale: Optional[float]) -> float:
 # ---------------------------------------------------------------------------
 # LoRA name translation (diffusers -> vllm-omni)
 # ---------------------------------------------------------------------------
-
-# The actor builds its LoRA against the diffusers Boogu model, whose module
-# tree differs from the vllm-omni Boogu transformer in two places. Both have
-# to be translated, because the vLLM manager matches ``target_modules`` against
-# the model's module names independently of the tensor keys -- renaming the
-# keys alone would still wrap no layer, and renaming the targets alone would
-# still bind no tensor.
-#
-# 1. ``to_out``. Diffusers keeps the attention output projection inside an
-#    ``nn.Sequential`` (``attn.to_out.0``); the vllm-omni transformer exposes a
-#    direct ``attn.to_out``. This applies to every self-attention block *and*
-#    to the double-stream joint attention, where ``img_instruct_attn.to_out[0]``
-#    is the projection that merges the image and instruction streams.
-#
-# 2. ``.processor.``. The joint attention's per-stream projections are owned by
-#    the custom attention *processor* on the trainer side, so they are named
-#    ``img_instruct_attn.processor.{img_to_q,img_to_k,img_to_v,instruct_to_q,
-#    instruct_to_k,instruct_to_v,img_out,instruct_out}``. ``Attention`` deletes
-#    its own ``to_q``/``to_k``/``to_v`` in that block (the processor owns them),
-#    which is why only ``to_out`` remains a direct child. The vllm-omni
-#    ``BooguImageJointAttention`` holds all nine as direct attributes, so the
-#    ``.processor.`` infix has to be dropped.
-#
-# Neither mismatch is self-announcing: every other target matches verbatim, so
-# vllm-omni binds a large majority of the deltas and never warns -- it only
-# complains when *nothing* binds. Left untranslated, those deltas are trained
-# on the actor, bind zero rollout modules and vanish, leaving the rollout
-# sampling from a policy that diverges in exactly the subspace the actor keeps
-# training. Measured against the shipped OCR recipe's own checkpoint, 118 of its
-# 394 pushed module paths bind nothing without a translation, and the ``to_out``
-# rule alone still leaves 64 of them (8 joint-attention projections x 8 layers)
-# unbound.
-# See https://github.com/verl-project/verl-omni/issues/658.
+# The diffusers actor and the vllm-omni rollout name two module sets differently. ``to_out.0`` (the attention output
+# projection) vs ``to_out``, and the joint attention's ``.processor.`` infix (8 projections x 8 layers). Both the
+# tensor keys and ``target_modules`` need renaming, else deltas bind nothing and vanish silently (118/394; #658).
 _BOOGU_LORA_NAME_RENAMES: tuple[tuple[str, str], ...] = (
     # The actor exports PEFT keys, which carry the PEFT wrapper in the name
     # (``fsdp_utils.py`` builds them as ``base_model.model.<module>``). Strip it
