@@ -115,6 +115,7 @@ trap 'rm -f "${TRAIN_LOG}"' EXIT
 
 n_resp_per_prompt=2
 micro_bsz_per_gpu=1
+rollout_tp=1
 micro_bsz=$((micro_bsz_per_gpu * NUM_GPUS))
 mini_bsz=${micro_bsz}
 train_batch_size=$((mini_bsz * n_resp_per_prompt))
@@ -169,7 +170,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${rollout_tp} \
     actor_rollout_ref.rollout.name=${ENGINE} \
     actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
     actor_rollout_ref.rollout.agent.num_workers=1 \
@@ -218,13 +219,21 @@ python3 -m verl_omni.trainer.main_diffusion \
 # INFO line about a loaded adapter never reaches this output. The mapper therefore
 # reports its binding outcome once per engine process at WARNING level; assert
 # that positive evidence rather than trusting the exit code.
-if ! grep -qE "Boogu-Image LoRA sync: bound [1-9][0-9]* actor delta modules to vllm-omni, 0 dropped" "${TRAIN_LOG}"; then
-    echo "FAIL: the rollout engine never reported a successful LoRA sync."
+#
+# The report is emitted once per engine process, so a single match is not enough:
+# if three of four workers dropped every delta, `grep -q` would still pass and the
+# run would look healthy. Count the reports and require exactly one per engine.
+expected_engine_workers=$((NUM_GPUS / rollout_tp))
+bind_reports=$(grep -cE "Boogu-Image LoRA sync: bound [1-9][0-9]* actor delta modules to vllm-omni, 0 dropped" "${TRAIN_LOG}" || true)
+if [[ "${bind_reports}" -ne "${expected_engine_workers}" ]]; then
+    echo "FAIL: expected ${expected_engine_workers} LoRA sync report(s) (one per engine"
+    echo "      process), got ${bind_reports}."
     echo "      Expected one line per engine process of the form:"
     echo "        Boogu-Image LoRA sync: bound <N> actor delta modules to vllm-omni, 0 dropped (<M> wrapped target modules)."
-    echo "      Look above for \"unsupported targets\" or \"update_weights_from_ipc' failed\":"
-    echo "      the actor's deltas did not reach the rollout, so this run never"
-    echo "      exercised the DiffusionNFT update path and its pass would be vacuous."
+    echo "      A missing report means that engine's deltas did not reach the rollout,"
+    echo "      so this run never exercised the DiffusionNFT update path and its pass"
+    echo "      would be vacuous. Look above for \"unsupported targets\" or"
+    echo "      \"update_weights_from_ipc' failed\"."
     exit 1
 fi
 
