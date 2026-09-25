@@ -156,6 +156,7 @@ class BooguImagePipelineWithLogProb(QwenImageTokenIdPromptMixin, BooguImagePipel
         peft_config: dict,
     ) -> tuple[dict[str, torch.Tensor], dict]:
         """Translate Boogu LoRA deltas to the vllm-omni transformer layout.
+        TODO (long): Remove this once vllm-omni natively supports syncing Boogu LoRA updates.
 
         The actor exports PEFT names verbatim, so two families of targets arrive
         spelled differently from this transformer:
