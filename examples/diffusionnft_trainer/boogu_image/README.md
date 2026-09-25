@@ -71,6 +71,18 @@ silence a load failure by adding `<image>` to the negative prompt -- that satisf
 count check while feeding the negative branch a placeholder token that is never expanded into
 image features, which quietly shifts the guidance.
 
+The converter also sets `data_source` to `diffusion_nft/pickscore_edit`, which is the label the
+trainer files this dataset's validation reward under. `data_source` is the middle segment of
+every validation key, so this run logs
+`val-core/diffusion_nft/pickscore_edit/reward/mean@1` rather than inheriting the
+`flow_grpo/ocr_edit` name its FlowGRPO ancestor used. Both segments have to be right: the recipe
+is DiffusionNFT, not FlowGRPO, and the reward is PickScore, not OCR. Unlike the T2I dataset above
+— which is shared with `examples/flowgrpo_trainer/boogu_image/run_boogu_image_ocr_lora.sh` and
+cannot be renamed without mislabelling genuine FlowGRPO runs — this one is read by no FlowGRPO
+recipe. The name is stored in the parquet at conversion time, so an existing dataset keeps its
+old key until it is regenerated. See [metrics](../../../docs/start/metrics.md) for what the
+per-step DiffusionNFT keys mean.
+
 ## Launch
 
 ```bash

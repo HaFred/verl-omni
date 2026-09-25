@@ -26,18 +26,13 @@ Input layout (mirrors ``examples/flowgrpo_trainer/qwen_image_edit/prepare_data.p
 first double-quoted span of the instruction, the same convention the T2I
 converter uses (``boogu_image_ocr.py::extract_solution``).
 
-``reward_model.ground_truth`` is the **instruction**, not ``target_text``, because
-that is what the reward reads. The edit recipe scores with PickScore
-(``verl_omni/utils/reward_score/pickscore_reward.py``), which CLIP-encodes
-``ground_truth`` as the *prompt* and measures its similarity to the generated
-image -- the same contract as the verified Qwen-Image-Edit recipe. Storing the
-bare target word there would instead score the image against ``"HELLO"`` as a
-prompt, which is not the edit that was asked for. ``target_text`` is still kept
-in ``extra_info`` for inspection and for the rollout log/validation tables.
-
-``negative_prompt`` mirrors ``prompt`` and keeps its ``<image>`` placeholder; see
-the note at its construction site for why that is load-bearing rather than
-cosmetic.
+The negative prompt is **text-only**: guided TI2I encodes the negative instruction
+without the reference image (upstream default
+``use_input_images_4_neg_instruct=False``), so an ``<image>`` placeholder here would
+be tokenized but never expanded into image features. That satisfies the media-count
+check while quietly shifting the guidance, so the row deliberately references
+**fewer** media than it carries — which ``RLHFDataset._build_messages`` permits for
+the negative key and for no other.
 """
 
 import argparse
@@ -99,25 +94,20 @@ def convert_split(input_dir: Path, split: str, max_samples: int, image_size: int
 
             rows.append(
                 {
-                    "data_source": "flow_grpo/ocr_edit",
+                    "data_source": "pickscore_edit",
                     "prompt": [
                         {"role": "system", "content": BOOGU_SYSTEM_PROMPT_TI2I},
                         {"role": "user", "content": f"Picture 1: <image>{instruction}"},
                     ],
-                    # The reference image is listed in the negative branch too: the
-                    # negative prompt must carry the same <image> placeholder as the
-                    # positive one. rl_dataset._build_messages asserts that the
-                    # placeholder count equals the row's image count for every prompt
-                    # it builds, and it only skips that check for text-only rows when
-                    # no processor is set -- never the case for Boogu. Omitting it here
-                    # is what made earlier launches die with
-                    # "image_offset 0 != len(images) 1". Sibling edit converters
-                    # (qwen_image_edit/prepare_data.py,
-                    # tests/special_e2e/create_dummy_image_edit_data.py) use the same
-                    # "Picture 1: <image> " form.
+                    # Text-only: the reference image is not fed to the negative branch
+                    # (upstream `use_input_images_4_neg_instruct=False`), so no `<image>`
+                    # placeholder here. `RLHFDataset._build_messages` allows the negative
+                    # key to consume fewer media than the row carries for exactly this
+                    # reason; adding a placeholder back would satisfy that check while
+                    # handing the negative encode a token that is never expanded.
                     "negative_prompt": [
                         {"role": "system", "content": BOOGU_SYSTEM_PROMPT_TI2I},
-                        {"role": "user", "content": "Picture 1: <image> "},
+                        {"role": "user", "content": ""},
                     ],
                     "ability": "image_edit",
                     "images": [{"bytes": load_condition_image(image_path, image_size)}],
