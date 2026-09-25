@@ -17,6 +17,7 @@ from typing import Optional
 
 import torch
 from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 
 from verl_omni.pipelines.boogu_image_flow_grpo.common import (
     apply_boogu_text_cfg,
@@ -26,7 +27,6 @@ from verl_omni.pipelines.boogu_image_flow_grpo.common import (
 )
 from verl_omni.pipelines.boogu_image_flow_grpo.diffusers_training_adapter import BooguImage
 from verl_omni.pipelines.model_base import DiffusionModelBase
-from verl_omni.pipelines.utils import scheduler_num_train_timesteps
 from verl_omni.workers.config import DiffusionModelConfig
 
 __all__ = ["BooguImageDiffusionNFT"]
@@ -51,8 +51,14 @@ class BooguImageDiffusionNFT(BooguImage):
         step: int,
     ) -> tuple[dict, Optional[dict]]:
         hidden_states = latents
-        num_train_timesteps = scheduler_num_train_timesteps(model_config.local_path)
-        timestep = boogu_timestep_from_scheduler(timesteps, num_train_timesteps).to(hidden_states.dtype)
+        num_train_timesteps = tu.get_non_tensor_data(data=micro_batch, key="num_train_timesteps", default=None)
+        if num_train_timesteps is None:
+            raise ValueError(
+                "Boogu-Image DiffusionNFT maps timesteps onto flow time with the engine's "
+                "`num_train_timesteps`, which the micro-batch does not carry. The engine "
+                "publishes it when it builds `xt`, so both agree on one scale."
+            )
+        timestep = boogu_timestep_from_scheduler(timesteps, int(num_train_timesteps)).to(hidden_states.dtype)
         freqs_cis = get_boogu_freqs_cis(module.config.axes_dim_rope, module.config.axes_lens)
         image_latents = micro_batch.get("condition_image_latents", None)
         if image_latents is not None:

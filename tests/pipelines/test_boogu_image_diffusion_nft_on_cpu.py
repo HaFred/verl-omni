@@ -22,6 +22,7 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 import torch
 from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 
 
 @pytest.fixture(scope="module")
@@ -228,6 +229,7 @@ def test_prepare_model_inputs_accepts_single_step_tensors(adapters, tmp_path, ha
     latents = torch.arange(96, dtype=torch.float16).reshape(2, 3, 4, 4)
     timesteps = torch.tensor([500.0, 1500.0])
     micro_batch = TensorDict({}, batch_size=[2])
+    tu.assign_non_tensor(micro_batch, num_train_timesteps=2000)
     if has_condition:
         micro_batch["condition_image_latents"] = latents.float() + 1
     kwargs = dict(
@@ -264,6 +266,58 @@ def test_prepare_model_inputs_accepts_single_step_tensors(adapters, tmp_path, ha
             torch.testing.assert_close(images[0], (latents.float() + 1)[index].to(latents.dtype))
     else:
         assert model_inputs["ref_image_hidden_states"] is None
+
+
+def test_prepare_model_inputs_reads_the_engine_scale_not_the_checkpoint(adapters, tmp_path):
+    """The engine's integer wins over whatever the checkpoint ships on disk.
+
+    The adapter used to re-read ``num_train_timesteps`` from
+    ``scheduler/scheduler_config.json``, so a checkpoint whose config disagreed with the
+    engine's in-memory scheduler noised ``xt`` at one scale and conditioned the
+    transformer on another.
+    """
+    scheduler_dir = tmp_path / "scheduler"
+    scheduler_dir.mkdir()
+    (scheduler_dir / "scheduler_config.json").write_text('{"num_train_timesteps": 1000}', encoding="utf-8")
+    config = _model_config(adapters)
+    object.__setattr__(config, "local_path", str(tmp_path))
+    module = SimpleNamespace(config=SimpleNamespace(axes_dim_rope=[16, 24, 24], axes_lens=[1, 8, 8]))
+    micro_batch = TensorDict({}, batch_size=[2])
+    tu.assign_non_tensor(micro_batch, num_train_timesteps=2000)
+
+    with patch.object(adapters.nft, "get_boogu_freqs_cis", return_value=torch.ones(1, dtype=torch.complex64)):
+        model_inputs, _ = adapters.adapter.prepare_model_inputs(
+            module=module,
+            model_config=config,
+            latents=torch.zeros(2, 3, 4, 4),
+            timesteps=torch.tensor([500.0, 1500.0]),
+            prompt_embeds=torch.ones(2, 5, 8),
+            prompt_embeds_mask=torch.ones(2, 5, dtype=torch.bool),
+            negative_prompt_embeds=None,
+            negative_prompt_embeds_mask=None,
+            micro_batch=micro_batch,
+            step=0,
+        )
+
+    # 1 - 500/2000 and 1 - 1500/2000; the 1000 on disk would give 0.5 and -0.5.
+    torch.testing.assert_close(model_inputs["timestep"], torch.tensor([0.75, 0.25]))
+
+
+def test_prepare_model_inputs_requires_the_engine_scale(adapters):
+    """A micro-batch without the engine's integer must fail loudly, not guess a scale."""
+    with pytest.raises(ValueError, match="num_train_timesteps"):
+        adapters.adapter.prepare_model_inputs(
+            module=SimpleNamespace(),
+            model_config=_model_config(adapters),
+            latents=torch.zeros(2, 3, 4, 4),
+            timesteps=torch.tensor([500.0, 1500.0]),
+            prompt_embeds=torch.ones(2, 5, 8),
+            prompt_embeds_mask=torch.ones(2, 5, dtype=torch.bool),
+            negative_prompt_embeds=None,
+            negative_prompt_embeds_mask=None,
+            micro_batch=TensorDict({}, batch_size=[2]),
+            step=0,
+        )
 
 
 @pytest.mark.parametrize("output_form", ["tuple", "sample", "tensor"])

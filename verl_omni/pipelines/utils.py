@@ -120,11 +120,10 @@ def prepare_model_inputs(
 def scheduler_num_train_timesteps(model_path: str) -> int:
     """Read a checkpoint's own timestep scale from ``scheduler/scheduler_config.json``.
 
-    The per-pipeline adapters use this to condition their DiT, and the engine derives the same
-    number from its in-memory ``scheduler.config`` when it recovers flow time as
-    ``train_timesteps / N``. Both have to agree: a disagreement noises the sample at one scale
-    and conditions it at another, which trains the model on inconsistent targets. Reading the
-    checkpoint keeps the two in step for every scheduler rather than only those shipping 1000.
+    Boogu-Image FlowGRPO needs this: its ``all_timesteps`` arrive as ``sigma * N`` from the
+    rollout process, whose scheduler the trainer cannot inspect, so the checkpoint is how the
+    training-side adapter recovers the same ``N``. Conditioning the DiT on a different one
+    noises the sample at one scale and conditions it at another.
 
     Args:
         model_path: Checkpoint directory holding ``scheduler/scheduler_config.json``.

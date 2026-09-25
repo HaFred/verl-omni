@@ -1381,6 +1381,7 @@ class NFTDiffusersFSDPEngine(DiffusersFSDPEngine):
                 f"scheduler.config.num_train_timesteps, but {type(self.scheduler).__name__} "
                 "does not define it."
             )
+        tu.assign_non_tensor(micro_batch, num_train_timesteps=int(num_train_timesteps))
         t = timestep.float() / float(num_train_timesteps)
         t_expanded = t.view(-1, *([1] * (x0.ndim - 1)))
 

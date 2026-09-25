@@ -19,6 +19,9 @@ rollout adapters, so the engine has to divide by *that* number to recover flow t
 ``xt`` for any checkpoint whose scheduler config disagrees -- invisible only because every
 in-tree checkpoint happens to declare ``num_train_timesteps: 1000``.
 
+The engine also publishes the integer it divides by on the micro-batch, so the adapter
+conditioning the DiT reads the same value rather than deriving a second one.
+
 The existing adapter-level test (``test_prepare_model_inputs_accepts_single_step_tensors``)
 runs at ``N=2000`` and therefore *could* have caught this, but it only exercises the
 adapter's own conversion, never the engine's divisor.
@@ -30,6 +33,7 @@ from unittest.mock import patch
 import pytest
 import torch
 from tensordict import TensorDict
+from verl.utils import tensordict_utils as tu
 
 from verl_omni.workers.engine.fsdp.diffusers_impl import NFTDiffusersFSDPEngine
 
@@ -75,11 +79,14 @@ def test_engine_divides_train_timesteps_by_the_scheduler_scale(num_train_timeste
     engine = _stub_engine(num_train_timesteps)
     timesteps = torch.tensor([[750.0, 250.0], [500.0, 100.0]])
 
+    micro_batch = _micro_batch(timesteps)
     with patch(_PREPARE_MODEL_INPUTS, return_value=({}, {})):
-        *_, t_expanded = engine.prepare_model_inputs(micro_batch=_micro_batch(timesteps), step=0)
+        *_, t_expanded = engine.prepare_model_inputs(micro_batch=micro_batch, step=0)
 
     expected = (timesteps[:, 0] / num_train_timesteps).view(-1, 1, 1, 1)
     torch.testing.assert_close(t_expanded, expected)
+    # The adapter conditions the DiT with this integer, so the engine hands it over.
+    assert tu.get_non_tensor_data(micro_batch, "num_train_timesteps", default=None) == num_train_timesteps
 
     # Span the whole schedule to confirm the divisor is uniform across steps.
     with patch(_PREPARE_MODEL_INPUTS, return_value=({}, {})):
@@ -90,17 +97,20 @@ def test_engine_divides_train_timesteps_by_the_scheduler_scale(num_train_timeste
 def test_engine_flow_time_is_complementary_to_the_boogu_timestep():
     """B2's cross-module invariant, without importing the pipeline.
 
-    The engine builds ``xt`` from ``t = ts / N`` while the Boogu adapter conditions the
-    transformer on ``1 - ts / N``. Both derive from the same integer, so the two must sum
-    to one; if the engine used a different divisor they would not.
+    The engine builds ``xt`` from ``t = ts / N`` and publishes that ``N`` on the
+    micro-batch; the Boogu adapter conditions the transformer on ``1 - ts / N`` read from
+    the same entry. Both derive from one integer, so the two must sum to one.
     """
     timesteps = torch.tensor([[750.0, 250.0], [500.0, 100.0]])
     for num_train_timesteps in (1000, 2000):
         engine = _stub_engine(num_train_timesteps)
+        micro_batch = _micro_batch(timesteps)
         with patch(_PREPARE_MODEL_INPUTS, return_value=({}, {})):
-            *_, t_expanded = engine.prepare_model_inputs(micro_batch=_micro_batch(timesteps), step=0)
+            *_, t_expanded = engine.prepare_model_inputs(micro_batch=micro_batch, step=0)
 
-        boogu_time = 1.0 - timesteps[:, 0] / num_train_timesteps
+        published = tu.get_non_tensor_data(micro_batch, "num_train_timesteps", default=None)
+        assert published == num_train_timesteps
+        boogu_time = 1.0 - timesteps[:, 0] / published
         torch.testing.assert_close(t_expanded.flatten() + boogu_time, torch.ones(2))
 
 
