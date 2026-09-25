@@ -141,17 +141,43 @@ python3 tests/special_e2e/build_boogu_image_tiny_random.py \
     --source-model "${SOURCE_MODEL}"
 
 if [[ "${MODE}" == "edit" ]]; then
+    # Mirror the real edit recipe's data contract: `boogu_image_edit_ocr.py` emits a text-only
+    # negative prompt (guided TI2I does not feed the reference image to the negative branch), so
+    # the row references fewer media than it carries. Generating the `with-image` form here would
+    # keep the harness green while the real recipe's parquet failed to load -- the placeholder
+    # count would match the image count and mask the loader's exact-count check.
     python3 tests/special_e2e/create_dummy_image_edit_data.py \
         --local_save_dir "${DATA_DIR}" \
         --train_size "${synthetic_train_size}" \
         --val_size 4 \
         --image-width 256 \
-        --image-height 256
+        --image-height 256 \
+        --negative-prompt-mode text-only
 else
     python3 tests/special_e2e/create_dummy_diffusion_data.py \
         --local_save_dir "${DATA_DIR}" \
         --train_size "${synthetic_train_size}" \
         --val_size 4
+fi
+
+# Guard the fixture contract the edit mode depends on. The row must reference fewer media than
+# it carries, i.e. carry a negative prompt with no `<image>` placeholder. If the generator ever
+# reverts to the `with-image` form, the placeholder count equals the image count, the loader's
+# exact-count check is satisfied for the wrong reason, and this harness silently stops covering
+# the row shape the real edit recipe trains on -- which is precisely how it stayed green while
+# `data/ocr/boogu_image_edit` could not be loaded.
+if [[ "${MODE}" == "edit" ]]; then
+    python3 - "${dummy_train_path}" <<'PY'
+import sys
+
+import pandas as pd
+
+negative = pd.read_parquet(sys.argv[1]).iloc[0]["negative_prompt"][1]["content"]
+assert "<image>" not in negative, (
+    f"edit fixture must emit a text-only negative prompt, got {negative!r}; the harness would no "
+    "longer cover the real edit recipe's data contract (see --negative-prompt-mode above)"
+)
+PY
 fi
 
 python3 -m verl_omni.trainer.main_diffusion \

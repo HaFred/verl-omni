@@ -13,12 +13,18 @@
 # Data: examples/flowgrpo_trainer/data_process/boogu_image_edit_ocr.py
 #   python3 examples/flowgrpo_trainer/data_process/boogu_image_edit_ocr.py \
 #       --input_dir ~/data/ocr_edit \
-#       --output_dir "$HOME/data/ocr/boogu_image_edit" \
+#       --output_dir "$HOME/data/ocr/boogu_image_edit_pickscore" \
 #       --image_size 512
-# The reward is the T2I recipe's OCR GenRM, unchanged: it transcribes the *edited* output and
-# compares it to the row's `target_text`, so an edit scores only once the requested text
-# actually appears. Output resolution follows the reference image (`align_res`), which the
-# converter pins by letterboxing onto a square `--image_size` canvas.
+# The reward is PickScore -- the reward the verified TI2I recipe
+# examples/flowgrpo_trainer/qwen_image_edit/run_qwen_image_edit_lora.sh uses. It scores the
+# generated image against the edit instruction by CLIP similarity, so it reads the
+# *instruction* from each row's `ground_truth`; that is why the dataset above is the
+# `_pickscore` one, which the converter writes with the instruction in `ground_truth` rather
+# than the target text the OCR GenRM needed. PickScore runs CLIP locally in the reward
+# workers, so this recipe serves no reward model at all.
+#
+# Output resolution follows the reference image (`align_res`), which the converter pins by
+# letterboxing onto a square `--image_size` canvas.
 #
 # Run from the repo root: `reward.custom_reward_function.path` is repo-relative.
 set -euo pipefail
@@ -26,8 +32,8 @@ set -euo pipefail
 # Set WORKSPACE to any writable directory; defaults to $HOME.
 WORKSPACE=${WORKSPACE:-$HOME}
 
-ocr_train_path=${TRAIN_FILES:-$WORKSPACE/data/ocr/boogu_image_edit/train.parquet}
-ocr_test_path=${VAL_FILES:-$WORKSPACE/data/ocr/boogu_image_edit/test.parquet}
+ocr_train_path=${TRAIN_FILES:-$WORKSPACE/data/ocr/boogu_image_edit_pickscore/train.parquet}
+ocr_test_path=${VAL_FILES:-$WORKSPACE/data/ocr/boogu_image_edit_pickscore/test.parquet}
 
 model_name=${MODEL_NAME:-Boogu/Boogu-Image-0.1-Base}
 # Boogu's tokenizer lives under `processor/`, but an HF hub id allows only two
@@ -42,23 +48,22 @@ PY
     )
 fi
 tokenizer_path=${TOKENIZER_PATH:-$model_dir/processor}
-reward_model_name=${REWARD_MODEL_NAME:-Qwen/Qwen3-VL-8B-Instruct}
-reward_function_path=verl_omni/utils/reward_score/genrm_ocr.py
 
 NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS:-4}
 # BooguImagePipeline supports neither TP nor SP nor CFG-parallel.
 ROLLOUT_TP=1
-# Qwen3-VL-8B has 32 query / 8 KV heads, so REWARD_TP must be a power of two
-# (TP=3 cannot partition them): the largest power of two dividing NUM_GPUS.
-if [[ -z "${REWARD_TP:-}" ]]; then
-    REWARD_TP=1
-    while (( NUM_GPUS_ACTOR_ROLLOUT_REWARD % (REWARD_TP * 2) == 0 )); do
-        REWARD_TP=$((REWARD_TP * 2))
-    done
-fi
 
 ENGINE=vllm_omni
-REWARD_ENGINE=vllm
+
+# --- reward function --------------------------------------------------------
+# PickScore, as in the verified Qwen-Image-Edit TI2I recipe. It runs CLIP locally in the
+# reward workers, so no reward model is served and the ~17GB/GPU GenRM replica the T2I
+# recipe carries is absent here. One worker per GPU, since each worker loads its own CLIP
+# onto the device it is placed on.
+reward_function_path=${REWARD_FUNCTION_PATH:-pkg://verl_omni.utils.reward_score.pickscore_reward}
+reward_function_name=${REWARD_FUNCTION_NAME:-compute_score_pickscore}
+REWARD_WORKERS=${REWARD_WORKERS:-$NUM_GPUS_ACTOR_ROLLOUT_REWARD}
+echo "[reward] fn=${reward_function_name} path=${reward_function_path} workers=${REWARD_WORKERS} data=$(dirname "$ocr_train_path")" >&2
 
 # FA3 is unavailable here; default to the native/SDPA pair, which must be used
 # together (enforced in diffusion_attention.py). ATTN_BACKEND=fa3 opts back in.
@@ -71,23 +76,11 @@ else
     ROLLOUT_ATTN_BACKEND=TORCH_SDPA
 fi
 
-# The rollout and reward engines are co-located, so these shares are additive
-# and must sum to ~0.75 (0.5+0.5 leaves the actor nothing and OOMs weight sync).
-# TP=1 puts the full ~17GB Qwen3-VL replica on every GPU, so it needs more.
-if [[ -z "${REWARD_GPU_MEM_UTIL:-}" ]]; then
-    if (( REWARD_TP >= 4 )); then
-        REWARD_GPU_MEM_UTIL=0.25
-    else
-        REWARD_GPU_MEM_UTIL=0.30
-    fi
-fi
-if [[ -z "${ROLLOUT_GPU_MEM_UTIL:-}" ]]; then
-    if (( REWARD_TP >= 4 )); then
-        ROLLOUT_GPU_MEM_UTIL=0.5
-    else
-        ROLLOUT_GPU_MEM_UTIL=0.45
-    fi
-fi
+# With PickScore there is no co-located reward engine, so the rollout no longer shares its
+# device with an 8B GenRM replica. The T2I recipe fits that replica in 0.25 on top of a 0.5
+# rollout; with the replica gone, 0.5 for the rollout is what this recipe already used and
+# leaves strictly more headroom for the actor than before.
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
 
 # Edit output resolution follows the reference image (align_res); this is the
 # fallback when a batch carries no reference.
@@ -104,6 +97,7 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-24}
 TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES:-7200}
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-256}
 TOTAL_TRAIN_STEPS=${TOTAL_TRAIN_STEPS:-30}
+DATA_SEED=${DATA_SEED:-42}
 
 python3 -m verl_omni.trainer.main_diffusion \
     trainer.use_v1=false \
@@ -113,6 +107,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.val_max_samples=$VAL_MAX_SAMPLES \
     data.train_batch_size=$TRAIN_BATCH_SIZE \
     data.max_prompt_length=$MAX_PROMPT_LENGTH \
+    data.seed=$DATA_SEED \
     actor_rollout_ref.model.algorithm=diffusion_nft \
     actor_rollout_ref.model.model_type=diffusion_nft_model \
     actor_rollout_ref.model.path=$model_dir \
@@ -167,15 +162,10 @@ python3 -m verl_omni.trainer.main_diffusion \
     algorithm.old_policy_decay_schedule=delayed_linear_to_0_999 \
     algorithm.old_policy_update_interval=2 \
     algorithm.adv_mode=continuous \
-    reward.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP)) \
-    reward.reward_model.enable=True \
-    reward.reward_model.model_path=$reward_model_name \
-    reward.reward_model.rollout.name=$REWARD_ENGINE \
-    reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_TP \
-    reward.reward_model.rollout.gpu_memory_utilization=$REWARD_GPU_MEM_UTIL \
-    reward.reward_model.rollout.max_model_len=8192 \
+    reward.num_workers=$REWARD_WORKERS \
+    reward.reward_model.enable=False \
     reward.custom_reward_function.path=$reward_function_path \
-    reward.custom_reward_function.name=compute_score_ocr \
+    reward.custom_reward_function.name=$reward_function_name \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name=diffusion_nft \
     trainer.experiment_name=boogu_image_ocr_edit_lora \

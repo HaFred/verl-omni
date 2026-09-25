@@ -15,11 +15,6 @@
 
 The task is *text editing*: each sample carries a source image that already
 contains rendered text, plus an instruction asking for that text to be replaced.
-The reward is the existing OCR GenRM (``compute_score_ocr``), which transcribes
-the rollout image and compares it to ``ground_truth`` — the text the edit was
-supposed to produce. No new reward code is needed, and unlike a preference
-scorer this reward *is* edit-aware for this task: the edit only scores if the
-requested text actually appears.
 
 Input layout (mirrors ``examples/flowgrpo_trainer/qwen_image_edit/prepare_data.py``)::
 
@@ -31,21 +26,18 @@ Input layout (mirrors ``examples/flowgrpo_trainer/qwen_image_edit/prepare_data.p
 first double-quoted span of the instruction, the same convention the T2I
 converter uses (``boogu_image_ocr.py::extract_solution``).
 
-Prompt conventions differ from the Qwen-Image-Edit converter in two ways that
-both silently corrupt training if copied over unchanged:
+``reward_model.ground_truth`` is the **instruction**, not ``target_text``, because
+that is what the reward reads. The edit recipe scores with PickScore
+(``verl_omni/utils/reward_score/pickscore_reward.py``), which CLIP-encodes
+``ground_truth`` as the *prompt* and measures its similarity to the generated
+image -- the same contract as the verified Qwen-Image-Edit recipe. Storing the
+bare target word there would instead score the image against ``"HELLO"`` as a
+prompt, which is not the edit that was asked for. ``target_text`` is still kept
+in ``extra_info`` for inspection and for the rollout log/validation tables.
 
-- **Both** the positive and the negative prompt use the *TI2I unified* system
-  prompt. For T2I only the empty negative prompt hits that template; on the
-  editing path it is the positive template too.
-- The negative prompt carries **no** ``<image>`` placeholder. Upstream defaults
-  to ``use_input_images_4_neg_instruct=False``, so the rollout adapter encodes
-  the negative instruction text-only (``vllm_omni_rollout_adapter.py``). A
-  placeholder here would never be expanded into image features.
-
-Condition images are letterboxed onto a square canvas. Boogu-Image-Edit derives
-its output resolution from the VAE-preprocessed reference (``align_res``), so
-mixed source aspect ratios would produce mixed output resolutions inside a
-rollout batch. A fixed square canvas pins the output to ``image_size``.
+``negative_prompt`` mirrors ``prompt`` and keeps its ``<image>`` placeholder; see
+the note at its construction site for why that is load-bearing rather than
+cosmetic.
 """
 
 import argparse
@@ -112,15 +104,26 @@ def convert_split(input_dir: Path, split: str, max_samples: int, image_size: int
                         {"role": "system", "content": BOOGU_SYSTEM_PROMPT_TI2I},
                         {"role": "user", "content": f"Picture 1: <image>{instruction}"},
                     ],
-                    # Text-only: upstream does not feed the reference image to the
-                    # negative branch, so no <image> placeholder here.
+                    # The reference image is listed in the negative branch too: the
+                    # negative prompt must carry the same <image> placeholder as the
+                    # positive one. rl_dataset._build_messages asserts that the
+                    # placeholder count equals the row's image count for every prompt
+                    # it builds, and it only skips that check for text-only rows when
+                    # no processor is set -- never the case for Boogu. Omitting it here
+                    # is what made earlier launches die with
+                    # "image_offset 0 != len(images) 1". Sibling edit converters
+                    # (qwen_image_edit/prepare_data.py,
+                    # tests/special_e2e/create_dummy_image_edit_data.py) use the same
+                    # "Picture 1: <image> " form.
                     "negative_prompt": [
                         {"role": "system", "content": BOOGU_SYSTEM_PROMPT_TI2I},
-                        {"role": "user", "content": ""},
+                        {"role": "user", "content": "Picture 1: <image> "},
                     ],
                     "ability": "image_edit",
                     "images": [{"bytes": load_condition_image(image_path, image_size)}],
-                    "reward_model": {"style": "model", "ground_truth": target_text},
+                    # The instruction, not `target_text`: this is the prompt PickScore
+                    # CLIP-encodes against the generated image (see the module docstring).
+                    "reward_model": {"style": "model", "ground_truth": instruction},
                     "extra_info": {
                         "split": split,
                         "index": index,

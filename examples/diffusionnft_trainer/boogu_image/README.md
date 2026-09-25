@@ -43,6 +43,34 @@ The parquet must carry a `negative_prompt` column. Boogu is a *guided* model
 (`pipeline.guidance_scale=4.0`), and both the training adapter and the rollout fail closed
 when guidance is active without negative embeddings, rather than silently sampling unguided.
 
+### Edit (TI2I) dataset
+
+[`run_boogu_image_edit_lora.sh`](run_boogu_image_edit_lora.sh) is the TI2I sibling of
+the launcher above. It reads a separate dataset, produced by the edit-specific converter:
+
+```bash
+python examples/flowgrpo_trainer/data_process/boogu_image_edit_ocr.py \
+    --input_dir ~/data/ocr_edit --output_dir ~/data/ocr/boogu_image_edit_pickscore --image_size 512
+```
+
+Each row pairs the source image in `images` with an "edit this text" instruction and a
+`target_text`. The reward is **PickScore** — the same reward as the verified
+[Qwen-Image-Edit TI2I recipe](../../flowgrpo_trainer/qwen_image_edit/README.md) — which
+CLIP-encodes `reward_model.ground_truth` as the prompt and scores its similarity to the
+generated image. `ground_truth` is therefore the **instruction**, not the target word; the
+converter writes it that way and keeps `target_text` in `extra_info`. With the OCR GenRM
+(rather than PickScore) a bare target word would be the right `ground_truth`, so the two are
+not interchangeable — the directory name carries the distinction so they cannot be confused.
+PickScore runs CLIP locally in the reward workers, so this recipe serves no reward model.
+
+That converter deliberately emits a **text-only** negative prompt: guided TI2I encodes the
+negative instruction without the reference image (`use_input_images_4_neg_instruct=False`), and
+the reference latents reach the unconditional forward separately. A negative prompt that
+references no media is therefore allowed to consume fewer media than the row carries. Do not
+silence a load failure by adding `<image>` to the negative prompt -- that satisfies the media
+count check while feeding the negative branch a placeholder token that is never expanded into
+image features, which quietly shifts the guidance.
+
 ## Launch
 
 ```bash
