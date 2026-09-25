@@ -61,9 +61,6 @@ class QwenImageDiffusionNFT(QwenImage):
 
         model_inputs = {
             "hidden_states": xt,
-            # Condition the DiT at the scale the engine used to mix `xt`: it divides `timesteps`
-            # by the checkpoint's `num_train_timesteps`, so a different divisor here would feed
-            # the DiT a timestep that disagrees with its own noisy input.
             "timestep": timestep / 1000.0,
             "guidance": guidance,
             "encoder_hidden_states_mask": prompt_embeds_mask,
