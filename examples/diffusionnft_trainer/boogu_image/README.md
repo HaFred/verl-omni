@@ -50,7 +50,10 @@ when guidance is active without negative embeddings, rather than silently sampli
 ### Edit (TI2I) dataset
 
 [`run_boogu_image_edit_lora.sh`](run_boogu_image_edit_lora.sh) is the TI2I sibling of
-the launcher above. It reads a separate dataset, produced by the edit-specific converter:
+the launcher above. It defaults to the edit-specialised
+[`Boogu/Boogu-Image-0.1-Edit`](https://huggingface.co/Boogu/Boogu-Image-0.1-Edit)
+checkpoint rather than `Boogu-Image-0.1-Base`, which the T2I launcher above uses. It reads
+a separate dataset, produced by the edit-specific converter:
 
 ```bash
 python examples/flowgrpo_trainer/data_process/boogu_image_edit_ocr.py \

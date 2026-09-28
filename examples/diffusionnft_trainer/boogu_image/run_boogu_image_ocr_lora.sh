@@ -162,6 +162,6 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
-    trainer.test_freq=5 \
+    trainer.test_freq=20 \
     trainer.total_epochs=1 \
     trainer.total_training_steps=$TOTAL_TRAIN_STEPS "$@"

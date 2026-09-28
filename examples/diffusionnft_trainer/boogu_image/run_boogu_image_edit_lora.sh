@@ -10,7 +10,7 @@ WORKSPACE=${WORKSPACE:-$HOME}
 ocr_train_path=${TRAIN_FILES:-$WORKSPACE/data/ocr/boogu_image_edit_pickscore/train.parquet}
 ocr_test_path=${VAL_FILES:-$WORKSPACE/data/ocr/boogu_image_edit_pickscore/test.parquet}
 
-model_name=${MODEL_NAME:-Boogu/Boogu-Image-0.1-Base}
+model_name=${MODEL_NAME:-Boogu/Boogu-Image-0.1-Edit}
 # Boogu's tokenizer lives under `processor/`, but an HF hub id allows only two
 # segments, so resolve MODEL_NAME to a local dir and point AutoTokenizer at it.
 if [[ -d "$model_name" ]]; then
@@ -139,6 +139,6 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
     trainer.nnodes=1 \
     trainer.save_freq=20 \
-    trainer.test_freq=5 \
+    trainer.test_freq=20 \
     trainer.total_epochs=1 \
     trainer.total_training_steps=$TOTAL_TRAIN_STEPS "$@"
