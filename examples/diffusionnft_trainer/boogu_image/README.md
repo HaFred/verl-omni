@@ -82,14 +82,16 @@ distinction belongs in `trainer.experiment_name`.
 
 PickScore runs CLIP locally in the reward workers, so this recipe serves no reward model.
 
-The converter lists the reference image in the negative branch too, so `negative_prompt` carries
-the same `<image>` placeholder as `prompt`. That is load-bearing rather than cosmetic:
-`RLHFDataset._build_messages` requires the placeholder count to equal the row's media count for
-every prompt it builds, and it only skips that check for a text-only negative when no processor is
-set — never the case for Boogu. Omitting the placeholder is what made earlier launches die with
-`image_offset 0 != len(images) 1`. Sibling edit converters (`qwen_image_edit/prepare_data.py`) use
-the same `Picture 1: <image> ` form, which is also the form the dataset this recipe loads was
-built with.
+The converter writes a **text-only** negative prompt (`negative_prompt` carries no `<image>`
+placeholder) for the edit arm: guided TI2I encodes the negative instruction without the reference
+image (upstream default `use_input_images_4_neg_instruct=False`), so a placeholder there would be
+tokenized but never expanded into image features — it would satisfy the media-count check while
+quietly shifting the guidance. `RLHFDataset._build_messages` therefore permits the negative key to
+consume **fewer** media than the row carries (`image_offset <= len(images)`), and only the negative
+key; the positive prompt still has to match exactly. The T2I converter (`boogu_image_ocr.py`) and
+the edit e2e fixture (`tests/special_e2e/create_dummy_image_edit_data.py --negative-prompt-mode
+text-only`) emit the same text-only form. Qwen-Image-Edit's converter instead keeps the placeholder, but that is a different model family
+whose negative branch does feed the image; do not copy it here.
 
 The name is baked into the parquet at conversion time, so an existing dataset keeps its old key
 until it is regenerated or rewritten in place with

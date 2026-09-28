@@ -44,9 +44,6 @@ fi
 
 ENGINE=vllm_omni
 REWARD_ENGINE=vllm
-
-# FA3 is unavailable here; default to the native/SDPA pair, which must be used
-# together (enforced in diffusion_attention.py). ATTN_BACKEND=fa3 opts back in.
 ATTN_BACKEND=${ATTN_BACKEND:-native}
 if [[ "$ATTN_BACKEND" == "fa3" ]]; then
     MODEL_ATTN_BACKEND=_flash_3_varlen_hub

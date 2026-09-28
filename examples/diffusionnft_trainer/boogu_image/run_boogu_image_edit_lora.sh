@@ -33,9 +33,6 @@ reward_function_path=${REWARD_FUNCTION_PATH:-pkg://verl_omni.utils.reward_score.
 reward_function_name=${REWARD_FUNCTION_NAME:-compute_score_pickscore}
 REWARD_WORKERS=${REWARD_WORKERS:-1}
 echo "[reward] fn=${reward_function_name} path=${reward_function_path} workers=${REWARD_WORKERS} data=$(dirname "$ocr_train_path")" >&2
-
-# FA3 is unavailable here; default to the native/SDPA pair, which must be used
-# together (enforced in diffusion_attention.py). ATTN_BACKEND=fa3 opts back in.
 ATTN_BACKEND=${ATTN_BACKEND:-native}
 if [[ "$ATTN_BACKEND" == "fa3" ]]; then
     MODEL_ATTN_BACKEND=_flash_3_varlen_hub
