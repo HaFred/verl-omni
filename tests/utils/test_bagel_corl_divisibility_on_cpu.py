@@ -39,7 +39,12 @@ from omegaconf.errors import MissingMandatoryValue
 from verl_omni.utils.config import _bagel_corl_divisibility_failures, validate_bagel_corl_config
 
 _RECIPE_DIR = pathlib.Path(__file__).resolve().parents[2] / "examples" / "agenticllmgrpo_trainer" / "bagel"
-_RECIPES = ("run_agentic_bagel_rpco_lora.sh", "run_agentic_bagel_rpco_lora_longrun.sh")
+# A one-element tuple, not a bare string: it is still parametrized over in many places
+# below. It used to hold ``run_agentic_bagel_rpco_lora_longrun.sh`` too, to catch the two
+# recipes drifting apart; that near-duplicate was removed (it defaulted to a 3-step smoke
+# run and still documented the superseded judge-sidecar RM), so there is nothing left to
+# diverge from.
+_RECIPES = ("run_agentic_bagel_rpco_lora.sh",)
 
 
 def _cfg(**over: object):

@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from contextlib import nullcontext
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 import torch.distributed
 from tensordict import TensorDict
@@ -632,6 +633,52 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         """Run forward/backward over a batch; implemented by algorithm-specific subclasses."""
         pass
 
+    @staticmethod
+    def _reslice_per_row_non_tensors(data: TensorDict, micro_batches: list[TensorDict]) -> None:
+        """Re-attach the correct per-row slice of each row-aligned non-tensor key.
+
+        ``prepare_micro_batches`` → ``chunk_tensordict`` rebuilds every micro-batch from
+        ``td.items()`` and copies non-tensor entries through **verbatim**, so a *per-row* non-tensor
+        key (one whose length equals ``len(data)``) is replicated **unsliced** into every
+        micro-batch. Scalars (``sp_size``, ``micro_batch_size_per_gpu``, ``skip_gen``) are
+        unaffected, which is why this stayed invisible until a per-row non-tensor reached the
+        diffusion step.
+
+        Reproduced on CPU 2026-09-24: an 8-row batch carrying ``prompt_token_ids`` of length 8
+        yields 8 micro-batches that each still report all 8. The Bagel adapter reads those ids per
+        row (``bagel_flow_grpo/diffusers_training_adapter.py:152``), so ``bagel_model`` then
+        concatenates 8 text rows against 1 latent row:
+
+            RuntimeError: Sizes of tensors must match except in dimension 1.
+            Expected size 8 but got size 1 for tensor number 1 in the list.
+
+        (measured 2026-09-23 17:23 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_170726``).
+
+        Only list-like values are re-sliced. A ``TensorDict`` stash such as ``bagel_corl_gen`` also
+        reports a length, but it is a single blob the caller consumes as a whole, not a column.
+        """
+        chunks = len(micro_batches)
+        rows = len(data)
+        if chunks <= 1 or not rows:
+            return
+        chunk_size = rows // chunks
+        if chunk_size * chunks != rows:
+            # ``prepare_micro_batches`` refuses a ragged split on the non-dynamic path, so this is
+            # unreachable today; refuse rather than mis-slice if that ever changes.
+            return
+        for key in list(data.keys()):
+            if isinstance(data.get(key), torch.Tensor):
+                continue
+            values = tu.get_non_tensor_data(data, key, default=None)
+            if not isinstance(values, (np.ndarray, list, tuple)):
+                continue
+            if len(values) != rows:
+                continue
+            for index, micro_batch in enumerate(micro_batches):
+                tu.assign_non_tensor(
+                    micro_batch, **{key: values[index * chunk_size : (index + 1) * chunk_size]}
+                )
+
     @abstractmethod
     def prepare_model_inputs(self, micro_batch: TensorDict, step: int):
         """Build model inputs for one diffusion step; implemented by algorithm-specific subclasses."""
@@ -886,9 +933,47 @@ class DiffusersFSDPEngine(LoRAAdapterMixin, BaseEngine, ABC):
         tu.assign_non_tensor(data, sp_size=self.ulysses_sequence_parallel_size)
         tu.assign_non_tensor(data, use_dynamic_bsz=False)
 
+        # Forcing ``use_dynamic_bsz=False`` above makes ``prepare_micro_batches`` read
+        # ``micro_batch_size_per_gpu`` straight off the batch
+        # (verl/verl/workers/engine/utils.py:89), so the key has to be present here.
+        #
+        # The parent batch carries it -- the worker injects it from ``engine_config``
+        # (verl_omni/workers/engine_workers.py:413 train / :473 infer) -- but the Bagel Co-RL
+        # GEN sub-batch is **materialized** from the trajectory view
+        # (``materialize_gen_train_batch``, see ``forward_backward_batch`` below) rather than
+        # selected out of the parent, so nothing propagates the key. Measured 2026-09-23 on
+        # hk01dgx039 (devices 0/1/6/7, ``outputs/bagel_corl_rm1_20260923_154117``): the very
+        # first step whose GEN rows were trainable (``ENABLE_RM=1``, so ``rm_scores`` was
+        # finally present) died inside ``update_actor`` with
+        #
+        #   KeyError: 'key "micro_batch_size_per_gpu" not found in TensorDict with keys
+        #   ['advantages', 'all_latents', 'all_timesteps', 'bagel_corl_gen', ...
+        #    'rm_scores', 'sample_level_scores', 'skip_gen', 'sp_size', 'use_dynamic_bsz']'
+        #
+        # It stayed invisible while the reward lane was off because ``skip_gen=True`` retired
+        # the GEN loss before this point. The UND pass had the identical defect against the
+        # identical line and carries the identical fix (``bagel_corl_composite.py:314-339``),
+        # including the fallback order: batch first, then the engine's train/infer knob.
+        micro_batch_size_per_gpu = tu.get_non_tensor_data(
+            data=data, key="micro_batch_size_per_gpu", default=None
+        )
+        if micro_batch_size_per_gpu is None:
+            config_key = "infer_micro_batch_size_per_gpu" if forward_only else "micro_batch_size_per_gpu"
+            micro_batch_size_per_gpu = getattr(getattr(self, "engine_config", None), config_key, None)
+        if micro_batch_size_per_gpu is None:
+            raise KeyError(
+                "Bagel Co-RL (Joint-Training) GEN pass requires micro_batch_size_per_gpu: this "
+                "engine forces use_dynamic_bsz=False, so prepare_micro_batches reads it from the "
+                "batch. Set actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu for the train "
+                "pass, and actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu (or "
+                "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu) for the infer pass."
+            )
+        tu.assign_non_tensor(data, micro_batch_size_per_gpu=int(micro_batch_size_per_gpu))
+
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
+        self._reslice_per_row_non_tensors(data, micro_batches)
 
         gradient_accumulation_steps = len(micro_batches) * num_timesteps
         output_lst = []

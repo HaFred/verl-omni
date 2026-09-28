@@ -514,7 +514,29 @@ class BagelPipelineWithLogProb(BagelPipeline):
             if traj_timesteps is not None:
                 traj_timesteps = traj_timesteps[begin:end]
             if traj_log_probs is not None:
-                traj_log_probs = traj_log_probs[begin:end]
+                # ... (see note below) only clamp when the engine handed back the whole
+                # per-step trajectory instead of the window-local vector.
+                _n_logp = (
+                    int(traj_log_probs.shape[0])
+                    if hasattr(traj_log_probs, "shape")
+                    else len(traj_log_probs)
+                )
+                if _n_logp > (end - begin):
+                    # ``latents`` / ``timesteps`` are recorded on *every* step, so they still
+                    # need this window slice.  ``log_probs`` does not: ``begin_forward`` above
+                    # gates ``return_logprobs`` to the window, so the scheduler returns a
+                    # log-prob only on in-window steps and the engine's vector is *already*
+                    # window-local (length ``end - begin``, aligned with ``traj_timesteps``).
+                    # Re-slicing it with the absolute ``[begin:end]`` selected nothing whenever
+                    # ``begin >= end - begin`` -- e.g. ``begin=3, end=5`` on a 2-element vector
+                    # -- so the trainer received a present-but-zero-length ``log_probs`` and
+                    # ``build_gen_flowgrpo_proto`` dropped every GEN row.  Measured 2026-09-23 on
+                    # devices 0,1,6,7 with ``ENABLE_RM=1``: ``rm_score missing=0`` yet
+                    # ``rollout_log_probs missing=N [absent=0 empty=N]`` and ``skip_gen=True`` on
+                    # every step, i.e. the RM was fine and GEN still never trained.  Keep the
+                    # slice only as a guard for an engine that returns the full per-step
+                    # trajectory instead.
+                    traj_log_probs = traj_log_probs[begin:end]
 
         # BAGEL trajectories are time-major; add a batch axis for training consumers.
         if traj_latents is not None:

@@ -139,7 +139,16 @@ def _payload(**overrides):
         "image_paths": ["/a.png", "/b.png"],
         "reference_paths": ["ref.png"],
         "extra_info": {"user_prompt": "draw a castle", "good_enough_threshold": 0.8},
-        "scorer_knobs": {"vllm_url": "http://rm:8000", "good_enough_threshold": 0.8},
+        # ``score_backend`` is a required knob, not an optional one: the scorer defaults to
+        # ``unified_reward`` (the live RM-on recipe's backend) and only the facet judge reads
+        # ``call_reflect_vlm``/``good_enough_threshold``. A payload that patches the facet judge
+        # and omits the knob would silently exercise the unified path instead -- which is how
+        # every facet-judge test in this file broke when that backend landed.
+        "scorer_knobs": {
+            "vllm_url": "http://rm:8000",
+            "good_enough_threshold": 0.8,
+            "score_backend": "vlm_judge",
+        },
         "image_prompt": "a castle at dusk",
     }
     payload.update(overrides)
@@ -302,3 +311,84 @@ def test_compute_score_dispatches_to_episode_scorer(monkeypatch):
     assert result == {"score": 0.42}
     assert seen["ground_truth"] == "a castle"
     assert seen["data_source"] == "bagel_corl_mid_loop_rm"
+
+
+def test_unified_reward_is_the_default_backend(monkeypatch, tmp_path):
+    """A payload without ``score_backend`` scores on UnifiedReward and never calls the judge.
+
+    This is the live recipe's path (``ENABLE_RM=1``, ``agentic_image_gen.score_backend=
+    unified_reward``) and it had no coverage at all, which is exactly how the facet-judge
+    tests above silently started exercising it. ``vlm_judge`` is the *opt-in* backend: the
+    loop stamps the knob, and the default must be the continuous one.
+    """
+    replies = iter(
+        [
+            "Alignment Score: 4\nCoherence Score: 4\nStyle Score: 3\n",  # mean 3.67 -> 0.667
+            "Alignment Score: 2\nCoherence Score: 1\nStyle Score: 1\n",  # mean 1.33 -> 0.083
+        ]
+    )
+    calls: list[dict] = []
+
+    def fake_post(**kwargs):
+        calls.append(kwargs)
+        return next(replies), None
+
+    def explode(**kwargs):  # pragma: no cover - must never run on this backend
+        raise AssertionError("the facet judge ran on the unified backend")
+
+    monkeypatch.setattr(sys.modules["verl_omni.utils.agentic.vllm_chat"], "post_vllm_chat", fake_post)
+    monkeypatch.setattr(client, "call_reflect_vlm", explode)
+
+    paths = []
+    for name in ("a", "b"):
+        path = tmp_path / f"{name}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")  # only the bytes are read; no decode happens
+        paths.append(str(path))
+
+    payload = _payload(image_paths=paths)
+    payload["scorer_knobs"] = {"vllm_url": "http://rm:8000", "good_enough_threshold": 0.8}
+    result = scorer.compute_score(**_kwargs(payload))
+
+    assert result["sample_scores"] == [pytest.approx(2 / 3), pytest.approx(1 / 12)]
+    # The 0.6 *unified* cut is the default stop cue; the facet judge's 0.8 must not be reused.
+    assert result["sample_good_enough"] == [True, False]
+    assert [row["image_path"] for row in result["per_image"]] == paths
+    assert len(calls) == 2
+    assert calls[0]["vllm_url"] == "http://rm:8000"
+
+
+def test_unified_good_enough_threshold_override_moves_the_stop_cue(monkeypatch, tmp_path):
+    """``unified_good_enough_threshold`` is the unified knob; the same axes flip with it."""
+    def fake_post(**kwargs):
+        return "Alignment Score: 4\nCoherence Score: 4\nStyle Score: 3\n", None
+
+    monkeypatch.setattr(sys.modules["verl_omni.utils.agentic.vllm_chat"], "post_vllm_chat", fake_post)
+    path = tmp_path / "a.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n")
+
+    payload = _payload(
+        image_paths=[str(path)],
+        scorer_knobs={
+            "vllm_url": "http://rm:8000",
+            "good_enough_threshold": 0.8,
+            "unified_good_enough_threshold": 0.9,
+        },
+    )
+    result = scorer.compute_score(**_kwargs(payload))
+    assert result["sample_scores"] == [pytest.approx(2 / 3)]
+    assert result["sample_good_enough"] == [False]
+
+
+def test_unified_backend_fails_loud_when_the_reply_has_no_axes(monkeypatch, tmp_path):
+    """A reply without all three 1-5 axes is a failure, never a zero-filled GEN call."""
+    monkeypatch.setattr(
+        sys.modules["verl_omni.utils.agentic.vllm_chat"],
+        "post_vllm_chat",
+        lambda **kwargs: ("sure, it looks nice!", None),
+    )
+    path = tmp_path / "a.png"
+    path.write_bytes(b"\x89PNG\r\n\x1a\n")
+    payload = _payload(image_paths=[str(path)])
+    payload["scorer_knobs"] = {"vllm_url": "http://rm:8000", "good_enough_threshold": 0.8}
+    with pytest.raises(ValueError, match="refusing zero-fill"):
+        scorer.compute_score(**_kwargs(payload))

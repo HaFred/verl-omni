@@ -43,8 +43,6 @@ actor_rollout_ref:
       entropy_from_logits_chunk_size: ${oc.select:actor_rollout_ref.actor.entropy_from_logits_chunk_size,2048}
       use_torch_compile: true
       entropy_checkpointing: ${oc.select:actor_rollout_ref.actor.entropy_checkpointing,False}
-      pad_to_length: ${oc.select:actor_rollout_ref.actor.pad_to_length,False}
-      pad_to_length_bucket: 1024
       forward_only: false
       strategy: fsdp
       dtype: bfloat16
@@ -59,20 +57,6 @@ actor_rollout_ref:
         - re:.*mlp.gate$
         activation_observer: static_minmax
         quantization_config_path: null
-      turbo_config:
-        distributed:
-          fully_shard_parallel_size: 16
-          tensor_parallel_size: 1
-          expert_parallel_size: 1
-          expert_fully_shard_parallel_size: 1
-          ulysses_parallel_size: 1
-          fsdp_plan:
-            param_dtype: bf16
-            reduce_dtype: fp32
-            output_dtype: bf16
-            fsdp_implementation: native
-            num_to_forward_prefetch: 1
-            num_to_backward_prefetch: 1
     _target_: verl_omni.workers.config.omni.OmniActorConfig
     rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
     strategy: fsdp
@@ -127,10 +111,6 @@ actor_rollout_ref:
       all_ranks: false
       ranks: []
       save_path: ${oc.select:global_profiler.save_path,null}
-      relocate_results: ${oc.select:global_profiler.relocate_results,false}
-      finish_hook_cmd: ${oc.select:global_profiler.finish_hook_cmd,null}
-      finish_hook_all_ranks: ${oc.select:global_profiler.finish_hook_all_ranks,false}
-      finish_hook_ranks: ${oc.select:global_profiler.finish_hook_ranks,[]}
       tool_config:
         nsys:
           _target_: verl.utils.profiler.config.NsightToolConfig
@@ -162,6 +142,11 @@ actor_rollout_ref:
           steps: null
           stages: ${oc.select:global_profiler.global_tool_config.precision_debugger.stages,null}
           strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
+    router_replay:
+      _target_: verl.workers.config.RouterReplayConfig
+      mode: disabled
+      record_file: null
+      replay_file: null
     qat:
       enable: false
       mode: w4a16
@@ -177,7 +162,6 @@ actor_rollout_ref:
     entropy_from_logits_with_chunking: false
     entropy_from_logits_chunk_size: 2048
     entropy_checkpointing: false
-    pad_to_length: false
     use_remove_padding: ${oc.select:actor_rollout_ref.model.use_remove_padding,false}
     trainer_type: ${algorithm.trainer_type}
     omni_loss:
@@ -203,10 +187,6 @@ actor_rollout_ref:
       all_ranks: false
       ranks: []
       save_path: ${oc.select:global_profiler.save_path,null}
-      relocate_results: ${oc.select:global_profiler.relocate_results,false}
-      finish_hook_cmd: ${oc.select:global_profiler.finish_hook_cmd,null}
-      finish_hook_all_ranks: ${oc.select:global_profiler.finish_hook_all_ranks,false}
-      finish_hook_ranks: ${oc.select:global_profiler.finish_hook_ranks,[]}
       tool_config:
         nsys:
           _target_: verl.utils.profiler.config.NsightToolConfig
@@ -238,6 +218,11 @@ actor_rollout_ref:
           steps: null
           stages: ${oc.select:global_profiler.global_tool_config.precision_debugger.stages,null}
           strict: ${oc.select:global_profiler.global_tool_config.precision_debugger.strict,False}
+    router_replay:
+      _target_: verl.workers.config.RouterReplayConfig
+      mode: disabled
+      record_file: null
+      replay_file: null
     fsdp_config:
       _target_: verl.workers.config.FSDPEngineConfig
       wrap_policy:
@@ -257,8 +242,6 @@ actor_rollout_ref:
       entropy_from_logits_chunk_size: ${oc.select:actor_rollout_ref.ref.entropy_from_logits_chunk_size,2048}
       use_torch_compile: true
       entropy_checkpointing: ${oc.select:actor_rollout_ref.ref.entropy_checkpointing,False}
-      pad_to_length: ${oc.select:actor_rollout_ref.ref.pad_to_length,False}
-      pad_to_length_bucket: ${oc.select:actor_rollout_ref.actor.fsdp_config.pad_to_length_bucket,1024}
       forward_only: true
       strategy: fsdp
       dtype: bfloat16
@@ -273,26 +256,11 @@ actor_rollout_ref:
         - re:.*mlp.gate$
         activation_observer: static_minmax
         quantization_config_path: null
-      turbo_config:
-        distributed:
-          fully_shard_parallel_size: 16
-          tensor_parallel_size: 1
-          expert_parallel_size: 1
-          expert_fully_shard_parallel_size: 1
-          ulysses_parallel_size: 1
-          fsdp_plan:
-            param_dtype: bf16
-            reduce_dtype: fp32
-            output_dtype: bf16
-            fsdp_implementation: native
-            num_to_forward_prefetch: 1
-            num_to_backward_prefetch: 1
     _target_: verl.workers.config.FSDPActorConfig
     ulysses_sequence_parallel_size: ${oc.select:actor_rollout_ref.actor.ulysses_sequence_parallel_size,1}
     entropy_from_logits_with_chunking: false
     entropy_from_logits_chunk_size: 2048
     entropy_checkpointing: false
-    pad_to_length: ${oc.select:actor_rollout_ref.actor.pad_to_length,False}
   rollout:
     _target_: verl.workers.config.RolloutConfig
     name: vllm_omni
@@ -302,6 +270,7 @@ actor_rollout_ref:
     temperature: 1.0
     top_k: -1
     top_p: 1
+    repetition_penalty: 1.0
     full_determinism: false
     seed: 42
     prompt_length: ${oc.select:data.max_prompt_length,512}
@@ -392,10 +361,6 @@ actor_rollout_ref:
       all_ranks: ${oc.select:actor_rollout_ref.actor.profiler.all_ranks,false}
       ranks: ${oc.select:actor_rollout_ref.actor.profiler.ranks,[]}
       save_path: ${oc.select:global_profiler.save_path,null}
-      relocate_results: ${oc.select:actor_rollout_ref.actor.profiler.relocate_results,false}
-      finish_hook_cmd: ${oc.select:actor_rollout_ref.actor.profiler.finish_hook_cmd,null}
-      finish_hook_all_ranks: ${oc.select:actor_rollout_ref.actor.profiler.finish_hook_all_ranks,false}
-      finish_hook_ranks: ${oc.select:actor_rollout_ref.actor.profiler.finish_hook_ranks,[]}
       tool_config:
         npu:
           _target_: verl.utils.profiler.config.NPUToolConfig
@@ -495,6 +460,7 @@ actor_rollout_ref:
       freeze_vision_projection: true
       freeze_language_model: true
     model_type: omni_model
+    composite_mode: null
     architecture: null
     model_stage: thinker
     hf_config_name: null
@@ -592,8 +558,6 @@ critic:
     entropy_from_logits_chunk_size: 2048
     use_torch_compile: true
     entropy_checkpointing: false
-    pad_to_length: false
-    pad_to_length_bucket: 1024
     forward_only: false
     strategy: fsdp
     dtype: bfloat16
@@ -608,20 +572,6 @@ critic:
       - re:.*mlp.gate$
       activation_observer: static_minmax
       quantization_config_path: null
-    turbo_config:
-      distributed:
-        fully_shard_parallel_size: 16
-        tensor_parallel_size: 1
-        expert_parallel_size: 1
-        expert_fully_shard_parallel_size: 1
-        ulysses_parallel_size: 1
-        fsdp_plan:
-          param_dtype: bf16
-          reduce_dtype: fp32
-          output_dtype: bf16
-          fsdp_implementation: native
-          num_to_forward_prefetch: 1
-          num_to_backward_prefetch: 1
   _target_: verl.workers.config.FSDPCriticConfig
   rollout_n: ${oc.select:actor_rollout_ref.rollout.n,1}
   strategy: fsdp
@@ -653,10 +603,6 @@ critic:
     all_ranks: false
     ranks: []
     save_path: ${oc.select:global_profiler.save_path,null}
-    relocate_results: ${oc.select:global_profiler.relocate_results,false}
-    finish_hook_cmd: ${oc.select:global_profiler.finish_hook_cmd,null}
-    finish_hook_all_ranks: ${oc.select:global_profiler.finish_hook_all_ranks,false}
-    finish_hook_ranks: ${oc.select:global_profiler.finish_hook_ranks,[]}
     tool_config:
       nsys:
         _target_: verl.utils.profiler.config.NsightToolConfig
@@ -943,7 +889,7 @@ distillation:
   nnodes: 0
   teacher_models:
     teacher_model:
-      _target_: verl.workers.config.DistillationTeacherModelConfig
+      _target_: verl_omni.workers.config.omni.distillation.OmniDistillationTeacherModelConfig
       key: null
       model_path: null
       num_replicas: 0
@@ -1009,7 +955,6 @@ trainer:
   esi_redundant_time: 0
   resume_mode: auto
   resume_from_path: null
-  checkpoint_callback_class: null
   val_before_train: true
   val_only: false
   test_freq: -1
@@ -1030,15 +975,6 @@ trainer:
     separate_async:
       num_warmup_batches: 1
       parameter_sync_step: 4
-      hybrid_rollout:
-        _target_: verl.trainer.config.HybridRolloutSwitchConfig
-        enable_switch: false
-        switch_threshold_ratio: 0.4
-        adaptive_switch_threshold: true
-        switch_threshold_step_up: 0.05
-        switch_threshold_step_down: 0.03
-        switch_threshold_release_steps: 2
-        switch_cost_window_size: 3
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
@@ -1047,16 +983,13 @@ trainer:
         path: null
         name: null
       sampler_kwargs: {}
+    bagel_corl_sync: {}
 global_profiler:
   _target_: verl.utils.profiler.ProfilerConfig
   tool: null
   steps: null
   profile_continuous_steps: false
   save_path: outputs/profile
-  relocate_results: false
-  finish_hook_cmd: null
-  finish_hook_all_ranks: false
-  finish_hook_ranks: []
   global_tool_config:
     nsys:
       _target_: verl.utils.profiler.config.NsightToolConfig
@@ -1104,6 +1037,35 @@ skip:
 ray_kwargs:
   ray_init:
     num_cpus: null
-    runtime_env:
-      py_executable: null
   timeline_json_file: null
+agentic_image_gen:
+  vllm_omni_url: ''
+  qwen_image_url: ''
+  qwen_image_seed: null
+  qwen_image_diversify_seed: true
+  qwen_image_height: 512
+  qwen_image_width: 512
+  qwen_image_steps: 20
+  qwen_image_true_cfg_scale: 4.0
+  diffusion_tool_url: ''
+  diffusion_tool_token: null
+  diffusion_tool_timeout: 900
+  vllm_url: ''
+  vllm_model: ''
+  reflect_max_new_tokens: 1024
+  judge_parse_retries: 1
+  reflect_vlm_timeout: 120
+  judge_enable_thinking: false
+  good_enough_threshold: 0.8
+  score_backend: unified_reward
+  unified_good_enough_threshold: 0.6
+  block_generate_after_yes: true
+  block_generate_after_max_passes: true
+  max_generate_image_passes: 3
+  force_first_generate: false
+  force_first_warmup_steps: 10
+  force_first_end_step: 20
+  force_reflection_after_judge: true
+  rewrite_judge_before_generate: true
+  e2e_root: null
+  run_dir: null

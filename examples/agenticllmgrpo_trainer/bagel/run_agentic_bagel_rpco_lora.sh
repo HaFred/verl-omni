@@ -149,7 +149,13 @@ if [[ -d "${_cuda_compat}" ]]; then
 fi
 
 model_name=${BAGEL_MODEL_PATH:-$HOME/models/ByteDance-Seed/BAGEL-7B-MoT}
-reward_model_name=${REWARD_MODEL:-/home/fq9hpsac/fq9hpsacuser11/fred/hf_home/hub/models--Qwen--Qwen3.5-2B/snapshots/15852e8c16360a2fea060d615a32b45270f8a8fc}
+# UnifiedReward 2.0 (Qwen3-VL-2B) is the GEN-lane numeric reward. The previous default
+# was a Qwen3.5-2B *VLM judge*, whose discrete 0.0-1.0 facet grid put every GEN image on
+# the 0.0 floor, so a whole FlowGRPO group scored identically and the advantage (and
+# actor/loss) was exactly zero. UnifiedReward emits graded 1-5 Alignment/Coherence/Style
+# scores, which keeps within-group variance. Same parameter count, so the RM memory
+# footprint and REWARD_TP=4 are unchanged. Override with REWARD_MODEL=... to go back.
+reward_model_name=${REWARD_MODEL:-/scratch/fq9hpsac/huggingface/hub/models--CodeGoat24--UnifiedReward-2.0-qwen3vl-2b/snapshots/64b2f51d68a2fa583b194784b6cce3aeb12ed7df}
 
 # UniCoT sources for the parquet build below. These MUST have defaults here: the
 # launch used to pass them through with no ``:-`` fallback, so an unset shell got
@@ -713,6 +719,8 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
     agentic_image_gen.run_dir=$RUN_DIR \
     agentic_image_gen.vllm_url=$JUDGE_VLLM_URL \
     agentic_image_gen.good_enough_threshold=$JUDGE_GOOD_ENOUGH_THRESHOLD \
+    agentic_image_gen.score_backend=${SCORE_BACKEND:-unified_reward} \
+    agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.6} \
     trainer.v1.trainer_mode=bagel_corl_sync \
     data.train_files=$TRAIN_FILE \
     data.val_files=$VAL_FILE \
@@ -808,4 +816,5 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
     trainer.experiment_name=bagel_corl_pr1 \
     trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
     trainer.nnodes=1 \
-    ${DEFAULT_LOCAL_DIR:+trainer.default_local_dir="$DEFAULT_LOCAL_DIR"}
+    ${DEFAULT_LOCAL_DIR:+trainer.default_local_dir="$DEFAULT_LOCAL_DIR"} \
+    "$@"

@@ -33,6 +33,15 @@ reference words into a long blob does not max ``R_reflect`` / ``R_plan``.
 Rewrite-after-YES zeros ``R_result`` as well as the Done indicator. Reflect
 ``R_result`` requires a terminal trusted YES. ``R_tool`` needs a successful
 PNG generate plus a trusted judge (not merely a parsed tool call).
+
+The Bagel Co-RL (Joint-Training) loop is the second producer of this reward and
+speaks a different observation dialect: calls ride ``<tools>{...}</tools>``, a
+generated image is announced as a bare ``path=<abs>.png``, and the in-loop RM
+verdict arrives paraphrased in the forced ``Reflection: VL judge reports ...``
+line instead of an ``agentic_judge ok=1`` observation. ``_normalize_trajectory_dialect``
+maps the lexical differences and ``_bagel_judge_hits`` reads the verdict, gated on
+the ``generate_image`` call it is attributable to. Both are inert on a Hermes
+transcript.
 """
 
 from __future__ import annotations
@@ -48,6 +57,84 @@ REWARD_COMPONENTS = tuple(f"reward_{name}" for name in (*DIMS, "done", "tool_cal
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
 _JUDGE_OK_RE = re.compile(r"\bagentic_judge\s+ok=1\b", re.IGNORECASE)
+# --- Bagel Co-RL (Joint-Training) observation dialect -------------------------------
+#
+# ``bagel_corl_lib.parse_und_tool_call`` accepts four dialects because the Bagel
+# checkpoint is handed a Hermes system prompt but does NOT answer in it: measured
+# 2026-09-21 15:36 on hk01dgx039 it emits its calls inside the *schema* tag
+# (``<tools>{...}</tools>``) and never in the documented ``<tool_call>`` one. The
+# rollout reads the tagged form; this scorer did not, so every Bagel episode scored a
+# structural zero (``critic/score/mean=0.0`` on every step of
+# ``bagel_corl_rm1_20260927_165227``). ``_TAGGED_CALL_RE`` deliberately accepts a JSON
+# *object* only: the schema block the prompt used to show is a JSON *array* of function
+# definitions, so it can never be mistaken for a call.
+_TAGGED_CALL_RE = re.compile(r"<tools>\s*(\{.*?\})\s*</tools>", re.DOTALL)
+# Bare payload at the **start of a line**: the checkpoint's other call dialect --
+# ``{"name": "generate_image", "arguments": {...}}`` with no tag at all. Measured 2026-09-27
+# 18:12, ``rollout_trajectories/step_000041/sample_19b9f8e0-6656-43f6-a8e6-eafdf2c64abe.02.txt``:
+# the turn leads with the bare object (then a bare ``judge_image``), the ``<tools>`` rewrite
+# above cannot see either, and the episode scored a structural ``0.0`` while its sibling --
+# same step, same task family, but the ``<tools>`` dialect -- scored ``0.43``. That is a
+# dialect artifact, and it also collapses the GRPO group it belongs to (a lone sibling has no
+# baseline), so it is worth the extra pass. The line-start anchor is what keeps a JSON example
+# quoted *inside* prose ("emit {"name": ...} for each subtask") from being read as a call.
+_LINE_START_OBJECT_RE = re.compile(r"(?m)^[ \t]*\{")
+_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+# The checkpoint's *native* call fence, and the third dialect the rollout accepts. Kept in
+# sync with ``bagel_corl_lib._NATIVE_OPEN_TAGS`` / ``_NATIVE_CLOSE_TAGS`` by hand -- this
+# scorer stays self-contained by design (see the module docstring), so the spellings are
+# duplicated rather than imported. Unlike every other dialect the payload is a JSON *array* of
+# call objects, so the rewrite has to pick the first element that carries an actionable
+# ``name`` instead of re-emitting the body: measured 2026-09-27 18:52+
+# (``outputs/bagel_corl_rm1_20260927_183640``), ``sample_1723296b`` emitted
+# ``<|begin_of ToolCall|>[{"name":"generate_image",...}]<|end_of ToolCall|>`` on turn 1 and the
+# same episode re-used ``<|end of the ToolCall|>`` on turn 4 -- three spellings of one marker.
+_NATIVE_OPEN_TAGS = (
+    "start of ToolCall",
+    "begin of ToolCall",
+    "begin_of ToolCall",
+    "begin_of_ToolCall",
+    "FunctionCallBegin",
+)
+_NATIVE_CLOSE_TAGS = (
+    "end of ToolCall",
+    "end_of ToolCall",
+    "end of the ToolCall",
+    "end_of the ToolCall",
+    "end_of_ToolCall",
+    "FunctionCallEnd",
+)
+_NATIVE_CALL_BLOCK_RE = re.compile(
+    r"<\|(?:%s)\|>\s*(.*?)\s*(?:<\|(?:%s)\|>|\Z)"
+    % (
+        "|".join(re.escape(tag) for tag in _NATIVE_OPEN_TAGS),
+        "|".join(re.escape(tag) for tag in _NATIVE_CLOSE_TAGS),
+    ),
+    re.DOTALL,
+)
+# Bagel's UND-facing image observation: ``bagel_corl_lib.compact_image_observation``
+# appends the bare path of the one image the loop accepted. It is *absolute*, which is what
+# keeps this from matching a ``path=`` that a prompt happened to mention, and it is glued to
+# whatever the model wrote last (see ``_count_successful_generates``), so no left anchor.
+_BAGEL_IMAGE_OBS_RE = re.compile(r"path=(/[^\s'\"]*?\.png)")
+# Bagel has no ``agentic_judge ok=1`` observation either: the in-loop RM verdict is
+# paraphrased by ``rpco_turn_protocol.build_forced_reflection`` into the forced
+# *Reflection* line, and only that paraphrase reaches the transcript. Same numbers as
+# ``format_rm_scores_as_judge_text`` would emit, different vocabulary.
+_BAGEL_VERDICT_RE = re.compile(
+    r"Reflection:\s*VL judge reports\s+correctness\s*=\s*([0-9]*\.?[0-9]+)\s*,\s*"
+    r"aesthetics\s*=\s*([0-9]*\.?[0-9]+)\s*,\s*good_enough\s*=\s*(YES|NO)\b",
+    re.IGNORECASE,
+)
+# Harness-injected stop cues. Text carrying one is context-only (``response_mask=0``) and
+# must not be read as policy prose. ``agentic_forced_reflection`` is what the Mode-2a loops
+# append (``tool_agent_loop`` / ``image_gen_tool_agent_loop``); the other two are what
+# ``rpco_turn_protocol.build_forced_reflection`` writes, and are the *only* cue the Bagel
+# Co-RL loop emits -- it never appends ``agentic_forced_reflection``.
+_FORCED_CONTEXT_CUE_RE = re.compile(
+    r"\bagentic_(?:forced_reflection|force_stop_max_passes|stop_decision_required)=1(?!\d)",
+    re.IGNORECASE,
+)
 _TOOL_OBS_LINE_RE = re.compile(
     r"(?im)^(?!.*\bReflection\s*:).*\b("
     r"agentic_tool|agentic_reflect|agentic_judge|"
@@ -81,6 +168,34 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
         "task_type": "",
         "method": method,
     }
+
+
+def _as_sequence(value: Any) -> list[Any]:
+    """Coerce a dataset reference field into a list of items.
+
+    ``reference_steps`` / ``reference_subtasks`` are written as Python lists but do not
+    survive the parquet round-trip as ones: they come back as ``ndarray``, 1-3 elements
+    wide (measured on ``outputs/data/agentic_unicot/train.parquet``: 5278 and 1107 rows
+    respectively). ``value or []`` is therefore a latent crash -- on a >1-element array it
+    raises ``ValueError: The truth value of an array with more than one element is
+    ambiguous``. That line was unreachable while the scorer bailed out early on every Bagel
+    trajectory (``prompts == []``, because the calls ride ``<tools>``); reading the tagged
+    dialect removed the bail-out and reachable it became, on ~2.5k of 8679 rows.
+
+    Coercion is deliberately permissive: ``None`` (the unused sibling key) and an empty
+    string degrade to no references, a plain string stays *one* reference rather than being
+    iterated into characters, and an unlistable scalar degrades to itself.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, dict):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
@@ -127,6 +242,156 @@ def _parse_tool_call_body(body: str) -> dict[str, Any] | None:
     return {"name": name, "arguments": arguments}
 
 
+def _balanced_object_end(text: str, start: int) -> int | None:
+    """Index just past the JSON object starting at ``start`` (string-aware brace counter).
+
+    ``text[start]`` must be ``{``. Returns ``None`` when the object never closes -- a turn cut
+    by the token budget leaves a half-written payload, and wrapping that would inject a
+    ``<tool_call>`` the model never emitted.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index + 1
+    return None
+
+
+def _wrap_bare_line_payloads(text: str) -> str:
+    """Wrap every line-anchored, named JSON object in ``<tool_call>`` tags.
+
+    Runs *after* the ``<tools>`` rewrite, and skips spans that rewrite already produced
+    (tracked by ``_TOOL_CALL_BLOCK_RE``) so a ``<tools>`` call is never wrapped twice -- a
+    nested ``<tool_call>`` would make ``raw_blocks`` and ``_extract_tool_calls`` disagree
+    again, which is the very check ``_format_reward`` opens with.
+    """
+    protected = [match.span() for match in _TOOL_CALL_BLOCK_RE.finditer(text)]
+    pieces: list[str] = []
+    cursor = 0
+    for match in _LINE_START_OBJECT_RE.finditer(text):
+        start = match.end() - 1
+        if start < cursor or any(low <= start < high for low, high in protected):
+            continue
+        end = _balanced_object_end(text, start)
+        if end is None:
+            continue
+        body = text[start:end]
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(payload, dict) or not payload.get("name"):
+            continue
+        pieces.append(text[cursor:start])
+        pieces.append(f"<tool_call>\n{body}\n</tool_call>")
+        cursor = end
+    if not pieces:
+        return text
+    pieces.append(text[cursor:])
+    return "".join(pieces)
+
+
+def _first_named_object(raw: str) -> dict[str, Any] | None:
+    """First ``{"name": ...}`` object inside a native call body (an array, or a bare object).
+
+    The native fence wraps a JSON **array** of calls, so :func:`_parse_tool_call_body` cannot
+    read it directly. Scans the body's own balanced objects in order and takes the first one
+    that names a tool, which mirrors ``bagel_corl_lib._native_payload``: a multi-call array
+    still drives the loop on its first actionable element. Returns ``None`` for a body with no
+    complete named object -- a turn cut by the token budget must not become a fabricated call.
+    """
+    if not raw:
+        return None
+    cursor = 0
+    while True:
+        start = raw.find("{", cursor)
+        if start < 0:
+            return None
+        end = _balanced_object_end(raw, start)
+        if end is None:
+            return None
+        try:
+            payload = json.loads(raw[start:end])
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("name"):
+            return payload
+        cursor = end
+
+
+def _wrap_native_call_payloads(text: str) -> str:
+    """Rewrite every native ``<|... ToolCall|>[...]<|... ToolCall|>`` span into ``<tool_call>``.
+
+    Runs *before* ``_wrap_bare_line_payloads`` (which would otherwise wrap a pretty-printed
+    element of the same array a second time) and before the ``<tools>`` rewrite is irrelevant
+    -- the spans cannot overlap. A fence whose body carries no named object is left untouched,
+    matching the loop, which also declines to execute it.
+    """
+    def replace(match: re.Match[str]) -> str:
+        payload = _first_named_object(match.group(1) or "")
+        if payload is None:
+            return match.group(0)
+        return f"<tool_call>\n{json.dumps(payload)}\n</tool_call>"
+
+    return _NATIVE_CALL_BLOCK_RE.sub(replace, text)
+
+
+def _normalize_trajectory_dialect(text: str) -> str:
+    """Rewrite the Bagel Co-RL call dialect into the Hermes vocabulary.
+
+    The scorer's dims are protocol-shaped (``format`` counts ``<tool_call>`` blocks
+    against parsed calls, ``result`` needs a judge verdict), and they were written against
+    the Mode-2a Hermes transcript. The Bagel Joint-Training loop renders the *same* facts in
+    its own vocabulary, so every dim read zero and ``critic/score/mean`` was a constant
+    0.0 on every step of ``bagel_corl_rm1_20260927_165227``:
+
+    * calls ride the schema tag -- ``<tools>{json}</tools>`` -- not ``<tool_call>``;
+    * or they ride the checkpoint's native ``<|start of ToolCall|>[{json}]<|end of ToolCall|>``
+      fence (every spelling in ``_NATIVE_OPEN_TAGS``/``_NATIVE_CLOSE_TAGS``), whose payload is an
+      array rather than an object;
+    * or they ride *no* tag at all, as a bare line-anchored JSON object (see
+      ``_LINE_START_OBJECT_RE``);
+    * a generated image is announced as a bare ``path=<abs>.png`` with no
+      ``agentic_tool ok=1`` prefix (handled in ``_count_successful_generates``);
+    * the RM verdict arrives as the forced ``Reflection: VL judge reports ...`` line
+      (handled in ``_bagel_judge_hits``).
+
+    Only the calls are a safe rewrite. The observation is *not* rewritten: a turn that runs
+    out of context is truncated mid-JSON, so the loop's ``compact_image_observation`` is
+    glued to the model's last tokens (``...ideal for`` + ``path=...``), and any rewrite that
+    inserts a line break to satisfy the line-oriented matcher would have to guess whether it
+    is landing inside a JSON string. The verdict is *parsed* rather than rewritten because
+    it is attributable to ``generate_image``, not to a policy ``judge_image`` action, and
+    laundering it into the Hermes judge gate would credit the wrong action.
+
+    The rewrite is inert on a Hermes transcript: ``_TAGGED_CALL_RE`` only matches a JSON
+    object, so the prompt's ``<tools>`` schema block -- a JSON *array* of function
+    definitions -- can never be mistaken for a call, and a Hermes transcript keeps its calls
+    inside ``<tool_call>`` blocks, which ``_wrap_bare_line_payloads`` skips.
+    """
+    if not text:
+        return text
+    text = _wrap_native_call_payloads(text)
+    text = _TAGGED_CALL_RE.sub(lambda match: f"<tool_call>\n{match.group(1)}\n</tool_call>", text)
+    return _wrap_bare_line_payloads(text)
+
+
 def _extract_tool_calls(text: str) -> list[tuple[int, int, dict[str, Any]]]:
     calls = []
     for match in _TOOL_CALL_RE.finditer(text or ""):
@@ -134,6 +399,16 @@ def _extract_tool_calls(text: str) -> list[tuple[int, int, dict[str, Any]]]:
         if call is not None:
             calls.append((match.start(), match.end(), call))
     return calls
+
+
+def _follows_generate_image_call(pos: int, calls: list[tuple[int, int, dict[str, Any]]]) -> bool:
+    """True when ``pos`` is after at least one parsed ``generate_image`` call.
+
+    The Bagel verdict is produced by the *reward loop* judging the images the policy asked
+    for, so ``generate_image`` -- not ``judge_image`` -- is the action it is attributable
+    to. A turn that never asked for an image can never earn the verdict.
+    """
+    return any(end <= pos for _, end, call in calls if _tool_name(call) == "generate_image")
 
 
 def _call_arguments(call: dict[str, Any]) -> dict[str, Any]:
@@ -210,12 +485,32 @@ def _coverage(candidate: str, reference: str) -> float:
 
 
 def _count_successful_generates(text: str) -> int:
-    return sum(
+    """Images the environment confirmed, in either lane's vocabulary.
+
+    Hermes writes ``agentic_tool ok=1 path=<p>.png`` on its own line. Bagel appends the bare
+    path of ``bagel_corl_lib.compact_image_observation``, and that observation is *glued* to
+    the model's preceding tokens whenever the turn was truncated mid-JSON (``...ideal for`` +
+    ``path=/abs/gen_x.png``). The line-oriented matcher cannot see it there: ``\\bagentic_tool``
+    needs a word boundary, and ``</tools`` + ``agentic_tool`` sits between two word characters.
+    Counting the bare form by occurrence sidesteps the glue entirely.
+
+    The bare form is only consulted when the transcript carries *no* Hermes generate
+    observation at all. A Hermes lane that reported ``ok=0`` writes a ``path=`` too, and a
+    failed generate is a hard zero -- counting it would resurrect exactly the zero-credit
+    rollout ``test_empty_and_failed_generate_rollouts_are_hard_zero`` pins.
+    """
+    blob = text or ""
+    strict = sum(
         1
-        for line in (text or "").splitlines()
+        for line in blob.splitlines()
         if re.search(r"\bagentic_tool\s+ok=1\b", line, re.IGNORECASE)
         and any(path.lower().endswith(".png") for path in re.findall(r"\bpath=([^\s'\"]+)", line, re.IGNORECASE))
     )
+    if strict:
+        return strict
+    if re.search(r"\bagentic_tool\s+ok=[01]\b", blob, re.IGNORECASE):
+        return 0
+    return len(_BAGEL_IMAGE_OBS_RE.findall(blob))
 
 
 def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] | None = None) -> tuple[int, int, float]:
@@ -225,6 +520,10 @@ def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] |
     for marker in _JUDGE_OK_RE.finditer(blob):
         if _follows_judge_image_call(marker.start(), parsed_calls):
             ok += 1
+    # Bagel's verdict is an observation over ``generate_image``; a malformed one cannot be
+    # rendered at all (``build_forced_reflection`` bails when the numbers are absent), so it
+    # only ever counts as a parse *success* and never inflates the failure rate.
+    ok += sum(1 for _, _, _, _ in _bagel_judge_hits(blob, parsed_calls))
     failed = 0
     for marker in re.finditer(r"\bagentic_judge\s+ok=0\b", blob, flags=re.IGNORECASE):
         if _follows_judge_image_call(marker.start(), parsed_calls):
@@ -245,11 +544,42 @@ def _good_enough(window: str) -> bool | None:
     return value in {"yes", "1", "true"}
 
 
+def _bagel_judge_hits(
+    text: str, calls: list[tuple[int, int, dict[str, Any]]] | None = None
+) -> list[tuple[float, float, bool, int]]:
+    """Trusted ``(correctness, aesthetics, good_enough, end)`` from a Bagel Reflection verdict.
+
+    The Bagel loop never writes an ``agentic_judge ok=1`` observation: the reward loop
+    judges the GEN samples of a ``generate_image`` call and
+    ``rpco_turn_protocol.build_forced_reflection`` paraphrases the verdict into the forced
+    ``Reflection: VL judge reports correctness=..., aesthetics=..., good_enough=...`` line,
+    which IS in the transcript. Reading it here is not a loosening of the Hermes gate -- the
+    Bagel verdict is attributable to a different action (the image request, not a
+    ``judge_image`` call) and is gated on that instead.
+    """
+    parsed_calls = calls if calls is not None else _extract_tool_calls(text or "")
+    hits = []
+    for match in _BAGEL_VERDICT_RE.finditer(text or ""):
+        if not _follows_generate_image_call(match.start(), parsed_calls):
+            continue
+        try:
+            c = min(1.0, max(0.0, float(match.group(1))))
+            a = min(1.0, max(0.0, float(match.group(2))))
+        except ValueError:
+            continue
+        hits.append((c, a, match.group(3).upper() == "YES", match.end()))
+    return hits
+
+
 def _successful_judges(text: str) -> list[tuple[float, float, bool | None, int]]:
     """Return trusted ``(correctness, aesthetics, good_enough, end)`` values.
 
-    Hits must follow a parsed ``judge_image`` ``<tool_call>`` and the tool's
-    ``VL judge on the last generated image`` header.
+    Hermes hits must follow a parsed ``judge_image`` ``<tool_call>`` and the tool's
+    ``VL judge on the last generated image`` header. Bagel hits follow a ``generate_image``
+    call and carry the verdict inline (``_bagel_judge_hits``). Both feed one
+    chronologically ordered list, because every consumer -- ``_terminal_decision``'s anchor,
+    ``_result_reward``'s final verdict, ``_generates_after_first_yes`` -- is asking about
+    "the last verdict", regardless of which lane wrote it.
     """
     blob = text or ""
     calls = _extract_tool_calls(blob)
@@ -272,6 +602,8 @@ def _successful_judges(text: str) -> list[tuple[float, float, bool | None, int]]
         except ValueError:
             continue
         hits.append((c, a, _good_enough(window), marker.end()))
+    hits.extend(_bagel_judge_hits(blob, calls))
+    hits.sort(key=lambda hit: hit[3])
     return hits
 
 
@@ -282,9 +614,22 @@ def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
 
     judge_end = judges[-1][3]
     line_end = text.find("\n", judge_end)
-    anchor = len(text) if line_end < 0 else line_end + 1
     forced_context = False
-    for marker in re.finditer(r"\bagentic_forced_reflection=1\b", text, re.IGNORECASE):
+    if line_end < 0:
+        # No newline follows the verdict. In the Bagel Co-RL transcript the verdict is
+        # embedded *inside* the harness's forced ``Reflection`` line and the harness writes its
+        # stop cue after it, so everything past the verdict is harness context
+        # (``response_mask=0``), not policy prose. Anchoring at ``len(text)`` -- what the
+        # line-oriented rule does, and is right when the verdict ends a message -- hides the
+        # trailing policy ``Done.`` completely: ``terminal_done`` stayed False, so ``R_format``
+        # lost its terminal check and ``R_result`` was pinned to 0 on every Bagel episode.
+        anchor = judge_end
+    else:
+        anchor = line_end + 1
+    # Walk every cue forward. ``build_forced_reflection`` writes ``...agentic_force_stop_max_passes=1
+    # agentic_stop_decision_required=1`` and the Mode-2a loops then append
+    # ``agentic_forced_reflection=1``, so the last cue is the end of the harness text either way.
+    for marker in _FORCED_CONTEXT_CUE_RE.finditer(text):
         if marker.start() < anchor:
             continue
         anchor = marker.end()
@@ -333,7 +678,7 @@ def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
         preferred = next((hit for hit in judges if hit[2] is True), judges[-1])
         quality = 0.5 * (preferred[0] + preferred[1])
 
-    steps = ground_truth.get("reference_steps") or []
+    steps = _as_sequence(ground_truth.get("reference_steps"))
     reference = " ".join(str(step.get("reflection") or "") for step in steps if isinstance(step, dict)).strip()
     if not reference and judges:
         feedback = []
@@ -350,7 +695,7 @@ def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
 
 
 def _plan_reward(text: str, ground_truth: dict[str, Any]) -> float:
-    references = [str(item).strip() for item in ground_truth.get("reference_subtasks") or [] if str(item).strip()]
+    references = [str(item).strip() for item in _as_sequence(ground_truth.get("reference_subtasks")) if str(item).strip()]
     candidates = _extract_plan_lines(text)
     if not references or not candidates:
         return 0.0
@@ -368,14 +713,22 @@ def _format_reward(
 ) -> float:
     raw_blocks = len(_TOOL_CALL_RE.findall(text))
     calls = _extract_tool_calls(text)
-    names = [_tool_name(call) for _, _, call in calls]
-    generates = [index for index, name in enumerate(names) if name == "generate_image"]
-    judges = [index for index, name in enumerate(names) if name == "judge_image"]
     terminal_done, policy_reflection, _ = _terminal_decision(text)
+    # The judge check gates on the *verdict*, not on a ``judge_image`` call index. Hermes
+    # renders the verdict as a ``judge_image`` ``<tool_call>`` plus an ``agentic_judge ok=1``
+    # observation; Bagel never emits a ``judge_image`` call at all (its judge is the colocated
+    # reward loop) and carries the verdict inside the forced ``Reflection: VL judge reports
+    # ...`` line. Gating on ``judge_image`` call indices therefore capped the Bagel lane's
+    # ``R_format`` at 4/5 and pinned ``protocol_ok`` to 0 forever, on every episode, no matter
+    # how clean the trajectory was. ``_successful_judges`` is the one list that already knows
+    # both dialects, and requiring it to land after the images it judged is the property the
+    # check was always trying to state.
+    verdicts = _successful_judges(text)
+    last_generate_end = max((end for _, end, call in calls if _tool_name(call) == "generate_image"), default=-1)
     checks = [
         raw_blocks > 0 and len(calls) == raw_blocks,
         successful_generates >= 1,
-        bool(judges) and (not generates or max(judges) > max(generates)),
+        bool(verdicts) and verdicts[-1][3] > last_generate_end,
         terminal_done,
     ]
     if task_type == "plan":
@@ -532,6 +885,11 @@ def compute_score(
         result = _zero_result(method="agentic_multidim_empty")
         result.update(task_type=task_type, expected_num_images=expected)
         return result
+    # One canonical text for every helper below. The Bagel Co-RL loop renders the same
+    # facts in a different vocabulary; rewriting it here (rather than teaching each dim
+    # about two dialects) is what keeps ``_extract_tool_calls`` spans aligned with the
+    # ``_JUDGE_OK_RE`` positions they are gated against.
+    text = _normalize_trajectory_dialect(text)
 
     calls = _extract_tool_calls(text)
     prompts = _generate_prompts(calls)

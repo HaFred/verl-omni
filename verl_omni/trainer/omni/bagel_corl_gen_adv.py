@@ -106,8 +106,19 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
     # and ``has_complete_gen_groups: 0`` are correct-but-opaque. Naming the missing column here
     # turns "GEN never trains" into one readable line.
     missing_score = missing_logprob = missing_uid = 0
+    # Split the log-prob counter by *cause*, because "missing" is ambiguous and the two
+    # have different fixes (measured 2026-09-22: 6/6 GEN rows reported missing):
+    #   ``absent`` -- the rebuild handed us ``None``: the value was dropped between
+    #     generation and advantage (TQ round-trip / row rebuild).
+    #   ``empty``  -- a vector with no elements. ``_logprob_1d`` collapses it to None, but
+    #     note the sampler cannot produce it *with the key present*: ``pipeline_bagel`` only
+    #     attaches ``log_probs`` when the trajectory list is truthy, and the stash raises
+    #     when the attribute is absent. So a truthy ``empty`` count would mean the value was
+    #     zero-length before the pipeline, which the stash's own guard should have caught.
+    missing_logprob_absent = missing_logprob_empty = 0
     for row in gen_batch:
-        logprob = _logprob_1d(row.get("rollout_log_probs"))
+        raw_logprob = row.get("rollout_log_probs")
+        logprob = _logprob_1d(raw_logprob)
         score = row.get("rm_score")
         uid = row.get("gen_group_uid")
         latents = _as_tensor(row.get("all_latents"))
@@ -121,6 +132,10 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
                 missing_score += 1
             if logprob is None:
                 missing_logprob += 1
+                if raw_logprob is None:
+                    missing_logprob_absent += 1
+                else:
+                    missing_logprob_empty += 1
             if uid is None:
                 missing_uid += 1
             continue
@@ -135,18 +150,20 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
         if gen_batch:
             logger.warning(
                 "bagel_corl: %d GEN row(s) arrived but none are trainable "
-                "(rm_score missing=%d, rollout_log_probs missing=%d, gen_group_uid missing=%d). "
+                "(rm_score missing=%d, rollout_log_probs missing=%d [absent=%d empty=%d], "
+                "gen_group_uid missing=%d). "
                 "FlowGRPO needs all three and this step trains UND only. Read the counts, not "
                 "an assumption: with the reward lane ON, 'rm_score missing=0' means the reward "
-                "is fine and the row died on a different column. 'rollout_log_probs missing' "
-                "with latents/timesteps present is the one to chase -- the SDE sampler returned "
-                "no per-step log-probs (an EMPTY vector counts here, and the upstream stash "
-                "checks only `is None`, so emptiness reaches this line). Check "
-                "rollout.calculate_log_probs, algo.noise_level>0, the SDE window, and the GEN "
-                "request's `logprobs` value in build_gen_sampling_params.",
+                "is fine and the row died on a different column. For the log-prob column, "
+                "'absent' means the vector was dropped between generation and this point "
+                "(TQ round-trip / row rebuild); 'empty' means a zero-length vector reached "
+                "here, which the sampler cannot produce with the key present, so treat it as a "
+                "plumbing bug rather than an engine setting.",
                 len(gen_batch),
                 missing_score,
                 missing_logprob,
+                missing_logprob_absent,
+                missing_logprob_empty,
                 missing_uid,
             )
         return None
@@ -182,12 +199,62 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
         batch_tensors["old_log_probs"] = resized
 
     batch = TensorDict(batch_tensors, batch_size=[len(usable)])
+    # Build the object array explicitly 1-D rather than ``np.array(prompt_token_ids,
+    # dtype=object)``. With ``dtype=object`` numpy will happily collapse the per-row lists
+    # into a *2-D* ``(B, L)`` matrix whenever every prompt in the batch happens to share the
+    # same token length, and then ``prompt_token_ids[i]`` is an ``ndarray`` instead of the
+    # row's list. ``DiffusionTrainingAdapter._prompt_token_ids_to_batch`` does
+    # ``torch.as_tensor(ids, dtype=torch.long)``, which refuses *any* object-dtype array even
+    # when every element is an int:
+    #
+    #   TypeError: can't convert np.ndarray of type numpy.object_. The only supported types
+    #   are: float64, float32, float16, ..., uint8, and bool.
+    #
+    # Ragged prompt lengths made a ``(B,)`` array and worked, which is why this crashed on
+    # only some steps: measured 2026-09-24, run ``bagel_corl_rm1_20260923_234021`` died at
+    # step 9 in ``prepare_model_inputs`` for exactly this. Assigning element-wise pins the
+    # shape regardless of whether the lengths collide.
+    prompt_token_ids_arr = np.empty(len(prompt_token_ids), dtype=object)
+    for index, ids in enumerate(prompt_token_ids):
+        prompt_token_ids_arr[index] = ids
+
     non_tensor: dict[str, Any] = {
         "uid": uids,
         "gen_group_uid": uids,
-        "prompt_token_ids": np.array(prompt_token_ids, dtype=object),
+        "prompt_token_ids": prompt_token_ids_arr,
     }
     return DataProto(batch=batch, non_tensor_batch=non_tensor)
+
+
+def fold_gen_prompt_token_ids(proto: DataProto) -> None:
+    """Move the GEN prompt token ids from ``non_tensor_batch`` onto the batch itself.
+
+    ``DiffusionTrainingAdapter._prompt_token_ids_to_batch`` reads ``prompt_token_ids`` off the
+    *micro-batch* (``bagel_flow_grpo/diffusers_training_adapter.py:152``), and
+    ``prepare_micro_batches`` only propagates non-tensor entries that sit on the batch it is handed
+    -- which is why the sibling ``skip_gen`` / ``has_complete_gen_groups`` / ``num_gen_rows`` flags
+    do reach the diffusion step while a list parked in ``non_tensor_batch`` does not. Leaving the ids
+    behind therefore costs the whole GEN lane at the last moment, inside ``update_actor``:
+
+        KeyError: 'key "prompt_token_ids" not found in TensorDict with keys
+        ['advantages', 'all_latents', 'all_timesteps', 'bagel_corl_gen',
+         'gradient_accumulation_steps', 'has_complete_gen_groups', 'micro_batch_size_per_gpu',
+         'num_gen_rows', 'old_log_probs', 'returns', 'rm_scores', ...]'
+
+    Measured 2026-09-23 16:58 on hk01dgx039 (devices 0/1/6/7,
+    ``bagel_corl_rm1_20260923_164059``), the first step to reach the diffusion loss at all.
+
+    Call this on **every** GEN proto. It used to be inlined in
+    :func:`apply_gen_flowgrpo_advantage` alone, but the live path does not call that function: with
+    an actor pool present the trainer goes through
+    ``_diffusion_v1_gen_lane()._compute_advantage(proto)`` instead, so the fold silently ran only on
+    the CPU-test fallback branch.
+    """
+    non_tensor = getattr(proto, "non_tensor_batch", None) or {}
+    if "prompt_token_ids" in non_tensor:
+        from verl.utils import tensordict_utils as tu
+
+        tu.assign_non_tensor(proto.batch, prompt_token_ids=non_tensor["prompt_token_ids"])
 
 
 def apply_gen_flowgrpo_advantage(
@@ -227,11 +294,7 @@ def apply_gen_flowgrpo_advantage(
         config=algo_config,
     )
     # Fold non-tensor traj metadata onto the batch so update_actor can materialize GEN.
-    ntb = getattr(proto, "non_tensor_batch", None) or {}
-    if "prompt_token_ids" in ntb:
-        from verl.utils import tensordict_utils as tu
-
-        tu.assign_non_tensor(proto.batch, prompt_token_ids=ntb["prompt_token_ids"])
+    fold_gen_prompt_token_ids(proto)
     metrics["gen/skipped_no_groups"] = 0.0
     metrics["gen/num_usable_rows"] = float(len(proto))
     metrics["has_complete_gen_groups"] = 1.0

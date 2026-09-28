@@ -21,13 +21,18 @@ from dataclasses import fields
 from typing import Any
 
 from omegaconf import OmegaConf, open_dict
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1.trainer_base import register_trainer
 from verl.utils.config import omega_conf_to_dataclass
 
 from verl_omni.agent_loop.bagel_corl_lib import aggregate_episode_metrics
 from verl_omni.trainer.omni.bagel_corl_diff_v1 import DiffusionV1GenLane
-from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage, build_gen_flowgrpo_proto
+from verl_omni.trainer.omni.bagel_corl_gen_adv import (
+    apply_gen_flowgrpo_advantage,
+    build_gen_flowgrpo_proto,
+    fold_gen_prompt_token_ids,
+)
 from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.config.diffusion import DiffusionRolloutConfig, DiffusionSamplingConfig
@@ -395,8 +400,25 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                         "loss_mode": filtered.get("algorithm", "flow_grpo"),
                     }
                 )
-            elif actor.diffusion_loss.get("loss_mode") is None:
-                actor.diffusion_loss.loss_mode = filtered.get("algorithm", "flow_grpo")
+            else:
+                if actor.diffusion_loss.get("loss_mode") is None:
+                    actor.diffusion_loss.loss_mode = filtered.get("algorithm", "flow_grpo")
+                # ``_target_`` is what binds this node to ``DiffusionLossConfig``, and therefore what
+                # supplies every knob the loss reads as an **attribute** (``adv_clip_max``,
+                # ``clip_ratio``, ``dpo_beta``). A recipe that overrides *inside* the node -- the
+                # Co-RL recipes pass ``+actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_grpo``
+                # -- creates a plain dict, and the old ``elif`` returned after filling in
+                # ``loss_mode``, leaving the node unbound. The first attribute read then died:
+                #
+                #   AttributeError: 'dict' object has no attribute 'adv_clip_max'.
+                #
+                # (measured 2026-09-23 18:16 on hk01dgx039, devices 0/1/6/7,
+                # ``bagel_corl_rm1_20260923_175819``). Stamp the schema unconditionally so an
+                # override can never strip the declared defaults.
+                if actor.diffusion_loss.get("_target_") is None:
+                    actor.diffusion_loss["_target_"] = (
+                        "verl_omni.workers.config.diffusion.DiffusionLossConfig"
+                    )
             # verl AgentLoopBase always reads data.continuous_token (struct). Omni data
             # schemas may omit it; missing key aborts every episode → empty TQ →
             # "no materializable trajectories".
@@ -526,10 +548,59 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             # CPU unit tests: no worker group. Packed traj logprobs stay on proto for GEN advantage.
             metrics["gen/old_log_prob_recomputed"] = 0.0
             return super()._compute_old_log_prob(batch, metrics)
+        # The GEN proto's row count is data-dependent: one row per *trainable* GEN call,
+        # and K varies per episode, so ``len(proto)`` is not necessarily a multiple of the
+        # actor DP size. ``actor_rollout_wg.infer_actor_batch`` dispatches through
+        # ``_split_args_kwargs_data_proto`` -> ``TensorDict.chunk(chunks=dp_size)``, whose
+        # guard is ``assert len(td) % chunks == 0`` (``verl/utils/tensordict_utils.py``).
+        # Measured 2026-09-23 on devices 0,1,6,7 with ENABLE_RM=1: the rollout-adapter
+        # window-slice fix finally let GEN rows through, and the very next step died with
+        # ``AssertionError: expecting td with length divisible by chunks, but got 6 and 4``.
+        # Pad with the same helper ``_balance_batch`` uses for the UND/main batch, then drop
+        # the repeated rows so ``bagel_corl_gen_old`` stays aligned with ``gen_rows``.
+        # ``pad_dataproto_to_divisor`` appends its copies at the tail and
+        # ``unpad_dataproto`` slices ``[:-pad_size]``, so the two are symmetric.
+        divisor = self._gen_dispatch_divisor()
+        pad_size = 0
+        if divisor > 1 and len(proto) % divisor != 0:
+            unpadded_n = len(proto)
+            proto, pad_size = pad_dataproto_to_divisor(proto, size_divisor=divisor)
+            logger.info(
+                "bagel_corl GEN old_log_prob: padded %d -> %d rows for dispatch divisor %d",
+                unpadded_n,
+                len(proto),
+                divisor,
+            )
         old = self._diffusion_v1_gen_lane()._compute_old_log_prob(proto)
+        if pad_size:
+            old = unpad_dataproto(old, pad_size)
         extra["bagel_corl_gen_old"] = old.batch
         metrics["gen/old_log_prob_recomputed"] = 1.0
         return super()._compute_old_log_prob(batch, metrics)
+
+    def _gen_dispatch_divisor(self) -> int:
+        """Row-count divisor the GEN lane's worker-group dispatch requires.
+
+        Mirrors ``DiffusionV1TrainerBase._balance_batch``: ``dp_size`` comes from the
+        actor's dispatch info, and the row count must also satisfy the actor mini-batch
+        multiple that downstream chunking assumes.
+        """
+        import math
+
+        wg = getattr(self, "actor_rollout_wg", None)
+        dp_size = 1
+        if wg is not None and hasattr(wg, "_query_dispatch_info"):
+            info = wg._query_dispatch_info("actor")
+            if isinstance(info, dict):
+                dp_size = max(info.values()) + 1 if info else 1
+            elif isinstance(info, (list, tuple, set)):
+                dp_size = max(info) + 1 if info else 1
+            else:
+                # ONE_TO_ALL dispatch may return a scalar dp rank per worker.
+                dp_size = int(info) + 1 if info is not None else 1
+        rollout_n = int(self.config.actor_rollout_ref.rollout.n)
+        mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size) * rollout_n
+        return max(1, math.lcm(int(dp_size), int(mini)))
 
     def _gen_batch_from_step(self, batch) -> list:
         """GEN rows for FlowGRPO: dual-lane ``child_gen_keys`` or ``extra['gen_batch']`` only."""
@@ -790,6 +861,14 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     raise RuntimeError(
                         "bagel_corl GEN V1 advantage returned no all_latents; refuse skip GEN loss."
                     )
+                # The diffusion V1 entry point returns the advantage proto but does not carry the
+                # GEN prompt ids onto the batch the way ``apply_gen_flowgrpo_advantage`` does, and
+                # the diffusion training adapter reads them from the micro-batch
+                # (``diffusers_training_adapter.py:152``). Without this the last step before the
+                # GEN loss dies with ``KeyError: 'prompt_token_ids'`` after the whole rollout,
+                # reward and advantage computation has already been paid for. Measured 2026-09-23
+                # 16:58 on hk01dgx039 (devices 0/1/6/7, ``bagel_corl_rm1_20260923_164059``).
+                fold_gen_prompt_token_ids(gen_proto)
                 gen_metrics = {
                     "gen/skipped_no_groups": 0.0,
                     "gen/num_rows": float(len(gen_proto)),
@@ -834,7 +913,34 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             metrics.get("episode/K"),
         )
         # UND token GRPO writes advantages/returns onto episode TQ keys.
-        return super()._compute_advantage(batch, metrics)
+        #
+        # ``super()`` hands back a *different* ``KVBatchMeta``: the v1 base ends with
+        # ``batch = tq.kv_batch_put(...)``, and ``kv_batch_put`` builds its result from a meta it
+        # creates internally (``extra_info=batch_meta.extra_info``), so the returned meta carries
+        # the ``KVBatchMeta`` dataclass default ``{}`` -- none of the flags written to ``extra``
+        # above survive the hand-off, and ``step()`` then rebinds ``batch`` to that new object
+        # (``verl/trainer/ppo/v1/trainer_base.py:444``).
+        #
+        # Measured 2026-09-23 on devices 0,1,6,7: ``advantage ... skip_gen=False`` was followed
+        # 35 ms later by ``update_actor skip_gen=True``, because ``_update_actor`` read
+        # ``has_complete_gen_groups`` back as ``None`` from the fresh dict and therefore retired
+        # the GEN loss on *every* step. Re-publish the lane's flags onto the meta ``super()``
+        # actually returns, which is the object ``_update_actor`` will be handed.
+        result = super()._compute_advantage(batch, metrics)
+        carried = self._extra_info(result)
+        for key in (
+            "has_complete_gen_groups",
+            "num_gen_rows",
+            "bagel_corl_gen",
+            "episode/J",
+            "episode/K",
+            "und/no_image_credit",
+            "gen/dropped_incomplete_groups",
+        ):
+            if key in extra:
+                carried[key] = extra[key]
+        carried["skip_gen"] = not has_complete
+        return result
 
     def _update_actor(self, batch, metrics: dict):
         """Single composite ``update_actor`` after the N-sibling gather. Skip GEN when no complete S-groups."""
@@ -1396,6 +1502,17 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         self._ensure_dual_role_rollout()
         return self._bagel_dual_client
 
+    def _gen_rollout_replicas(self) -> list:
+        """The GEN (hybrid) replicas: everything registered except the UND AR pool.
+
+        The parent registers the GEN replicas and we ``add_replicas`` the UND AR pool on top
+        (RFC §4.11), so the set difference is exactly the pool the parent's own wake touches.
+        Identity comparison, not equality: replica objects are not value types.
+        """
+        registered = getattr(getattr(self, "checkpoint_manager", None), "replicas", None) or []
+        und_ids = {id(r) for r in (getattr(self, "und_rollout_replicas", None) or [])}
+        return [r for r in registered if id(r) not in und_ids]
+
     def _wake_und_rollout_replicas(self) -> None:
         """Wake the colocated UND AR replica(s) after ``on_sample_end`` slept them.
 
@@ -1430,6 +1547,62 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         ``_setup``'s sleep.
         """
         replicas = getattr(self, "und_rollout_replicas", None) or []
+        self._wake_replicas(replicas, label="UND AR")
+
+    def _wake_rollout_replicas(self) -> None:
+        """Wake *both* colocated pools after a sleep, GEN included.
+
+        ``checkpoint_manager.sleep_replicas()`` sleeps every registered replica, so the GEN
+        pool is asleep too. The parent's naive publish only resumes the actor's *own*
+        colocated GEN server, and that call passes no tags -- ``vLLMOmniHttpServer.wake_up``
+        then falls back to ``_get_wake_up_tags() == ["weights"]``, while ``AsyncOmni`` keeps
+        rejecting generation until *every* tag is cleared. The GEN pool therefore never had
+        its ``kv_cache`` tag cleared by anything. This is the same gap
+        ``_wake_und_rollout_replicas`` closes for the AR pool, one pool over.
+
+        Measured 2026-09-24, ``bagel_corl_rm1_20260923_213235`` (200-step run, ``test_freq=30``):
+        30 steps trained cleanly, then the first validation boundary died with
+
+            RuntimeError: Generation rejected: Engine is partially or fully asleep.
+            Currently sleeping tags: ['weights', 'kv_cache'].
+
+        followed by ``StageDiffusionProc executor reported permanent failure``. That ruled out
+        the loop-exit/shutdown hypothesis for this signature: it recurs mid-run, not only on
+        the final step.
+        """
+        und = getattr(self, "und_rollout_replicas", None) or []
+        gen = self._gen_rollout_replicas()
+        # Per-step wake topology. The omni server exposes no "which tags are still sleeping"
+        # query, so the trail comes from the trainer side: if a rollout later dies with
+        # ``Engine is partially or fully asleep``, this line shows the pools and the tags each
+        # was asked for. Emitted before any early return so a run with no UND AR replica still
+        # reports the GEN side.
+        logger.info(
+            "bagel_corl_sync step=%s wake topology: und_ar=%d gen=%d (both woken explicitly "
+            "with ['weights', 'kv_cache']; the parent publish alone requests no tags and so "
+            "resolves to ['weights'] through _get_wake_up_tags)",
+            getattr(self, "global_steps", None),
+            len(und),
+            len(gen),
+        )
+        self._wake_replicas(und, label="UND AR")
+        self._wake_replicas(gen, label="GEN")
+
+    @staticmethod
+    def _wake_replicas(replicas: list, *, label: str) -> None:
+        """Wake every server of ``replicas`` with both tags, one at a time, then report the count.
+
+        Both tags are requested on purpose (see ``_wake_und_rollout_replicas``); this is a
+        no-op for an already-warm engine because ``wake_up`` returns early in that case.
+
+        **Sequential, not gathered.** The wake is a ``cuMemCreate`` re-map -- it needs a large
+        *physically contiguous* region (see ``verl_omni.utils.rollout_wake``) -- and the previous
+        ``asyncio.gather`` asked all 3 replicas (1 UND AR + 2 GEN, each TP=2, plus the colocated
+        RM pool's 4 GPUs) for one at the same instant. ``bagel_corl_rm1_20260927_165227`` died at
+        step 41 on exactly that: ``CUDA Error: out of memory at .../cumem_allocator.cpp:163`` while
+        waking. Awaiting each server in turn removes the self-contention for free; the servers are
+        independent and the wake is idempotent, so nothing depends on the concurrency.
+        """
         if not replicas:
             return
         import asyncio
@@ -1438,18 +1611,15 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
 
         @auto_await
         async def _wake_all() -> None:
-            await asyncio.gather(
-                *(
-                    server.wake_up.remote(tags=["weights", "kv_cache"])
-                    for replica in replicas
-                    for server in replica.servers
-                )
-            )
+            for replica in replicas:
+                for server in replica.servers:
+                    await server.wake_up.remote(tags=["weights", "kv_cache"])
 
         _wake_all()
         logger.info(
-            "bagel_corl_sync woke %s UND AR replica(s) (weights+kv_cache) after sleep",
+            "bagel_corl_sync woke %s %s replica(s) (weights+kv_cache, sequentially) after sleep",
             len(replicas),
+            label,
         )
 
     def _bagel_rm_enabled(self) -> bool:
@@ -1517,8 +1687,9 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         super().on_init_end()
         # ``_setup`` slept the GEN replica(s) to load the checkpoint and the parent hook
         # woke them through the actor; the AR replica is created after that sleep, so this
-        # is a no-op today and a guard if the creation order ever moves.
-        self._wake_und_rollout_replicas()
+        # is a no-op today and a guard if the creation order ever moves. Both pools are
+        # woken, since the parent's tagless wake leaves each one's ``kv_cache`` set.
+        self._wake_rollout_replicas()
 
     def on_step_end(self):
         # Parent updates weights for every replica registered on checkpoint_manager
@@ -1540,10 +1711,12 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 getattr(self, "global_steps", None),
                 len(registered),
             )
-        # The parent hook's naive publish only resumed the actor's own GEN server, so the
-        # AR engine is still asleep here and every rollout since would fail on its first
-        # UND decode. See ``_wake_und_rollout_replicas``.
-        self._wake_und_rollout_replicas()
+        # The parent hook's naive publish only resumed the actor's own GEN server, and it
+        # requests no tags, so neither pool is fully awake here: the AR engine is still
+        # asleep and every rollout since would fail on its first UND decode, while the GEN
+        # engine is awake on weights but still holds ``kv_cache``. See
+        # ``_wake_und_rollout_replicas`` / ``_wake_rollout_replicas``.
+        self._wake_rollout_replicas()
 
     def on_validate_end(self):
         """Re-wake the AR replica after ``_validate``'s colocated-reward sleep.
@@ -1561,7 +1734,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         without touching the engine.
         """
         super().on_validate_end()
-        self._wake_und_rollout_replicas()
+        self._wake_rollout_replicas()
 
     def _validate(self):
         """V1 validation, plus the RFC §8.2 evidence record.
@@ -1571,8 +1744,52 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         (``trainer.test_freq``); this hook records what the validated episodes
         actually exercise — in-episode J/K, pattern coverage, and whether UND got
         image credit — because §8.2 gates PR1 on seeing pattern-1/2/3 episodes.
+
+        Wraps the parent's per-batch publish so both rollout pools are fully awake again
+        before the *next* validation batch rolls out. The parent's loop
+        (``verl/trainer/ppo/v1/trainer_base.py:1034-1037``) does, once per validation batch::
+
+            self.agent_loop_manager.generate_sequences(batch)   # needs the engines awake
+            if self.reward_loop_manager.reward_loop_worker_handles is None:
+                self.checkpoint_manager.sleep_replicas()        # hand the GPU to the colocated RM
+                batch = self._compute_reward_colocate(batch)
+                self.checkpoint_manager.update_weights()        # naive: ['weights'], GEN server only
+
+        That branch is entered only when the RM is *colocated*, i.e. only with
+        ``ENABLE_RM=1``. Its publish resumes just the actor's own GEN server and passes no
+        tags, so every batch after the first starts its rollout against a sleeping engine, while
+        ``on_validate_end`` only wakes once the whole loop is over -- too late for the batches in
+        between. Measured 2026-09-24 on devices 0/1/6/7 (``bagel_corl_rm1_20260924_034359``,
+        ``ENABLE_RM=1``, ``VAL_MAX_SAMPLES=8`` with ``val_batch_size=2`` -> 4 validation
+        batches): 30 training steps completed cleanly, then a later batch's rollout died with::
+
+            RuntimeError: Generation rejected: Engine is partially or fully asleep.
+            Currently sleeping tags: ['weights', 'kv_cache'].
+
+        and the diffusion stage reported permanent failure, ending the run at exactly the
+        ``test_freq=30`` boundary. ``..._213235``, the only other run to reach step 30, ended with
+        the same signature. Nothing about the step count is special: it is the first validation
+        that spans more than one batch.
+
+        The wrap is scoped to this call rather than installed permanently, so the training path
+        keeps using its single wake in ``on_step_end``.
         """
-        val_metrics = super()._validate()
+        manager = getattr(self, "checkpoint_manager", None)
+        publish = getattr(manager, "update_weights", None)
+        if publish is None:
+            val_metrics = super()._validate()
+        else:
+
+            def _publish_then_wake(*args, **kwargs):
+                result = publish(*args, **kwargs)
+                self._wake_rollout_replicas()
+                return result
+
+            try:
+                manager.update_weights = _publish_then_wake
+                val_metrics = super()._validate()
+            finally:
+                manager.update_weights = publish
         evidence = {
             key: float(value)
             for key, value in (val_metrics or {}).items()

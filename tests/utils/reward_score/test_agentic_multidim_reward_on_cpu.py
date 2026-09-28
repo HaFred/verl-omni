@@ -17,6 +17,10 @@ import json
 
 import pytest
 
+from verl_omni.agent_loop.rpco_turn_protocol import (
+    build_forced_reflection,
+    format_rm_scores_as_judge_text,
+)
 from verl_omni.utils.reward_score.agentic_multidim_reward import (
     DIMS,
     REWARD_COMPONENTS,
@@ -480,3 +484,302 @@ def test_coverage_dump_does_not_max_plan_reward():
     assert tight["reward_plan"] == pytest.approx(1.0)
     assert dumped["reward_plan"] < 0.5
     assert dumped["reward_plan"] < tight["reward_plan"]
+
+
+# --- Bagel Co-RL (Joint-Training) dialect ------------------------------------------
+#
+# The second producer of this reward is the Bagel dual-lane loop, which speaks a different
+# observation vocabulary. It reads ``<tools>{...}</tools>`` (the schema tag) rather than
+# ``<tool_call>``, announces a generated image with a bare ``path=<abs>.png``, and renders
+# the in-loop RM verdict as the forced ``Reflection: VL judge reports ...`` line instead of
+# an ``agentic_judge ok=1`` observation. Nothing here matched, so every episode took the
+# ``prompts == []`` early return and the trainer published a constant zero. Measured
+# 2026-09-27 on devices 0/1/6/7 (``bagel_corl_rm1_20260927_165227``): steps 1-8 all logged
+# ``critic/score/mean: 0.0`` and ``actor/pg_loss: 0.0`` -- a zero-gradient composite step --
+# while the same episodes' GEN lane trained normally.
+
+
+def _bagel_call(name: str, **arguments) -> str:
+    """A Bagel call. No trailing newline: the loop appends its observations to token ids."""
+    return f"<tools>\n{json.dumps({'name': name, 'arguments': arguments})}\n</tools>"
+
+
+def _bagel_transcript(
+    *,
+    prompt: str = "a cafe poster with a bold headline",
+    path: str = "/tmp/bagel_corl_gen/gen_ab.png",
+    correctness: float = 0.31,
+    aesthetics: float = 0.31,
+    accepted: bool = False,
+    force_done: bool = True,
+    call_text: str | None = None,
+    done: bool = True,
+) -> str:
+    """The exact decoded shape of ``bagel_corl_lib.run_serial_episode``.
+
+    Model turn, then ``compact_image_observation``'s bare path, then
+    ``build_forced_reflection``'s forced Reflection, then the policy's terminal ``Done.``.
+    Nothing separates them -- the loop appends token ids, it never inserts a newline -- so
+    the path is glued to whatever the model wrote last and the stop cue is glued to ``Done.``.
+    """
+    judge_text = format_rm_scores_as_judge_text(
+        correctness=correctness, aesthetics=aesthetics, good_enough=accepted
+    )
+    built = build_forced_reflection(
+        judge_text, force_done=force_done, generate_pass=1, max_passes=1 if force_done else 3
+    )
+    assert built is not None, "the forced-reflection producer rejected its own verdict format"
+    parts = [call_text if call_text is not None else _bagel_call("generate_image", prompt=prompt)]
+    parts.append(f"path={path}")
+    parts.append(built[0])
+    if done:
+        parts.append("Done.")
+    return "".join(parts)
+
+
+def test_bagel_tagged_calls_and_bare_observation_are_not_a_structural_zero():
+    """The regression: this transcript used to score 0.0 and pin ``critic/score`` at zero."""
+    text = _bagel_transcript()
+    output = compute_score(solution_str=text, ground_truth=_ground_truth())
+
+    assert output["rollout_valid"] == 1
+    assert output["method"] == "agentic_multidim"
+    assert output["num_hermes_tool_calls"] == 1
+    assert output["num_generate_image_prompts"] == 1
+    assert output["n_successful_generates"] == 1
+    assert output["judge_parse_ok"] == 1
+    assert output["terminal_done"] == 1
+    assert output["reward_tool"] == 1.0
+    assert output["reward_reflect"] == pytest.approx(0.31)
+    assert output["score"] > 0.0
+
+
+def test_bagel_truncated_turn_glues_the_observation_but_still_counts_it():
+    """A turn that runs out of context is cut mid-JSON, so ``path=`` has no line start.
+
+    ``_count_successful_generates`` is line-oriented and needs ``\\bagentic_tool``, which
+    cannot match across the ``</tools`` + ``agentic_tool`` glue, so the Bagel form is counted
+    by occurrence instead. The call itself is unparseable, so the episode is still a hard
+    zero -- an observation without a parsed request cannot buy ``R_tool``.
+    """
+    truncated = '<tools>\n{"name": "generate_image", "arguments": {"prompt": "a cafe poster"}'
+    text = _bagel_transcript(call_text=truncated)
+
+    # The observation is glued straight onto the model's last token -- no closing tag, no
+    # newline -- so the line-oriented Hermes matcher can never see the ``path=``.
+    assert "}path=/" in text
+    output = compute_score(solution_str=text, ground_truth=_ground_truth())
+    assert output["n_successful_generates"] == 1
+    assert output["num_generate_image_prompts"] == 0
+    assert output["score"] == 0.0
+    assert output["rollout_valid"] == 0
+
+
+def test_bagel_glued_stop_cue_still_marks_the_episode_terminal():
+    """``agentic_stop_decision_required=1`` is glued to ``Done.``, so the cue cannot use ``\\b``."""
+    text = _bagel_transcript()
+    assert "agentic_force_stop_max_passes=1 agentic_stop_decision_required=1Done." in text
+
+    output = compute_score(solution_str=text, ground_truth=_ground_truth())
+    assert output["terminal_done"] == 1
+    assert output["forced_reflection_context"] == 1
+    assert output["reward_done"] == 1.0
+    assert output["reward_format"] == pytest.approx(1.0)
+
+
+def test_bagel_accepted_verdict_earns_the_result_dimension():
+    output = compute_score(
+        solution_str=_bagel_transcript(correctness=0.9, aesthetics=0.9, accepted=True),
+        ground_truth=_ground_truth(expected=1),
+    )
+
+    assert output["judge_parse_ok"] == 1
+    assert output["terminal_done"] == 1
+    assert output["reward_result"] == 1.0
+    assert output["reward_reflect"] == pytest.approx(0.9)
+
+
+def test_bagel_verdict_is_only_credited_after_a_generate_call():
+    """The verdict judges an image *request*; without one it is not the policy's to earn."""
+    text = _bagel_transcript(call_text=_bagel_call("judge_image", image_prompt="last"))
+    output = compute_score(solution_str=text, ground_truth=_ground_truth())
+
+    assert output["judge_parse_ok"] == 0
+    assert output["reward_reflect"] == 0.0
+    assert output["reward_tool"] == 0.0
+    assert output["score"] == 0.0
+    assert output["rollout_valid"] == 0
+
+
+def test_bagel_transcript_without_a_generate_stays_a_hard_zero():
+    output = compute_score(
+        solution_str=_bagel_call("judge_image", image_prompt="last") + "Done.",
+        ground_truth=_ground_truth(),
+    )
+
+    assert output["n_successful_generates"] == 0
+    assert output["score"] == 0.0
+    assert output["rollout_valid"] == 0
+
+
+def test_bagel_normalization_is_inert_on_a_hermes_transcript():
+    """Normalization rewrites *calls only*; the Hermes lane must not move.
+
+    The prompt itself shows a ``<tools>`` block, but ``_TAGGED_CALL_RE`` accepts a JSON
+    *object* inside it and the schema scaffold is a JSON *array* of function definitions, so
+    the rewrite can never fire on the policy's own prompt text. Prepending that scaffold to a
+    Hermes transcript must therefore leave every dim bit-identical.
+    """
+    plain = _reflect_trajectory(correctness=0.31, aesthetics=0.31)
+    schema = '<tools>\n[{"name": "generate_image", "description": "render", "parameters": {}}]\n</tools>\n'
+    assert compute_score(solution_str=schema + plain, ground_truth=_ground_truth()) == compute_score(
+        solution_str=plain, ground_truth=_ground_truth()
+    )
+
+    # Dialect parity where the protocol admits it: a structurally equivalent single-generate
+    # episode earns the same tool/format/done credit in either lane.
+    tagged = compute_score(solution_str=_bagel_transcript(), ground_truth=_ground_truth())
+    hermes = compute_score(solution_str=plain, ground_truth=_ground_truth())
+    assert tagged["reward_tool"] == hermes["reward_tool"] == 1.0
+    assert tagged["reward_format"] == hermes["reward_format"] == 1.0
+    assert tagged["reward_done"] == hermes["reward_done"] == 1.0
+    assert tagged["reward_reflect"] > 0.0
+    assert hermes["reward_reflect"] > 0.0
+
+
+def test_bagel_bare_line_anchored_payloads_are_normalized():
+    """Measured 2026-09-27 18:12, ``step_000041/sample_19b9f8e0-6656-43f6-a8e6-eafdf2c64abe.02``.
+
+    The checkpoint also samples its calls with *no* tag at all: the turn leads with a bare
+    ``{"name": "generate_image", ...}`` object and then replays a bare ``{"name":
+    "judge_image", "arguments": {}}``. ``_TAGGED_CALL_RE`` can see neither, so ``raw_blocks``
+    was 0, ``_extract_tool_calls`` was empty, and the episode scored a flat ``0.0`` -- in the
+    same step whose sibling, written in the ``<tools>`` dialect, scored ``0.43``. A hard zero
+    that tracks the call dialect rather than the episode's quality both poisons the policy
+    gradient and collapses the 2-sibling GRPO group it sits in (no baseline -> no advantage).
+    """
+    bare_generate = '{\n  "name": "generate_image",\n  "arguments": {\n    "prompt": "a cafe poster"\n  }\n}'
+    bare_judge = '{\n  "name": "judge_image",\n  "arguments": {}\n}'
+    text = _bagel_transcript(call_text=f"{bare_generate}\n\n{bare_judge}\n")
+    result = compute_score(solution_str=text, ground_truth=_ground_truth())
+    assert result["num_hermes_tool_calls"] == 2
+    assert result["n_successful_generates"] == 1
+    assert result["judge_parse_ok"] == 1
+    assert result["terminal_done"] == 1
+    assert result["reward_format"] == 1.0
+    assert result["score"] > 0.0
+
+    # ...and the tag-free dialect must not swallow a JSON example that sits *inside* prose.
+    # The line-start anchor is the whole guard: ``emit {"name": ...}`` mid-sentence is not a call.
+    prose_example = '1. Plan: emit {"name": "generate_image", "arguments": {"prompt": "x"}} for each step.'
+    with_prose = compute_score(
+        solution_str=_bagel_transcript(call_text=f"{prose_example}\n{_bagel_call('generate_image', prompt='a cafe poster')}"),
+        ground_truth=_ground_truth(),
+    )
+    assert with_prose["num_hermes_tool_calls"] == 1
+
+
+def test_bagel_native_toolcall_fence_is_normalized():
+    """Measured 2026-09-27 18:52+ in ``outputs/bagel_corl_rm1_20260927_183640``, ``sample_1723296b``.
+
+    The checkpoint's third dialect: its own ``<|begin_of ToolCall|>[{...}]<|end_of ToolCall|>``
+    fence, whose payload is a JSON **array** of calls. ``_TAGGED_CALL_RE`` sees only ``<tools>``
+    objects and ``_LINE_START_OBJECT_RE`` only line-anchored ones, so the span was invisible:
+    ``raw_blocks`` 0, no parsed call, and a flat ``0.0`` for the episode whose sibling -- the
+    ``<tools>`` dialect, same step, same task family -- scored ``0.38``. The loop accepts this
+    fence (``bagel_corl_lib._NATIVE_CALL_TAGS``); the scorer has to read the same payload, or a
+    recovered episode is *executed* by the rollout and then punished by the reward.
+    """
+    native_call = '<|begin_of ToolCall|>[{"name":"generate_image","arguments":{"prompt":"a cafe poster"}}]<|end_of ToolCall|>'
+    result = compute_score(
+        solution_str=_bagel_transcript(call_text=native_call),
+        ground_truth=_ground_truth(),
+    )
+    assert result["num_hermes_tool_calls"] == 1
+    assert result["n_successful_generates"] == 1
+    assert result["reward_format"] == 1.0
+    assert result["reward_tool"] == 1.0
+    assert result["score"] > 0.0
+
+    # ...and the rewrite is equivalent to the tag the scorer was written for, so a recovered
+    # episode earns exactly the credit its ``<tools>`` sibling does (no dialect bonus/penalty).
+    tagged = compute_score(
+        solution_str=_bagel_transcript(call_text=_bagel_call("generate_image", prompt="a cafe poster")),
+        ground_truth=_ground_truth(),
+    )
+    assert result["score"] == pytest.approx(tagged["score"])
+
+
+def test_bagel_native_fence_takes_the_first_actionable_call():
+    """A multi-call array drives the loop on its *first* named element, and so must the scorer."""
+    array_call = (
+        '<|start of ToolCall|>[{"arguments": {}}, {"name": "generate_image", "arguments": '
+        '{"prompt": "a cafe poster"}}, {"name": "judge_image", "arguments": {}}]<|end of ToolCall|>'
+    )
+    result = compute_score(
+        solution_str=_bagel_transcript(call_text=array_call),
+        ground_truth=_ground_truth(),
+    )
+    assert result["n_successful_generates"] == 1
+
+
+def test_bagel_native_fence_without_a_named_call_is_left_alone():
+    """A body naming no tool must not be rewritten into a call the model never emitted."""
+    prose = '<|begin_of ToolCall|>[{"subtasks": [{"prompt": "a cafe poster"}]}]<|end_of ToolCall|>'
+    result = compute_score(
+        solution_str=_bagel_transcript(call_text=prose),
+        ground_truth=_ground_truth(),
+    )
+    assert result["num_hermes_tool_calls"] == 0
+    assert result["rollout_valid"] == 0
+    assert result["score"] == 0.0
+
+
+def test_parquet_round_trip_reference_arrays_are_not_a_crash():
+    """``reference_steps`` / ``reference_subtasks`` survive parquet as ``ndarray``, not list.
+
+    ``value or []`` raises ``ValueError: The truth value of an array with more than one
+    element is ambiguous``. Measured on ``outputs/data/agentic_unicot/train.parquet``: 5278
+    rows carry a 1-3 element ``reference_steps`` array and 1107 a 2-3 element
+    ``reference_subtasks`` one, so ~2.5k of 8679 rows would have raised the moment the
+    scorer stopped taking the ``<tools>`` early return. The one-element arrays happened to
+    be truthy-safe, which is why a single-sample smoke test would not have caught this.
+
+    The reference strings are kept realistic on purpose: ``_extract_plan_lines`` drops any plan
+    line under 4 tokens as noise, and the measured parquet subtasks bottom out at exactly 4
+    (min tokens = 4 over 2974 items), so a toy ``"a snowy market"`` would zero ``R_plan`` for a
+    reason that has nothing to do with the array coercion under test.
+    """
+    import numpy as np
+
+    reference = "The headline is legible and the composition is balanced."
+    steps = np.array(
+        [{"reflection": reference, "action": "stop"}, {"reflection": "also fine", "action": "stop"}],
+        dtype=object,
+    )
+    reflect = compute_score(
+        solution_str=_reflect_trajectory(correctness=0.8, aesthetics=0.6),
+        ground_truth=_ground_truth(reference_steps=steps),
+    )
+    assert reflect["reward_reflect"] > 0.0
+
+    planned = "An African American librarian floats while reading a book in an underwater library in a cave."
+    subtasks = np.array(
+        [
+            planned,
+            "Keep the outline of the image unchanged and edit with the following details about the gown.",
+        ],
+        dtype=object,
+    )
+    plan = compute_score(
+        solution_str=_plan_trajectory([planned]),
+        ground_truth=_ground_truth(task_type="plan", expected=1, reference_subtasks=subtasks),
+    )
+    assert plan["reward_plan"] > 0.0
+    assert plan["rollout_valid"] == 1
+
+    scalar = compute_score(
+        solution_str=_reflect_trajectory(),
+        ground_truth=_ground_truth(reference_steps="The headline is legible."),
+    )
+    assert scalar["rollout_valid"] == 1

@@ -39,6 +39,8 @@ from verl.utils.distributed import initialize_global_process_group_ray, set_numa
 from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
+
+from verl_omni.utils.rollout_wake import is_cuda_oom
 from verl.utils.metric.utils import Metric
 from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
 from verl.utils.py_functional import append_to_dict
@@ -80,6 +82,67 @@ async def _timed_await(name: str, timings: dict, coro):
     start = time.perf_counter()
     try:
         return await coro
+    finally:
+        timings[name] = time.perf_counter() - start
+
+
+# A rollout wake re-maps the memory the engine backed up during its level-1 sleep, and it does
+# so through vLLM's sleep-mode allocator (``cuMemCreate``/``cuMemMap``; see
+# ``cumem_allocator.cpp``). That call needs a large *physically contiguous* region, so on a card
+# we share with another tenant it can fail even when the free total is ample, and the engine
+# reports it as
+#
+#   Wake-up failed on Rank 0: CUDA Error: out of memory at /workspace/csrc/cumem_allocator.cpp:163
+#
+# (measured 2026-09-25 00:21:42 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260925_000612``:
+# device 0 carried 28.66GiB of a *neighbouring* job while our actor shard reserved 8.57GiB, so
+# ~41GiB was free against a ~14GiB TP=2 re-map and the create still failed). The same run's
+# predecessor reached step 30 on the same configuration, so this is the shared card, not the
+# layout: the neighbour's pid 3240057 held 28.72GiB the whole time.
+#
+# Retrying is safe because a *failed* wake samples nothing -- the weights are still in the CPU
+# backup and the engine stays asleep -- so re-issuing the same request is idempotent. Each retry
+# first hands the driver back everything the actor is merely caching: ``aggressive_empty_cache``
+# reclaims exactly the ``reserved - allocated`` gap the re-map wants (2.0GiB of it in the run
+# above), which is what makes a later attempt more likely to succeed than the one that failed.
+WAKE_OOM_RETRIES = int(os.getenv("VERL_OMNI_WAKE_OOM_RETRIES", "4"))
+WAKE_OOM_BACKOFF_S: tuple[float, ...] = (3.0, 8.0, 20.0, 40.0)
+
+# The classifier itself lives in ``verl_omni.utils.rollout_wake`` (a leaf module) so the rollout
+# server can apply the same judgement inside ``wake_up`` -- it is reached directly by the trainer
+# and has no caller-side retry, which is how ``bagel_corl_rm1_20260927_165227`` died at step 41
+# with the very OOM this file's retry was written for. Re-exported under the old private name so
+# ``tests/workers/test_rollout_wake_oom_retry_on_cpu.py`` keeps pinning one implementation.
+_is_cuda_oom = is_cuda_oom
+
+
+async def _resume_rollout_vram_safe(rollout, tags: list[str], timings: dict, name: str):
+    """``rollout.resume(tags)`` with a bounded retry for a transient VRAM re-map failure.
+
+    Any non-OOM error is re-raised on the first attempt, and a persistent OOM still fails loud
+    once the schedule is exhausted -- the retries buy back a shared card's transient window, they
+    do not paper over a genuine shortage.
+    """
+    start = time.perf_counter()
+    try:
+        for attempt in range(WAKE_OOM_RETRIES + 1):
+            if attempt:
+                aggressive_empty_cache(force_sync=True)
+                delay = WAKE_OOM_BACKOFF_S[min(attempt - 1, len(WAKE_OOM_BACKOFF_S) - 1)]
+                logger.warning(
+                    "rollout resume(%s) failed with CUDA OOM (attempt %d/%d); flushed the actor "
+                    "cache and retrying in %.0fs",
+                    tags,
+                    attempt,
+                    WAKE_OOM_RETRIES,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            try:
+                return await rollout.resume(tags=tags)
+            except Exception as exc:  # noqa: BLE001 -- only the transient VRAM failure is retried
+                if not _is_cuda_oom(exc) or attempt >= WAKE_OOM_RETRIES:
+                    raise
     finally:
         timings[name] = time.perf_counter() - start
 
@@ -1073,7 +1136,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         resume_weights_task = None
         if self.config.rollout.free_cache_engine:
             resume_weights_task = asyncio.create_task(
-                _timed_await("resume_weights", timings, self.rollout.resume(tags=["weights"]))
+                _resume_rollout_vram_safe(self.rollout, ["weights"], timings, "resume_weights")
             )
 
         # 2. Detect the actor's adapter setup *without* triggering the heavy param
@@ -1186,7 +1249,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 5. resume kv_cache
         if self.config.rollout.free_cache_engine:
-            await _timed_await("resume_kv_cache", timings, self.rollout.resume(tags=["kv_cache"]))
+            await _resume_rollout_vram_safe(self.rollout, ["kv_cache"], timings, "resume_kv_cache")
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True

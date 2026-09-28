@@ -126,6 +126,43 @@ class DiffusionLossFn(ABC):
 DIFFUSION_LOSS_REGISTRY: dict[str, DiffusionLossFn] = {}
 
 
+def _loss_cfg_of(config: Any) -> Any:
+    """Return an attribute-accessible view of ``config.diffusion_loss``.
+
+    Every diffusion loss reads its knobs as **attributes** (``loss_cfg.adv_clip_max``,
+    ``loss_cfg.clip_ratio``, ``loss_cfg.dpo_beta``). The Bagel Co-RL (Joint-Training) composite
+    retargets the GEN actor config onto the outer AR trainer's ``OmniActorConfig``, whose
+    ``diffusion_loss`` node can arrive as a **plain dict** -- a recipe that overrides *inside* the
+    node (the Co-RL recipes pass ``+actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_grpo``)
+    creates one, and Hydra never binds it to ``DiffusionLossConfig``. The first attribute read then
+    dies:
+
+        AttributeError: 'dict' object has no attribute 'adv_clip_max'.
+
+    (measured 2026-09-23 18:16 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_175819``).
+
+    ``_rewrite_bagel_corl_configs`` now stamps ``_target_`` so the node is normally schema-bound and
+    this never triggers. This accessor is the belt to that braces: it upgrades a plain dict using the
+    declared ``DiffusionLossConfig`` defaults, so a partial dict behaves exactly like a partial
+    override. Config nodes that are not dicts (a ``DictConfig``, or the instantiated dataclass) are
+    returned untouched.
+    """
+    loss_cfg = config.diffusion_loss
+    if not isinstance(loss_cfg, dict):
+        return loss_cfg
+    import dataclasses
+
+    from verl_omni.workers.config.diffusion.actor import DiffusionLossConfig
+
+    values = {
+        field.name: field.default
+        for field in dataclasses.fields(DiffusionLossConfig)
+        if field.default is not dataclasses.MISSING
+    }
+    values.update(loss_cfg)
+    return DiffusionLossConfig(**values)
+
+
 def register_diffusion_loss(name: str) -> Callable[[type[DiffusionLossFn]], type[DiffusionLossFn]]:
     """Register a worker-side diffusion loss function class."""
 
@@ -304,7 +341,7 @@ class FlowGRPOLoss(DiffusionLossFn):
                 the mean reduction.
         """
         assert config is not None, "config is required for FlowGRPOLoss!"
-        loss_cfg = config.diffusion_loss
+        loss_cfg = _loss_cfg_of(config)
         advantages = torch.clamp(
             advantages,
             -loss_cfg.adv_clip_max,
@@ -392,7 +429,7 @@ class FlowDPPOLoss(DiffusionLossFn):
         divergence threshold and move farther from the old policy.
         """
         assert config is not None, "config is required for FlowDPPOLoss!"
-        loss_cfg = config.diffusion_loss
+        loss_cfg = _loss_cfg_of(config)
         advantages = advantages.detach()
 
         log_ratio = log_prob - old_log_prob
@@ -517,7 +554,7 @@ class GRPOGuardLoss(DiffusionLossFn):
                 the per-element policy loss is multiplied by these (detached) weights before
                 the mean reduction.
         """
-        loss_cfg = config.diffusion_loss
+        loss_cfg = _loss_cfg_of(config)
         advantages = torch.clamp(
             advantages,
             -loss_cfg.adv_clip_max,
@@ -731,7 +768,7 @@ class DPOLoss(DiffusionLossFn):
         if torch.any(chosen_scores < rejected_scores).item():
             raise ValueError("DPO loss expects each chosen sample reward to be >= its rejected pair reward.")
 
-        beta = config.diffusion_loss.dpo_beta
+        beta = _loss_cfg_of(config).dpo_beta
         target = noise.float() - latent.float()
         model_err = ((model_noise_pred.float() - target) ** 2).flatten(1).mean(dim=1)
         ref_err = ((ref_noise_pred.float() - target) ** 2).flatten(1).mean(dim=1)
@@ -806,7 +843,7 @@ class DiffusionNFTLoss(DiffusionLossFn):
         config: DiffusionActorConfig,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the DiffusionNFT policy loss and auxiliary metrics."""
-        loss_cfg = config.diffusion_loss
+        loss_cfg = _loss_cfg_of(config)
         beta = loss_cfg.mix_beta
 
         old_prediction = old_prediction.detach()
@@ -973,7 +1010,7 @@ class DiffusionNFTLoss(DiffusionLossFn):
 
         algorithm_cfg = config.algorithm
         actor_cfg = config.actor_rollout_ref.actor
-        adv_clip_max = actor_cfg.diffusion_loss.adv_clip_max
+        adv_clip_max = _loss_cfg_of(actor_cfg).adv_clip_max
         timestep_shuffle_seed = actor_cfg.data_loader_seed
 
         rollout_batch = {key: batch.batch[key] for key in batch.batch.keys()}

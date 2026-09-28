@@ -550,6 +550,33 @@ def run_und_token_forward_backward(
     return postprocess_und_batch(output_lst=output_lst, indices=indices, data=und, forward_only=forward_only)
 
 
+def _flatten_losses(value) -> list[float]:
+    """Flatten one lane's ``loss`` blob into a flat list of scalars.
+
+    The two lanes use different, individually-valid conventions. The UND part publishes flat
+    per-micro-batch scalars (``"loss": [loss.detach().item()]``, ``bagel_corl_composite.py``), while
+    the GEN part comes from the diffusion ``postprocess_batch_func``, which appends the *per-timestep*
+    list for each micro-batch (``losses.append(output["loss"])``, ``diffusers_impl.py``). Merging them
+    verbatim produced a ragged ``[scalar, [scalar, ...]]``, which the worker's reduction cannot
+    tensorize:
+
+        TypeError: must be real number, not list
+        (``engine_workers.py:249``, ``torch.sum(torch.tensor(output.pop("loss")))``)
+
+    (measured 2026-09-23 20:09 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_195416`` --
+    the first step whose GEN loss actually ran to completion). Flattening is sum-preserving and the
+    consumer only ever sums the entries, so the reported total is unchanged; a single-lane call never
+    reaches this (``merge_composite_outputs`` returns a lone part untouched).
+    """
+    flat: list[float] = []
+    for item in value if isinstance(value, (list, tuple)) else [value]:
+        if isinstance(item, (list, tuple)):
+            flat.extend(_flatten_losses(item))
+        elif item is not None:
+            flat.append(float(item))
+    return flat
+
+
 def merge_composite_outputs(parts: list[dict]) -> dict:
     """Merge UND + GEN ``postprocess_batch_func`` dicts for one train_batch metrics blob.
 
@@ -572,14 +599,24 @@ def merge_composite_outputs(parts: list[dict]) -> dict:
     merged_loss: list = []
     merged_metrics: dict = {}
     for part in parts:
-        merged_loss.extend(part.get("loss") or [])
-        for key, val in (part.get("metrics") or {}).items():
-            if key in merged_metrics and isinstance(merged_metrics[key], list) and isinstance(val, list):
-                merged_metrics[key].extend(val)
-            elif key in merged_metrics and isinstance(merged_metrics[key], list):
-                merged_metrics[key].append(val)
-            else:
-                merged_metrics[key] = val if isinstance(val, list) else [val]
+        # Per-lane ``loss`` shapes differ (see ``_flatten_losses``); normalize before merging or the
+        # worker's ``torch.tensor(...)`` reduction dies on "must be real number, not list".
+        merged_loss.extend(_flatten_losses(part.get("loss") or []))
+        # Metrics must go through ``append_to_dict``, which is ``Metric``-aware: the two lanes do not
+        # agree on the value type either — the UND part publishes ``Metric`` objects and the GEN part
+        # (via ``diffusion_loss`` → ``Metric.from_dict``) does too, but the hand-rolled merge below
+        # wrapped each lane's single ``Metric`` in a **list**, so the key ended up as
+        # ``[Metric, Metric]`` and the driver's legacy reducer did ``np.mean`` over it:
+        #
+        #   TypeError: unsupported operand type(s) for +: 'Metric' and 'Metric'
+        #   (``reduce_metrics`` → ``np.mean(val)``)
+        #
+        # (measured 2026-09-23 20:33 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_201744``
+        # -- the first step that produced GEN *and* UND metrics in the same blob). ``append_to_dict``
+        # creates ``val.init_list()`` for a ``Metric`` and ``Metric.append``/``extend`` flattens nested
+        # metrics, so the key stays a single aggregatable ``Metric``; plain scalars keep accumulating
+        # into a list, which ``reduce_metrics`` means as before.
+        append_to_dict(merged_metrics, part.get("metrics") or {})
     return {
         "model_output": parts[-1].get("model_output") or {},
         "loss": merged_loss,

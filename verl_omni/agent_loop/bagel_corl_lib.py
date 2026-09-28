@@ -24,6 +24,7 @@ import math
 import os
 import re
 import time
+import traceback
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -121,7 +122,12 @@ _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 # the tag the recipe's prompt uses to *describe* the available functions, so the checkpoint
 # re-emits it as its own call tag. See ``_tools_tagged_call``.
 _TAGGED_CALL_RE = re.compile(r"<tools>\s*(.*?)\s*</tools>", re.DOTALL)
-_DONE_RE = re.compile(r"\bDone\.\s*$", re.IGNORECASE)
+# The terminal ``Done.`` decode comes back from the engine with ``skip_special_tokens=False``, so
+# the raw text is ``Done.<|im_end|>`` (measured 2026-09-27 in
+# ``outputs/bagel_corl_rm1_20260927_165227/rollout_trajectories/step_000031``). The trailing
+# special tokens are therefore tolerated; without that the loop reads its own stop word as
+# ``continue`` and appends a second ``Done.``.
+_DONE_RE = re.compile(r"\bDone\.\s*(?:<\|[^|]*?\|>\s*)*$", re.IGNORECASE)
 
 # Role labels the checkpoint sometimes re-emits as *text* before a payload
 # ("ASSISTANT\n {json}"), and control/tag markers it echoes back from the prompt itself
@@ -139,13 +145,70 @@ _FENCED_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+.-]*[ \t]*\r?\n?(.*?)```", re.DOT
 # object per step (a plan, then the call) still counts, while a lone quoted example does not.
 _FENCED_PREAMBLE_LIMIT = 120
 
+# Native call tags. The checkpoint's *own* serving template wraps a call as
+# ``<|start of ToolCall|>[...]<|end of ToolCall|>`` (older builds spell it
+# ``<|FunctionCallBegin|>``/``<|FunctionCallEnd|>``), and -- unlike every other dialect here --
+# the payload is a JSON **array** of call objects, not a single object. The closing tag is
+# optional because a turn cut by ``und_turn_max_tokens`` can stop mid-array.
+#
+# The *spelling* of the marker is not stable across turns of a single episode, so every observed
+# variant is accepted rather than one canonical pair. Measured 2026-09-27 18:52+ in
+# ``outputs/bagel_corl_rm1_20260927_183640`` (devices 0/1/6/7, RM on) -- ``sample_1723296b``,
+# the one zero-reward episode of step 10, spent all eight turns in this dialect because the
+# opener was ``begin_of``, not ``start of``::
+#
+#     turn=1 kind=continue out_tokens=39
+#       text='<|begin_of ToolCall|>[{"name":"generate_image","arguments":{"prompt":"a magnesium
+#             ribbon igniting, emitting a brilliant white light"}}]<|end_of ToolCall|><|im_end|>'
+#     turn=4 ... '...<|end of the ToolCall|>...'   # same episode, a third spelling
+#
+# ``parse_und_tool_call`` returned ``None`` for a complete, well-formed call, ``K`` stayed 0 and
+# ``und_reward`` was a flat 0.0 -- the exact loss mode the ``start of`` spelling was added for.
+# The closer deliberately accepts the ``the`` variant too: it is the same episode's own text.
+_NATIVE_OPEN_TAGS = (
+    "start of ToolCall",
+    "begin of ToolCall",
+    "begin_of ToolCall",
+    "begin_of_ToolCall",
+    "FunctionCallBegin",
+)
+_NATIVE_CLOSE_TAGS = (
+    "end of ToolCall",
+    "end_of ToolCall",
+    "end of the ToolCall",
+    "end_of the ToolCall",
+    "end_of_ToolCall",
+    "FunctionCallEnd",
+)
+_NATIVE_CALL_RE = re.compile(
+    r"<\|(?:%s)\|>\s*(.*?)\s*(?:<\|(?:%s)\|>|\Z)"
+    % (
+        "|".join(re.escape(tag) for tag in _NATIVE_OPEN_TAGS),
+        "|".join(re.escape(tag) for tag in _NATIVE_CLOSE_TAGS),
+    ),
+    re.DOTALL,
+)
+
 _GENERATE_IMAGE_TOOL = "generate_image"
+#: Tool names the checkpoint uses to *stop*. Measured 2026-09-27 17:35 in
+#: ``outputs/bagel_corl_rm1_20260927_165227``: the UND lane emitted ``{"name": "Done"}`` and the
+#: fail-closed guard below killed the episode -- dropping the row, shrinking the batch from 4 to 3
+#: and forcing ``synthetic padding`` into the loss. A stop payload is exactly the terminal signal
+#: the loop wants; the guard exists for *Qwen* tools, not for the model's own stop word.
+_STOP_TOOL_NAMES = frozenset({"done", "done.", "stop", "finish", "finished", "finalize", "end", "complete", "terminate"})
+
 # The recipe's system prompt asks the UND lane to ``judge_image`` after the last image, but the
 # loop's tool registry has only ``generate_image`` (judging is the RM's job, see
 # ``bagel_corl_rm``). A *Hermes*-tagged unsupported tool stays fail-closed
 # (``test_unsupported_tool_is_fail_closed``); every other dialect the checkpoint actually samples
-# (bare, fenced, and ``<tools>``) treats ``judge_image`` as a non-action instead of killing the
-# episode, because there the protocol's judge turn is routine.
+# (bare, fenced, ``<tools>``, native array) treats a non-action name as prose instead of killing
+# the episode. Measured 2026-09-27 17:24 in
+# ``outputs/bagel_corl_rm1_20260927_165227/rollout_trajectories/step_000026``: the checkpoint
+# replays the *reference* trajectory's extra ``<tools>`` blocks inside the same turn as its real
+# ``generate_image`` call -- ``judge_image``, then a hallucinated ``reflect_and润色``. The old
+# allow-list (``_INERT_BARE_TOOLS = {"judge_image"}``) turned that replay into a dropped episode
+# per step, so the batch kept arriving 3 rows wide with one synthetic pad sample mixed into the
+# gradient.
 _INERT_BARE_TOOLS = frozenset({"judge_image"})
 
 
@@ -311,10 +374,84 @@ def _tools_tagged_call(text: str) -> dict[str, Any] | None:
     return None
 
 
-def parse_und_tool_call(text: str) -> dict[str, Any] | None:
-    """Parse a tool call emitted by the UND lane -- tagged, ``<tools>``, bare, or fenced.
+def _native_candidates(raw: str):
+    """Yield the substrings of a native tag body that could hold the call.
 
-    Four dialects have to be accepted, because the *same* published checkpoint produced all of
+    The body is normally a bare JSON array, but a turn cut at the token cap has no closing
+    bracket, so the bracketed scan is offered as a fallback rather than assumed.
+    """
+    yield raw
+    start, end = raw.find("["), raw.rfind("]")
+    if start >= 0 and end > start:
+        yield raw[start : end + 1]
+    start, end = raw.find("{"), raw.rfind("}")
+    if start >= 0 and end > start:
+        yield raw[start : end + 1]
+
+
+def _native_payload(raw: str) -> dict[str, Any] | None:
+    """Read the first named call out of a native tag body (array *or* object)."""
+    raw = raw.strip()
+    for candidate in _native_candidates(raw):
+        try:
+            loaded = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(loaded, list):
+            for item in loaded:
+                payload = _named_payload(item if isinstance(item, dict) else None)
+                if payload is not None:
+                    return payload
+            continue
+        payload = _named_payload(loaded if isinstance(loaded, dict) else None)
+        if payload is not None:
+            return payload
+    # Truncated body: fall back to the leading-object scan, which tolerates a cut tail.
+    return _named_payload(_leading_json_object(raw))
+
+
+def _native_tagged_call(text: str) -> dict[str, Any] | None:
+    """Parse a ``<|start of ToolCall|>[...]<|end of ToolCall|>`` span.
+
+    This is the checkpoint's *native* dialect, and it is the one that wasted the largest share
+    of a six-hour run. Measured 2026-09-23 15:19 on hk01dgx039 (devices 0/1/6/7,
+    ``bagel_corl_20260923_092424``), an eight-turn episode that never issued a single GEN
+    request, in the middle of which sits a **complete, well-formed call**:
+
+        turn=3 kind=continue out_tokens=76
+          text=' unintended\\nuser\\nA synthwave-inspired image featuring a wolf. Keep any
+                private thinking to one short paragraph; ...\\n\\n<|start of ToolCall|>
+                [{"name":"generate_image","arguments":{"prompt":"A synthwave-inspired image
+                featuring a wolf."}}]<|end of ToolCall|><|im_end|>'
+
+    ``parse_und_tool_call`` returned ``None`` for it, so the loop read the turn as prose and
+    decoded again -- and because the model had *already* made its call, every following turn
+    repeated the same payload (turns 3 and 6 were byte-identical, as were 4 and 7) until the
+    eight-turn cap, with ``gen_calls=0`` and a flat 0 reward. That is the loss mode
+    :func:`count_degenerate_und_turns` counts. Across the run's 161 zero-image episodes, 113
+    contained an actionable payload in this dialect: accepting it recovers ~70% of them.
+
+    The array shape is why the other dialects cannot see it: Hermes and bare expect a single
+    object, and there is no fence or ``<tools>`` tag anywhere in the span. The first element
+    that carries an actionable ``name`` wins, so a multi-call array still drives the loop.
+
+    The tag *spelling* varies across -- and within -- episodes (``begin_of ToolCall``,
+    ``end of the ToolCall``, ...); ``_NATIVE_CALL_RE`` accepts every observed variant, because
+    matching only one of them is what made this dialect invisible the first time. Measured
+    2026-09-27 18:52+ in ``outputs/bagel_corl_rm1_20260927_183640``: 2 of 48 recorded
+    trajectories, 1% of turns, and 1 of the 7 zero-reward episodes.
+    """
+    for match in _NATIVE_CALL_RE.finditer(text):
+        payload = _native_payload(match.group(1))
+        if payload is not None:
+            return payload
+    return None
+
+
+def parse_und_tool_call(text: str) -> dict[str, Any] | None:
+    """Parse a tool call emitted by the UND lane -- tagged, native, ``<tools>``, bare, or fenced.
+
+    Five dialects have to be accepted, because the *same* published checkpoint produced all of
     them here:
 
     * Hermes, ``<tool_call>{"name": ...}</tool_call>`` -- what ``HERMES_SPECIAL_TOKENS``, the
@@ -365,17 +502,25 @@ def parse_und_tool_call(text: str) -> dict[str, Any] | None:
       the payload neither starts the text nor sits in a fence, so every turn read as ``continue``
       -- 0 GEN calls and a flat 0 reward on all 90 steps. See :func:`_tools_tagged_call` for why
       ``<output>`` is not accepted alongside it.
+    * the **native ``<|start of ToolCall|>`` array** (spellings vary: ``begin_of``, ``end of the
+      ToolCall``, ...; see ``_NATIVE_OPEN_TAGS``). Measured 2026-09-23 15:19 on hk01dgx039
+      (devices 0/1/6/7, ``bagel_corl_20260923_092424``); see :func:`_native_tagged_call` for the
+      transcript and the 70%-of-episodes recovery it enables.
 
     Only a payload that *starts* the text (bare, after an optional role echo and echoed ``<...>``
-    markers), that sits inside a ``<tools>`` block, or that is a fenced block naming a tool behind
-    a label of at most ``_FENCED_PREAMBLE_LIMIT`` characters counting no braces counts; a JSON
-    example inside the model's prose plan satisfies none of those, so it is not mistaken for a
-    call. Every fenced block is considered in turn, each against its **own** label, because the
-    checkpoint also emits a numbered plan whose call is a later fence than the plan itself.
+    markers), that sits inside a ``<tools>`` block or a native ``<|start of ToolCall|>`` tag, or
+    that is a fenced block naming a tool behind a label of at most ``_FENCED_PREAMBLE_LIMIT``
+    characters counting no braces counts; a JSON example inside the model's prose plan satisfies
+    none of those, so it is not mistaken for a call. Every fenced block is considered in turn, each
+    against its **own** label, because the checkpoint also emits a numbered plan whose call is a
+    later fence than the plan itself.
     """
     tagged = parse_hermes_tool_call(text)
     if tagged is not None:
         return tagged
+    native = _native_tagged_call(text)
+    if native is not None:
+        return native
     head = _LEADING_MARKER_RE.sub("", _ROLE_ECHO_RE.sub("", text, count=1).lstrip())
     if head.startswith("{"):
         return _named_payload(_leading_json_object(head))
@@ -398,6 +543,116 @@ UND_STOP_SEQUENCES: tuple[str, ...] = ("<output>",)
 
 #: Fraction of the *remaining* context a single UND turn may consume.
 UND_TURN_FRACTION: float = 0.5
+
+#: Substring of the rejection ``AsyncOmni.generate`` raises while any sleep tag is still set.
+#: The engine reports the exact tag set, e.g. ``Currently sleeping tags: ['weights', 'kv_cache']``.
+ENGINE_ASLEEP_MARKER: str = "partially or fully asleep"
+
+#: Backoff schedule for re-issuing a decode that was rejected by a still-waking engine.
+#: A level-1 wake re-maps ~28 GiB through ``create_and_map``, which measured ~30 s on hk01dgx039
+#: (2026-09-23 22:35:24 wake logged -> 22:35:56 rejection), so the schedule has to outlast that.
+#: Total ~62 s across 5 retries; a genuine, never-waking engine still fails loudly rather than
+#: spinning forever.
+ENGINE_ASLEEP_BACKOFF_S: tuple[float, ...] = (2.0, 5.0, 10.0, 15.0, 30.0)
+
+
+def _iter_exception_chain(exc: BaseException):
+    """Yield ``exc`` followed by every exception it wraps.
+
+    Both spellings are followed because the two wrappers in this path disagree: Python sets
+    ``__cause__``/``__context__``, while ``ray.exceptions.RayTaskError`` also carries an
+    explicit ``cause`` attribute.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        wrapped = getattr(current, "cause", None)
+        if not isinstance(wrapped, BaseException):
+            wrapped = current.__cause__ if isinstance(current.__cause__, BaseException) else current.__context__
+        current = wrapped if isinstance(wrapped, BaseException) else None
+
+
+def exception_search_text(exc: BaseException) -> str:
+    """Flatten ``exc`` and everything it wraps into one searchable string.
+
+    ``str()`` alone is not enough, and that is the entire reason this exists. The rejection from
+    ``AsyncOmni.generate`` reaches the agent loop wrapped in ``ray.exceptions.RayTaskError``,
+    whose ``__str__`` is the *task* repr -- ``ray::vLLMOmniHttpServer.generate() (pid=...,
+    ip=..., actor_id=...)`` -- with the actual ``RuntimeError: Generation rejected: Engine is
+    partially or fully asleep...`` only in the cause chain. Measured 2026-09-24 on hk01dgx039
+    (devices 0/1/6/7, ``bagel_corl_rm1_20260924_034359``): two episodes were rejected with that
+    exact message while the retry wrapper *was* on the stack (``bagel_corl_lib.py:543``) and
+    **not one** retry fired, because the marker was matched against that task repr.
+
+    The rendered traceback is appended as a backstop: it is the same text the log shows, so a
+    future wrapper that hides the cause behind yet another ``__str__`` cannot silently disable
+    the retry again.
+    """
+    parts: list[str] = []
+    for current in _iter_exception_chain(exc):
+        parts.append(f"{type(current).__name__}: {current}")
+        parts.append(repr(current))
+    try:
+        parts.append("".join(traceback.format_exception(exc)))
+    except Exception:  # noqa: BLE001 -- classification must never raise
+        pass
+    return "\n".join(parts)
+
+
+def engine_asleep_retry_delay(attempt: int, message: str) -> float | None:
+    """Seconds to wait before re-issuing a decode rejected by a still-waking engine.
+
+    Returns ``None`` when the error is not the transient wake-window rejection, or when the
+    backoff schedule is exhausted -- in both cases the caller must re-raise.
+
+    Why this is safe to retry: ``AsyncOmni.generate`` rejects the request **before** executing
+    it, so nothing was sampled and no log-prob, KV entry or RNG state was consumed. The engine
+    clears the sleeping tag set only once its re-map finishes, so the rejection simply means
+    "not yet" rather than "this request is invalid". Re-issuing with the *same* ``request_id``
+    keeps the conditioning-cache affinity that the GEN S-group depends on
+    (``_cond_routing_key``), and is harmless for the UND lane's per-turn ``uuid4``.
+
+    Measured 2026-09-23 on hk01dgx039 (devices 0/1/6/7): the trainer logged
+    ``bagel_corl_sync woke 1 UND AR replica(s) (weights+kv_cache) after sleep`` at 22:35:24 and
+    two episodes were rejected 32 s later, then the engine's diffusion subprocess segfaulted in
+    ``cuMemcpy`` and the run wedged at 0% GPU for an hour. The wake call returns as soon as the
+    request is dispatched, not when the memory is mapped, so the rollout can start inside the
+    wake window.
+    """
+    if ENGINE_ASLEEP_MARKER not in message:
+        return None
+    if attempt >= len(ENGINE_ASLEEP_BACKOFF_S):
+        return None
+    return ENGINE_ASLEEP_BACKOFF_S[attempt]
+
+
+async def generate_retrying_engine_wake(attempt_fn, *, on_retry=None, sleep=None):
+    """Await ``attempt_fn()``, re-issuing while the engine reports a still-waking sleep tag.
+
+    ``attempt_fn`` is a zero-argument callable returning a fresh coroutine per try (a coroutine
+    object cannot be awaited twice). ``on_retry(attempt, delay, exc)`` is an optional hook for
+    logging; ``sleep`` is injectable so CPU tests need not wait the real backoff.
+
+    See :func:`engine_asleep_retry_delay` for why the rejection is retryable and for the measured
+    2026-09-23 wake-window race this exists to absorb.
+    """
+    import asyncio
+
+    sleeper = sleep or asyncio.sleep
+    attempt = 0
+    while True:
+        try:
+            return await attempt_fn()
+        except Exception as exc:  # noqa: BLE001 — only the wake-window rejection is swallowed
+            delay = engine_asleep_retry_delay(attempt, exception_search_text(exc))
+            if delay is None:
+                raise
+            if on_retry is not None:
+                on_retry(attempt, delay, exc)
+            await sleeper(delay)
+            attempt += 1
 
 
 def und_turn_max_tokens(
@@ -533,22 +788,35 @@ def und_turn_kind(text: str) -> str:
     """Classify an UND decode: ``generate_image``, ``done``, or ``continue``.
 
     Accepts every tool-call dialect of :func:`parse_und_tool_call` (Hermes-tagged, ``<tools>``,
-    bare, fenced). A *Hermes-tagged* unsupported tool stays fail-closed (the Qwen-tool guard the
-    RFC asks for); the same name in the dialects the checkpoint actually samples
-    (``judge_image``) is inert -- the recipe's prompt asks the lane to judge after the last image
-    and the RM does that judging, so killing the episode there would drop rows for following the
-    prompt.
+    bare, fenced, native array).
+
+    A *Hermes-tagged* unsupported tool stays fail-closed -- that is the Qwen-tool guard the RFC
+    asks for, and it is the only dialect where the tag itself claims "this is an OpenAI/Hermes
+    function call". Every dialect the checkpoint actually samples treats a non-action name as a
+    non-action instead of killing the episode:
+
+    * a stop name (``Done``, ``finish``, ...) is the terminal signal, not an unsupported tool -- the
+      loop wants ``done``;
+    * anything else (``judge_image``, and the hallucinated ``reflect_and润色`` the 2026-09-27 run
+      replayed out of the reference trajectory) is inert: the recipe's prompt asks for those turns
+      and the RM does the real judging, so killing the episode there drops rows and pads the batch.
     """
     tagged = parse_hermes_tool_call(text)
     call = tagged if tagged is not None else parse_und_tool_call(text)
     if call is not None:
         name = str(call.get("name", ""))
-        if name == "generate_image":
+        normalized = name.strip().strip(".\"' ").lower()
+        if normalized == _GENERATE_IMAGE_TOOL:
             return "generate_image"
-        if tagged is None and name in _INERT_BARE_TOOLS:
-            logger.debug("bagel_corl_und_bare_inert_tool name=%s (no loop tool; RM judges)", name)
-            return "continue"
-        raise ValueError(f"Bagel CoRL UND emitted unsupported tool {name!r}; Qwen/other tools are fail-closed")
+        if normalized in _STOP_TOOL_NAMES:
+            logger.debug("bagel_corl_und_stop_tool name=%s (terminal signal)", name)
+            return "done"
+        if tagged is not None:
+            raise ValueError(
+                f"Bagel CoRL UND emitted unsupported tool {name!r}; Qwen/other tools are fail-closed"
+            )
+        logger.debug("bagel_corl_und_inert_tool name=%s (no loop tool; RM judges)", name)
+        return "continue"
     if _DONE_RE.search(text.strip()):
         return "done"
     return "continue"
@@ -1212,7 +1480,17 @@ async def run_serial_episode(
                         done_step = await done_decode if asyncio.iscoroutine(done_decode) else done_decode
                     done_ids = list(done_step.get("token_ids") or [])
                     done_text = str(done_step.get("text") or "")
-                    if done_ids and und_turn_kind(done_text) == "done":
+                    try:
+                        kind = und_turn_kind(done_text)
+                    except ValueError as exc:
+                        # A stop decode is the one place the fail-closed guard has nothing to
+                        # protect: the episode is ending either way, and the ``else`` branch below
+                        # already appends the tokenizer's literal ``Done.``. Raising here instead
+                        # dropped the whole episode (measured 2026-09-27 17:35, ``{"name": "Done"}``)
+                        # and shrank the batch to 3 rows with one synthetic pad sample.
+                        logger.warning("bagel_corl_und_done_decode_unparsed err=%s; using Done. fallback", exc)
+                        kind = "continue"
+                    if done_ids and kind == "done":
                         _append_response(done_ids, 1, done_step.get("log_probs"))
                     else:
                         fallback = _encode_text(

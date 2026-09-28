@@ -23,6 +23,7 @@ import os
 import time
 import uuid
 import zlib
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     cond_reuse_metrics,
     conditioning_uid,
     count_degenerate_und_turns,
+    generate_retrying_engine_wake,
     run_serial_episode,
     turn_histogram,
     und_turn_max_tokens,
@@ -59,6 +61,25 @@ from verl_omni.tools.trajectory.paths import build_trajectory_relpath, resolve_r
 from verl_omni.utils.agentic.image_gen_rollout_parse import last_user_prompt
 
 logger = logging.getLogger(__name__)
+
+
+def _log_engine_asleep_retry(_logger, attempt: int, delay: float, exc: Exception, *, lane: str, step: Any = None) -> None:
+    """Report a re-issue of a decode the engine rejected mid-wake.
+
+    Logged at WARNING, not DEBUG: this is a transient that the retry schedule is expected to
+    absorb, but a *run* of these means wake latency is outgrowing the schedule and the rollout is
+    stalling on it. ``lane`` separates the AR (``und``) and diffusion (``gen``) pools, which wake
+    on different paths.
+    """
+    _logger.warning(
+        "bagel_corl %s lane: engine rejected a decode mid-wake (step=%s attempt=%d, retrying in %.1fs) -- "
+        "the wake call returns when the request is dispatched, not when the memory is mapped: %s",
+        lane,
+        step,
+        attempt + 1,
+        delay,
+        exc,
+    )
 
 
 def _messages_are_text_only(messages: Any) -> bool:
@@ -687,10 +708,19 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                 ):
                     und_params.pop(_k, None)
                 try:
-                    output = await self.server_manager.generate(
-                        request_id=str(uuid.uuid4()),
-                        prompt_ids=list(_decode_kwargs["prompt_ids"]) + list(_decode_kwargs["response_ids"]),
-                        sampling_params=und_params,
+                    output = await generate_retrying_engine_wake(
+                        partial(
+                            self.server_manager.generate,
+                            request_id=str(uuid.uuid4()),
+                            prompt_ids=list(_decode_kwargs["prompt_ids"]) + list(_decode_kwargs["response_ids"]),
+                            sampling_params=und_params,
+                        ),
+                        on_retry=partial(
+                            _log_engine_asleep_retry,
+                            logger,
+                            lane="und",
+                            step=getattr(self, "global_steps", None),
+                        ),
                     )
                 except Exception as exc:  # noqa: BLE001 — map diffusion-replica errors to UND dual-role failure
                     err = str(exc)
@@ -883,10 +913,23 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             try:
                 request_params = build_gen_sampling_params(rollout, base=base, seed=int(seed))
                 request_params["bagel_role"] = "gen"
-                output = await self.server_manager.generate(
-                    request_id=routing_key or str(uuid.uuid4()),
-                    prompt_ids=gen_prompt_ids,
-                    sampling_params=request_params,
+                # Same wake-window rejection as the UND lane, and the same fix: the engine
+                # rejects before executing, so re-issuing is safe. The request id is the S-group's
+                # sticky ``routing_key``, so reusing it is required -- a fresh uuid would scatter
+                # the group across replicas and cold the conditioning cache (RFC §4.4.2b).
+                output = await generate_retrying_engine_wake(
+                    partial(
+                        self.server_manager.generate,
+                        request_id=routing_key or str(uuid.uuid4()),
+                        prompt_ids=gen_prompt_ids,
+                        sampling_params=request_params,
+                    ),
+                    on_retry=partial(
+                        _log_engine_asleep_retry,
+                        logger,
+                        lane="gen",
+                        step=getattr(self, "global_steps", None),
+                    ),
                 )
                 row = stash_gen_row_from_diffusion_output(output, seed=int(seed))
                 row["cond_uid"] = cond_uid

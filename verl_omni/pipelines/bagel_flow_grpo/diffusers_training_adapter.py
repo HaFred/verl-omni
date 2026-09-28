@@ -23,8 +23,9 @@ renormalization matching the rollout pipeline exactly.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Any, Optional
 
+import numpy as np
 import torch
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
@@ -44,6 +45,37 @@ from verl_omni.workers.config import DiffusionModelConfig
 from .common import BAGEL_FLOWGRPO_CFG_DEFAULTS, setup_bagel_sigmas
 
 logger = logging.getLogger(__name__)
+
+
+def _as_token_id_list(ids: Any, *, index: int) -> list[int]:
+    """Coerce one row of ``prompt_token_ids`` to a flat list of python ints.
+
+    A row arrives as a list, a 1-D ``np.ndarray`` (sometimes ``dtype=object``), or a tensor.
+    The dtype is what actually breaks the adapter: ``torch.as_tensor`` rejects an object-dtype
+    array outright -- "can't convert np.ndarray of type numpy.object_" -- even when every
+    element is an int, and a row sliced out of a 2-D object matrix is 1-D, so the shape alone
+    is never the tell. Normalising here is what makes those rows usable.
+
+    A row that is still 2-D after this is a genuine upstream shape bug (the payload is a batch
+    of sequences, not one sequence) and is rejected loudly rather than silently flattened into
+    one over-long sequence.
+    """
+    if isinstance(ids, torch.Tensor):
+        ids = ids.reshape(-1).tolist()
+    elif isinstance(ids, np.ndarray):
+        if ids.ndim != 1:
+            raise ValueError(
+                f"prompt_token_ids row {index} has shape {ids.shape}; expected one flat "
+                "sequence. A 2-D object array here means the per-row lists were collapsed into "
+                "a matrix upstream (uniform prompt lengths), so build it 1-D instead."
+            )
+        ids = ids.tolist()
+    try:
+        return [int(token) for token in ids]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"prompt_token_ids row {index} is not a flat sequence of ints: {type(ids).__name__}"
+        ) from exc
 
 
 @DiffusionModelBase.register("OmniBagelForConditionalGeneration", algorithm="flow_grpo")
@@ -159,6 +191,13 @@ class BagelDiffusion(DiffusionModelBase):
 
         if isinstance(prompt_token_ids, torch.Tensor) and prompt_token_ids.ndim == 1:
             prompt_token_ids = [prompt_token_ids]
+
+        # Normalise every row to a flat list of ints before touching torch, so ``max_len``
+        # below and the copy after it measure the same thing and an object-dtype row cannot
+        # reach ``torch.as_tensor``.
+        prompt_token_ids = [
+            _as_token_id_list(ids, index=index) for index, ids in enumerate(prompt_token_ids)
+        ]
 
         B = len(prompt_token_ids)
         max_len = max(len(ids) for ids in prompt_token_ids)

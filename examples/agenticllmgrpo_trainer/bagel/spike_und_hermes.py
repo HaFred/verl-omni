@@ -92,6 +92,9 @@ _FENCED_PREAMBLE_LIMIT = 120
 # ``generate_image`` call is a later one.
 _FENCED_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+.-]*[ \t]*\r?\n?(.*?)```", re.DOTALL)
 _INERT_BARE_TOOLS = frozenset({"judge_image"})
+# Mirrors ``bagel_corl_lib._STOP_TOOL_NAMES``: a stop payload from the checkpoint's own dialect is
+# the terminal signal (measured 2026-09-27: ``{"name": "Done"}``), never an unsupported Qwen tool.
+_STOP_TOOL_NAMES = frozenset({"done", "done.", "stop", "finish", "finished", "finalize", "end", "complete", "terminate"})
 
 
 def _normalize_call(payload: dict | None) -> dict | None:
@@ -171,13 +174,18 @@ def _und_turn_kind(text: str) -> str:
     call = tagged if tagged is not None else _parse_und_tool_call(text)
     if call is not None:
         name = str(call.get("name", ""))
-        if name == "generate_image":
+        normalized = name.strip().strip(".\"' ").lower()
+        if normalized == "generate_image":
             return "generate_image"
-        if tagged is None and name in _INERT_BARE_TOOLS:
-            # The recipe's prompt asks the lane to judge after the last image and the RM
-            # does that judging, so a bare ``judge_image`` is inert, not a hard failure.
-            return "continue"
-        raise ValueError(f"Bagel CoRL UND emitted unsupported tool {name!r}; Qwen/other tools are fail-closed")
+        if normalized in _STOP_TOOL_NAMES:
+            # Mirrors ``bagel_corl_lib``: the checkpoint's own stop payload (``{"name": "Done"}``)
+            # is the terminal signal, not an unsupported Qwen tool.
+            return "done"
+        if tagged is not None:
+            raise ValueError(f"Bagel CoRL UND emitted unsupported tool {name!r}; Qwen/other tools are fail-closed")
+        # The recipe's prompt asks the lane to judge after the last image and the RM does that
+        # judging, so a non-action name is inert, not a hard failure.
+        return "continue"
     if _DONE_RE.search(text.strip()):
         return "done"
     return "continue"

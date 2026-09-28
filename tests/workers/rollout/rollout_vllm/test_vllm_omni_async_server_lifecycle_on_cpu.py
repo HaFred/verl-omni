@@ -897,3 +897,103 @@ def test_the_async_omni_client_exposes_collective_rpc_not_the_engine_internal_na
         "collective_rpc_async belongs to AsyncOmniEngine; if it appears on the client, "
         "re-check which object verl_omni holds before changing the call sites back"
     )
+
+
+# ---------------------------------------------------------------------------
+# In-flight drain before sleep
+#
+# AsyncOmni.sleep defaults to mode="abort" / reset_running_requests=True, so a sleep issued
+# while a decode is still running tears that request down *and* unmaps the memory the worker
+# is reading it from. Measured 2026-09-24 on hk01dgx039 (devices 0/1/6/7,
+# bagel_corl_rm1_20260924_034359, ENABLE_RM=1, test_freq=30): the first validation batch
+# reached trainer_base.py:1036's colocated-RM sleep_replicas() with two episodes still
+# decoding, VllmWorker-0 died silently (exit code None, no traceback, only a stray NCCL
+# version line) and the run ended with 30 clean steps behind it.
+#
+# AsyncOmni.request_states cannot answer "is anything in flight?" -- only its abort path ever
+# pops, so it grows for the life of the process. The server therefore counts its own
+# generate() calls, which is what these tests pin.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_wait_for_requests_to_drain_returns_at_once_when_idle():
+    """The training path sleeps after a drained rollout, so this must cost no tick."""
+    server = _make_server(_FakeAsyncOmni())
+    server._inflight_generations = 0
+
+    assert await server.wait_for_requests_to_drain(timeout_s=30.0) == 0
+
+
+@pytest.mark.asyncio
+async def test_wait_for_requests_to_drain_waits_for_the_last_generate_to_return():
+    """A sleep must not release memory while a decode is still reading it."""
+    server = _make_server(_FakeAsyncOmni())
+    server._inflight_generations = 2
+    finished: list[int] = []
+
+    async def _drain_later():
+        await asyncio.sleep(0.6)
+        server._inflight_generations = 0
+        finished.append(1)
+
+    waiter = asyncio.ensure_future(server.wait_for_requests_to_drain(timeout_s=30.0))
+    drained = asyncio.ensure_future(_drain_later())
+
+    assert await waiter == 0
+    assert finished == [1]  # it really waited, rather than reading a stale 0
+    await drained
+
+
+@pytest.mark.asyncio
+async def test_sleep_observes_a_drained_engine_not_a_live_decode():
+    """The regression: the engine sleep must not run until the count reaches zero."""
+    engine = _FakeAsyncOmni()
+    server = _make_server(engine)
+    server._inflight_generations = 1
+    observed: list[int] = []
+
+    original_sleep = engine.sleep
+
+    async def _recording_sleep(*args, **kwargs):
+        observed.append(server._inflight_generations)
+        return await original_sleep(*args, **kwargs)
+
+    engine.sleep = _recording_sleep
+
+    async def _release():
+        await asyncio.sleep(0.4)
+        server._inflight_generations = 0
+
+    releaser = asyncio.ensure_future(_release())
+    await server.sleep()
+    await releaser
+
+    assert observed == [0]
+    assert engine.sleep_calls == [{"stage_ids": None, "level": 1, "mode": "abort"}]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_requests_to_drain_gives_up_without_turning_a_stuck_request_into_an_error():
+    """A wedged request must not become a second failure: the engine's abort is the fallback."""
+    server = _make_server(_FakeAsyncOmni())
+    server._inflight_generations = 1
+
+    assert await server.wait_for_requests_to_drain(timeout_s=0.0) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_counts_itself_as_in_flight_for_the_whole_call():
+    """The counter is the drain's only input, so it must span the entire generate."""
+    server = _server_with_strategy(_FakeAsyncOmni(), ARStrategy)
+    observed: list[int] = []
+
+    async def _generate(**kwargs):
+        observed.append(server._inflight_generations)
+        return "TokenOutput"
+
+    server._generate_strategy.generate = _generate
+
+    assert await server.generate(prompt_ids=[1], sampling_params={}, request_id="r1") == "TokenOutput"
+    assert observed == [1]
+    assert server._inflight_generations == 0

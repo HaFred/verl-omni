@@ -20,6 +20,7 @@ import pathlib
 import types
 
 import hydra
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -37,7 +38,11 @@ from verl_omni.trainer.omni.bagel_corl_trainer import (
 )
 from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
 from verl_omni.utils.config import validate_bagel_corl_config, validate_config
-from verl_omni.workers.config.diffusion import DiffusionPipelineConfig, DiffusionSamplingConfig
+from verl_omni.workers.config.diffusion import (
+    DiffusionLossConfig,
+    DiffusionPipelineConfig,
+    DiffusionSamplingConfig,
+)
 from verl_omni.workers.utils.losses import bagel_composite_loss
 
 # RFC §4.0.2 dual-lane LoRA: bagel_corl_sync requires the explicit list, so fixtures use
@@ -657,6 +662,148 @@ def test_composite_loss_und_plus_gen_separate_views():
     assert order == ["und"]
 
 
+def test_advantage_flags_survive_the_kv_batch_put_hand_off(monkeypatch):
+    """``_compute_advantage`` must publish its lane flags onto the meta ``super()`` returns.
+
+    The v1 base ends that method with ``batch = tq.kv_batch_put(...)``. ``kv_batch_put`` builds its
+    result from a meta it creates internally (``extra_info=batch_meta.extra_info``), so the returned
+    ``KVBatchMeta`` carries the dataclass default ``{}`` and never sees the incoming batch's dict.
+    ``step()`` then rebinds ``batch`` to that new object, so any flag written to the *incoming*
+    batch is dropped before ``_update_actor`` reads it back.
+
+    Measured 2026-09-23 on devices 0,1,6,7: ``bagel_corl_sync advantage ... skip_gen=False`` was
+    followed 35 ms later by ``bagel_corl_sync update_actor skip_gen=True`` on every step -- GEN
+    advantages were computed and then never optimised. The stub below returns a *new* object with a
+    fresh ``extra_info``, which is what the real parent does; a stub returning the same batch cannot
+    catch this, which is why the existing view test above passed while the run was broken.
+    """
+    from types import SimpleNamespace
+
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = OmegaConf.create(
+        {
+            "algorithm": {
+                "adv_estimator": "grpo",
+                "norm_adv_by_std_in_grpo": True,
+                "global_std": True,
+            },
+            "actor_rollout_ref": {
+                "model": {"algorithm": "flow_grpo"},
+                "rollout": {"agent": {"gen_samples_per_call": 2}},
+            },
+        }
+    )
+
+    def _rows(scores_by_group):
+        rows = []
+        for group, scores in scores_by_group:
+            for seed, score in enumerate(scores):
+                rows.append(
+                    {
+                        "gen_group_uid": group,
+                        "gen_sample_uid": f"{group}:{seed}",
+                        "rollout_log_probs": [0.1, 0.2, 0.3],
+                        "rm_score": score,
+                        "all_latents": torch.randn(3, 4),
+                        "timesteps": torch.tensor([900.0, 600.0, 300.0]),
+                    }
+                )
+        return rows
+
+    def _fresh_meta(self, batch, metrics):
+        # Mimic ``tq.kv_batch_put``: a brand-new carrier whose ``extra_info`` is the default ``{}``.
+        return SimpleNamespace(extra_info={})
+
+    monkeypatch.setattr(OmniPPOTrainerSync, "_compute_advantage", _fresh_meta)
+
+    # Both GEN samples of each group present -> the lane is trainable.
+    incoming = SimpleNamespace(
+        extra_info={"gen_batch": _rows((("callA", (1.0, 0.0)), ("callB", (0.5, 0.5))))}
+    )
+    result = trainer._compute_advantage(incoming, {})
+
+    assert result is not incoming, "the parent hands back a new carrier; the test must model that"
+    assert result.extra_info["has_complete_gen_groups"] is True
+    assert result.extra_info["skip_gen"] is False
+    assert result.extra_info["num_gen_rows"] == 4
+    assert result.extra_info["bagel_corl_gen"] is not None
+    assert "advantages" in result.extra_info["bagel_corl_gen"].keys()
+
+    # No GEN rows at all -> the flags must still reach the returned carrier, now skipping GEN.
+    skipped = trainer._compute_advantage(SimpleNamespace(extra_info={"gen_batch": []}), {})
+    assert skipped.extra_info["has_complete_gen_groups"] is False
+    assert skipped.extra_info["skip_gen"] is True
+
+
+def test_gen_prompt_token_ids_stay_a_1d_object_array():
+    """Uniform prompt lengths must not collapse ``prompt_token_ids`` into a 2-D matrix.
+
+    ``np.array(list_of_lists, dtype=object)`` returns a ``(B, L)`` **2-D** object array when
+    every row happens to share one length, and a ``(B,)`` array of lists when they are ragged.
+    Only the ragged case used to survive the consumer: for the 2-D case
+    ``prompt_token_ids[i]`` is an ``ndarray``, and ``torch.as_tensor(ids, dtype=torch.long)``
+    rejects any object-dtype array even when every element is an int:
+
+        TypeError: can't convert np.ndarray of type numpy.object_.
+
+    Measured 2026-09-24: run ``bagel_corl_rm1_20260923_234021`` died at step 9 this way after
+    9 otherwise clean steps. Identical lengths are the trigger, so both cases are pinned here.
+    """
+    import numpy as np
+
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import build_gen_flowgrpo_proto
+
+    def _rows(lengths):
+        rows = []
+        for index, length in enumerate(lengths):
+            rows.append(
+                {
+                    "gen_group_uid": "callA",
+                    "gen_sample_uid": f"callA:{index}",
+                    "rollout_log_probs": [0.1, 0.2, 0.3],
+                    "rm_score": 1.0 if index == 0 else 0.0,
+                    "all_latents": torch.randn(3, 4),
+                    "timesteps": torch.tensor([900.0, 600.0, 300.0]),
+                    "prompt_token_ids": list(range(10, 10 + length)),
+                }
+            )
+        return rows
+
+    # The regression: identical lengths used to yield shape (2, 5) and crash the adapter.
+    for label, lengths in (("identical", [5, 5]), ("ragged", [3, 5])):
+        proto = build_gen_flowgrpo_proto(_rows(lengths))
+        ids = proto.non_tensor_batch["prompt_token_ids"]
+        assert isinstance(ids, np.ndarray), label
+        assert ids.dtype == object, label
+        assert ids.ndim == 1, f"{label}: expected 1-D, got shape {ids.shape}"
+        # Each row must be the row's own flat sequence, not a column slice of a matrix.
+        assert list(ids[0]) == list(range(10, 10 + lengths[0])), label
+
+
+def test_as_token_id_list_normalises_dtypes_and_rejects_nesting():
+    """The consumer-side guard: object dtype is normalised, real nesting is rejected."""
+    import numpy as np
+
+    from verl_omni.pipelines.bagel_flow_grpo.diffusers_training_adapter import _as_token_id_list
+
+    assert _as_token_id_list([1, 2, 3], index=0) == [1, 2, 3]
+    # The regression itself: a 1-D object-dtype row. ``torch.as_tensor`` rejects this dtype
+    # even though every element is an int, so the normalisation is what saves the adapter.
+    assert _as_token_id_list(np.array([1, 2, 3], dtype=object), index=0) == [1, 2, 3]
+    # Exactly the row the upstream collapse produced: ``arr[i]`` of a 2-D object matrix is a
+    # 1-D object-dtype array, so shape was never the problem -- dtype was.
+    assert _as_token_id_list(np.array([[1, 2, 3], [4, 5, 6]], dtype=object)[0], index=0) == [1, 2, 3]
+    assert _as_token_id_list(np.array([1, 2, 3], dtype=np.int64), index=0) == [1, 2, 3]
+    assert _as_token_id_list(torch.tensor([[1, 2, 3]]), index=0) == [1, 2, 3]
+
+    # A genuinely nested payload (a batch of sequences handed in as one row) must raise a
+    # pointed error rather than let torch emit its opaque dtype complaint.
+    with pytest.raises(ValueError, match="expected one flat sequence"):
+        _as_token_id_list(np.array([[1, 2], [3, 4]], dtype=object), index=0)
+    with pytest.raises(ValueError, match="not a flat sequence of ints"):
+        _as_token_id_list([{"not": "a token"}], index=0)
+
+
 def test_normalize_tq_kv_get_result_columnar_tensordict():
     """kv_batch_get returns a columnar TensorDict, not a keyed dict."""
     keys = ["k0::gen::c::0", "k0::gen::c::1"]
@@ -882,6 +1029,219 @@ def test_gen_regularizer_velocity_mse_fails_loud():
         bagel_composite_loss(config=config, model_output=model_output, data=data)
 
 
+def test_lane_views_are_moved_onto_the_forward_device_before_dispatch():
+    """``bagel_corl_{und,gen}`` views must be aligned with the model output device.
+
+    Both views are parked as **non-tensor** data, so the diffusion engine's
+    ``micro_batch.to(device)`` (``diffusers_impl.py:983``) never recurses into them -- ``TensorDict.to``
+    leaves non-tensor payloads alone. Their tensors are allocated on the CPU by
+    ``build_gen_flowgrpo_proto``, so the first elementwise op against a cuda model output died:
+
+        RuntimeError: Expected all tensors to be on the same device, but found at least two devices,
+        cuda:0 and cpu!   (``diffusion_algos.py:350``, ``log_ratio = log_prob - old_log_prob``)
+
+    (measured 2026-09-23 18:50 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_183457``).
+
+    ``meta`` stands in for cuda: the views start on the CPU (as they really do) and the forward output
+    starts on ``meta``, so the assertion below is a genuine cross-device move rather than a same-device
+    no-op. (``meta`` -> cpu is not permitted by torch, which is why the stand-in runs this direction.)
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    und_data = TensorDict(
+        {
+            "response_mask": torch.ones(2, 3),
+            "old_log_probs": torch.zeros(2, 3),
+            "advantages": torch.ones(2, 3),
+        },
+        batch_size=[2],
+    )
+    gen_data = TensorDict(
+        {"advantages": torch.ones(2, 2), "old_log_probs": torch.zeros(2, 2)},
+        batch_size=[2],
+    )
+    data = TensorDict({}, batch_size=[])
+    assign_non_tensor_data(data, "bagel_corl_und", und_data)
+    assign_non_tensor_data(data, "bagel_corl_gen", gen_data)
+    assign_non_tensor_data(data, "has_complete_gen_groups", True)
+    assign_non_tensor_data(data, "skip_gen", False)
+    assign_non_tensor_data(data, "num_gen_rows", 2)
+    # The engine stamps these on the *micro-batch* (``diffusers_impl.py:984``); the lane views are
+    # non-tensor stashes and never receive them, so the loss has to inherit them. Without that,
+    # ``gradient_accumulation_steps`` is None and ``diffusion_loss`` dies on the division.
+    assign_non_tensor_data(data, "gradient_accumulation_steps", 3)
+    assign_non_tensor_data(data, "sp_size", 1)
+
+    # The forward "ran on cuda" (meta here), so that is the device the lane views have to match.
+    model_output = {
+        "und": {"log_probs": torch.zeros(2, 3, device="meta", requires_grad=True)},
+        "gen": {"log_probs": torch.zeros(2, device="meta", requires_grad=True)},
+    }
+    config = SimpleNamespace(diffusion_loss=OmegaConf.create({"loss_weight_und": 1.0, "loss_weight_gen": 1.0}))
+
+    seen: dict[str, str] = {}
+    inherited: dict[str, object] = {}
+
+    def fake_ppo(config, model_output, data, dp_group=None):
+        seen["und"] = data["old_log_probs"].device.type
+        return torch.tensor(1.0, requires_grad=True), {}
+
+    def fake_diff(config, model_output, data, dp_group=None):
+        seen["gen"] = data["old_log_probs"].device.type
+        inherited["gradient_accumulation_steps"] = tu.get_non_tensor_data(
+            data, "gradient_accumulation_steps", default=None
+        )
+        inherited["sp_size"] = tu.get_non_tensor_data(data, "sp_size", default=None)
+        return torch.tensor(2.0, requires_grad=True), {}
+
+    with (
+        patch("verl.workers.utils.losses.ppo_loss", fake_ppo),
+        patch("verl_omni.workers.utils.losses.diffusion_loss", fake_diff),
+    ):
+        bagel_composite_loss(config=config, model_output=model_output, data=data)
+
+    assert seen == {"und": "meta", "gen": "meta"}, (
+        f"lane views must be moved onto the forward device before dispatch, got {seen}"
+    )
+    assert inherited == {"gradient_accumulation_steps": 3, "sp_size": 1}, (
+        f"lane views must inherit the micro-batch's non-tensor scalars, got {inherited}"
+    )
+
+
+def test_first_tensor_device_sees_through_nested_output_and_align_tolerates_plain_dicts():
+    """The device probe must find a nested ``log_probs``, and alignment must not choke on odd views."""
+    from types import SimpleNamespace
+
+    from verl_omni.workers.utils.losses import _align_view_to_device, _first_tensor_device
+
+    assert _first_tensor_device({"gen": {"log_probs": torch.zeros(1, device="meta")}}) == torch.device("meta")
+    # A payload with no tensor at all reports None rather than raising, so the caller can fall back.
+    assert _first_tensor_device({"a": {"b": 1.0}}) is None
+    assert _first_tensor_device(None) is None
+
+    # A plain mapping is handled as well as a TensorDict.
+    plain = {"old_log_probs": torch.zeros(1)}
+    _align_view_to_device(plain, torch.device("meta"))
+    assert plain["old_log_probs"].device.type == "meta"
+
+    # A matching device is a no-op, and a None device short-circuits.
+    same = {"old_log_probs": torch.zeros(1)}
+    _align_view_to_device(same, torch.device("cpu"))
+    assert same["old_log_probs"].device.type == "cpu"
+    assert _align_view_to_device(same, None) is None
+    # A non-mapping payload is left alone rather than raising.
+    _align_view_to_device(SimpleNamespace(old_log_probs=1), torch.device("meta"))
+
+
+def test_diffusion_loss_tolerates_an_ar_config_without_the_distill_node():
+    """The GEN lane's loss must not need the diffusion-only distill node to exist.
+
+    ``use_distill_loss`` / ``distill_loss_mode`` / ``distill_loss_coef`` are declared on
+    ``DiffusionActorConfig``, but the Co-RL composite hands ``diffusion_loss`` the outer AR trainer's
+    ``OmniActorConfig``, which declares none of them. The unconditional read killed the GEN loss on
+    the first step that reached it:
+
+        AttributeError: 'OmniActorConfig' object has no attribute 'use_distill_loss'.
+
+    (measured 2026-09-23 19:12 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_185651``).
+
+    ``rollout_correction`` on the same object was the identical failure one step earlier, so the
+    assertion below pins the *class* of problem: every node the diffusion loss reads off the actor
+    config has to be optional.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from verl_omni.workers.utils.losses import diffusion_loss
+
+    # Only the fields ``OmniActorConfig`` really declares; no distill node, no rollout_correction.
+    ar_config = SimpleNamespace(
+        global_batch_info={},
+        loss_scale_factor=1.0,
+        diffusion_loss=OmegaConf.create({"loss_mode": "flow_grpo"}),
+        use_kl_loss=False,
+        rollout_correction=None,
+    )
+    data = TensorDict(
+        {
+            "advantages": torch.ones(2, 2),
+            "old_log_probs": torch.zeros(2, 2),
+            "return": torch.ones(2, 2),
+            "response_mask": torch.ones(2, 2),
+        },
+        batch_size=[2],
+    )
+    # ``diffusion_loss`` divides by the accumulation count and scales by ``sp_size``; the engine
+    # stamps both as non-tensor data, so the fixture has to as well.
+    assign_non_tensor_data(data, "gradient_accumulation_steps", 1)
+    assign_non_tensor_data(data, "sp_size", 1)
+    model_output = {"log_probs": torch.zeros(2, requires_grad=True)}
+
+    with patch("verl_omni.workers.utils.losses.get_diffusion_loss_fn") as get_fn:
+        stub = get_fn.return_value
+        stub.required_model_output_keys = ["log_probs"]
+        stub.validate_inputs.return_value = None
+        stub.return_value = SimpleNamespace(
+            loss=torch.tensor(0.0, requires_grad=True) * 1.0, metrics={}, add_loss_metric=True
+        )
+        loss, _metrics = diffusion_loss(ar_config, model_output, data)
+
+    assert float(loss) == pytest.approx(0.0)
+    # The distill term must not have been dispatched at all.
+    assert get_fn.call_count == 1
+    assert get_fn.call_args.args[0] == "flow_grpo"
+
+
+def test_diffusion_loss_still_activates_distillation_from_the_loss_mode():
+    """Selecting distillation via ``diffusion_loss.loss_mode`` must still dispatch the distill term.
+
+    ``diffusion_trainer_utils._validate_distill_config`` already treats "``loss_mode`` is a distill
+    mode" as equivalent to ``use_distill_loss``, so the loss has to agree with it -- otherwise making
+    the flag optional would silently drop a configured term.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from verl_omni.workers.utils.losses import diffusion_loss
+
+    ar_config = SimpleNamespace(
+        global_batch_info={},
+        loss_scale_factor=1.0,
+        diffusion_loss=OmegaConf.create({"loss_mode": "distill_kl"}),
+        use_kl_loss=False,
+    )
+    data = TensorDict(
+        {
+            "advantages": torch.ones(2, 2),
+            "old_log_probs": torch.zeros(2, 2),
+            "return": torch.ones(2, 2),
+            "response_mask": torch.ones(2, 2),
+        },
+        batch_size=[2],
+    )
+    # ``diffusion_loss`` divides by the accumulation count and scales by ``sp_size``; the engine
+    # stamps both as non-tensor data, so the fixture has to as well.
+    assign_non_tensor_data(data, "gradient_accumulation_steps", 1)
+    assign_non_tensor_data(data, "sp_size", 1)
+    model_output = {"log_probs": torch.zeros(2, requires_grad=True)}
+
+    with patch("verl_omni.workers.utils.losses.get_diffusion_loss_fn") as get_fn:
+        stub = get_fn.return_value
+        stub.required_model_output_keys = ["log_probs"]
+        stub.validate_inputs.return_value = None
+        # A real loss returns a non-leaf tensor (``loss_value += ...`` is in-place), so the stub
+        # must not hand back a leaf that requires grad.
+        stub.return_value = SimpleNamespace(
+            loss=torch.tensor(0.5, requires_grad=True) * 1.0, metrics={}, add_loss_metric=True
+        )
+        diffusion_loss(ar_config, model_output, data)
+
+    dispatched = [call.args[0] for call in get_fn.call_args_list]
+    # ``loss_mode`` itself is dispatched first, then the distill term -- both are "distill_kl" here.
+    assert dispatched.count("distill_kl") >= 1, f"distill term was not dispatched: {dispatched}"
+
+
 def test_dual_lora_param_groups_lr_override():
     import torch.nn as nn
 
@@ -1030,6 +1390,87 @@ def test_rewrite_retargets_val_kwargs_to_diffusion_sampling():
     )
     assert isinstance(bare, DiffusionSamplingConfig)
     assert hasattr(bare, "pipeline") and hasattr(bare, "algo") and hasattr(bare, "seed")
+
+
+def test_rewrite_binds_a_recipe_supplied_diffusion_loss_node_to_the_schema():
+    """A partial ``diffusion_loss`` dict from the recipe must still carry the schema defaults.
+
+    The omni schema does not declare ``actor_rollout_ref.actor.diffusion_loss`` at all -- the
+    Co-RL recipes create it with an append (``+actor_rollout_ref.actor.diffusion_loss.loss_mode=
+    flow_grpo``), which produces a **plain dict**. The loss reads its knobs as attributes, so the
+    first step that reached the GEN loss died on
+
+        AttributeError: 'dict' object has no attribute 'adv_clip_max'.
+
+    (measured 2026-09-23 18:16 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_175819``,
+    after the five earlier GEN-lane fixes finally let the loss run). The rewrite has to stamp
+    ``_target_`` so ``omega_conf_to_dataclass`` fills in ``clip_ratio`` / ``adv_clip_max`` /
+    ``dpo_beta`` rather than leaving a bare dict behind.
+    """
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = _corl_cfg()
+    trainer.config.actor_rollout_ref.rollout.agent.max_und_turns = 8
+    # Exactly what the recipe's ``+...diffusion_loss.loss_mode=flow_grpo`` append composes to: a
+    # dict with one meaningful key and no ``_target_``.
+    trainer.config.actor_rollout_ref.actor = OmegaConf.create(
+        {"diffusion_loss": {"loss_mode": "flow_grpo"}}
+    )
+
+    trainer._rewrite_bagel_corl_configs()
+
+    node = trainer.config.actor_rollout_ref.actor.diffusion_loss
+    assert node.get("_target_") == "verl_omni.workers.config.diffusion.DiffusionLossConfig"
+    # The recipe's override survives the binding.
+    assert node.get("loss_mode") == "flow_grpo"
+
+    # Bind for real and confirm every attribute the loss reads is present with its declared default.
+    instantiated = hydra.utils.instantiate(OmegaConf.to_container(node, resolve=True))
+    assert isinstance(instantiated, DiffusionLossConfig)
+    assert instantiated.loss_mode == "flow_grpo"
+    assert instantiated.adv_clip_max == pytest.approx(5.0)
+    assert instantiated.clip_ratio == pytest.approx(0.0001)
+
+    # A node the recipe never touched keeps being created whole.
+    trainer2 = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer2.config = _corl_cfg()
+    trainer2.config.actor_rollout_ref.rollout.agent.max_und_turns = 8
+    trainer2.config.actor_rollout_ref.actor = OmegaConf.create({})
+    trainer2._rewrite_bagel_corl_configs()
+    built = hydra.utils.instantiate(
+        OmegaConf.to_container(trainer2.config.actor_rollout_ref.actor.diffusion_loss, resolve=True)
+    )
+    assert isinstance(built, DiffusionLossConfig)
+    assert built.adv_clip_max == pytest.approx(5.0)
+
+
+def test_loss_cfg_of_upgrades_a_plain_dict_with_the_declared_defaults():
+    """The loss-side belt to the rewrite's braces (see ``diffusion_algos._loss_cfg_of``).
+
+    Even if a ``diffusion_loss`` dict reaches the loss unbound, the attribute reads must resolve to
+    the declared ``DiffusionLossConfig`` defaults instead of raising. A config node that is not a
+    dict (a ``DictConfig``, or the instantiated dataclass) has to pass through untouched.
+    """
+    from types import SimpleNamespace
+
+    from verl_omni.trainer.diffusion.diffusion_algos import _loss_cfg_of
+
+    upgraded = _loss_cfg_of(SimpleNamespace(diffusion_loss={"loss_mode": "flow_grpo"}))
+    assert upgraded.loss_mode == "flow_grpo"
+    assert upgraded.adv_clip_max == pytest.approx(5.0)
+    assert upgraded.clip_ratio == pytest.approx(0.0001)
+    assert upgraded.dpo_beta == pytest.approx(2000.0)
+
+    # An explicit value in the dict wins over the default.
+    overridden = _loss_cfg_of(
+        SimpleNamespace(diffusion_loss={"loss_mode": "flow_grpo", "adv_clip_max": 9.0})
+    )
+    assert overridden.adv_clip_max == pytest.approx(9.0)
+
+    # A typed node is returned as-is, not rebuilt.
+    typed = DiffusionLossConfig(loss_mode="flow_grpo", adv_clip_max=7.0)
+    assert _loss_cfg_of(SimpleNamespace(diffusion_loss=typed)) is typed
+    node = OmegaConf.create({"_target_": "x", "loss_mode": "dpo"})
+    assert _loss_cfg_of(SimpleNamespace(diffusion_loss=node)) is node
 
 
 def test_rewrite_fails_loud_on_non_list_lora_targets():
@@ -1736,6 +2177,144 @@ def test_und_pass_fails_loud_when_no_micro_batch_size_is_declared(monkeypatch):
         composite.run_und_token_forward_backward(_stub_bagel_engine(), _und_batch(), None, forward_only=True)
 
 
+# --- GEN pass must hand the same splitter the same batch size ---------------------
+#
+# The sibling defect to the UND one above, and it is worth keeping the two tests adjacent
+# because the fix is identical: ``DiffusersFSDPEngine._run_forward_backward_batch`` force-sets
+# ``use_dynamic_bsz=False`` (verl_omni/workers/engine/fsdp/diffusers_impl.py) and then calls
+# ``prepare_micro_batches``, which reads ``micro_batch_size_per_gpu`` off the batch
+# (verl/verl/workers/engine/utils.py:89). The worker injects the key onto the *parent* batch
+# (verl_omni/workers/engine_workers.py:413 train / :473 infer), but the Bagel Co-RL GEN sub-batch
+# is materialized from the trajectory view by ``materialize_gen_train_batch``, so the key never
+# propagates. It stayed invisible while ``ENABLE_RM=0`` because ``skip_gen=True`` retired the GEN
+# loss before the splitter ran; the first RM-on step to reach it died with, on hk01dgx039
+# (devices 0/1/6/7, ``bagel_corl_rm1_20260923_154117``):
+#
+#   KeyError: 'key "micro_batch_size_per_gpu" not found in TensorDict with keys
+#   ['advantages', 'all_latents', 'all_timesteps', 'bagel_corl_gen', 'has_complete_gen_groups',
+#    'num_gen_rows', 'old_log_probs', 'returns', 'rm_scores', 'sample_level_rewards',
+#    'sample_level_scores', 'skip_gen', 'sp_size', 'use_dynamic_bsz']'
+#
+# These tests call the GEN entry point directly with ``prepare_micro_batches`` spied out. The spy
+# returns no micro-batches, so ``forward_step``/``postprocess_batch_func`` never run and the test
+# stays a pure plumbing check on what the splitter was handed.
+
+_GEN_INFER_MICRO_BSZ = 5
+_GEN_TRAIN_MICRO_BSZ = 7
+
+
+def _diffusers_engine_stub(engine_config: object | None = None) -> object:
+    """Minimal stand-in for ``DiffusersFSDPEngine`` around ``_run_forward_backward_batch``."""
+    from verl_omni.workers.engine.fsdp import diffusers_impl
+
+    engine = types.SimpleNamespace()
+    engine.ulysses_sequence_parallel_size = 1
+    engine.get_data_parallel_group = lambda: None
+    engine.engine_config = engine_config
+    # The GEN pass re-slices row-aligned non-tensors for the micro-batches; a stub has to carry the
+    # real implementation or the call raises before the splitter is ever reached.
+    engine._reslice_per_row_non_tensors = diffusers_impl.DiffusersFSDPEngine._reslice_per_row_non_tensors
+    engine.postprocess_batch_func = lambda output_lst, indices, data: {
+        "output_lst": output_lst,
+        "indices": indices,
+    }
+    return engine
+
+
+def _gen_batch() -> TensorDict:
+    """A batch shaped like the materialized GEN sub-batch (latents over a timestep axis)."""
+    return TensorDict(
+        {
+            "all_latents": torch.zeros(2, 4, 3, 8, 8),
+            "all_timesteps": torch.zeros(2, 4),
+            "old_log_probs": torch.zeros(2, 4),
+            "advantages": torch.zeros(2, 4),
+            "rm_scores": torch.zeros(2),
+        },
+        batch_size=[2],
+    )
+
+
+def _spy_on_gen_split(monkeypatch: pytest.MonkeyPatch):
+    """Swap the GEN path's ``prepare_micro_batches`` for a spy; return ``(engine_mod, seen)``."""
+    from verl_omni.workers.engine.fsdp import diffusers_impl
+
+    seen: dict = {}
+
+    def _spy(data, **kwargs):
+        seen["micro_batch_size_per_gpu"] = tu.get_non_tensor_data(
+            data=data, key="micro_batch_size_per_gpu", default=None
+        )
+        seen["use_dynamic_bsz"] = tu.get_non_tensor_data(data=data, key="use_dynamic_bsz", default=None)
+        seen["sp_size"] = tu.get_non_tensor_data(data=data, key="sp_size", default=None)
+        # No micro-batches: the timestep loop and the postprocess never run, so this test only
+        # observes what the splitter was handed.
+        return [], None
+
+    monkeypatch.setattr(diffusers_impl, "prepare_micro_batches", _spy)
+    return diffusers_impl, seen
+
+
+def test_gen_pass_reattaches_the_micro_batch_size_the_splitter_needs(monkeypatch):
+    """A batch size carried on the GEN sub-batch must reach the splitter."""
+    diffusers_impl, seen = _spy_on_gen_split(monkeypatch)
+    data = _gen_batch()
+    tu.assign_non_tensor(data, micro_batch_size_per_gpu=3)
+
+    diffusers_impl.DiffusersFSDPEngine._run_forward_backward_batch(
+        _diffusers_engine_stub(), data, None, False, timesteps_key="all_timesteps"
+    )
+
+    assert seen["micro_batch_size_per_gpu"] == 3
+
+
+def test_gen_pass_train_falls_back_to_the_train_micro_batch_size(monkeypatch):
+    """The materialized GEN train batch carries no key, so the engine's train knob must be used."""
+    diffusers_impl, seen = _spy_on_gen_split(monkeypatch)
+    engine = _diffusers_engine_stub(
+        types.SimpleNamespace(
+            infer_micro_batch_size_per_gpu=_GEN_INFER_MICRO_BSZ,
+            micro_batch_size_per_gpu=_GEN_TRAIN_MICRO_BSZ,
+        )
+    )
+
+    diffusers_impl.DiffusersFSDPEngine._run_forward_backward_batch(
+        engine, _gen_batch(), None, False, timesteps_key="all_timesteps"
+    )
+
+    assert seen["micro_batch_size_per_gpu"] == _GEN_TRAIN_MICRO_BSZ
+    # The forcing that makes the key mandatory in the first place must still be in place.
+    assert seen["use_dynamic_bsz"] is False
+    assert seen["sp_size"] == 1
+
+
+def test_gen_pass_infer_falls_back_to_the_infer_micro_batch_size(monkeypatch):
+    """A GEN infer pass must read the infer knob, not the train one."""
+    diffusers_impl, seen = _spy_on_gen_split(monkeypatch)
+    engine = _diffusers_engine_stub(
+        types.SimpleNamespace(
+            infer_micro_batch_size_per_gpu=_GEN_INFER_MICRO_BSZ,
+            micro_batch_size_per_gpu=_GEN_TRAIN_MICRO_BSZ,
+        )
+    )
+
+    diffusers_impl.DiffusersFSDPEngine._run_forward_backward_batch(
+        engine, _gen_batch(), None, True, timesteps_key="all_timesteps"
+    )
+
+    assert seen["micro_batch_size_per_gpu"] == _GEN_INFER_MICRO_BSZ
+
+
+def test_gen_pass_fails_loud_when_no_micro_batch_size_is_declared(monkeypatch):
+    """No batch key and no engine config must fail here, not deep inside tensordict."""
+    diffusers_impl, _ = _spy_on_gen_split(monkeypatch)
+
+    with pytest.raises(KeyError, match="micro_batch_size_per_gpu"):
+        diffusers_impl.DiffusersFSDPEngine._run_forward_backward_batch(
+            _diffusers_engine_stub(), _gen_batch(), None, False, timesteps_key="all_timesteps"
+        )
+
+
 # --- FSDP2 must treat the UND entry point as a forward method ---------------------
 #
 # FSDP2 only all-gathers parameters and converts activations for ``nn.Module.forward``
@@ -1996,6 +2575,141 @@ def test_merge_composite_outputs_is_silent_when_only_the_last_lane_has_model_out
     assert merged["metrics"] == {"gen/skipped_no_groups": [1.0]}
 
 
+def test_merge_composite_outputs_flattens_the_gen_per_timestep_losses():
+    """Merging the two lanes must yield a rectangular ``loss`` the worker can tensorize.
+
+    The lanes publish different shapes: UND is flat per-micro-batch scalars, GEN is the
+    diffusion postprocessor's per-*timestep* list per micro-batch. Merged verbatim the result is
+    ragged, and ``engine_workers._postprocess_output`` does
+    ``torch.sum(torch.tensor(output.pop("loss")))``:
+
+        TypeError: must be real number, not list
+
+    (measured 2026-09-23 20:09 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_195416``).
+    The flatten has to be sum-preserving, since the only consumer sums the entries.
+    """
+    from verl_omni.workers.engine.fsdp import bagel_corl_composite as composite
+
+    und = {"model_output": {}, "loss": [0.5], "metrics": {}}
+    # Two micro-batches, three denoise timesteps each -- exactly what the diffusion postprocessor
+    # appends when GEN is the last lane.
+    gen = {"model_output": {"latents": torch.zeros(2, 3)}, "loss": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], "metrics": {}}
+
+    merged = composite.merge_composite_outputs([und, gen])
+
+    assert merged["loss"] == [0.5, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6], (
+        f"every entry must be a scalar, got {merged['loss']}"
+    )
+    # The one thing the worker does with it: sum. It has to be a valid tensor, and the total has to
+    # match the ragged input's total exactly.
+    total = float(torch.sum(torch.tensor(merged["loss"])))
+    assert total == pytest.approx(0.5 + 0.1 + 0.2 + 0.3 + 0.4 + 0.5 + 0.6)
+
+
+def test_merge_composite_outputs_keeps_a_gen_only_merge_tensorizable():
+    """A GEN-only merge (no UND part) must stay tensorizable too, not just the mixed case."""
+    from verl_omni.workers.engine.fsdp import bagel_corl_composite as composite
+
+    gen = {"model_output": {"latents": torch.zeros(2, 3)}, "loss": [[0.1, 0.2], [0.3, 0.4]], "metrics": {}}
+    empty = {"model_output": {}, "loss": [], "metrics": {}}
+
+    merged = composite.merge_composite_outputs([empty, gen])
+
+    assert all(isinstance(entry, float) for entry in merged["loss"]), merged["loss"]
+    assert float(torch.sum(torch.tensor(merged["loss"]))) == pytest.approx(1.0)
+
+
+def test_extra_fields_rows_reads_the_tq_column_and_unwraps_it():
+    """The ``agentic_rewards`` telemetry read must survive the TransferQueue's columnar shape.
+
+    ``tq.kv_batch_get`` returns a *columnar* TensorDict whose columns are tensordict containers, and
+    the old reader called ``.tolist()`` on it -- which no ``LinkedList``/``NonTensorStack`` has. The
+    blanket ``except`` in ``_compute_metrics`` swallowed the raise, so every step logged
+
+        Failed to compute agentic_rewards metrics: 'LinkedList' object has no attribute 'tolist'
+
+    and the whole ``agentic_rewards/*`` block was dead for the Bagel lanes (measured 2026-09-23 21:12
+    on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_205640``). The unwrap matters just as
+    much: ``list(NonTensorStack)`` yields ``NonTensorData`` wrappers, and the caller's
+    ``isinstance(ef, dict)`` is False for those -- an all-zero block that reads like "no tool rewards
+    were collected" rather than an error.
+    """
+    from tensordict import NonTensorStack
+    from tensordict.tensorclass import NonTensorData
+
+    from verl.trainer.ppo.v1.trainer_base import _extra_fields_rows
+
+    rows = [{"tool_rewards": [1.0, 0.5]}, {"reward_extra_info": {"calc_gsm8k_reward_sum": 2.0}}]
+    ef_data = TensorDict({"extra_fields": NonTensorStack(*[NonTensorData(r) for r in rows])}, batch_size=[])
+
+    # The shape the helper must tolerate really has no ``tolist``.
+    assert not hasattr(ef_data["extra_fields"], "tolist")
+
+    assert _extra_fields_rows(ef_data) == rows
+
+
+def test_extra_fields_rows_also_handles_a_plain_list_column():
+    """A backend that already returns plain rows must keep working unchanged."""
+    from verl.trainer.ppo.v1.trainer_base import _extra_fields_rows
+
+    rows = [{"tool_rewards": [0.25]}, {"tool_rewards": []}]
+    ef_data = TensorDict({"extra_fields": rows}, batch_size=[])
+
+    assert _extra_fields_rows(ef_data) == rows
+
+
+def test_merge_composite_outputs_keeps_metrics_aggregatable():
+    """A merged metric must stay a single ``Metric``, not a list of them.
+
+    Both lanes publish ``Metric`` objects, and the hand-rolled merge wrapped each lane's single
+    ``Metric`` in a list, so the key became ``[Metric, Metric]`` and the driver's legacy reducer did
+    ``np.mean`` over it:
+
+        TypeError: unsupported operand type(s) for +: 'Metric' and 'Metric'
+        (``reduce_metrics`` in ``verl/verl/utils/metric/utils.py``)
+
+    (measured 2026-09-23 20:33 on hk01dgx039, devices 0/1/6/7, ``bagel_corl_rm1_20260923_201744``).
+    ``append_to_dict`` creates ``val.init_list()`` for a ``Metric`` and flattens nested metrics, so
+    the merged key stays aggregatable.
+    """
+    from verl.utils.metric import Metric, reduce_metrics
+
+    from verl_omni.workers.engine.fsdp import bagel_corl_composite as composite
+
+    und = {
+        "model_output": {},
+        "loss": [0.5],
+        "metrics": Metric.from_dict({"actor/loss": 0.5}, aggregation="mean"),
+    }
+    gen = {
+        "model_output": {"latents": torch.zeros(2, 3)},
+        "loss": [[0.25]],
+        "metrics": Metric.from_dict({"actor/loss": 0.25, "actor/kl": 0.1}, aggregation="mean"),
+    }
+
+    merged = composite.merge_composite_outputs([und, gen])
+
+    # ``reduce_metrics`` is exactly what the driver runs; it must not raise.
+    reduced = reduce_metrics(dict(merged["metrics"]))
+    assert reduced["actor/loss"] == pytest.approx(0.375)  # mean of both lanes' contributions
+    assert reduced["actor/kl"] == pytest.approx(0.1)
+
+
+def test_merge_composite_outputs_keeps_plain_scalar_metrics_working():
+    """Plain scalar metrics must still accumulate into a list that ``reduce_metrics`` can mean."""
+    from verl.utils.metric import reduce_metrics
+
+    from verl_omni.workers.engine.fsdp import bagel_corl_composite as composite
+
+    und = {"model_output": {}, "loss": [0.5], "metrics": {"gen/skipped_no_groups": [1.0]}}
+    gen = {"model_output": {"latents": torch.zeros(2, 3)}, "loss": [[0.25]], "metrics": {"gen/skipped_no_groups": 0.0}}
+
+    merged = composite.merge_composite_outputs([und, gen])
+    reduced = reduce_metrics(dict(merged["metrics"]))
+
+    assert reduced["gen/skipped_no_groups"] == pytest.approx(0.5)
+
+
 # ---------------------------------------------------------------------------
 # UND AR sleep/wake bridge (RFC §4.11).
 #
@@ -2111,9 +2825,456 @@ def test_on_validate_end_rewakes_und_after_the_colocated_reward_sleep():
     ]
 
 
+def test_wake_rollout_replicas_wakes_the_gen_pool_too():
+    """``on_step_end`` must clear BOTH pools' tags, not just the UND AR one.
+
+    ``checkpoint_manager.sleep_replicas()`` sleeps every registered replica, so the GEN pool
+    is asleep too. The parent's naive publish resumes only the actor's own GEN server and
+    passes no tags -- ``vLLMOmniHttpServer.wake_up`` then falls back to
+    ``_get_wake_up_tags() == ["weights"]`` while ``AsyncOmni`` keeps rejecting generation
+    until every tag is cleared. Measured 2026-09-24, ``bagel_corl_rm1_20260923_213235``
+    (200-step, ``test_freq=30``): 30 clean steps, then the validation boundary died with
+    ``Generation rejected: Engine is partially or fully asleep ... ['weights', 'kv_cache']``.
+    """
+    log: list = []
+    # The real topology: the parent registered the GEN replica, we added the UND AR one on top.
+    gen_replica = _RecordingReplica(log)
+    und_replica = _RecordingReplica(log)
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.timing_raw = {}
+    trainer.global_steps = 7
+    trainer.und_rollout_replicas = [und_replica]
+    trainer.checkpoint_manager = _FakeCheckpointManager(log, [gen_replica, und_replica])
+
+    trainer._wake_rollout_replicas()
+
+    assert log == [
+        ("wake_up", ("weights", "kv_cache")),  # UND AR pool
+        ("wake_up", ("weights", "kv_cache")),  # GEN pool, previously left on ['weights']
+    ]
+
+    # The GEN pool is exactly "registered minus the UND AR pool", by identity.
+    assert trainer._gen_rollout_replicas() == [gen_replica]
+
+
+def test_validate_rewakes_both_pools_between_the_rm_sleep_and_the_next_batch(monkeypatch):
+    """The val loop's colocated-RM sleep must be undone *before* the next val batch rolls out.
+
+    The parent loop (``verl/trainer/ppo/v1/trainer_base.py:1034-1037``) sleeps every replica to
+    hand the GPU to the colocated RM, scores, then publishes through
+    ``checkpoint_manager.update_weights()`` -- whose naive path resumes only the actor's own GEN
+    server and requests no tags. It then rolls out again, so every batch after the first starts
+    against a sleeping engine. ``on_validate_end`` runs after the whole loop, too late.
+
+    Measured 2026-09-24 (``bagel_corl_rm1_20260924_034359``, ``ENABLE_RM=1``): 4 validation
+    batches (``VAL_MAX_SAMPLES=8`` / ``val_batch_size=2``) and the run died at the ``test_freq=30``
+    boundary with "Generation rejected: Engine is partially or fully asleep". This pins the wake
+    landing *between* the publish and the next rollout.
+    """
+    log: list = []
+    gen_replica = _RecordingReplica(log)
+    und_replica = _RecordingReplica(log)
+
+    def _fake_parent_validate(self):
+        """Stand in for one pass of the parent's per-batch val loop."""
+        log.append(("generate_sequences", 1))
+        self.checkpoint_manager.sleep_replicas()
+        self.checkpoint_manager.update_weights()
+        log.append(("generate_sequences", 2))
+        return {"episode/K": 1.0}
+
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.global_steps = 30
+    trainer.und_rollout_replicas = [und_replica]
+    trainer.checkpoint_manager = _FakeCheckpointManager(log, [gen_replica, und_replica])
+
+    monkeypatch.setattr(OmniPPOTrainerSync, "_validate", _fake_parent_validate)
+    trainer._validate()
+
+    assert log == [
+        ("generate_sequences", 1),
+        ("sleep_replicas", None),
+        ("update_weights", None),
+        # Both pools fully awake again, and in that order: UND AR then GEN.
+        ("wake_up", ("weights", "kv_cache")),
+        ("wake_up", ("weights", "kv_cache")),
+        ("generate_sequences", 2),
+    ]
+    # The wrap must not outlive the call, or the training path would double-wake.
+    assert trainer.checkpoint_manager.update_weights.__func__ is _FakeCheckpointManager.update_weights
+
+
 def test_wake_und_rollout_replicas_is_a_noop_without_a_dual_role_replica():
     """No colocated AR replica means no Ray traffic, so the hook is safe to call unguarded."""
     trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
     trainer._wake_und_rollout_replicas()  # attribute never set
     trainer.und_rollout_replicas = []
     trainer._wake_und_rollout_replicas()
+
+
+# --- The colocated RM must be handed the fields its scorer keys off -----------------
+#
+# ``_compute_reward_colocate`` is the *only* scorer once ``reward.reward_model.enable=1``:
+# ``RewardLoopManager.reward_loop_worker_handles`` returns None without a separate resource
+# pool (verl/verl/experimental/reward_loop/reward_loop.py:300), so ``AgentLoopWorker._compute_score``
+# never runs the RM inline and ``_postprocess``'s ``input_non_tensor_batch`` forwarding is not
+# the path that feeds it. The colocated path then fetched only
+# ``prompts``/``responses``/``raw_prompt``, so the episode row reached ``VisualRewardManager``
+# with ``data_source=''`` and no ground truth, and every episode scored a structural zero.
+# Measured 2026-09-23 on hk01dgx039 (devices 0/1/6/7, ``bagel_corl_rm1_20260923_154117``),
+# once per UND row:
+#
+#   VisualRewardManager: episode row carries no reward_model.ground_truth
+#   (data_source=''); the episode scorer will return a zero reward for it.
+#
+# The non-zero ``und_reward`` in that run's trajectory dumps came from the agent loop's own
+# tool-call-presence term, not from this scorer, so the zero was invisible in ``und_reward``.
+
+
+def _colocate_reward_harness(monkeypatch, *, tq_fields: dict):
+    """Call ``_compute_reward_colocate`` against a fake TQ and a capturing reward manager."""
+    from verl.trainer.ppo.v1 import trainer_base as v1_trainer_base
+    from verl import DataProto
+
+    seen: dict = {}
+
+    def _kv_batch_get(keys=None, partition_id=None, select_fields=None):
+        seen["select_fields"] = list(select_fields or [])
+        return dict(tq_fields)
+
+    def _kv_batch_put(keys=None, partition_id=None, fields=None):
+        seen["write_back"] = fields
+
+    monkeypatch.setattr(v1_trainer_base.tq, "kv_batch_get", _kv_batch_get)
+    monkeypatch.setattr(v1_trainer_base.tq, "kv_batch_put", _kv_batch_put)
+
+    class _RewardManager:
+        def compute_rm_score(self, rm_input):
+            seen["rm_input"] = rm_input
+            return DataProto.from_tensordict(
+                tu.get_tensordict({"rm_scores": torch.zeros(2, 3)}), meta_info={"reward_extra_keys": []}
+            )
+
+    trainer = types.SimpleNamespace()
+    trainer.reward_loop_manager = _RewardManager()
+    trainer.tokenizer = types.SimpleNamespace(pad_token_id=0)
+    trainer._lengths_to_mask = v1_trainer_base.PPOTrainer._lengths_to_mask
+
+    class _Batch(dict):
+        """Stand-in for ``KVBatchMeta``: the real object supports ``len()`` and ``.keys``."""
+
+        partition_id = "train"
+
+    batch = _Batch({"a": None, "b": None})
+    v1_trainer_base.PPOTrainer._compute_reward_colocate(trainer, batch)
+    return seen
+
+
+def _nested(rows):
+    return torch.nested.as_nested_tensor([torch.tensor(r, dtype=torch.long) for r in rows], layout=torch.jagged)
+
+
+def _tq_episode_fields(*, with_dataset_fields: bool) -> dict:
+    fields = {"prompts": _nested([[1, 2, 3], [4, 5]]), "responses": _nested([[6], [7, 8]])}
+    fields["raw_prompt"] = ["drop me", "drop me too"]
+    if with_dataset_fields:
+        fields["data_source"] = ["unicot_reflection", "unicot_breakdown"]
+        fields["reward_model"] = [
+            {"ground_truth": {"task_type": "reflect", "expected_num_images": 3}},
+            {"ground_truth": {"task_type": "plan", "expected_num_images": 2}},
+        ]
+    return fields
+
+
+def test_colocate_reward_requests_the_dataset_fields(monkeypatch):
+    """The scorer cannot dispatch without them, so they must be in the TQ projection."""
+    seen = _colocate_reward_harness(monkeypatch, tq_fields=_tq_episode_fields(with_dataset_fields=True))
+
+    assert "data_source" in seen["select_fields"]
+    assert "reward_model" in seen["select_fields"]
+
+
+def test_colocate_reward_forwards_data_source_and_ground_truth(monkeypatch):
+    """``VisualRewardManager`` must actually see them on the row, not just in the fetch."""
+    seen = _colocate_reward_harness(monkeypatch, tq_fields=_tq_episode_fields(with_dataset_fields=True))
+    non_tensor = seen["rm_input"].non_tensor_batch
+
+    assert list(non_tensor["data_source"]) == ["unicot_reflection", "unicot_breakdown"]
+    assert [gt["ground_truth"]["task_type"] for gt in non_tensor["reward_model"]] == ["reflect", "plan"]
+    # The pre-existing contract must survive: ``raw_prompt`` is still forwarded.
+    assert list(non_tensor["raw_prompt"]) == ["drop me", "drop me too"]
+
+
+def test_colocate_reward_unwraps_non_tensor_data_wrappers(monkeypatch):
+    """The TQ hands these back wrapped; the scorer needs plain values, not wrappers.
+
+    ``VisualRewardManager`` reads ``data_source`` as a string and
+    ``reward_model["ground_truth"]`` as a dict. A ``NonTensorData`` wrapper satisfies neither, and
+    the failure is silent: the wrapper is truthy where a default would have been used, so the
+    episode still scores a structural zero.
+    """
+    from tensordict.tensorclass import NonTensorData
+
+    fields = _tq_episode_fields(with_dataset_fields=False)
+    fields["data_source"] = [NonTensorData("unicot_reflection"), NonTensorData("unicot_breakdown")]
+    fields["reward_model"] = [
+        NonTensorData({"ground_truth": {"task_type": "reflect"}}),
+        NonTensorData({"ground_truth": {"task_type": "plan"}}),
+    ]
+    seen = _colocate_reward_harness(monkeypatch, tq_fields=fields)
+    non_tensor = seen["rm_input"].non_tensor_batch
+
+    assert list(non_tensor["data_source"]) == ["unicot_reflection", "unicot_breakdown"]
+    assert [gt["ground_truth"]["task_type"] for gt in non_tensor["reward_model"]] == ["reflect", "plan"]
+
+
+def test_colocate_reward_tolerates_rows_without_the_dataset_fields(monkeypatch):
+    """Padding rows / non-dataset partitions must degrade to a default, never to a crash."""
+    seen = _colocate_reward_harness(monkeypatch, tq_fields=_tq_episode_fields(with_dataset_fields=False))
+    non_tensor = seen["rm_input"].non_tensor_batch
+
+    assert "data_source" not in non_tensor
+    assert "reward_model" not in non_tensor
+    assert list(non_tensor["raw_prompt"]) == ["drop me", "drop me too"]
+
+
+# --- The GEN prompt ids must survive onto the batch the diffusion step sees -------
+#
+# ``DiffusionTrainingAdapter._prompt_token_ids_to_batch``
+# (``bagel_flow_grpo/diffusers_training_adapter.py:152``) reads ``prompt_token_ids`` off the
+# micro-batch, and ``prepare_micro_batches`` only propagates non-tensor entries that sit on the
+# batch it is handed -- the sibling ``skip_gen`` / ``has_complete_gen_groups`` / ``num_gen_rows``
+# flags ride through for exactly that reason. Ids parked in ``non_tensor_batch`` therefore never
+# reach the diffusion step:
+#
+#   KeyError: 'key "prompt_token_ids" not found in TensorDict with keys
+#   ['advantages', 'all_latents', 'all_timesteps', 'bagel_corl_gen', 'gradient_accumulation_steps',
+#    'has_complete_gen_groups', 'micro_batch_size_per_gpu', 'num_gen_rows', 'old_log_probs',
+#    'returns', 'rm_scores', 'sample_level_rewards', 'sample_level_scores', 'skip_gen', 'sp_size',
+#    'use_dynamic_bsz']'
+#
+# Measured 2026-09-23 16:58 on hk01dgx039 (devices 0/1/6/7, ``bagel_corl_rm1_20260923_164059``):
+# the first step to reach the GEN diffusion loss at all, dying after rollout + reward + advantage
+# had all been paid for. The fold had been inlined in ``apply_gen_flowgrpo_advantage`` -- the
+# CPU-test fallback branch -- while the live path goes through
+# ``_diffusion_v1_gen_lane()._compute_advantage(proto)``, so it never ran where it mattered.
+
+
+def _gen_proto_with_prompt_ids(prompt_ids=None):
+    from verl import DataProto
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import build_gen_flowgrpo_proto
+
+    rows = [
+        {
+            "gen_group_uid": "g0",
+            "all_latents": torch.zeros(3, 4),
+            "timesteps": torch.zeros(3),
+            "rollout_log_probs": torch.zeros(3),
+            "rm_score": 1.0,
+            "seed_index": i,
+            "prompt_token_ids": ids,
+        }
+        for i, ids in enumerate(prompt_ids if prompt_ids is not None else ([11, 12], [21]))
+    ]
+    return build_gen_flowgrpo_proto(rows)
+
+
+def test_gen_prompt_token_ids_fold_puts_the_ids_on_the_batch():
+    """``fold_gen_prompt_token_ids`` must move them off ``non_tensor_batch``."""
+    from verl.utils import tensordict_utils as tu
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import fold_gen_prompt_token_ids
+
+    proto = _gen_proto_with_prompt_ids()
+    assert "prompt_token_ids" in proto.non_tensor_batch
+    assert "prompt_token_ids" not in proto.batch.keys()
+
+    fold_gen_prompt_token_ids(proto)
+
+    folded = tu.get_non_tensor_data(proto.batch, "prompt_token_ids", default=None)
+    assert folded is not None
+    assert [list(ids) for ids in folded] == [[11, 12], [21]]
+
+
+def test_gen_prompt_token_ids_fold_is_a_noop_without_the_field():
+    """A proto that never carried the ids must not gain an empty one."""
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import fold_gen_prompt_token_ids
+
+    proto = _gen_proto_with_prompt_ids()
+    proto.non_tensor_batch.pop("prompt_token_ids", None)
+
+    fold_gen_prompt_token_ids(proto)
+
+    assert "prompt_token_ids" not in proto.batch.keys()
+
+
+def test_apply_gen_flowgrpo_advantage_still_folds_the_ids():
+    """The fallback branch must keep folding, now via the shared helper."""
+    from verl.utils import tensordict_utils as tu
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage
+
+    rows = [
+        {
+            "gen_group_uid": "g0",
+            "all_latents": torch.zeros(3, 4),
+            "timesteps": torch.zeros(3),
+            "rollout_log_probs": torch.zeros(3),
+            "rm_score": float(i),
+            "seed_index": i,
+            "prompt_token_ids": [i, i + 1],
+        }
+        for i in range(2)
+    ]
+    proto, _ = apply_gen_flowgrpo_advantage(rows)
+
+    folded = tu.get_non_tensor_data(proto.batch, "prompt_token_ids", default=None)
+    assert folded is not None
+    assert [list(ids) for ids in folded] == [[0, 1], [1, 2]]
+
+
+# --- The GEN prompt ids must survive onto the batch the diffusion step sees -------
+#
+# ``DiffusionTrainingAdapter._prompt_token_ids_to_batch``
+# (``bagel_flow_grpo/diffusers_training_adapter.py:152``) reads ``prompt_token_ids`` off the
+# micro-batch, and ``prepare_micro_batches`` only propagates non-tensor entries that sit on the
+# batch it is handed -- the sibling ``skip_gen`` / ``has_complete_gen_groups`` / ``num_gen_rows``
+# flags ride through for exactly that reason. Ids parked in ``non_tensor_batch`` therefore never
+# reach the diffusion step:
+#
+#   KeyError: 'key "prompt_token_ids" not found in TensorDict with keys
+#   ['advantages', 'all_latents', 'all_timesteps', 'bagel_corl_gen', 'gradient_accumulation_steps',
+#    'has_complete_gen_groups', 'micro_batch_size_per_gpu', 'num_gen_rows', 'old_log_probs',
+#    'returns', 'rm_scores', 'sample_level_rewards', 'sample_level_scores', 'skip_gen', 'sp_size',
+#    'use_dynamic_bsz']'
+#
+# Measured 2026-09-23 16:58 on hk01dgx039 (devices 0/1/6/7, ``bagel_corl_rm1_20260923_164059``):
+# the first step to reach the GEN diffusion loss at all, dying after rollout + reward + advantage
+# had all been paid for. The fold had been inlined in ``apply_gen_flowgrpo_advantage`` -- the
+# CPU-test fallback branch -- while the live path goes through
+# ``_diffusion_v1_gen_lane()._compute_advantage(proto)``, so it never ran where it mattered.
+
+
+def _gen_proto_with_prompt_ids(prompt_ids=None):
+    from verl import DataProto
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import build_gen_flowgrpo_proto
+
+    rows = [
+        {
+            "gen_group_uid": "g0",
+            "all_latents": torch.zeros(3, 4),
+            "timesteps": torch.zeros(3),
+            "rollout_log_probs": torch.zeros(3),
+            "rm_score": 1.0,
+            "seed_index": i,
+            "prompt_token_ids": ids,
+        }
+        for i, ids in enumerate(prompt_ids if prompt_ids is not None else ([11, 12], [21]))
+    ]
+    return build_gen_flowgrpo_proto(rows)
+
+
+def test_gen_prompt_token_ids_fold_puts_the_ids_on_the_batch():
+    """``fold_gen_prompt_token_ids`` must move them off ``non_tensor_batch``."""
+    from verl.utils import tensordict_utils as tu
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import fold_gen_prompt_token_ids
+
+    proto = _gen_proto_with_prompt_ids()
+    assert "prompt_token_ids" in proto.non_tensor_batch
+    assert "prompt_token_ids" not in proto.batch.keys()
+
+    fold_gen_prompt_token_ids(proto)
+
+    folded = tu.get_non_tensor_data(proto.batch, "prompt_token_ids", default=None)
+    assert folded is not None
+    assert [list(ids) for ids in folded] == [[11, 12], [21]]
+
+
+def test_gen_prompt_token_ids_fold_is_a_noop_without_the_field():
+    """A proto that never carried the ids must not gain an empty one."""
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import fold_gen_prompt_token_ids
+
+    proto = _gen_proto_with_prompt_ids()
+    proto.non_tensor_batch.pop("prompt_token_ids", None)
+
+    fold_gen_prompt_token_ids(proto)
+
+    assert "prompt_token_ids" not in proto.batch.keys()
+
+
+def test_apply_gen_flowgrpo_advantage_still_folds_the_ids():
+    """The fallback branch must keep folding, now via the shared helper."""
+    from verl.utils import tensordict_utils as tu
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage
+
+    rows = [
+        {
+            "gen_group_uid": "g0",
+            "all_latents": torch.zeros(3, 4),
+            "timesteps": torch.zeros(3),
+            "rollout_log_probs": torch.zeros(3),
+            "rm_score": float(i),
+            "seed_index": i,
+            "prompt_token_ids": [i, i + 1],
+        }
+        for i in range(2)
+    ]
+    proto, _ = apply_gen_flowgrpo_advantage(rows)
+
+    folded = tu.get_non_tensor_data(proto.batch, "prompt_token_ids", default=None)
+    assert folded is not None
+    assert [list(ids) for ids in folded] == [[0, 1], [1, 2]]
+
+
+def test_gen_pass_reslices_per_row_non_tensors_for_the_diffusion_step(monkeypatch):
+    """A per-row non-tensor must be sliced per micro-batch, not replicated whole.
+
+    ``chunk_tensordict`` rebuilds each micro-batch from ``td.items()`` and copies non-tensor entries
+    through verbatim, so an 8-row ``prompt_token_ids`` used to reach **every** micro-batch intact.
+    The Bagel adapter reads those ids per row (``diffusers_training_adapter.py:152``), so
+    ``bagel_model`` then concatenated 8 text rows against 1 latent row:
+
+        RuntimeError: Sizes of tensors must match except in dimension 1.
+        Expected size 8 but got size 1 for tensor number 1 in the list.
+
+    Measured 2026-09-23 17:23 on hk01dgx039 (devices 0/1/6/7, ``bagel_corl_rm1_20260923_170726``).
+    """
+    from verl.utils import tensordict_utils as tu
+    from verl_omni.workers.engine.fsdp import diffusers_impl
+
+    rows = 4
+    data = TensorDict({"all_latents": torch.zeros(rows, 3, 2, 2, 2)}, batch_size=[rows])
+    tu.assign_non_tensor(data, prompt_token_ids=np.array([[i, i + 1] for i in range(rows)], dtype=object))
+    tu.assign_non_tensor(data, sp_size=1)
+
+    micro_batches = tu.chunk_tensordict(data, rows)
+
+    # The defect, before the fix: every micro-batch still sees all rows.
+    assert len(tu.get_non_tensor_data(micro_batches[0], "prompt_token_ids", default=None)) == rows
+
+    diffusers_impl.DiffusersFSDPEngine._reslice_per_row_non_tensors(data, micro_batches)
+
+    for index, micro_batch in enumerate(micro_batches):
+        ids = tu.get_non_tensor_data(micro_batch, "prompt_token_ids", default=None)
+        assert [list(row) for row in ids] == [[index, index + 1]]
+        # Scalars are untouched: they are not row-aligned and must keep reaching every micro-batch.
+        assert tu.get_non_tensor_data(micro_batch, "sp_size", default=None) == 1
+
+
+def test_gen_pass_rereslice_leaves_scalars_and_blobs_alone():
+    """Only row-aligned list-like keys are re-sliced; a whole-batch stash must survive intact."""
+    from verl.utils import tensordict_utils as tu
+    from verl_omni.workers.engine.fsdp import diffusers_impl
+
+    rows = 4
+    data = TensorDict({"all_latents": torch.zeros(rows, 3, 2, 2, 2)}, batch_size=[rows])
+    tu.assign_non_tensor(data, skip_gen=False)
+    stash = TensorDict({"all_latents": torch.zeros(rows, 3, 2, 2, 2)}, batch_size=[rows])
+    tu.assign_non_tensor(data, bagel_corl_gen=stash)
+
+    micro_batches = tu.chunk_tensordict(data, rows)
+
+    diffusers_impl.DiffusersFSDPEngine._reslice_per_row_non_tensors(data, micro_batches)
+
+    for micro_batch in micro_batches:
+        assert tu.get_non_tensor_data(micro_batch, "skip_gen", default=None) is False
+        # ``bagel_corl_gen`` reports a length too, but it is one blob, not a column.
+        assert len(tu.get_non_tensor_data(micro_batch, "bagel_corl_gen", default=None)) == rows

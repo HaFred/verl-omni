@@ -248,6 +248,62 @@ def test_bare_judge_image_is_inert_but_tagged_is_fatal():
         lib.und_turn_kind('<tool_call>{"name": "judge_image", "arguments": {}}</tool_call>')
 
 
+def test_done_payload_is_the_terminal_signal_in_every_dialect():
+    """Measured 2026-09-27 17:35, ``outputs/bagel_corl_rm1_20260927_165227``.
+
+    The UND lane emitted ``{"name": "Done"}`` and the Qwen fail-closed guard killed the episode:
+    ``ValueError: Bagel CoRL UND emitted unsupported tool 'Done'``. The row was dropped, the batch
+    arrived 3 wide and the trainer logged ``Upsampled batch from 3 to 4 with 1 synthetic padding
+    samples`` -- i.e. a fabricated sample went into the gradient. A stop payload is what the loop
+    is asking for at the end of an episode, so it must classify as ``done`` in *any* dialect,
+    tagged included: ``Done`` is the checkpoint's own stop word, not a Qwen tool.
+    """
+    for text in (
+        '{"name": "Done", "arguments": {}}',
+        'ASSISTANT\n {"name": "Done"}<|im_end|>',
+        '<tools>\n{"name": "Done"}\n</tools>',
+        '<tool_call>{"name": "Done", "arguments": {}}</tool_call>',
+        '{"name": "done."}',
+    ):
+        assert lib.und_turn_kind(text) == "done", text
+
+
+def test_done_decode_with_trailing_special_tokens_is_terminal():
+    """The engine decodes with ``skip_special_tokens=False``, so the stop turn arrives as
+    ``Done.<|im_end|>`` (step_000031 of the 2026-09-27 run). The old ``\\bDone\\.\\s*$`` anchor
+    rejected it, so ``und_turn_kind`` said ``continue`` and the loop appended a *second* ``Done.``
+    instead of using the engine's own terminal ids.
+    """
+    assert lib.und_turn_kind("Done.<|im_end|>") == "done"
+    assert lib.und_turn_kind(" Done. <|im_end|>\n") == "done"
+
+
+def test_replayed_reference_tools_blocks_are_inert():
+    """Measured 2026-09-27 17:24, ``rollout_trajectories/step_000026/sample_add66fd8...02.txt``.
+
+    A single-turn rollout makes its real ``generate_image`` call and then keeps replaying the
+    *reference* trajectory's tool blocks as prose: another ``judge_image`` and a hallucinated
+    ``reflect_and润色`` (the noun varies -- ``该如何改进`` in the 17:24 failure, ``润色`` in the
+    dump). The old allow-list held only ``judge_image``, so the second name raised
+    ``unsupported tool 'reflect_and该如何改进'`` and cost another episode. No non-Hermes name
+    should ever reach the fail-closed guard: only the ``<tool_call>`` tag claims "this is an
+    OpenAI/Hermes function call", and that is the dialect the Qwen guard is for.
+    """
+    text = (
+        "<tools>\n{\n    \"name\": \"generate_image\",\n    \"arguments\": {\"prompt\": \"an animal\"}\n}\n</tools>\n"
+        '{\n  "image_url": "https://placekitten.com/g/600/400"\n}\n'
+        '<tools>\n{\n    "name": "judge_image",\n    "arguments": {}\n}\n</tools>\n'
+        '<tools>\n{\n    "name": "reflect_and润色",\n    "arguments": {}\n}\n</tools>\n'
+    )
+    assert lib.und_turn_kind(text) == "generate_image"  # the real call still wins
+    # And the hallucinated block on its own is inert rather than fatal.
+    assert lib.und_turn_kind('<tools>\n{"name": "reflect_and该如何改进", "arguments": {}}\n</tools>') == "continue"
+    assert lib.und_turn_kind('ASSISTANT\n {"name": "reflect_and润色", "arguments": {}}<|im_end|>') == "continue"
+    # Third name of the same family, measured 17:54:08 on the done decode of step 32.
+    assert lib.und_turn_kind('{"name": "reflect_image", "arguments": {}}') == "continue"
+    assert lib.und_turn_kind('<tools>{"name": "reflect_image"}</tools>') == "continue"
+
+
 def test_json_example_in_prose_is_not_a_tool_call():
     text = '1. Plan: emit {"name": "generate_image", "arguments": {"prompt": "x"}} for each subtask.'
     assert lib.parse_und_tool_call(text) is None
@@ -328,6 +384,137 @@ def test_tools_judge_image_is_inert():
 def test_tools_tagged_call_without_arguments_is_not_a_call():
     """A ``<tools>`` span naming a tool but carrying no ``arguments`` is not a complete call."""
     text = 'Here you go.\n<tools>\n{"name": "generate_image"}\n</tools>\n'
+    assert lib.parse_und_tool_call(text) is None
+    assert lib.und_turn_kind(text) == "continue"
+
+
+def test_native_start_of_toolcall_array_is_accepted():
+    """The checkpoint's own ``<|start of ToolCall|>`` tag wraps a JSON **array**, not an object.
+
+    Measured 2026-09-23 on hk01dgx039 (devices 0/1/6/7, ``bagel_corl_20260923_092424``): an
+    eight-turn episode that issued no GEN request at all, whose turn 3 carried this complete call.
+    Unparsed, the loop decoded the same payload for eight turns until the cap (``gen_calls=0``).
+    """
+    text = (
+        " unintended\nuser\nA synthwave-inspired image featuring a wolf.\n\n"
+        '<|start of ToolCall|>[{"name": "generate_image", "arguments": {"prompt": '
+        '"A synthwave-inspired image featuring a wolf."}}]<|end of ToolCall|><|im_end|>'
+    )
+    call = lib.parse_und_tool_call(text)
+    assert call is not None and call["name"] == "generate_image"
+    assert call["arguments"]["prompt"] == "A synthwave-inspired image featuring a wolf."
+    assert lib.und_turn_kind(text) == "generate_image"
+
+
+@pytest.mark.parametrize("begin,end", [("<|FunctionCallBegin|>", "<|FunctionCallEnd|>"), ("<|start of ToolCall|>", "")])
+def test_native_older_spelling_and_truncated_body_are_accepted(begin, end):
+    """Older builds spell the tag ``FunctionCallBegin``, and a capped turn can lose the close."""
+    text = f'{begin}[{{"name": "generate_image", "arguments": {{"prompt": "a wolf"}}}}]{end}'
+    call = lib.parse_und_tool_call(text)
+    assert call is not None and call["name"] == "generate_image"
+    assert call["arguments"]["prompt"] == "a wolf"
+
+
+def test_native_array_takes_the_first_actionable_call():
+    """A multi-call array still drives the loop: the first entry naming a tool wins."""
+    text = '<|start of ToolCall|>[{"arguments": {}}, {"name": "judge_image", "arguments": {}}, {"name": "generate_image", "arguments": {"prompt": "a wolf"}}]<|end of ToolCall|>'
+    assert lib.parse_und_tool_call(text)["name"] == "judge_image"
+
+
+def test_native_judge_image_is_inert():
+    """The native tag is a checkpoint dialect, not Hermes, so its judge turn stays inert."""
+    text = '<|start of ToolCall|>[{"name": "judge_image", "arguments": {}}]<|end of ToolCall|>'
+    assert lib.parse_und_tool_call(text)["name"] == "judge_image"
+    assert lib.und_turn_kind(text) == "continue"
+
+
+def test_native_tag_without_a_named_call_is_not_a_tool_call():
+    """A native tag whose array names nothing must not become a GEN request."""
+    assert lib.parse_und_tool_call('<|start of ToolCall|>[{"subtasks": [{"prompt": "x"}]}]<|end of ToolCall|>') is None
+    assert lib.und_turn_kind('<|start of ToolCall|>[]<|end of ToolCall|>') == "continue"
+
+
+def test_native_begin_of_spelling_is_accepted():
+    """``begin_of ToolCall`` is the same dialect as ``start of ToolCall`` and must be executed.
+
+    Measured 2026-09-27 18:52+ in ``outputs/bagel_corl_rm1_20260927_183640`` (devices 0/1/6/7,
+    RM on), the one zero-reward episode of step 10: ``sample_1723296b-2962-45a4-ad6f-e5790d8badd2.01``
+    spent all eight turns here -- because only the ``start of`` spelling was matched,
+    ``parse_und_tool_call`` returned ``None`` for a complete, well-formed call, ``K`` stayed 0 and
+    ``und_reward`` was a flat 0.0 while its sibling scored 0.38. 2 of the run's 48 recorded
+    trajectories (4%), 1 of its 7 zero-reward episodes.
+    """
+    text = (
+        '<|begin_of ToolCall|>[{"name":"generate_image","arguments":{"prompt":"a magnesium '
+        'ribbon igniting, emitting a brilliant white light"}}]<|end_of ToolCall|><|im_end|>'
+    )
+    call = lib.parse_und_tool_call(text)
+    assert call is not None and call["name"] == "generate_image"
+    assert call["arguments"]["prompt"] == "a magnesium ribbon igniting, emitting a brilliant white light"
+    assert lib.und_turn_kind(text) == "generate_image"
+
+
+def test_native_closer_spelling_variants_are_tolerated():
+    """The closer varies *within* one episode: ``end_of``, then ``end of the`` on a later turn.
+
+    The episode above re-used ``<|end of the ToolCall|>`` at turn 4, and a turn that still names
+    a tool must stay a GEN request whichever spelling closes it.
+    """
+    opener = '<|begin_of ToolCall|>[{"name": "generate_image", "arguments": {"prompt": "a wolf"}}]'
+    for closer in ("<|end_of ToolCall|>", "<|end of the ToolCall|>", "<|end_of_ToolCall|>", ""):
+        text = f"{opener}{closer}<|im_end|>"
+        call = lib.parse_und_tool_call(text)
+        assert call is not None and call["name"] == "generate_image", closer
+
+
+def test_native_begin_of_stop_tool_is_the_terminal_signal():
+    """A stop name inside the native fence ends the episode instead of being inert prose."""
+    text = '<|begin_of ToolCall|>[{"name":"Done","arguments":{}}]<|end_of ToolCall|>'
+    assert lib.und_turn_kind(text) == "done"
+
+
+def test_fenced_call_behind_a_long_prose_plan_is_still_not_executed():
+    """A fenced call behind a >120-char prose plan stays rejected -- and that costs nothing.
+
+    Measured 2026-09-23 on hk01dgx039 (devices 0/1/6/7): the dataset's appended "Keep any private
+    thinking to one short paragraph" instruction makes the model narrate a plan before its fence, so
+    116 of that run's 165 zero-image episodes hold a well-formed payload here. Relaxing the label
+    bound to reach them was built and measured: it recovered **0** extra episodes, because every
+    one of them also carries the same call in the native dialect (see
+    :func:`test_native_start_of_toolcall_array_is_accepted`), and it *broke* the quoted-example
+    guarantee pinned by :func:`test_fenced_example_inside_a_prose_plan_is_not_a_tool_call`. The
+    bound stays.
+    """
+    text = (
+        "Sure, I've created a plan based on your request. Here's a brief summary:\n\n"
+        "1. Plan: Create a synthwave-inspired image featuring a wolf.\n"
+        "2. Generate an image using the prompt: \"A synthwave-inspired image featuring a wolf.\"\n\n"
+        "Here is the JSON object for the first tool call:\n"
+        "```json\n"
+        '{\n  "name": "generate_image",\n  "arguments": {\n    "prompt": "A synthwave-inspired '
+        'image featuring a wolf."\n  }\n}\n'
+        "```\n"
+    )
+    assert len(text.split("```")[0]) > lib._FENCED_PREAMBLE_LIMIT, "probe must exceed the label bound"
+    assert lib.parse_und_tool_call(text) is None
+    assert lib.und_turn_kind(text) == "continue"
+
+
+def test_fenced_schema_echo_behind_a_long_plan_is_still_not_a_call():
+    """The relaxation keys on ``arguments``, so a *signature* behind prose stays inert.
+
+    This is the guard that keeps the wider fence rule from executing a quoted schema: the
+    prompt's own block carries ``parameters``/``description`` and never ``arguments``.
+    """
+    text = (
+        "Sure, here are the tools I have available, explained at length so that the prose plan "
+        "in front of the fence comfortably exceeds the label bound the parser applies.\n\n"
+        "```json\n"
+        '{"type": "function", "function": {"name": "generate_image", "description": "Generate an '
+        'image from a text prompt.", "parameters": {"type": "object"}}}\n'
+        "```\n"
+    )
+    assert len(text.split("```")[0]) > lib._FENCED_PREAMBLE_LIMIT, "probe must exceed the label bound"
     assert lib.parse_und_tool_call(text) is None
     assert lib.und_turn_kind(text) == "continue"
 
@@ -1330,3 +1517,201 @@ def test_degenerate_counter_handles_a_missing_text_field():
 
 def test_degenerate_counter_loop_threshold_is_positive():
     assert lib.UND_LOOP_MIN_TOKENS >= 1
+
+
+# ---------------------------------------------------------------------------
+# Wake-window retry (2026-09-23 0/1/6/7 wedge)
+# ---------------------------------------------------------------------------
+# The trainer logs `woke 1 UND AR replica(s)` as soon as the wake *request* is dispatched, not
+# when the ~28 GiB re-map finishes. A decode that arrives inside that window is rejected with
+# `Engine is partially or fully asleep. Currently sleeping tags: [...]`, which is transient and
+# was previously fatal: measured 2026-09-23 22:35:24 wake -> 22:35:56 rejection on hk01dgx039,
+# after which the engine's diffusion subprocess segfaulted and the run sat at 0% GPU for an hour.
+
+
+def test_engine_asleep_retry_delay_absorbs_the_wake_window():
+    """The real rejection message must schedule a retry long enough to outlast a re-map."""
+    msg = (
+        "RuntimeError: Generation rejected: Engine is partially or fully asleep. "
+        "Currently sleeping tags: ['weights', 'kv_cache']. Please perform a full wake_up "
+        "before generating."
+    )
+    first = lib.engine_asleep_retry_delay(0, msg)
+    assert first is not None and first > 0
+    # Cumulative backoff must cover the measured ~32 s wake latency.
+    assert sum(lib.ENGINE_ASLEEP_BACKOFF_S) >= 32.0
+
+
+def test_engine_asleep_retry_delay_ignores_other_errors():
+    """A real engine fault must surface immediately, not be retried into a timeout."""
+    for msg in (
+        "ValueError: _generate_image requires a non-empty diffusion prompt",
+        "RuntimeError: StageDiffusionProc executor reported permanent failure",
+        "KeyError: 'prompt_token_ids'",
+    ):
+        assert lib.engine_asleep_retry_delay(0, msg) is None
+
+
+def test_engine_asleep_retry_delay_gives_up_when_exhausted():
+    """A never-waking engine must fail loudly instead of retrying forever."""
+    msg = "Engine is partially or fully asleep"
+    assert lib.engine_asleep_retry_delay(len(lib.ENGINE_ASLEEP_BACKOFF_S), msg) is None
+
+
+def test_generate_retrying_engine_wake_reissues_until_it_succeeds():
+    """The retry must re-call the generate, not reuse a spent coroutine."""
+    calls = []
+    waits = []
+
+    async def attempt():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("Generation rejected: Engine is partially or fully asleep. Currently sleeping tags: ['weights']")
+        return "TokenOutput"
+
+    async def fake_sleep(delay):
+        waits.append(delay)
+
+    async def run():
+        return await lib.generate_retrying_engine_wake(attempt, sleep=fake_sleep)
+
+    assert asyncio.run(run()) == "TokenOutput"
+    assert len(calls) == 3
+    assert waits == list(lib.ENGINE_ASLEEP_BACKOFF_S[:2])
+
+
+def test_generate_retrying_engine_wake_does_not_retry_a_real_failure():
+    """Only the wake-window rejection is swallowed; anything else propagates on the first try."""
+    calls = []
+
+    async def attempt():
+        calls.append(1)
+        raise ValueError("_generate_image requires a non-empty diffusion prompt")
+
+    async def fake_sleep(delay):  # pragma: no cover - must never be called
+        raise AssertionError("must not back off for a non-wake error")
+
+    async def run():
+        return await lib.generate_retrying_engine_wake(attempt, sleep=fake_sleep)
+
+    with pytest.raises(ValueError, match="non-empty diffusion prompt"):
+        asyncio.run(run())
+    assert len(calls) == 1
+
+
+def test_generate_retrying_engine_wake_reraises_when_the_schedule_runs_out():
+    """A persistently sleeping engine raises the original error, so the run fails loud."""
+    calls = []
+
+    async def attempt():
+        calls.append(1)
+        raise RuntimeError("Generation rejected: Engine is partially or fully asleep. Currently sleeping tags: ['weights']")
+
+    async def fake_sleep(delay):
+        pass
+
+    async def run():
+        return await lib.generate_retrying_engine_wake(attempt, sleep=fake_sleep)
+
+    with pytest.raises(RuntimeError, match="partially or fully asleep"):
+        asyncio.run(run())
+    assert len(calls) == len(lib.ENGINE_ASLEEP_BACKOFF_S) + 1
+
+
+# ---------------------------------------------------------------------------
+# Exception classification: the wake-window marker lives in the *cause chain*
+# ---------------------------------------------------------------------------
+
+
+class _RayStyleTaskError(Exception):
+    """Stand-in for ``ray.exceptions.RayTaskError``.
+
+    Same shape that made the retry dead code: ``str()`` is the task repr, while the real
+    rejection text sits on ``.cause``.
+    """
+
+    def __init__(self, cause: BaseException):
+        super().__init__("ray::vLLMOmniHttpServer.generate() (pid=2589081, ip=10.248.12.145)")
+        self.cause = cause
+
+
+_ASLEEP_MESSAGE = (
+    "Generation rejected: Engine is partially or fully asleep. Currently sleeping tags: "
+    "['weights', 'kv_cache']. Please perform a full wake_up before generating."
+)
+
+
+def test_exception_search_text_reads_through_a_ray_style_wrapper():
+    """`str()` is the task repr, so the marker must be found via the cause chain.
+
+    This is the exact 2026-09-24 miss: the retry wrapper was on the stack and no retry fired,
+    because the classification ran against ``ray::vLLMOmniHttpServer.generate() (pid=...)``.
+    """
+    exc = _RayStyleTaskError(RuntimeError(_ASLEEP_MESSAGE))
+
+    assert lib.ENGINE_ASLEEP_MARKER not in str(exc)  # the trap this guards against
+    assert lib.ENGINE_ASLEEP_MARKER in lib.exception_search_text(exc)
+
+
+def test_exception_search_text_follows_a_raise_from_chain():
+    """`raise ... from ...` sets ``__cause__``; classification must follow it too."""
+    try:
+        try:
+            raise RuntimeError(_ASLEEP_MESSAGE)
+        except RuntimeError as inner:
+            raise ValueError("wrapper") from inner
+    except ValueError as exc:
+        assert lib.ENGINE_ASLEEP_MARKER in lib.exception_search_text(exc)
+
+
+def test_exception_search_text_is_safe_on_a_self_referential_chain():
+    """A cycle must terminate rather than hang the rollout."""
+
+    class _Loop(Exception):
+        pass
+
+    exc = _Loop("no marker here")
+    exc.__cause__ = exc
+    assert lib.exception_search_text(exc)  # returns; no RecursionError
+
+
+def test_generate_retrying_engine_wake_retries_a_ray_wrapped_rejection():
+    """The regression: a Ray-wrapped rejection must be retried, not surfaced.
+
+    Measured 2026-09-24 on hk01dgx039 (devices 0/1/6/7, ``bagel_corl_rm1_20260924_034359``):
+    two episodes died on this shape while the engine was still re-mapping.
+    """
+    calls = []
+    waits = []
+
+    async def attempt():
+        calls.append(1)
+        if len(calls) < 3:
+            raise _RayStyleTaskError(RuntimeError(_ASLEEP_MESSAGE))
+        return "TokenOutput"
+
+    async def fake_sleep(delay):
+        waits.append(delay)
+
+    async def run():
+        return await lib.generate_retrying_engine_wake(attempt, sleep=fake_sleep)
+
+    assert asyncio.run(run()) == "TokenOutput"
+    assert len(calls) == 3
+    assert waits == list(lib.ENGINE_ASLEEP_BACKOFF_S[:2])
+
+
+def test_generate_retrying_engine_wake_still_refuses_a_wrapped_real_failure():
+    """Chain-aware matching must not start retrying genuine engine faults."""
+
+    async def attempt():
+        raise _RayStyleTaskError(RuntimeError("StageDiffusionProc executor reported permanent failure"))
+
+    async def fake_sleep(delay):  # pragma: no cover - must never be called
+        raise AssertionError("must not back off for a non-wake error")
+
+    async def run():
+        return await lib.generate_retrying_engine_wake(attempt, sleep=fake_sleep)
+
+    with pytest.raises(_RayStyleTaskError):
+        asyncio.run(run())

@@ -56,7 +56,6 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _RECIPE_DIR = _REPO_ROOT / "examples" / "agenticllmgrpo_trainer" / "bagel"
 _RECIPES = (
     _RECIPE_DIR / "run_agentic_bagel_rpco_lora.sh",
-    _RECIPE_DIR / "run_agentic_bagel_rpco_lora_longrun.sh",
 )
 _AR_DEPLOY = _RECIPE_DIR / "bagel_corl_deploy_ar.yaml"
 

@@ -50,12 +50,22 @@ failure): a silently-unscored GEN call would zero FlowGRPO signal for that group
 
 from __future__ import annotations
 
+import base64
 import logging
+import re
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["BAGEL_RM_EXTRA_INFO_KEY", "compute_score"]
+
+# Default ``good_enough`` cut on the [0, 1] UnifiedReward scale. The score is
+# ``(mean(1-5 axes) - 1) / 4``, so 0.6 is a mean axis score of 3.4/5 -- deliberately
+# not a quality bar but a *stop cue*: the agent should keep rewriting below it.
+# ``good_enough_threshold`` (used by the facet judge, 0.8 on a 6-level grid) must NOT
+# be reused here; 0.8 would mean a 4.2/5 average and read as "always NO".
+DEFAULT_UNIFIED_GOOD_ENOUGH = 0.6
 
 # Wire key shared with the producer (verl_omni/agent_loop/bagel_corl_rm.py). Spelled
 # out in both modules rather than imported so this module stays importable in
@@ -105,6 +115,71 @@ def _resolve_judge_endpoint(knobs: dict[str, Any], manager_kwargs: dict[str, Any
         # by the OpenAI route, so carry the RM's own path through.
         out["vllm_model"] = model_name
     return out
+
+
+def _score_image_unified(
+    *, path: str, caption: str, knobs: dict[str, Any]
+) -> tuple[float, bool] | None:
+    """Score one image with UnifiedReward 2.0; ``(normalized_score, good_enough)`` or None.
+
+    Reuses the canonical prompt/parse/aggregate helpers from
+    ``unified_reward.py`` so this path and the plain ``compute_score_unified_reward``
+    recipe stay byte-identical in what they ask the model and how they read the answer.
+
+    Returns ``None`` (caller records a failure and raises) when the endpoint is
+    unset, the file is gone, the HTTP call fails, or the reply does not carry all
+    three 1-5 axes. Never zero-fills: a silently-zeroed GEN call is exactly the
+    degenerate reward this backend exists to replace.
+    """
+    from verl_omni.utils.agentic.vllm_chat import post_vllm_chat
+    from verl_omni.utils.reward_score.unified_reward import (
+        _aggregate_unified_reward_scores,
+        _build_unified_reward_prompt,
+        _parse_unified_reward_scores,
+    )
+
+    vllm_url = str(knobs.get("vllm_url") or "").strip()
+    if not vllm_url:
+        logger.warning("unified reward: no judge endpoint (vllm_url) in knobs; cannot score %s", path)
+        return None
+    try:
+        image_b64 = base64.b64encode(Path(path).read_bytes()).decode("ascii")
+    except OSError as exc:
+        logger.warning("unified reward: cannot read image %s: %s", path, exc)
+        return None
+
+    raw, err = post_vllm_chat(
+        vllm_url=vllm_url,
+        image_b64=image_b64,
+        prompt_text=_build_unified_reward_prompt(caption),
+        max_tokens=int(knobs.get("reflect_max_new_tokens") or 512),
+        model=str(knobs.get("vllm_model") or ""),
+        timeout=float(knobs.get("reflect_vlm_timeout") or 120.0),
+        enable_thinking=bool(knobs.get("judge_enable_thinking", False)),
+    )
+    if raw is None:
+        logger.warning("unified reward: call failed for %s: %s", path, err)
+        return None
+    axes = _parse_unified_reward_scores(raw)
+    if not axes:
+        logger.warning(
+            "unified reward: reply lacks the 1-5 axes for %s; raw=%r",
+            path,
+            re.sub(r"\s+", " ", raw.strip())[:200],
+        )
+        return None
+
+    normalized, raw_score = _aggregate_unified_reward_scores(axes)
+    threshold = float(knobs.get("unified_good_enough_threshold", DEFAULT_UNIFIED_GOOD_ENOUGH))
+    logger.debug(
+        "unified reward %s: axes=%s raw=%.3f normalized=%.3f good_enough=%s",
+        path,
+        axes,
+        raw_score,
+        normalized,
+        normalized >= threshold,
+    )
+    return float(normalized), bool(normalized >= threshold)
 
 
 def compute_score(
@@ -177,29 +252,56 @@ def compute_score(
     else:
         notes = str(extra_info.get("judge_notes") or "")
 
+    # Reward backend. ``vlm_judge`` is the original discrete facet-grid judge
+    # (correctness/aesthetics snapped to 0.0/0.2/.../1.0). ``unified_reward`` scores
+    # the image against its prompt on UnifiedReward 2.0's 1-5 Alignment/Coherence/Style
+    # axes and normalizes to [0, 1] -- a *continuous* score.
+    #
+    # Why the continuous path exists (measured 2026-09-22): the facet judge put every
+    # GEN image on the 0.0 floor, so every sample in a FlowGRPO group scored identically
+    # and the group advantage was exactly zero (``actor/loss: 0.0`` on every step). The
+    # judge was not broken -- a probe showed it could describe the image accurately, and
+    # it returned 0.0 on both the 6-level grid and a free 0-100 scale. A reward with no
+    # within-group variance cannot train a policy no matter how correct it is.
+    backend = str(knobs.get("score_backend") or "unified_reward").strip().lower()
+    if backend not in ("unified_reward", "vlm_judge"):
+        raise ValueError(
+            f"bagel_rm_image_scorer: unknown score_backend {backend!r}; "
+            "expected 'unified_reward' or 'vlm_judge'"
+        )
+    caption = image_prompt or user_request
+
     scores: list[float] = []
     flags: list[bool] = []
     per_image: list[dict[str, Any]] = []
     failed: list[str] = []
     for path in image_paths:
-        judged = call_reflect_vlm(
-            user_request=user_request,
-            image_prompt=image_prompt,
-            notes=notes,
-            image_path=path,
-            extra_info=dict(knobs),
-        )
-        if judged is None or not judged.get("ok"):
-            failed.append(path)
-            continue
-        correctness = float(judged.get("correctness", 0.0))
-        aesthetics = float(judged.get("aesthetics", 0.0))
-        match = judged.get("match")
-        facets = [correctness, aesthetics] + ([float(match)] if match is not None else [])
-        score = sum(facets) / len(facets)
+        if backend == "vlm_judge":
+            judged = call_reflect_vlm(
+                user_request=user_request,
+                image_prompt=image_prompt,
+                notes=notes,
+                image_path=path,
+                extra_info=dict(knobs),
+            )
+            if judged is None or not judged.get("ok"):
+                failed.append(path)
+                continue
+            correctness = float(judged.get("correctness", 0.0))
+            aesthetics = float(judged.get("aesthetics", 0.0))
+            match = judged.get("match")
+            facets = [correctness, aesthetics] + ([float(match)] if match is not None else [])
+            score = sum(facets) / len(facets)
+            good_enough = bool(judged.get("good_enough", False))
+        else:
+            unified = _score_image_unified(path=path, caption=caption, knobs=knobs)
+            if unified is None:
+                failed.append(path)
+                continue
+            score, good_enough = unified
         scores.append(score)
-        flags.append(bool(judged.get("good_enough", False)))
-        per_image.append({"image_path": path, "score": score, "good_enough": flags[-1]})
+        flags.append(good_enough)
+        per_image.append({"image_path": path, "score": score, "good_enough": good_enough})
     if failed:
         raise ValueError(
             f"bagel_rm_image_scorer: failed to score {len(failed)}/{len(image_paths)} image(s) "

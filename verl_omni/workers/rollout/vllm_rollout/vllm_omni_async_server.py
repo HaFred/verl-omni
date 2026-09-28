@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import logging
 import os
+import time
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -111,6 +112,10 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         strategy_cls = ARStrategy if omni_kwargs.get("output_mode", "diffusion") == "ar" else DiffusionStrategy
         self._generate_strategy = strategy_cls(self)
         self._rollout_flags: dict[int, dict] = {}
+        # Number of ``generate`` calls accepted but not yet returned, across *both* lanes.
+        # Used by ``wait_for_requests_to_drain`` before any sleep; see that method for why the
+        # engine's own ``request_states`` cannot answer this.
+        self._inflight_generations = 0
         rollout_config = self._generate_strategy.init_config(config)
         if getattr(rollout_config, "seed", None) is None:
             rollout_config.seed = 42
@@ -247,6 +252,39 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         """
         return 1
 
+    async def _wake_engine_vram_safe(self, tags: list[str]) -> None:
+        """``engine.wake_up(tags)`` with a bounded retry for a transient VRAM re-map failure.
+
+        The trainer reaches ``wake_up`` **directly** (``BagelCoRLTrainer._wake_rollout_replicas``,
+        once per step for both lanes), so there is no caller-side retry to fall back on the way
+        ``update_weights`` has one in :func:`verl_omni.workers.engine_workers._resume_rollout_vram_safe`.
+        Measured 2026-09-27 18:11 in ``.gpu_watch/bagel_rm1_20260927_165227.log``: the RM-on run
+        reached step 41 and then died from exactly the transient sleep-mode allocator OOM that
+        helper exists to absorb --
+
+            RuntimeError: wake_up failed on a stage: 'CUDA Error: out of memory at
+            /workspace/csrc/cumem_allocator.cpp:163'
+
+        raised out of ``_validate_acks`` (the failure rides the ack, not the await), so the retry
+        wraps both. Each retry first hands this process's cached blocks back to the driver:
+        ``aggressive_empty_cache`` reclaims the ``reserved - allocated`` gap the ``cuMemCreate``
+        re-map is asking for. A failed wake leaves the engine asleep, so re-issuing is idempotent.
+        """
+        from verl.utils.memory_utils import aggressive_empty_cache
+
+        from verl_omni.utils.rollout_wake import wake_with_oom_retry
+
+        async def _wake_once():
+            acks = await self.engine.wake_up(tags=tags)
+            self._validate_acks("wake_up", acks)
+            return acks
+
+        await wake_with_oom_retry(
+            _wake_once,
+            flush=lambda: aggressive_empty_cache(force_sync=True),
+            label=f"rollout wake_up(tags={tags})",
+        )
+
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
             return
@@ -254,8 +292,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             logger.info("skip wake_up in standalone mode")
             return
         resolved_tags = tags if tags is not None else self._get_wake_up_tags()
-        acks = await self.engine.wake_up(tags=resolved_tags)
-        self._validate_acks("wake_up", acks)
+        await self._wake_engine_vram_safe(resolved_tags)
         await self.engine.resume_generation()
         await self._invalidate_policy_caches()
 
@@ -306,6 +343,10 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         if self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
             return
+        # Never unmap engine memory under a live decode: ``AsyncOmni.sleep`` aborts in-flight
+        # requests, and doing that to a request the worker is mid-way through killed a worker
+        # outright (see ``wait_for_requests_to_drain`` for the measured 2026-09-24 case).
+        await self.wait_for_requests_to_drain()
         acks = await self.engine.sleep(level=self._resolve_sleep_level())
         self._validate_acks("sleep", acks)
         await self._reset_frontend_mm_cache()
@@ -317,12 +358,14 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
+        # Same hazard as ``sleep``: this path frees the kv_cache device memory, so it must not
+        # run while a request is still reading it.
+        await self.wait_for_requests_to_drain()
         acks = await self.engine.sleep(level=self._resolve_sleep_level())
         self._validate_acks("sleep", acks)
         await self._reset_frontend_mm_cache()
         await self._invalidate_policy_caches()
-        acks = await self.engine.wake_up(tags=["weights"])
-        self._validate_acks("wake_up", acks)
+        await self._wake_engine_vram_safe(["weights"])
         await self.engine.resume_generation()
         await self._invalidate_policy_caches()
 
@@ -332,8 +375,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             return
         if self.rollout_mode == RolloutMode.COLOCATED:
             return
-        acks = await self.engine.wake_up(tags=["kv_cache"])
-        self._validate_acks("wake_up", acks)
+        await self._wake_engine_vram_safe(["kv_cache"])
         await self.engine.resume_generation()
         await self._invalidate_policy_caches()
 
@@ -391,20 +433,26 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         negative_extra_prompt_ids: Optional[dict[str, list[int]]] = None,
         priority: int = 0,
     ) -> DiffusionOutput | TokenOutput:
-        return await self._generate_strategy.generate(
-            prompt_ids=prompt_ids,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            image_data=image_data,
-            video_data=video_data,
-            audio_data=audio_data,
-            mm_processor_kwargs=mm_processor_kwargs,
-            negative_prompt_ids=negative_prompt_ids,
-            prompt_mask=prompt_mask,
-            extra_prompt_ids=extra_prompt_ids,
-            negative_extra_prompt_ids=negative_extra_prompt_ids,
-            priority=priority,
-        )
+        # Read-modify-write rather than ``+=`` so a server built without ``_init_config`` (the CPU
+        # tests use ``object.__new__``) still counts correctly instead of raising AttributeError.
+        self._inflight_generations = getattr(self, "_inflight_generations", 0) + 1
+        try:
+            return await self._generate_strategy.generate(
+                prompt_ids=prompt_ids,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                mm_processor_kwargs=mm_processor_kwargs,
+                negative_prompt_ids=negative_prompt_ids,
+                prompt_mask=prompt_mask,
+                extra_prompt_ids=extra_prompt_ids,
+                negative_extra_prompt_ids=negative_extra_prompt_ids,
+                priority=priority,
+            )
+        finally:
+            self._inflight_generations = max(0, self._inflight_generations - 1)
 
     # -----------------------------------------------------------------------
     # Shared LoRA state
@@ -523,9 +571,60 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             )
             return self._lora_request_cache  # type: ignore[return-value]
 
-    async def wait_for_requests_to_drain(self):
-        # TODO (mike): implement this once DP is supported.
-        pass
+    async def wait_for_requests_to_drain(self, timeout_s: float | None = None) -> int:
+        """Block until no ``generate`` call is in flight; return how many remain.
+
+        Why this exists: ``AsyncOmni.sleep`` defaults to ``mode="abort"`` /
+        ``reset_running_requests=True``, so a sleep issued while a decode is still running tears
+        that request down *and* unmaps the memory the worker is reading it from. Measured
+        2026-09-24 on hk01dgx039 (devices 0/1/6/7, ``bagel_corl_rm1_20260924_034359``,
+        ``ENABLE_RM=1``, ``test_freq=30``): the first validation batch reached
+        ``verl/trainer/ppo/v1/trainer_base.py:1036``'s colocated-RM
+        ``checkpoint_manager.sleep_replicas()`` with two episodes still decoding -- the replay
+        buffer's own debug line read ``running: 2`` a second earlier -- and ``VllmWorker-0``
+        died silently at the unmap (``exit code: None``, no Python traceback, only a stray
+        ``NCCL version`` line). That surfaced as ``RuntimeError: sleep failed on a stage: 'Call
+        to collective_rpc method failed: cancelled'`` and ended a run with 30 clean steps behind
+        it; ``..._213235`` ended at the same boundary.
+
+        Why it counts here rather than asking the engine: ``AsyncOmni.request_states`` is
+        append-only -- only its ``abort`` path ever pops, so it is never emptied for the life of
+        the process and would read as "everything is always in flight". ``vLLMOmniHttpServer``
+        is instead the single entry point for both lanes' ``generate`` calls, so it is the one
+        place that can count this exactly (and it counts a *number*, not a set of ids, because
+        the GEN S-group deliberately reuses one ``routing_key`` across siblings).
+
+        The training path never hit this because ``on_sample_end`` sleeps only after the rollout
+        has drained, so for it this returns immediately.
+
+        On timeout it logs and returns the remainder instead of raising: the caller is a sleep,
+        the engine's own abort semantics are the fallback, and a stuck request is already
+        reported by the rollout's own watchdog -- turning it into a second, unrelated failure
+        would only hide which one happened.
+        """
+        if timeout_s is None:
+            timeout_s = float(os.getenv("VERL_OMNI_DRAIN_TIMEOUT_S", "900"))
+        deadline = time.monotonic() + timeout_s
+        announced = False
+        while True:
+            remaining = getattr(self, "_inflight_generations", 0)
+            if remaining <= 0:
+                return 0
+            if not announced:
+                logger.info(
+                    "[vLLMOmniHttpServer] waiting for %d in-flight generate call(s) to drain before sleep",
+                    remaining,
+                )
+                announced = True
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[vLLMOmniHttpServer] %d generate call(s) still in flight after %.0fs; sleeping "
+                    "anyway (the engine will abort them)",
+                    remaining,
+                    timeout_s,
+                )
+                return remaining
+            await asyncio.sleep(0.5)
 
     # -----------------------------------------------------------------------
     # Abort: AsyncOmni has no `output_processor` (it routes through an

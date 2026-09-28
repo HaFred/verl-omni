@@ -33,6 +33,7 @@ this test exists to catch.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 
 import numpy as np
@@ -89,11 +90,16 @@ def _judge(**kwargs):
     return {"ok": True, "correctness": 0.4, "aesthetics": 0.2, "good_enough": False}
 
 
-def _mid_loop_payload(image_paths=("/a.png", "/b.png")):
+def _mid_loop_payload(image_paths=("/a.png", "/b.png"), *, backend="vlm_judge"):
+    # ``backend`` is pinned here, not left to default: these tests monkeypatch
+    # ``call_reflect_vlm`` and assert on the facet-grid arithmetic (0.8+0.6)/2 == 0.7,
+    # so they exercise the ``vlm_judge`` backend specifically. The shipped default is
+    # ``unified_reward`` (continuous 1-5 axes); see
+    # ``test_unified_backend_scores_are_graded_and_fail_loud`` for that path.
     return rm.build_rm_score_payload(
         list(image_paths),
         extra_info={"user_prompt": "a castle", "good_enough_threshold": THRESHOLD},
-        scorer_knobs={"good_enough_threshold": THRESHOLD},
+        scorer_knobs={"good_enough_threshold": THRESHOLD, "score_backend": backend},
     )
 
 
@@ -213,6 +219,71 @@ def test_visual_reward_manager_consumes_the_in_loop_payload(monkeypatch):
     scores, flags = rm.parse_rm_result(result, payload["image_paths"])
     assert scores == [pytest.approx(0.7), pytest.approx(0.3)]
     assert flags == [True, False]
+
+
+def test_unified_backend_scores_are_graded_and_fail_loud(monkeypatch, tmp_path):
+    """The continuous backend must (a) keep within-group variance and (b) never zero-fill.
+
+    Measured 2026-09-22: the facet judge put every GEN image on the 0.0 floor, so a whole
+    FlowGRPO group scored identically and ``actor/loss`` was 0.0 on every step -- a reward
+    with no variance cannot train a policy. UnifiedReward's graded 1-5 axes exist to keep
+    that variance, so a regression to a constant score is the failure this test guards.
+    """
+    from verl_omni.utils.agentic import vllm_chat
+    from verl_omni.utils.reward_score import bagel_rm_image_scorer as scorer_mod
+
+    # Two images, two different quality levels -> 1-5 axes that must survive as 0.5 vs 0.0.
+    replies = {
+        "good.png": "Alignment Score (1-5): 4\nCoherence Score (1-5): 3\nStyle Score (1-5): 3\n",
+        "bad.png": "Alignment Score (1-5): 1\nCoherence Score (1-5): 1\nStyle Score (1-5): 1\n",
+    }
+    seen: list[str] = []
+
+    def fake_post(*, vllm_url, image_b64, prompt_text, max_tokens, model="", timeout=120.0,
+                  enable_thinking=False):
+        # Identify which image by its encoded payload.
+        import base64
+
+        name = base64.b64decode(image_b64).decode()
+        seen.append(name)
+        # The canonical prompt must be the one UnifiedReward expects.
+        assert "Alignment Score (1-5)" in prompt_text and "Text Caption" in prompt_text
+        return replies[name], None
+
+    monkeypatch.setattr(vllm_chat, "post_vllm_chat", fake_post)
+
+    paths = []
+    for name in ("good.png", "bad.png"):
+        p = tmp_path / name
+        # Contents must differ per file: the stub identifies the image by what it read.
+        p.write_bytes(name.encode())
+        paths.append(str(p))
+
+    knobs = {"good_enough_threshold": THRESHOLD, "score_backend": "unified_reward",
+             "vllm_url": "http://rm-router:1", "unified_good_enough_threshold": 0.6}
+    payload = rm.build_rm_score_payload(paths, extra_info={"user_prompt": "a castle"},
+                                        scorer_knobs=knobs)
+    payload["image_prompt"] = "a castle at dusk"
+    out = scorer_mod.compute_score(
+        data_source="bagel_corl_mid_loop_rm", solution_str="", ground_truth="",
+        extra_info={rm.BAGEL_RM_EXTRA_INFO_KEY: payload},
+    )
+
+    # (4+3+3)/3 = 3.333 -> (3.333-1)/4 = 0.5833 ; (1+1+1)/3 = 1 -> 0.0
+    assert out["sample_scores"] == [pytest.approx(7 / 12), pytest.approx(0.0)]
+    assert out["sample_scores"][0] != out["sample_scores"][1], "reward collapsed: no GRPO gradient"
+    assert out["sample_good_enough"] == [False, False]  # 0.5833 < 0.6, and 0.0 < 0.6
+    assert out["score"] == pytest.approx(7 / 24)
+    assert [os.path.basename(s) for s in seen] == ["good.png", "bad.png"]
+
+    # Fail loud: an unparseable reply must raise, not silently score 0.0.
+    monkeypatch.setattr(vllm_chat, "post_vllm_chat",
+                        lambda **kw: ("I cannot help with that.", None))
+    with pytest.raises(ValueError, match="failed to score"):
+        scorer_mod.compute_score(
+            data_source="bagel_corl_mid_loop_rm", solution_str="", ground_truth="",
+            extra_info={rm.BAGEL_RM_EXTRA_INFO_KEY: payload},
+        )
 
 
 def test_episode_row_without_payload_dispatches_to_episode_scorer(monkeypatch):
