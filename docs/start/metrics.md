@@ -1,7 +1,7 @@
 (metrics)=
 # Training Metrics
 
-Last updated: 09/24/2026
+Last updated: 09/28/2026
 
 Metrics are logged each step to your configured backend (console / W&B). The diffusion RL
 trainers share the group-statistic metrics, and each objective adds its own block below. Names

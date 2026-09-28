@@ -1,7 +1,7 @@
 (diffusion_mfu)=
 # Diffusion FLOPs / MFU
 
-Last updated: 09/06/2026
+Last updated: 09/28/2026
 
 VeRL-Omni reports **Model FLOPs Utilization (MFU)** for diffusion RL
 training using the same actor keys upstream
