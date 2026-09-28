@@ -34,6 +34,10 @@ python examples/flowgrpo_trainer/data_process/boogu_image_ocr.py \
 
 The converter is shared with the FlowGRPO Boogu recipe and produces
 `~/data/ocr/boogu_image/{train,test}.parquet`, which is where the launcher looks by default.
+It writes `data_source: "ocr"` — the reward that scores these rows, not the task or the
+trainer. Both trainers read `data_source` as `data.reward_fn_key` and the validation trainer
+splices it into every metric key as `<val-core|val-aux>/<data_source>/<var>/<metric>`, so
+T2I OCR runs log `val-core/ocr/reward/mean@1`. See the Edit section below for the naming rule.
 Note the deliberate quirk documented there: the upstream pipeline encodes empty instructions
 — including the default negative prompt `""` — with the *TI2I unified* system prompt, not the
 T2I one. Do not "fix" this; a template mismatch between the data and the released model
@@ -50,7 +54,8 @@ the launcher above. It reads a separate dataset, produced by the edit-specific c
 
 ```bash
 python examples/flowgrpo_trainer/data_process/boogu_image_edit_ocr.py \
-    --input_dir ~/data/ocr_edit --output_dir ~/data/ocr/boogu_image_edit_pickscore --image_size 512
+    --input_dir ~/data/ocr_edit --output_dir ~/data/ocr/boogu_image_edit_pickscore \
+    --image_size 512 --reward pickscore
 ```
 
 Each row pairs the source image in `images` with an "edit this text" instruction and a
@@ -60,7 +65,21 @@ CLIP-encodes `reward_model.ground_truth` as the prompt and scores its similarity
 generated image. `ground_truth` is therefore the **instruction**, not the target word; the
 converter writes it that way and keeps `target_text` in `extra_info`. With the OCR GenRM
 (rather than PickScore) a bare target word would be the right `ground_truth`, so the two are
-not interchangeable — the directory name carries the distinction so they cannot be confused.
+not interchangeable. `--reward` selects the arm and writes both fields together, so they
+cannot drift apart:
+
+| `--reward` | `ground_truth` | `data_source` | scored by |
+| --- | --- | --- | --- |
+| `pickscore` (default) | the instruction | `pickscore` | `pickscore_reward.py` (CLIP) |
+| `ocr` | the target text | `ocr` | `genrm_ocr.py` (Qwen3-VL GenRM) |
+
+`data_source` is the reward, and it is not cosmetic: both trainers read it as
+`data.reward_fn_key` and the validation trainer splices it into every metric key as
+`<val-core|val-aux>/<data_source>/<var>/<metric>`. Naming it after the task
+(`ocr_edit`) or the algorithm (`flow_grpo/...`) makes `val-core/pickscore/reward/mean@1`
+impossible to read and mislabels diffusionnft runs as flow_grpo; the T2I/EDIT
+distinction belongs in `trainer.experiment_name`.
+
 PickScore runs CLIP locally in the reward workers, so this recipe serves no reward model.
 
 That converter deliberately emits a **text-only** negative prompt: guided TI2I encodes the

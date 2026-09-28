@@ -81,7 +81,21 @@ def load_condition_image(image_path: Path, image_size: int) -> bytes:
     return buffer.getvalue()
 
 
-def convert_split(input_dir: Path, split: str, max_samples: int, image_size: int) -> pd.DataFrame:
+REWARD_CHOICES = ("ocr", "pickscore")
+
+
+def ground_truth_for(reward: str, instruction: str, target_text: str) -> str:
+    """Return the text ``reward`` actually compares against (see the module docstring)."""
+    if reward == "ocr":
+        # genrm_ocr.py transcribes the generated image and string-compares it.
+        return target_text
+    if reward == "pickscore":
+        # pickscore_reward.py does `prompt = ground_truth` and CLIP-encodes it.
+        return instruction
+    raise ValueError(f"unknown reward {reward!r}; expected one of {REWARD_CHOICES}")
+
+
+def convert_split(input_dir: Path, split: str, max_samples: int, image_size: int, reward: str) -> pd.DataFrame:
     jsonl_path = input_dir / f"{split}.jsonl"
     image_dir = input_dir / "images"
     rows = []
@@ -99,7 +113,8 @@ def convert_split(input_dir: Path, split: str, max_samples: int, image_size: int
 
             rows.append(
                 {
-                    "data_source": "flow_grpo/ocr_edit",
+                    # Names the reward, so it stays in step with ground_truth below.
+                    "data_source": reward,
                     "prompt": [
                         {"role": "system", "content": BOOGU_SYSTEM_PROMPT_TI2I},
                         {"role": "user", "content": f"Picture 1: <image>{instruction}"},
@@ -121,9 +136,12 @@ def convert_split(input_dir: Path, split: str, max_samples: int, image_size: int
                     ],
                     "ability": "image_edit",
                     "images": [{"bytes": load_condition_image(image_path, image_size)}],
-                    # The instruction, not `target_text`: this is the prompt PickScore
-                    # CLIP-encodes against the generated image (see the module docstring).
-                    "reward_model": {"style": "model", "ground_truth": instruction},
+                    # Which text the reward compares against: the instruction for
+                    # PickScore, the bare target word for OCR. See the module docstring.
+                    "reward_model": {
+                        "style": "model",
+                        "ground_truth": ground_truth_for(reward, instruction, target_text),
+                    },
                     "extra_info": {
                         "split": split,
                         "index": index,
@@ -143,6 +161,16 @@ def main() -> None:
     parser.add_argument("--train_size", type=int, default=-1)
     parser.add_argument("--val_size", type=int, default=-1)
     parser.add_argument(
+        "--reward",
+        choices=REWARD_CHOICES,
+        default="pickscore",
+        help=(
+            "Which reward will score this data. Sets both `reward_model.ground_truth` and "
+            "`data_source`, so the validation metric key reads `<val-core>/<reward>/...`. "
+            "'pickscore' stores the instruction (CLIP prompt); 'ocr' stores the bare target word."
+        ),
+    )
+    parser.add_argument(
         "--image_size",
         type=int,
         default=512,
@@ -154,11 +182,14 @@ def main() -> None:
         raise ValueError(f"--image_size must be a multiple of 16 in (0, 2048]; got {args.image_size}")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    train = convert_split(args.input_dir.expanduser(), "train", args.train_size, args.image_size)
-    validation = convert_split(args.input_dir.expanduser(), "test", args.val_size, args.image_size)
+    train = convert_split(args.input_dir.expanduser(), "train", args.train_size, args.image_size, args.reward)
+    validation = convert_split(args.input_dir.expanduser(), "test", args.val_size, args.image_size, args.reward)
     train.to_parquet(args.output_dir / "train.parquet", row_group_size=500)
     validation.to_parquet(args.output_dir / "test.parquet", row_group_size=500)
-    print(f"Wrote {len(train)} training and {len(validation)} validation samples to {args.output_dir}")
+    print(
+        f"Wrote {len(train)} training and {len(validation)} validation samples to {args.output_dir} "
+        f"(reward={args.reward})"
+    )
 
 
 if __name__ == "__main__":
