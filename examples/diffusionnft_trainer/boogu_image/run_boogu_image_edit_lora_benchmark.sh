@@ -25,6 +25,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
 NUM_GPUS=${NUM_GPUS:-4}
 
 NUM_GPUS=$NUM_GPUS bash "$SCRIPT_DIR/run_boogu_image_edit_lora.sh" \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=6 \
     trainer.test_freq=0 \
     trainer.val_before_train=False \
     trainer.save_freq=0 \

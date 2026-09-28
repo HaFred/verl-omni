@@ -82,13 +82,19 @@ distinction belongs in `trainer.experiment_name`.
 
 PickScore runs CLIP locally in the reward workers, so this recipe serves no reward model.
 
-That converter deliberately emits a **text-only** negative prompt: guided TI2I encodes the
-negative instruction without the reference image (`use_input_images_4_neg_instruct=False`), and
-the reference latents reach the unconditional forward separately. A negative prompt that
-references no media is therefore allowed to consume fewer media than the row carries. Do not
-silence a load failure by adding `<image>` to the negative prompt -- that satisfies the media
-count check while feeding the negative branch a placeholder token that is never expanded into
-image features, which quietly shifts the guidance.
+The converter lists the reference image in the negative branch too, so `negative_prompt` carries
+the same `<image>` placeholder as `prompt`. That is load-bearing rather than cosmetic:
+`RLHFDataset._build_messages` requires the placeholder count to equal the row's media count for
+every prompt it builds, and it only skips that check for a text-only negative when no processor is
+set — never the case for Boogu. Omitting the placeholder is what made earlier launches die with
+`image_offset 0 != len(images) 1`. Sibling edit converters (`qwen_image_edit/prepare_data.py`) use
+the same `Picture 1: <image> ` form, which is also the form the dataset this recipe loads was
+built with.
+
+The name is baked into the parquet at conversion time, so an existing dataset keeps its old key
+until it is regenerated or rewritten in place with
+[`set_data_source.py`](../../flowgrpo_trainer/data_process/set_data_source.py). See
+[metrics](../../../docs/start/metrics.md) for what the per-step DiffusionNFT keys mean.
 
 ## Launch
 
