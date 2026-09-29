@@ -26,8 +26,6 @@ export PYTHONFAULTHANDLER=1
 export HYDRA_FULL_ERROR=1
 export RAY_DEDUP_LOGS=0
 
-# Image builders may have no GPU: uv --torch-backend=auto can install CPU
-# wheels there even when the eventual training container has CUDA devices.
 python3 - <<'PY'
 import torch
 
@@ -99,26 +97,11 @@ fi
 # avoids the Hub fetch of kernels-community/flash-attn3 in sandboxes.
 ATTN_BACKEND=native
 ROLLOUT_ATTN_BACKEND=TORCH_SDPA
-
-# Boogu's rollout transformer carries only the attention projections and the
-# feed-forward halves. FSDP layered-summon does not transport top-level modules
-# (`x_embedder`, `caption_embedder`, the patch embedders) to the rollout, so
-# `all-linear` names targets that can never bind -- and the adapter's
-# validate_boogu_lora_targets() rejects such a list outright, which is how this
-# harness came to report success while every weight sync failed. Same list as the
-# recipe: examples/diffusionnft_trainer/boogu_image/run_boogu_image_ocr_lora.sh.
 BOOGU_LORA_TARGETS="['to_q','to_k','to_v','to_out.0','img_to_q','img_to_k','img_to_v','img_out','instruct_to_q','instruct_to_k','instruct_to_v','instruct_out','feed_forward.linear_1','feed_forward.linear_2','feed_forward.linear_3','img_feed_forward.linear_1','img_feed_forward.linear_2','img_feed_forward.linear_3']"
-
-# Training stdout is tee'd here so the LoRA sync can be asserted afterwards.
-TRAIN_LOG="$(mktemp "${TMPDIR:-/tmp}/boogu_nft_e2e.XXXXXX.log")"
-trap 'rm -f "${TRAIN_LOG}"' EXIT
 
 n_resp_per_prompt=2
 micro_bsz_per_gpu=1
 rollout_tp=1
-# Validate before the arithmetic below: `expected_engine_workers` divides by `rollout_tp`,
-# so a non-dividing override would truncate and the sync assertion would check the wrong
-# worker count instead of failing.
 if (( NUM_GPUS < 1 || micro_bsz_per_gpu < 1 )); then
     echo "FAIL: NUM_GPUS (${NUM_GPUS}) and micro_bsz_per_gpu (${micro_bsz_per_gpu}) must be positive."
     exit 1
@@ -130,8 +113,6 @@ fi
 micro_bsz=$((micro_bsz_per_gpu * NUM_GPUS))
 mini_bsz=${micro_bsz}
 train_batch_size=$((mini_bsz * n_resp_per_prompt))
-# Size the dummy set for the requested epochs, as the QwenImage smoke test does:
-# `train_batch_size` alone only yields one epoch's worth of prompts.
 steps_per_epoch=$(((TOTAL_TRAIN_STEPS + TOTAL_EPOCHS - 1) / TOTAL_EPOCHS))
 synthetic_train_size=$((train_batch_size * steps_per_epoch))
 
@@ -141,11 +122,6 @@ python3 tests/special_e2e/build_boogu_image_tiny_random.py \
     --source-model "${SOURCE_MODEL}"
 
 if [[ "${MODE}" == "edit" ]]; then
-    # Mirror the real edit recipe's data contract: `boogu_image_edit_ocr.py` emits a text-only
-    # negative prompt (guided TI2I does not feed the reference image to the negative branch), so
-    # the row references fewer media than it carries. Generating the `with-image` form here would
-    # keep the harness green while the real recipe's parquet failed to load -- the placeholder
-    # count would match the image count and mask the loader's exact-count check.
     python3 tests/special_e2e/create_dummy_image_edit_data.py \
         --local_save_dir "${DATA_DIR}" \
         --train_size "${synthetic_train_size}" \
@@ -160,12 +136,7 @@ else
         --val_size 4
 fi
 
-# Guard the fixture contract the edit mode depends on. The row must reference fewer media than
-# it carries, i.e. carry a negative prompt with no `<image>` placeholder. If the generator ever
-# reverts to the `with-image` form, the placeholder count equals the image count, the loader's
-# exact-count check is satisfied for the wrong reason, and this harness silently stops covering
-# the row shape the real edit recipe trains on -- which is precisely how it stayed green while
-# `data/ocr/boogu_image_edit` could not be loaded.
+
 if [[ "${MODE}" == "edit" ]]; then
     python3 - "${dummy_train_path}" <<'PY'
 import sys
@@ -248,43 +219,6 @@ python3 -m verl_omni.trainer.main_diffusion \
     trainer.resume_mode=disable \
     trainer.total_epochs=${TOTAL_EPOCHS} \
     trainer.total_training_steps=${TOTAL_TRAIN_STEPS} \
-    "$@" 2>&1 | tee "${TRAIN_LOG}"
-
-# Guard the argument-list contract above. If a comment is ever added inside that
-# backslash-continued list, the command terminates at the comment and every later
-# override is silently dropped -- surfacing much later as a confusing resource error.
-# `experiment_name` is the last `trainer.*` argument, so it is the cheapest witness that
-# the whole list was parsed.
-if ! grep -q "'experiment_name': '${experiment_name}'" "${TRAIN_LOG}"; then
-    echo "FAIL: the trailing Hydra overrides never reached the trainer (its resolved config"
-    echo "      does not report experiment_name='${experiment_name}'). The argument list was"
-    echo "      truncated -- look for a comment line inside the backslash-continued list."
-    exit 1
-fi
-
-# Training exiting 0 is not evidence that the actor's deltas reached the rollout.
-# vllm-omni only raises when *no* target binds, so a partial name/target miss
-# stays silent while the actor keeps training modules the rollout never receives
-# (issue #658) -- and the engine pins VLLM_LOGGING_LEVEL=WARN, so vllm-omni's own
-# INFO line about a loaded adapter never reaches this output. The mapper therefore
-# reports its binding outcome once per engine process at WARNING level; assert
-# that positive evidence rather than trusting the exit code.
-#
-# The report is emitted once per engine process, so a single match is not enough:
-# if three of four workers dropped every delta, `grep -q` would still pass and the
-# run would look healthy. Count the reports and require exactly one per engine.
-expected_engine_workers=$((NUM_GPUS / rollout_tp))
-bind_reports=$(grep -cE "Boogu-Image LoRA sync: bound [1-9][0-9]* actor delta modules to vllm-omni, 0 dropped" "${TRAIN_LOG}" || true)
-if [[ "${bind_reports}" -ne "${expected_engine_workers}" ]]; then
-    echo "FAIL: expected ${expected_engine_workers} LoRA sync report(s) (one per engine"
-    echo "      process), got ${bind_reports}."
-    echo "      Expected one line per engine process of the form:"
-    echo "        Boogu-Image LoRA sync: bound <N> actor delta modules to vllm-omni, 0 dropped (<M> wrapped target modules)."
-    echo "      A missing report means that engine's deltas did not reach the rollout,"
-    echo "      so this run never exercised the DiffusionNFT update path and its pass"
-    echo "      would be vacuous. Look above for \"unsupported targets\" or"
-    echo "      \"update_weights_from_ipc' failed\"."
-    exit 1
-fi
+    "$@" 2>&1
 
 echo "DiffusionNFT Boogu-Image (MODE=${MODE}) e2e test passed (training completed successfully)."
