@@ -87,13 +87,26 @@ def build_gen_sampling_params(
     params.update(config_to_sampling_dict(algo))
     if base:
         # ``base`` is the worker's per-phase sampling params.  On a validation
-        # batch ``AgentLoopWorker.run`` has already overlaid
-        # ``val_kwargs.pipeline`` / ``val_kwargs.algo`` onto them, so the train
-        # ``pipeline``/``algo`` above may only supply keys ``base`` lacks.
-        # Applying them *last* silently stamped the training
-        # ``num_inference_steps`` / ``noise_level`` over the validation ones, so
-        # ``VAL_GEN_STEPS``/``VAL_NOISE_LEVEL`` never reached image generation
-        # and validation images stayed as stochastic as the training rollout.
+        # batch it must already carry the val overlay (``val_kwargs.pipeline`` /
+        # ``val_kwargs.algo``), so the train ``pipeline``/``algo`` above may only
+        # supply keys ``base`` lacks.  Applying them *last* silently stamped the
+        # training ``num_inference_steps`` / ``noise_level`` over the validation
+        # ones, so ``VAL_GEN_STEPS``/``VAL_NOISE_LEVEL`` never reached image
+        # generation and validation images stayed as stochastic as the training
+        # rollout.
+        #
+        # CORRECTION (2026-09-30): the sentence above used to assert that the
+        # worker had *already* overlaid val_kwargs.  On the bagel path it had not.
+        # ``AgentLoopWorkerTQ.generate_sequences`` overrides only the three AR knobs
+        # (``top_p``/``top_k``/``temperature``); ``val_kwargs.pipeline``/``.algo``
+        # were never applied, so ``base`` carried the *training* kernel and this
+        # branch faithfully let it win -- validation denoised at the training
+        # ``noise_level``/steps.  The overlay now exists for this path in
+        # ``BagelCorlAgentLoopWorkerTQ._run_prompt`` (see
+        # ``val_overlay_sampling_params``), which is what makes the original claim
+        # true.  Keep this branch *after* the train merge: it is the mechanism that
+        # lets the val kernel win.
+        #
         # Keep non-AR keys (e.g. global_steps) from the worker; drop text-decoding knobs.
         params.update({k: v for k, v in base.items() if k not in _AR_ONLY_SAMPLING_KEYS})
 
@@ -198,8 +211,19 @@ def stash_gen_row_from_diffusion_output(
     *,
     seed: int,
     image_root: Optional[str] = None,
+    require_traj: bool = True,
 ) -> dict[str, Any]:
-    """Build one GEN seed row; fail closed when latents / timesteps / logprobs are missing."""
+    """Build one GEN seed row.
+
+    ``require_traj`` is the training/validation split.  Training packs the FlowGRPO
+    trajectory (latents + timesteps + SDE log-probs) and fails closed without it.
+    Validation instead decodes with ODE (``noise_level=0.0``), which by construction
+    has no SDE log-probs, so it passes ``require_traj=False``: the row stays ``valid``
+    and keeps its ``image_path`` (so the image is dumped and RM-scored) but carries no
+    trajectory.  ``pack_dual_lane_episode`` then drops it from the GEN *training* lane
+    via ``_sample_has_gen_traj`` and books it as ``gen/dropped_incomplete_groups`` --
+    the state that helper exists to express.
+    """
     if not hasattr(output, "diffusion_output"):
         raise RuntimeError(
             "Bagel Co-RL (Joint-Training) generate_image returned a non-diffusion output: dual-role GEN "
@@ -212,7 +236,10 @@ def stash_gen_row_from_diffusion_output(
         raise RuntimeError(f"Bagel Co-RL (Joint-Training) GEN aborted (stop_reason={stop_reason!r}); refuse soft-skip.")
 
     latents, timesteps, log_probs = extract_gen_traj_from_diffusion_output(output)
-    if latents is None or timesteps is None or log_probs is None:
+    # Training still fails closed *before* writing anything.  Validation
+    # (``require_traj=False``) falls through to save the image: an ODE decode
+    # legitimately has no log-probs, and the image is the point of a val pass.
+    if require_traj and (latents is None or timesteps is None or log_probs is None):
         raise RuntimeError(
             "Bagel Co-RL (Joint-Training) GEN traj stash incomplete from vLLM-Omni "
             f"(all_latents={'ok' if latents is not None else 'missing'}, "

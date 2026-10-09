@@ -324,6 +324,33 @@ def test_pack_metrics_carry_exactly_the_measured_r2_names():
     assert pack.metrics["gen/cond_amortization"] == pytest.approx(2.0)
 
 
+def test_k_zero_incidence_is_published_and_aggregated_to_a_rate():
+    """``episode/K_zero`` names the K=0 episodes, and its step value is their *rate*.
+
+    The failure it tracks (measured 2026-09-27, ``bagel_corl_rm1_20260927_165227``: 14 of 173
+    episodes) is an episode that never issues a ``generate_image`` call at all -- the GEN lane
+    has nothing to score and UND falls back to the pattern-3 non-image scalar.
+    ``gen/skipped_no_groups`` cannot stand in for it: that keys on ``k_complete`` and also fires
+    for a K>=1 episode whose groups were all dropped. Pinned end to end, pack *and* aggregator,
+    so neither end can silently stop emitting it.
+    """
+    healthy = pack_dual_lane_episode(
+        _ep(uid="taskA", turns=1, k=1, samples=[_sample("c0", 0), _sample("c0", 1)]),
+        und_key="taskA_0_0",
+        expected_s=2,
+    )
+    k_zero = pack_dual_lane_episode(
+        _ep(uid="taskB", turns=8, k=0, samples=[], used=False),
+        und_key="taskB_0_0",
+        expected_s=2,
+    )
+    assert healthy.metrics["episode/K_zero"] == 0.0
+    assert k_zero.metrics["episode/K_zero"] == 1.0
+
+    agg = aggregate_episode_metrics([_as_step_record(healthy), _as_step_record(k_zero)])
+    assert agg["episode/K_zero"] == pytest.approx(0.5)
+
+
 def _as_step_record(pack):
     """The shape ``aggregate_episode_metrics`` actually receives.
 

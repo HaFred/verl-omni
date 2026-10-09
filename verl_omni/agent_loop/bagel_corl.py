@@ -42,6 +42,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     count_degenerate_und_turns,
     generate_retrying_engine_wake,
     run_serial_episode,
+    strip_reflection_tail,
     turn_histogram,
     und_turn_max_tokens,
 )
@@ -442,6 +443,26 @@ def dump_episode_hermes_action(
     except Exception:  # noqa: BLE001 - diagnostics must never fail a rollout
         logger.warning("bagel_corl_hermes_dump_failed relpath=%s", relpath, exc_info=True)
         return None
+
+
+def validation_artifact_relpath(relpath: str, sampling_params: dict | None) -> str:
+    """Return ``relpath`` under a ``val/`` prefix for a validation episode.
+
+    Validation images are the only *deterministic* GEN reference this recipe produces
+    (``noise_level=0.0`` / 50-step ODE, applied by the val overlay in
+    ``BagelCorlAgentLoopWorkerTQ._run_prompt``), so they must not be merged into the
+    training step dir.  Measured 2026-09-30 on
+    ``bagel_corl_rm1_0123_20260930_021712``: the step-30 validation boundary dumped 8
+    val + 4 train episodes into one ``step_000030``, and no pixel metric could separate
+    them -- the sample count was the only tell.  A ``val/`` prefix leaves the training
+    tree byte-identical while making the reference reviewable.
+
+    ``logprobs is False`` is the validate marker: the val overlay sets it and the
+    training path leaves it True, so it is the per-phase answer
+    ``bagel_corl_gen_serve`` documents.  Keying on the prompt or episode uid cannot
+    work, because a validation prompt legitimately repeats across steps.
+    """
+    return f"val/{relpath}" if (sampling_params or {}).get("logprobs") is False else relpath
 
 
 def dump_episode_images(*, episode: EpisodeRollout, relpath: str, step: Any = None) -> list[str]:
@@ -850,8 +871,15 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             user_prompt=user_prompt_text,
         )
         # Same reason: copy the GEN PNGs out of the scratch dir into the run's
-        # ``rollout_images`` tree, next to this episode's trajectory.
-        dump_episode_images(episode=episode, relpath=relpath, step=global_steps)
+        # ``rollout_images`` tree, next to this episode's trajectory. Validation
+        # episodes land under ``val/`` so the deterministic ODE reference is never
+        # merged with the stochastic training rollout -- see
+        # ``validation_artifact_relpath``.
+        dump_episode_images(
+            episode=episode,
+            relpath=validation_artifact_relpath(relpath, getattr(self, "_sampling_params", None)),
+            step=global_steps,
+        )
         # RFC §4.4.4 R2: engine-measured conditioning reuse for this episode. Empty
         # whenever the engine exposed no counters, so nothing is fabricated.
         r2 = getattr(self, "_bagel_r2", None) or {}
@@ -872,20 +900,30 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         (group size for FlowGRPO), e.g. ``UND → GEN(S seeds) → UND → Done``.
 
         Each returned row carries ``valid`` / ``all_latents`` / ``timesteps`` /
-        ``rollout_log_probs`` / ``image_path``. Fails closed when traj stash is
-        missing (no soft-fallback to logprobs-only / skip GEN loss) and when the
+        ``rollout_log_probs`` / ``image_path``. Fails closed when the *training* traj
+        stash is missing (no soft-fallback to logprobs-only / skip GEN loss); on a
+        validation batch there is no SDE traj to stash by design, so the row is
+        returned ``valid`` with its image and no trajectory. Also fails when the
         server returns a token output — do not fall back to a Qwen image sidecar.
 
         Incomplete / invalid S-groups are dropped at dual-lane ingest (no dummy pads).
         Pattern 3 (``K = 0``) never calls this.
         """
-        prompt = str(kwargs.get("prompt", ""))
+        prompt = strip_reflection_tail(str(kwargs.get("prompt", "")))
         seeds = list(kwargs.get("seeds") or [])
         if not prompt:
             raise ValueError("_generate_image requires a non-empty diffusion prompt")
 
         rollout = self.config.actor_rollout_ref.rollout
         base = dict(getattr(self, "_sampling_params", None) or {})
+        # ``logprobs is False`` is the validate marker the val overlay sets (see
+        # ``validation_artifact_relpath``).  Validation decodes with ODE
+        # (``noise_level=0.0``), which has no SDE log-probs, so its rows legitimately
+        # carry no trajectory: they stay ``valid`` and keep their images, and the GEN
+        # *training* lane drops them (``_sample_has_gen_traj``).  Without this the stash
+        # failed closed on a missing ``log_probs`` and, because it raises *before*
+        # saving, validation produced no image at all.
+        is_validate = base.get("logprobs") is False
         rows: list[dict[str, Any]] = []
         timing = getattr(self, "_bagel_timing", None)
         # BagelPipeline reads text from the request prompt; encode the diffusion
@@ -931,7 +969,9 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                         step=getattr(self, "global_steps", None),
                     ),
                 )
-                row = stash_gen_row_from_diffusion_output(output, seed=int(seed))
+                row = stash_gen_row_from_diffusion_output(
+                    output, seed=int(seed), require_traj=not is_validate
+                )
                 row["cond_uid"] = cond_uid
                 row["cond_len"] = cond_len
                 rows.append(row)

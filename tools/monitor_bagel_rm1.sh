@@ -135,7 +135,7 @@ while true; do
           | rg -o '[0-9]+$' | awk '{s+=$1} END {print s+0}')
     echo "BAGEL_OK $(date '+%F %T') step=${cur} steps_with_dumps=$ndump pngs=$npng degenerate_und_turns_total=$deg"
     # skip_gen / gen_rows for the most recent step: the two numbers that say the GEN lane is live.
-    rg -o 'update_actor skip_gen=[A-Za-z]+ policy_version=[0-9]+ J=[0-9.]+ K=[0-9.]+' "$LOG" 2>/dev/null | tail -1 | sed 's/^/  last: /'
+    rg -o 'update_actor skip_gen=[A-Za-z]+ policy_version=[0-9]+ J=[0-9.]+ K=[0-9.]+ K0=[A-Za-z0-9.]+' "$LOG" 2>/dev/null | tail -1 | sed 's/^/  last: /'
     rg -o 'old_log_prob batch_rows=[0-9]+ roles=\{[^}]*\} gen_rows=[0-9]+' "$LOG" 2>/dev/null | tail -1 | sed 's/^/  last: /'
     python3 - "$RUN_DIR" <<'PY' 2>/dev/null | tail -3
 import glob, json, os, sys

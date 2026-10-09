@@ -43,6 +43,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (
     und_episode_rm_scores,
 )
 from verl_omni.agent_loop.bagel_corl_rm import bind_bagel_rm_handles
+from verl_omni.agent_loop.diffusion_agent_loop import _config_to_sampling_dict
 from verl_omni.tools.trajectory.hydra_env import bind_agentic_image_gen
 from verl_omni.tools.trajectory.paths import bind_run_artifacts
 
@@ -53,12 +54,84 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 # underlying AgentLoopWorkerTQ implementation, then re-wrap with @ray.remote.
 _AgentLoopWorkerTQBase = AgentLoopWorkerTQ.__ray_metadata__.modified_class
 
+
+def _optional_val_field(val_kwargs: Any, name: str, default: Any = None) -> Any:
+    """Read ``name`` from ``val_kwargs`` when present, else ``default`` -- never raising.
+
+    The worker holds ``val_kwargs`` as a **struct** OmegaConf node containing only the
+    keys the recipe actually set.  In struct mode a missing key raises
+    ``ConfigAttributeError`` rather than yielding ``None``, so a plain attribute read is
+    unsafe.  Measured 2026-09-30 on ``bagel_corl_rm1_0123_20260930_091627``:
+    ``params["seed"] = val_kwargs.seed`` raised ``Key 'seed' is not in struct`` on every
+    validation episode, so the init validation generated nothing and dumped no images at
+    all -- the failure mode looked like "no images" rather than a crash, because the TQ
+    worker logs the task exception and records a failed group.
+
+    The dataclass form (``DiffusionSamplingConfig``) always carries the field, so both
+    shapes must work and a missing key must degrade to "not set".
+    """
+    if val_kwargs is None:
+        return default
+    try:
+        return getattr(val_kwargs, name)
+    except Exception:  # noqa: BLE001 - a config probe must never fail a rollout
+        pass
+    try:
+        return val_kwargs[name]
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def val_overlay_sampling_params(sampling_params: dict, rollout_config: Any) -> dict:
+    """Return ``sampling_params`` with the validation diffusion kernel overlaid.
+
+    ``AgentLoopWorkerTQ.generate_sequences`` builds ``sampling_params`` from the
+    *training* rollout config and, when validating, overrides only the three AR knobs
+    (``top_p`` / ``top_k`` / ``temperature``).  ``val_kwargs.pipeline`` and
+    ``val_kwargs.algo`` are never applied, so the recipe's ``VAL_NOISE_LEVEL`` /
+    ``VAL_GEN_STEPS`` / val ``cfg_*`` never reach the diffusion request:
+    ``build_gen_sampling_params`` then fills those keys from the training
+    ``pipeline`` / ``algo``, and validation denoises with the *training* kernel.
+
+    That made validation exactly as stochastic as training and non-reproducible
+    between runs -- the two things the val overlay exists to prevent.  Measured
+    2026-09-30 on ``bagel_corl_rm1_0123_20260930_021712``: the step-30 validation
+    boundary (``test_freq=30``) dumped 8 val + 4 train episodes into one
+    ``step_000030``, with flat-region noise indistinguishable (val 3.1-7.1 vs train
+    4.7-7.3).  Val prompts were identified by matching
+    ``outputs/data/agentic_unicot/val.parquet``.
+
+    ``logprobs=False`` is required, not cosmetic: ``build_gen_sampling_params`` raises
+    when a request wants log-probs *and* carries ``noise_level <= 0``, because a
+    deterministic decode has no SDE log-probs to stash.  Setting it is also what makes
+    it true that ``base["logprobs"]`` is the per-phase answer
+    ``bagel_corl_gen_serve`` documents -- the base worker does not set it.  The
+    ``val/`` artifact tag in ``BagelMultiturnAgentLoop.run`` keys on this same flag.
+
+    Mirrors ``diffusion_agent_loop_tq``, which performs this same overlay on the stock
+    diffusion path (``composite_agent_loop`` and ``diffusion_agent_loop`` likewise);
+    the bagel loop was the one path missing it.
+    """
+    params = dict(sampling_params)
+    val_kwargs = getattr(rollout_config, "val_kwargs", None)
+    params.update(_config_to_sampling_dict(_optional_val_field(val_kwargs, "pipeline")))
+    params.update(_config_to_sampling_dict(_optional_val_field(val_kwargs, "algo")))
+    # ``seed`` is set only when the config actually carries one. Absent, the agent loop
+    # keeps deriving its per-episode seed from ``global_steps``/sample index -- which is
+    # still reproducible for a given step, unlike inventing value that no recipe asked for.
+    seed = _optional_val_field(val_kwargs, "seed")
+    if seed is not None:
+        params["seed"] = seed
+    params["logprobs"] = False
+    return params
+
 __all__ = [
     "BagelCorlAgentLoopManagerTQ",
     "BagelCorlAgentLoopWorkerTQ",
     "DualLanePack",
     "classify_episode_pattern",
     "episode_from_agent_extra",
+    "val_overlay_sampling_params",
     "gate_episode_jk",
     "gen_tq_key",
     "pack_dual_lane_episode",
@@ -235,6 +308,14 @@ def pack_dual_lane_episode(
         "episode/J": float(j),
         "episode/K": float(k),
         "episode/K_complete": float(k_complete),
+        # K=0 incidence: the episode never issued a single ``generate_image`` call, so the GEN
+        # lane had nothing to score and UND fell back to the pattern-3 non-image scalar. Averaged
+        # over the sibling batch by ``aggregate_episode_metrics``, this is the step's K=0 *rate*
+        # -- distinct from ``gen/skipped_no_groups``, which keys on ``k_complete`` and therefore
+        # also counts an episode whose K>=1 groups were all dropped. Measured 2026-09-27 in
+        # ``outputs/bagel_corl_rm1_20260927_165227``: 14 of 173 episodes, each burning the full
+        # ``max_und_turns=8`` cap.
+        "episode/K_zero": 1.0 if k == 0 else 0.0,
         "gen/num_rows": float(len(gen_records)),
         "gen/dropped_incomplete_groups": float(dropped),
         # ``used_image_credit`` is the authoritative signal (set when a generate_image
@@ -409,6 +490,48 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
                 "the dual-lane GEN seed gate cannot infer S"
             )
         return int(raw)
+
+    async def _run_prompt(self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False) -> None:
+        """Overlay the validation diffusion kernel before the episode runs.
+
+        WHY THIS EXISTS. ``AgentLoopWorkerTQ.generate_sequences`` builds
+        ``sampling_params`` from the *training* rollout config and, when validating,
+        overrides only the three AR knobs (``top_p`` / ``top_k`` / ``temperature``).
+        ``val_kwargs.pipeline`` and ``val_kwargs.algo`` are never applied, so the
+        recipe's ``VAL_NOISE_LEVEL`` / ``VAL_GEN_STEPS`` / val ``cfg_*`` never reach
+        the diffusion request: ``build_gen_sampling_params`` then fills those keys
+        from the training ``pipeline`` / ``algo``, and validation denoises with the
+        *training* kernel.
+
+        That is not cosmetic. Validation is the only deterministic reference this
+        recipe produces (``noise_level=0.0``, 50-step ODE), while the training
+        rollout is deliberately stochastic (``noise_level=0.7``; ``gen_serve``
+        refuses ``noise_level <= 0`` for a batch that wants log-probs). Running val
+        on the training kernel therefore made it exactly as grainy as training *and*
+        non-reproducible between runs -- the two things the val overlay exists to
+        prevent.
+
+        Measured 2026-09-30 on ``bagel_corl_rm1_0123_20260930_021712``: the step-30
+        validation boundary (``test_freq=30``) dumped 8 val + 4 train episodes, and
+        flat-region noise was indistinguishable (val 3.1-7.1 vs train 4.7-7.3), with
+        the train frames grainy on plain white backgrounds -- which a deterministic
+        ODE decode cannot produce. Val prompts were identified by matching
+        ``outputs/data/agentic_unicot/val.parquet``.
+
+        ``logprobs=False`` is required, not cosmetic: ``build_gen_sampling_params``
+        raises when a request wants log-probs *and* carries ``noise_level <= 0``,
+        because a deterministic decode has no SDE log-probs to stash. Setting it is
+        also what makes it true that ``base["logprobs"]`` is the per-phase answer
+        that ``bagel_corl_gen_serve`` documents -- the base worker does not set it.
+
+        Mirrors ``diffusion_agent_loop_tq``, which performs this same overlay on the
+        stock diffusion path (``composite_agent_loop`` and ``diffusion_agent_loop``
+        likewise); the bagel loop was the one path missing it.
+        """
+        if trajectory.get("validate"):
+            config = self.config.actor_rollout_ref.rollout
+            sampling_params = val_overlay_sampling_params(sampling_params, config)
+        await super()._run_prompt(prompt, sampling_params, trajectory=trajectory, trace=trace)
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs

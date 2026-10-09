@@ -61,11 +61,22 @@ logger = logging.getLogger(__name__)
 __all__ = ["BAGEL_RM_EXTRA_INFO_KEY", "compute_score"]
 
 # Default ``good_enough`` cut on the [0, 1] UnifiedReward scale. The score is
-# ``(mean(1-5 axes) - 1) / 4``, so 0.6 is a mean axis score of 3.4/5 -- deliberately
-# not a quality bar but a *stop cue*: the agent should keep rewriting below it.
-# ``good_enough_threshold`` (used by the facet judge, 0.8 on a 6-level grid) must NOT
-# be reused here; 0.8 would mean a 4.2/5 average and read as "always NO".
-DEFAULT_UNIFIED_GOOD_ENOUGH = 0.6
+# ``(mean(1-5 axes) - 1) / 4``. ``good_enough_threshold`` (used by the facet judge,
+# 0.8 on a 6-level grid) must NOT be reused here: it is a different scale.
+#
+# Calibrated against the judge it is paired with, not chosen a priori. UnifiedReward
+# 2.0 on this GEN lane emits a ceiling near 0.49: across 663 episodes in the
+# ``bagel_corl_rm1_*`` runs the per-episode score spanned 0.213..0.490
+# (p50=0.346, p85=0.394, p90=0.406). The original 0.6 sat *above that ceiling*, so
+# every single episode read ``good_enough=NO`` -- 663/663 -- and the stop cue the
+# loop branches on was a constant, carrying no GRPO signal and never reinforcing the
+# terminal ``Done``. 0.41 is the measured p90: YES fires on ~8-10% of episodes, rare
+# enough to mean something and reachable enough to learn from.
+#
+# This is a curriculum knob, not a quality bar. Raise it toward ``good_enough_threshold``
+# as the GEN lane actually improves; the calibration above is re-derivable from any run
+# dir with ``tools/_verify_bagel_episode_reward.py``.
+DEFAULT_UNIFIED_GOOD_ENOUGH = 0.41
 
 # Wire key shared with the producer (verl_omni/agent_loop/bagel_corl_rm.py). Spelled
 # out in both modules rather than imported so this module stays importable in

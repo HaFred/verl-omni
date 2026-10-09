@@ -278,6 +278,35 @@ def test_done_decode_with_trailing_special_tokens_is_terminal():
     assert lib.und_turn_kind(" Done. <|im_end|>\n") == "done"
 
 
+def test_control_marker_only_turn_is_terminal():
+    """A turn carrying no content at all is the model's terminal signal, not a ``continue``.
+
+    Measured 2026-09-27 in ``outputs/bagel_corl_rm1_20260927_165227``: 14 of that run's 173
+    episodes issued no ``generate_image`` call, and **every one of them burned the full
+    ``max_und_turns=8`` cap**. Their turns were a bare ``<|im_end|>`` (``out_tokens=1``) or the
+    template's own ``End of conversation.``, both of which classified as ``continue`` -- so the
+    loop spent six or seven further decodes re-sampling its own silence. Reading them as ``done``
+    ends the episode at turn 2 and leaves the K=0 / pattern-3 reward path untouched.
+    """
+    for text in ("<|im_end|>", " <|im_end|> ", "<|end of conversation|>", "", "   \n"):
+        assert lib.und_turn_kind(text) == "done", repr(text)
+    for text in ("End of conversation.", "End of conversation", "end of conversation."):
+        assert lib.und_turn_kind(text) == "done", text
+
+
+def test_control_marker_plus_content_is_not_terminal():
+    """The rule keys on "carries no content", not on "mentions a control token".
+
+    The measured K=0 trace opens with ``tools<|im_end|>`` -- a *mangled* ``<tools>`` opener, i.e.
+    a real (malformed) turn the loop must keep going past, and the turn that made the episode
+    recoverable-looking in the first place. A native empty array is a payload too, and prose that
+    merely ends in a marker keeps its content.
+    """
+    assert lib.und_turn_kind("tools<|im_end|>") == "continue"
+    assert lib.und_turn_kind("<|start of ToolCall|>[]<|end of ToolCall|>") == "continue"
+    assert lib.und_turn_kind("A wolf in a forest.<|im_end|>") == "continue"
+
+
 def test_replayed_reference_tools_blocks_are_inert():
     """Measured 2026-09-27 17:24, ``rollout_trajectories/step_000026/sample_add66fd8...02.txt``.
 
@@ -1164,6 +1193,24 @@ def test_aggregate_episode_metrics_averages_over_siblings():
     assert empty == {"gen/dropped_incomplete_groups": 0.0}
 
 
+def test_aggregate_episode_metrics_reports_k_zero_rate():
+    """``episode/K_zero`` is the step's K=0 episode *rate*.
+
+    Keyed on ``K == 0`` -- no ``generate_image`` call was ever issued, so the GEN lane had nothing
+    to score -- rather than on ``gen/skipped_no_groups``'s ``k_complete == 0``, which also counts
+    an episode whose K>=1 groups were all dropped. Measured 2026-09-27: 14 of 173 episodes.
+    """
+
+    def record(k_zero):
+        return {"fields": {"bagel_corl_metrics": {"episode/K_zero": k_zero}}}
+
+    out = lib.aggregate_episode_metrics([record(1.0), record(0.0), record(0.0), record(0.0)])
+    assert out["episode/K_zero"] == pytest.approx(0.25)
+    # A sibling that never measured it must not be averaged in as a zero.
+    out = lib.aggregate_episode_metrics([record(1.0), {"fields": {}}])
+    assert out["episode/K_zero"] == pytest.approx(1.0)
+
+
 def test_aggregate_episode_metrics_sums_r2_counts_and_means_r2_ratios():
     """RFC §4.4.4: cache counters add up; the three ratios are batch means.
 
@@ -1715,3 +1762,63 @@ def test_generate_retrying_engine_wake_still_refuses_a_wrapped_real_failure():
 
     with pytest.raises(_RayStyleTaskError):
         asyncio.run(run())
+
+
+def test_strip_reflection_tail_drops_the_measured_in_turn_clause():
+    """The checkpoint appends its in-turn reflection to the diffusion prompt.
+
+    Measured 2026-09-27 in ``outputs/bagel_corl_rm1_20260927_165227``: the recorded
+    ``gen_calls[].prompt`` ended with ``Short reflection: The image seems to
+    capture the desired aesthetic ...``. Left in, that critique of a *previous*
+    sample conditions the diffusion model instead of the requested subject.
+    """
+    prompt = (
+        "Full body portrait of a handsome bald male with a head tattoo, sporting a pink "
+        "fancy mustache, embodying the character of a D&D hero. Short reflection: The image "
+        "seems to capture the desired aesthetic, but the mustache could be more defined."
+    )
+    assert lib.strip_reflection_tail(prompt) == (
+        "Full body portrait of a handsome bald male with a head tattoo, sporting a pink "
+        "fancy mustache, embodying the character of a D&D hero"
+    )
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "Reflection: too dark.",
+        "Private thinking: the pose is wrong.",
+        "Self-reflection: needs more contrast.",
+        "Final thoughts: acceptable.",
+    ],
+)
+def test_strip_reflection_tail_covers_the_labelled_dialects(tail):
+    """Every labelled reflection dialect the checkpoint samples is stripped."""
+    assert lib.strip_reflection_tail(f"A red fox in snow. {tail}") == "A red fox in snow"
+
+
+def test_strip_reflection_tail_keeps_genuine_subject_matter():
+    """A colon is required, so real subjects that use the word survive untouched.
+
+    The lookbehind also demands a sentence boundary: mid-sentence prose is never
+    mistaken for the scaffolding tail.
+    """
+    for prompt in (
+        "The reflection of the moon on a still lake at dusk",
+        "A gallery of mirrors, each showing a different reflection: a study in light",
+        "Reflective chrome sculpture in a plaza",
+    ):
+        assert lib.strip_reflection_tail(prompt) == prompt
+
+
+def test_strip_reflection_tail_never_returns_empty_for_a_reflection_only_prompt():
+    """A prompt that is *only* a reflection keeps its text rather than losing conditioning."""
+    prompt = "Reflection: the last image was too dark."
+    assert lib.strip_reflection_tail(prompt) == prompt
+
+
+def test_strip_reflection_tail_is_idempotent():
+    """The sanitiser runs at extraction *and* at the encode choke point."""
+    once = lib.strip_reflection_tail("A cat on a mat. Short reflection: dark.")
+    assert once == "A cat on a mat"
+    assert lib.strip_reflection_tail(once) == once

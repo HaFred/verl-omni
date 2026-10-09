@@ -1319,6 +1319,96 @@ def test_rewrite_sets_lr_gen_and_cfg_free_pipeline():
             assert getattr(instantiated, key) == value
 
 
+def test_rewrite_honours_recipe_cfg_text_scale_override():
+    """A recipe-supplied ``cfg_text_scale`` must survive and stay parity-equal.
+
+    The rewrite used to do an unconditional ``pipeline["cfg_text_scale"] = 1.0``, so the
+    GEN lane was CFG-free with no recipe-level escape hatch. That default measured
+    28-74% less Laplacian variance than canonical BAGEL (4.0) at a fixed step count on
+    the untouched BAGEL-7B-MoT checkpoint, i.e. the washed rollout images. The knob is now
+    ``setdefault``-based, so the recipe's ``+...rollout.pipeline.cfg_text_scale=4.0`` wins
+    while an unset recipe still gets the UniGRPO CFG-free 1.0.
+
+    RFC §5 still has to hold: whatever the recipe picks is mirrored onto
+    ``model.pipeline`` verbatim, so the transition-kernel parity assert cannot trip.
+    """
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = OmegaConf.create(
+        {
+            "data": {"train_files": "/tmp/train.parquet"},
+            "actor_rollout_ref": {
+                "model": {"path": "/tmp/bagel", "lora_rank": 64, "target_modules": list(_BAGEL_LORA_TARGETS)},
+                "actor": {},
+                "rollout": {
+                    "name": "vllm_omni",
+                    "response_length": 512,
+                    # exactly how the recipe reaches this node: it is not declared in the
+                    # omni yaml, so it must be appended with the '+' prefix.
+                    "pipeline": {"cfg_text_scale": 4.0, "cfg_img_scale": 1.5},
+                    "agent": {
+                        "default_agent_loop": "bagel_multiturn_agent",
+                        "gen_samples_per_call": 2,
+                        "max_generate_passes": 1,
+                        "max_und_turns": 8,
+                    },
+                },
+            },
+        }
+    )
+    trainer._rewrite_bagel_corl_configs()
+    model = trainer.config.actor_rollout_ref.model
+    pipeline = trainer.config.actor_rollout_ref.rollout.pipeline
+    assert pipeline.cfg_text_scale == pytest.approx(4.0), "recipe override was clobbered"
+    assert model.pipeline.cfg_text_scale == pytest.approx(4.0), "model side not mirrored"
+    # the parity assert inside _rewrite_bagel_corl_configs must not have raised
+    assert model.pipeline.cfg_text_scale == pytest.approx(pipeline.cfg_text_scale)
+    # Image guidance is a transition-kernel knob too, and it is the one that silently
+    # mismatches by default (rollout falls back to 1.5, training's typed default is 1.0).
+    # ``generate_image`` only gates the CFG block on cfg_text_scale > 1.0, so leaving it
+    # unset used to be inert and becomes a 3-forward vs 2-forward kernel split once text
+    # CFG is on. Both sides must therefore carry the same value.
+    assert pipeline.cfg_img_scale == pytest.approx(1.5), "image guidance override lost"
+    assert model.pipeline.cfg_img_scale == pytest.approx(1.5), "model image guidance not mirrored"
+    assert model.pipeline.cfg_img_scale == pytest.approx(pipeline.cfg_img_scale)
+
+
+def test_rewrite_defaults_cfg_img_scale_so_parity_never_lacks_the_key():
+    """A recipe that does not pin ``cfg_img_scale`` must still get a parity-equal value.
+
+    The parity assert reads ``model.pipeline.cfg_img_scale``; without a ``setdefault`` on
+    the rollout node that key would be absent and every launch that omits it would die on
+    an OmegaConf missing-key lookup instead of a clear config error. Default both sides to
+    ``BAGEL_FLOWGRPO_CFG_DEFAULTS`` (1.0) -- inert while ``cfg_text_scale`` stays 1.0.
+    """
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = OmegaConf.create(
+        {
+            "data": {"train_files": "/tmp/train.parquet"},
+            "actor_rollout_ref": {
+                "model": {"path": "/tmp/bagel", "lora_rank": 64, "target_modules": list(_BAGEL_LORA_TARGETS)},
+                "actor": {},
+                "rollout": {
+                    "name": "vllm_omni",
+                    "response_length": 512,
+                    "agent": {
+                        "default_agent_loop": "bagel_multiturn_agent",
+                        "gen_samples_per_call": 2,
+                        "max_generate_passes": 1,
+                        "max_und_turns": 8,
+                    },
+                },
+            },
+        }
+    )
+    trainer._rewrite_bagel_corl_configs()
+    pipeline = trainer.config.actor_rollout_ref.rollout.pipeline
+    model = trainer.config.actor_rollout_ref.model
+    assert pipeline.cfg_img_scale == pytest.approx(1.0)
+    assert model.pipeline.cfg_img_scale == pytest.approx(1.0)
+    # and the CFG-free default is untouched by this change
+    assert pipeline.cfg_text_scale == pytest.approx(1.0)
+
+
 def test_rewrite_retargets_val_kwargs_to_diffusion_sampling():
     """The recipe's ``val_kwargs`` appends must survive as a typed diffusion node.
 

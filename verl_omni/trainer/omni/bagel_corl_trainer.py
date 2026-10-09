@@ -335,9 +335,42 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         pipeline = dict(rollout_filtered.get("pipeline") or {})
         pipeline.setdefault("num_inference_steps", 10)
         # UniGRPO (arXiv:2603.23500): CFG doubles per-step evaluations and branches
-        # the rollout graph — prohibitive for multi-turn episodes. Joint-Training runs
-        # CFG-free on BOTH sides; the recipe's eval block re-enables CFG if desired.
-        pipeline["cfg_text_scale"] = 1.0
+        # the rollout graph — prohibitive for multi-turn episodes. So the Joint-Training
+        # DEFAULT stays CFG-free (1.0), and a recipe that wants canonical BAGEL quality
+        # opts in with ``+actor_rollout_ref.rollout.pipeline.cfg_text_scale=4.0``.
+        #
+        # This used to be an unconditional ``pipeline["cfg_text_scale"] = 1.0``, which
+        # silently made the whole GEN lane CFG-free with no way to override it from the
+        # recipe. Measured cost of that default (untouched BAGEL-7B-MoT ckpt, official
+        # inferencer, identical seed, only CFG varying): Laplacian variance fell 2162 ->
+        # 958, 5662 -> 4073 and 307 -> 80 on three prompts — i.e. 28-74% less detail at a
+        # fixed 50 steps, while 50 -> 15 steps moved it by only -17%/+11%/+2%. CFG, not
+        # the step count, was the detail knob.
+        #
+        # ``setdefault`` (not an assignment) is what keeps RFC §5 intact: the value below
+        # is mirrored onto ``model.pipeline`` verbatim, so whatever the recipe picks stays
+        # equal on both sides and the parity assert holds.
+        #
+        # This node is NOT what validation reads. ``VisualRewardManager`` selects
+        # ``rollout.val_kwargs.pipeline`` when validating, and that subtree carries only the
+        # keys the recipe names (``num_inference_steps`` / ``algo.noise_level``), so its
+        # ``cfg_text_scale`` comes from ``DiffusionPipelineConfig``'s own default -- which
+        # is 4.0, NOT this value. Validation therefore does not inherit a CFG-free rollout,
+        # and it does not inherit a canonical one either; it is pinned at 4.0 regardless.
+        # Here those happen to agree, so val is guided at 50 steps (the canonical arm of
+        # the A/B). The one real consequence is that a recipe which sets this to 1.0 still
+        # gets guided validation, i.e. there is no guided-vs-free val comparison for free.
+        # Note also ``cfg_img_scale`` differs on that path: ``DiffusionPipelineConfig``
+        # defaults it to 1.0 while this node sets 1.5, so val denoises with text guidance
+        # only (2 forwards) where rollout also applies image guidance (3).
+        pipeline.setdefault("cfg_text_scale", 1.0)
+        # Default image guidance alongside it, so ``model.pipeline`` never lacks the key
+        # (the parity assert below reads it) and both sides land on one value. The rollout
+        # request would otherwise fall back to 1.5 while training's typed default is 1.0 —
+        # see the assert for why that divergence only bites once text CFG is enabled.
+        # 1.0 mirrors ``BAGEL_FLOWGRPO_CFG_DEFAULTS["cfg_img_scale"]``; a recipe wanting
+        # canonical Bagel image guidance opts in via the recipe's CFG_IMG_SCALE.
+        pipeline.setdefault("cfg_img_scale", 1.0)
         # Neither the omni rollout config nor its yaml declares a ``pipeline`` node —
         # the recipe reaches it with ``+actor_rollout_ref.rollout.pipeline.*`` — so the
         # dict built here must carry ``_target_`` exactly like ``diffusion_rollout.yaml``
@@ -434,6 +467,9 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         # ``model.pipeline`` AND ``rollout.pipeline``. A mismatch is NON-CONFORMANT —
         # the GEN importance ratio would be computed under a different kernel than
         # the rollout that produced the trajectory. Assert it at launch, not later.
+        # (In practice the block above copies one dict into both nodes, so this can only
+        # trip if some later code rewrites one side independently — which is exactly the
+        # regression worth trapping.)
         model_cfg = float(self.config.actor_rollout_ref.model.pipeline.cfg_text_scale)
         rollout_cfg = float(self.config.actor_rollout_ref.rollout.pipeline.cfg_text_scale)
         if model_cfg != rollout_cfg:
@@ -441,8 +477,26 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 "bagel_corl_sync CFG parity violated: "
                 f"model.pipeline.cfg_text_scale={model_cfg} != "
                 f"rollout.pipeline.cfg_text_scale={rollout_cfg}. Training and rollout "
-                "must share one transition kernel (RFC §5); set both to 1 (CFG-free) "
-                "as §4.8.5 prescribes."
+                "must share one transition kernel (RFC §5); set both to the same value "
+                "(1.0 for CFG-free, 4.0 for canonical BAGEL)."
+            )
+        # ``cfg_img_scale`` is a transition-kernel knob too, and it is NOT self-correcting:
+        # the rollout request falls back to 1.5 when the key is absent
+        # (``pipeline_bagel.py``) while training reads ``model.pipeline``, whose typed
+        # default is 1.0. The mismatch is invisible at ``cfg_text_scale == 1.0`` because
+        # ``generate_image`` gates its entire CFG block on ``cfg_text_scale > 1.0`` -- so
+        # an unset ``cfg_img_scale`` used to be inert and turns into a real kernel
+        # divergence (3 forwards/step vs 2) the moment text CFG is enabled. Pin it.
+        model_img = float(self.config.actor_rollout_ref.model.pipeline.cfg_img_scale)
+        rollout_img = float(self.config.actor_rollout_ref.rollout.pipeline.cfg_img_scale)
+        if model_img != rollout_img:
+            raise ValueError(
+                "bagel_corl_sync CFG parity violated: "
+                f"model.pipeline.cfg_img_scale={model_img} != "
+                f"rollout.pipeline.cfg_img_scale={rollout_img}. Image guidance branches "
+                "the denoise graph exactly like text guidance, so training and rollout "
+                "must agree (RFC §5). Pin both via "
+                "'+actor_rollout_ref.rollout.pipeline.cfg_img_scale=1.5'."
             )
 
     def _init_tokenizer(self):
@@ -893,6 +947,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             "gen/dropped_incomplete_groups",
             "episode/J",
             "episode/K",
+            "episode/K_zero",
         ):
             if extra.get(metric_key) is not None:
                 metrics.setdefault(metric_key, extra[metric_key])
@@ -905,12 +960,13 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         skipped = gen_metrics.get("gen/skipped_no_groups", 1.0 if not has_complete else 0.0)
         metrics["gen/skipped_no_groups"] = float(skipped)
         logger.info(
-            "bagel_corl_sync advantage und=%s gen=%s skip_gen=%s J=%s K=%s",
+            "bagel_corl_sync advantage und=%s gen=%s skip_gen=%s J=%s K=%s K0=%s",
             und_estimator,
             gen_estimator,
             extra["skip_gen"],
             metrics.get("episode/J"),
             metrics.get("episode/K"),
+            metrics.get("episode/K_zero"),
         )
         # UND token GRPO writes advantages/returns onto episode TQ keys.
         #
@@ -934,6 +990,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             "bagel_corl_gen",
             "episode/J",
             "episode/K",
+            "episode/K_zero",
             "und/no_image_credit",
             "gen/dropped_incomplete_groups",
         ):
@@ -952,7 +1009,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         extra["has_complete_gen_groups"] = has_complete
         if not has_complete:
             metrics["gen/skipped_no_groups"] = 1.0
-        for key in ("episode/J", "episode/K", "und/no_image_credit"):
+        for key in ("episode/J", "episode/K", "episode/K_zero", "und/no_image_credit"):
             if extra.get(key) is not None:
                 metrics[key] = extra[key]
         # The flags have to ride on whatever carrier this trainer's bus uses, and ``_extra_info``
@@ -974,11 +1031,12 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             if extra.get("bagel_corl_gen") is not None:
                 tu.assign_non_tensor_data(batch, "bagel_corl_gen", extra["bagel_corl_gen"])
         logger.info(
-            "bagel_corl_sync update_actor skip_gen=%s policy_version=%s J=%s K=%s",
+            "bagel_corl_sync update_actor skip_gen=%s policy_version=%s J=%s K=%s K0=%s",
             extra.get("skip_gen"),
             getattr(self, "global_steps", None),
             metrics.get("episode/J"),
             metrics.get("episode/K"),
+            metrics.get("episode/K_zero"),
         )
         return super()._update_actor(batch, metrics)
 

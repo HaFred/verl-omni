@@ -392,3 +392,20 @@ def test_unified_backend_fails_loud_when_the_reply_has_no_axes(monkeypatch, tmp_
     payload["scorer_knobs"] = {"vllm_url": "http://rm:8000", "good_enough_threshold": 0.8}
     with pytest.raises(ValueError, match="refusing zero-fill"):
         scorer.compute_score(**_kwargs(payload))
+
+
+def test_default_unified_good_enough_is_reachable_by_the_judge():
+    """The stop cue must be reachable, or it is a constant and carries no GRPO signal.
+
+    Regression guard for the original ``0.6``: across 663 measured episodes in the
+    ``bagel_corl_rm1_*`` runs the per-episode UnifiedReward score never exceeded
+    ``0.490``, so ``good_enough`` read ``NO`` 663/663 times and the branch the loop
+    keys on never varied. The calibrated default is the measured p90 (0.41).
+    """
+    measured_max = 0.490
+    measured_p90 = 0.406
+    assert scorer.DEFAULT_UNIFIED_GOOD_ENOUGH < measured_max, (
+        "an unreachable threshold makes good_enough a constant (the 0.6 regression)"
+    )
+    # Non-trivial: still above the bulk of the distribution, so YES stays a real event.
+    assert scorer.DEFAULT_UNIFIED_GOOD_ENOUGH > measured_p90 - 0.02

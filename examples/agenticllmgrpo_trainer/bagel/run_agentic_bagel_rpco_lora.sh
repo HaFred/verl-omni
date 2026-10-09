@@ -379,7 +379,11 @@ for stage in stages:
 PY
 # 1-GPU cannot colocate Bagel FSDP + vLLM-Omni + Qwen RM. Default: drop RM, tiny util.
 # 2-GPU: actor + Omni + colocated UND AR is already tight — keep RM off.
-# 4-GPU e2e: still default RM off until Hermes+composite step are green; ENABLE_RM=1 to re-enable.
+# >=4-GPU: RM is ON by default. Without it every step takes skip_gen=True (no complete
+# S-group carries an rm_score), so the GEN lane is frozen and the run is a pure rollout --
+# nothing the GEN half can improve. The Hermes + composite-step path it was gated behind is
+# now green (measured: update_actor skip_gen=False on 42/42 steps, no prompt_token_ids dtype
+# failure, no dropped episodes). ENABLE_RM=0 still forces it off for a plumbing-only run.
 if [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -eq 1 ]]; then
   ENABLE_RM=${ENABLE_RM:-0}
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.08}
@@ -388,6 +392,13 @@ if [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -eq 1 ]]; then
   MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-512}
   GEN_STEPS=${GEN_STEPS:-4}
   GEN_HW=${GEN_HW:-256}
+  # CFG doubles the per-step evaluations (it branches the denoise graph), and this branch
+  # is a bare memory concession already, so it stays CFG-free. See the >=4-GPU branch.
+  CFG_TEXT_SCALE=${CFG_TEXT_SCALE:-1.0}
+  # Canonical BAGEL image guidance. INERT while CFG_TEXT_SCALE <= 1.0: ``generate_image``
+  # gates the entire CFG block on ``cfg_text_scale > 1.0``, so image guidance is only
+  # honoured once text guidance is on. Pinned here anyway to keep the two sides equal.
+  CFG_IMG_SCALE=${CFG_IMG_SCALE:-1.5}
   LORA_RANK=${LORA_RANK:-4}
   LORA_ALPHA=${LORA_ALPHA:-8}
 elif [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -le 2 ]]; then
@@ -402,10 +413,15 @@ elif [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -le 2 ]]; then
   # actor + Omni + RM at all -- that is a memory concession, not a quality target.
   GEN_STEPS=${GEN_STEPS:-15}
   GEN_HW=${GEN_HW:-512}
+  # Same reasoning as the 1-GPU branch: CFG doubles the denoise cost and this branch is
+  # already tight, so it stays CFG-free here.
+  CFG_TEXT_SCALE=${CFG_TEXT_SCALE:-1.0}
+  CFG_IMG_SCALE=${CFG_IMG_SCALE:-1.5}
   LORA_RANK=${LORA_RANK:-8}
   LORA_ALPHA=${LORA_ALPHA:-16}
 else
-  ENABLE_RM=${ENABLE_RM:-0}
+  # >=4 GPUs: RM on by default — see the branch comment above. GEN cannot train without it.
+  ENABLE_RM=${ENABLE_RM:-1}
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.15}
   # GEN engine budget on a card that also carries the actor shard and one UND AR stage.
   # Measured: this knob does NOT bound the engine's footprint -- each GEN rank held
@@ -419,6 +435,28 @@ else
   # See the 2-GPU branch: 15 matches the canonical BAGEL FlowGRPO training rollout.
   GEN_STEPS=${GEN_STEPS:-15}
   GEN_HW=${GEN_HW:-512}
+  # Canonical BAGEL classifier-free guidance (cfg_text_scale=4.0). This branch has the
+  # headroom for the doubled per-step cost, and it is the fix for the wall of washed GEN
+  # images: the kernel used to be unconditionally CFG-free (see
+  # ``bagel_corl_trainer._rewrite_bagel_corl_configs``), which measured 28-74% less
+  # detail than canonical at a fixed step count. Set 1.0 to restore pure UniGRPO
+  # CFG-free rollouts (cheaper, but the detail loss comes back).
+  #
+  # Cost, measured from the pipeline source: ``generate_image`` gates its whole CFG block
+  # on ``cfg_text_scale > 1.0`` and then adds ONE ``forward_single_branch`` per enabled
+  # scale. So the previous CFG-free kernel ran 1 forward/step; text-CFG alone runs 2, and
+  # text+image runs 3. That extra work is confined to the ``cfg_interval`` window
+  # (default 0.4..1.0), so expect the GEN lane to get materially slower -- budget for it
+  # rather than treating it as a regression.
+  CFG_TEXT_SCALE=${CFG_TEXT_SCALE:-4.0}
+  # Canonical BAGEL image guidance. MUST be pinned on both sides: the rollout request
+  # defaults this to 1.5 (``pipeline_bagel.py``) while training reads
+  # ``model.pipeline.cfg_img_scale``, whose dataclass default is 1.0. Left unset, the
+  # rollout would run a 3-forward kernel and training a 2-forward one -- different
+  # transition kernels, hence a biased GEN importance ratio (RFC §5). Because the trainer
+  # copies this very dict onto ``model.pipeline``, setting it here fixes both sides at
+  # once. Set CFG_IMG_SCALE=1.0 to drop the third forward at some cost in fidelity.
+  CFG_IMG_SCALE=${CFG_IMG_SCALE:-1.5}
   LORA_RANK=${LORA_RANK:-8}
   LORA_ALPHA=${LORA_ALPHA:-16}
 fi
@@ -574,15 +612,27 @@ VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-8}
 # Smoke defaults. N = sibling episodes (Token GRPO); S = seeds per generate_image (FlowGRPO).
 # In-episode J (UND turns) and K (GEN calls) are runtime with J>=K — not these env vars.
 # Production example: N=8 S=4. S must be >= 2.
-# Do not inherit stale K=1 from an old shell (`S=${K:-2}` would still pick K=1).
+# S is the FlowGRPO group: a 2-seed group collapses the advantage to
+# ``sign(score0 - score1)``, and the two seeds' UnifiedReward scores were frequently
+# inside the judge's own noise (measured stdev 0.107 across 173 episodes). >=4-GPU runs
+# at the canonical production value 4; the 1/2-GPU branches keep 2 as a memory
+# concession, the same way they lower GEN_STEPS/GEN_HW.
+# Do not inherit stale K=1 from an old shell (`S=${K:-...}` would still pick K=1).
 if [[ -z "${N:-}" ]]; then
   if [[ -n "${J:-}" ]]; then N=$J; else N=2; fi
 fi
 if [[ -z "${S:-}" ]]; then
-  if [[ -n "${K:-}" && "$K" -ge 2 ]]; then S=$K; else S=2; fi
+  if [[ -n "${K:-}" && "$K" -ge 2 ]]; then
+    S=$K
+  elif [[ "${NUM_GPUS_ACTOR_ROLLOUT_REWARD}" -ge 4 ]]; then
+    S=4
+  else
+    # 1/2-GPU: one seed fewer, the same memory concession GEN_STEPS/GEN_HW make above.
+    S=2
+  fi
 fi
 if [[ "$S" -lt 2 ]]; then
-  echo "gen_samples_per_call S must be >= 2 (FlowGRPO seeds; got S=$S). Use S=2 or unset stale K." >&2
+  echo "gen_samples_per_call S must be >= 2 (FlowGRPO seeds; got S=$S). Use S=4 or unset stale K." >&2
   exit 1
 fi
 if [[ "$N" -lt 1 ]]; then
@@ -690,9 +740,37 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
 #     noise_level/GEN_STEPS. `build_gen_sampling_params` now lets the worker's per-phase
 #     `base` win, so VAL_GEN_STEPS/VAL_NOISE_LEVEL reach the diffusion request; expect
 #     validation PNGs to change from stochastic SDE to a deterministic 50-step ODE decode.
+#
+#     SECOND FIX (2026-09-30): the 09-21 fix made `base` win, but nothing ever put the
+#     val overlay *into* `base` on this path. `AgentLoopWorkerTQ.generate_sequences`
+#     overrides only the three AR knobs (top_p/top_k/temperature) when validating, so
+#     `base` carried the *training* noise_level/GEN_STEPS and the branch above faithfully
+#     let it win. Net effect: VAL_GEN_STEPS/VAL_NOISE_LEVEL were still dead here, 9 days
+#     after the note above claimed otherwise. Measured on `bagel_corl_rm1_0123_20260930_021712`:
+#     the step-30 val boundary (test_freq=30) dumped 8 val + 4 train episodes into one
+#     `step_000030`, both with flat-region grain 3.1-7.3 while a genuine ODE decode
+#     measures ~0.14-0.41. `BagelCorlAgentLoopWorkerTQ._run_prompt` now applies the val
+#     overlay (mirroring `diffusion_agent_loop_tq`), and val artifacts are written under
+#     `rollout_images/val/step_*/` so the deterministic reference is never merged with
+#     the stochastic training rollout. Validation PNGs change on the next run, not
+#     retroactively.
+#
 #     Separately, `sde_window_range` is now clamped to the real denoise-step count, so the
 #     1-GPU branch's GEN_STEPS=4 (3 denoise steps vs a `[0, 7]` range) can no longer draw
 #     a window past the whole schedule and silently record no noise/log-probs at all.
+#
+# SYNC_REFILL_FAILED_GROUPS (default True). The CoRL sync sampler raises when a whole
+# selected batch produces no materializable trajectories -- every group in it was
+# dropped by the dual-lane gates (K=0 / GEN-lane skipped / no valid S-group), which is
+# routine for this recipe because a GEN call is only stashed when the judge clears the
+# threshold. Measured on `bagel_corl_rm1_0123_20260930_063928`: the run trained to ~step
+# 25 and then died with
+#     RuntimeError: Sync replay buffer selected terminal groups with no materializable
+#     trajectories. Enable trainer.v1.sampler.sync_refill_failed_groups to replace failed
+#     groups.
+# The knob is the remedy the error itself names (verl default is False): it refills the
+# failed groups instead of aborting. Left overridable so a run that must fail-loud on
+# empty batches can set SYNC_REFILL_FAILED_GROUPS=0.
 #
 # The dump root is keyed on the run dir, not just on ``trainer.experiment_name``.
 # ``agentic_image_gen.e2e_root`` namespaces as ``<e2e_root>/<experiment_name>/``
@@ -720,8 +798,9 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
     agentic_image_gen.vllm_url=$JUDGE_VLLM_URL \
     agentic_image_gen.good_enough_threshold=$JUDGE_GOOD_ENOUGH_THRESHOLD \
     agentic_image_gen.score_backend=${SCORE_BACKEND:-unified_reward} \
-    agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.6} \
+    agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.41} \
     trainer.v1.trainer_mode=bagel_corl_sync \
+    trainer.v1.sampler.sync_refill_failed_groups=${SYNC_REFILL_FAILED_GROUPS:-True} \
     data.train_files=$TRAIN_FILE \
     data.val_files=$VAL_FILE \
     data.train_batch_size=$TRAIN_BSZ \
@@ -769,6 +848,8 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
     +actor_rollout_ref.rollout.pipeline.width=$GEN_HW \
     +actor_rollout_ref.rollout.pipeline.num_inference_steps=$GEN_STEPS \
     +actor_rollout_ref.rollout.pipeline.max_sequence_length=$MAX_PROMPT_LEN \
+    +actor_rollout_ref.rollout.pipeline.cfg_text_scale=$CFG_TEXT_SCALE \
+    +actor_rollout_ref.rollout.pipeline.cfg_img_scale=$CFG_IMG_SCALE \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.temperature=$ROLLOUT_TEMPERATURE \
     actor_rollout_ref.rollout.top_p=$ROLLOUT_TOP_P \
@@ -805,7 +886,7 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
     reward.reward_model.rollout.skip_tokenizer_init=False \
     reward.reward_model.rollout.max_model_len=$REWARD_MAX_MODEL_LEN \
     +reward.reward_model.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=$REWARD_KV_CACHE_BYTES \
-    trainer.val_before_train=False \
+    trainer.val_before_train=True \
     trainer.test_freq=${TEST_FREQ:-30} \
     data.val_batch_size=${VAL_BSZ:-$TRAIN_BSZ} \
     data.val_max_samples=$VAL_MAX_SAMPLES \

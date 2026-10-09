@@ -129,6 +129,14 @@ _TAGGED_CALL_RE = re.compile(r"<tools>\s*(.*?)\s*</tools>", re.DOTALL)
 # ``continue`` and appends a second ``Done.``.
 _DONE_RE = re.compile(r"\bDone\.\s*(?:<\|[^|]*?\|>\s*)*$", re.IGNORECASE)
 
+# Control markers, which the engine returns inside ``text`` because it decodes with
+# ``skip_special_tokens=False`` (``<|im_end|>``, ``<|end of conversation|>``, ...). A turn made
+# of nothing else carries no policy content at all.
+_SPECIAL_TOKEN_RE = re.compile(r"<\|[^|]*?\|>")
+#: The Bagel template's own end-of-conversation line, which this checkpoint emits as a *whole
+#: turn*. Matched case-insensitively after the trailing period is stripped.
+_END_OF_CONVERSATION = "end of conversation"
+
 # Role labels the checkpoint sometimes re-emits as *text* before a payload
 # ("ASSISTANT\n {json}"), and control/tag markers it echoes back from the prompt itself
 # ("<tools>\n {json}"). Both are stripped before a bare-payload call is recognized; prose is
@@ -210,6 +218,42 @@ _STOP_TOOL_NAMES = frozenset({"done", "done.", "stop", "finish", "finished", "fi
 # per step, so the batch kept arriving 3 rows wide with one synthetic pad sample mixed into the
 # gradient.
 _INERT_BARE_TOOLS = frozenset({"judge_image"})
+
+# The user prompt asks for a short private reflection in the same turn (``_BREVITY_SUFFIX``
+# in ``build_unicot_agentic_rl``), and the checkpoint appends that reflection to the
+# ``generate_image`` prompt itself. Measured 2026-09-27 in
+# ``outputs/bagel_corl_rm1_20260927_165227``:
+#
+#   "Full body portrait of ... D&D hero. Short reflection: The image seems to capture
+#    the desired aesthetic ... but the mustache could be slightly more defined."
+#
+# That tail conditions the diffusion model on a critique of a *previous* image instead of
+# on the requested subject. ~11% of the measured gen prompts carried one.
+#
+# The lookbehind requires a sentence boundary and the colon requires a labelled clause, so
+# a genuine subject ("the reflection of the moon on the lake") survives untouched.
+_REFLECTION_TAIL_RE = re.compile(
+    r"(?:^|(?<=[.!?\n]))\s*"
+    r"(?:(?:short|brief|private|self|final|quick|inner)\s+)*"
+    r"(?:(?:self-)?reflection|thinking|thoughts?|deliberation)\s*:",
+    re.IGNORECASE,
+)
+
+
+def strip_reflection_tail(prompt: str) -> str:
+    """Drop a trailing ``Short reflection: ...`` / ``Reflection: ...`` clause.
+
+    The in-turn reflection is scaffolding the reward consumes; it is not image
+    conditioning. Leaving it in made the GEN lane render a critique of the previous
+    sample rather than the requested subject. Returns ``prompt`` unchanged when no
+    labelled reflection clause is present, and refuses to return an empty string (a
+    prompt that is *only* a reflection keeps its original text rather than losing all
+    conditioning).
+    """
+    match = _REFLECTION_TAIL_RE.search(prompt)
+    if match is None:
+        return prompt
+    return prompt[: match.start()].rstrip(" \t\n.,;:-") or prompt
 
 
 class GenerateImageCapError(RuntimeError):
@@ -819,7 +863,33 @@ def und_turn_kind(text: str) -> str:
         return "continue"
     if _DONE_RE.search(text.strip()):
         return "done"
+    if _is_terminal_only(text):
+        return "done"
     return "continue"
+
+
+def _is_terminal_only(text: str) -> bool:
+    """True when a decode carries only control markers / the end-of-conversation line.
+
+    Measured 2026-09-27 in ``outputs/bagel_corl_rm1_20260927_165227``: of that run's 173
+    episodes, 14 issued no ``generate_image`` call at all (``K=0``) and **every one of them
+    burned the full ``max_und_turns=8`` cap**. Their turns were nothing but a bare ``<|im_end|>``
+    (``out_tokens=1``) or the template's ``End of conversation.`` -- both of which this function's
+    caller read as ``continue``, so the loop spent six or seven further decodes re-sampling the
+    same silence. ``rollout_trajectories/step_000004/sample_040a708f-...02.txt`` is the dump.
+
+    This is the *opposite* trade to :data:`_INERT_BARE_TOOLS`: there the turn carried a name the
+    loop does not execute but the episode could still continue, so ending it would have dropped a
+    row. Here the turn carries **no content at all**, so continuing cannot produce anything the
+    episode did not already have -- terminal is exactly what the checkpoint is signalling, and
+    the episode still reaches the K=0 / pattern-3 path that gives UND its non-image scalar.
+
+    A turn holding a real payload in any dialect never reaches this test: ``parse_und_tool_call``
+    runs first, and a native empty array (``<|start of ToolCall|>[]<|end of ToolCall|>``) leaves
+    ``[]`` as its residue, which is not terminal.
+    """
+    residue = _SPECIAL_TOKEN_RE.sub(" ", text).strip().strip(".").strip()
+    return not residue or residue.lower() == _END_OF_CONVERSATION
 
 
 def bind_episode_ids(
@@ -1371,7 +1441,11 @@ async def run_serial_episode(
         arguments = call.get("arguments", call.get("parameters", {}))
         if isinstance(arguments, str):
             arguments = json.loads(arguments)
-        prompt = str(arguments.get("prompt", ""))
+        # Strip any in-turn "Short reflection: ..." tail before the prompt conditions the
+        # diffusion model -- see ``strip_reflection_tail``. Applies at extraction so the
+        # recorded trajectory ``prompt``, ``build_generate_call_meta`` and the GEN request
+        # all see the same sanitized text.
+        prompt = strip_reflection_tail(str(arguments.get("prompt", "")))
         meta = build_generate_call_meta(prompt=prompt, user_prompt=active_user_prompt)
         # RFC component-1 IDs: GEN TQ keys must be deterministic per (episode, call)
         # so a replay reproduces the same keys. Call 0 keeps the episode's base
@@ -1748,6 +1822,7 @@ def aggregate_episode_metrics(records: list[Any]) -> dict[str, float]:
     dropped = 0.0
     no_credit_flags: list[float] = []
     skipped_flags: list[float] = []
+    k_zero_flags: list[float] = []
     # RFC §4.4.4 R2: counts are additive over the batch, ratios are batch means
     # (each episode's ratio was already measured against the engine counters).
     cond_sums: dict[str, float] = {
@@ -1778,6 +1853,8 @@ def aggregate_episode_metrics(records: list[Any]) -> dict[str, float]:
             no_credit_flags.append(float(metrics["und/no_image_credit"] or 0.0))
         if "gen/skipped_no_groups" in metrics:
             skipped_flags.append(float(metrics["gen/skipped_no_groups"] or 0.0))
+        if "episode/K_zero" in metrics:
+            k_zero_flags.append(float(metrics["episode/K_zero"] or 0.0))
         for key in cond_sums:
             if key in metrics:
                 cond_sums[key] += float(metrics[key] or 0.0)
@@ -1794,6 +1871,8 @@ def aggregate_episode_metrics(records: list[Any]) -> dict[str, float]:
         aggregated["und/no_image_credit"] = float(sum(no_credit_flags) / len(no_credit_flags))
     if skipped_flags:
         aggregated["gen/skipped_no_groups"] = float(sum(skipped_flags) / len(skipped_flags))
+    if k_zero_flags:
+        aggregated["episode/K_zero"] = float(sum(k_zero_flags) / len(k_zero_flags))
     if any(value > 0.0 for value in cond_sums.values()):
         aggregated.update(cond_sums)
     for key, values in cond_means.items():

@@ -69,8 +69,12 @@ good_enough_threshold: 0.80
 score_backend: unified_reward
 
 # Min normalized UnifiedReward score for client-side good_enough=YES. Not the same
-# scale as good_enough_threshold: 0.6 here is a 3.4/5 mean axis score.
-unified_good_enough_threshold: 0.6
+# scale as good_enough_threshold (that one is the facet judge's 6-level grid).
+# Calibrated to the judge's actual ceiling: 0.6 was never reached in 663 measured
+# episodes (max 0.490), so YES never fired and the stop cue was a constant.
+# 0.41 is the measured p90 -> ~8-10% YES. Raise toward good_enough_threshold as the
+# GEN lane improves.
+unified_good_enough_threshold: 0.41
 
 # Block further generate_image after good_enough=YES.
 block_generate_after_yes: true
