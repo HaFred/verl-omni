@@ -61,23 +61,27 @@ def test_build_gen_sampling_params_merges_pipeline_algo():
         base={"temperature": 0.7, "top_p": 0.9, "global_steps": 3},
         seed=11,
     )
-    assert params["num_inference_steps"] == 4
-    assert params["noise_level"] == 0.7
+    # Train config may say 4 steps / noise 0.7; the request is still a finished ODE.
+    assert params["num_inference_steps"] == serve.GEN_ODE_STEPS
+    assert params["noise_level"] == serve.GEN_ODE_NOISE_LEVEL
     assert params["sde_window_size"] == 2
-    assert params["logprobs"] is True
+    assert params["logprobs"] is False
     assert params["seed"] == 11
     assert params["global_steps"] == 3
     assert "temperature" not in params
 
 
-def test_build_gen_sampling_params_rejects_zero_noise():
+def test_build_gen_sampling_params_pins_ode_even_when_config_is_short_sde():
+    """A 4-step, noise-0.7 config must not reach the diffusion request."""
     rollout = SimpleNamespace(
         pipeline={"num_inference_steps": 4},
-        algo={"noise_level": 0.0},
+        algo={"noise_level": 0.7},
         calculate_log_probs=True,
     )
-    with pytest.raises(ValueError, match="noise_level"):
-        serve.build_gen_sampling_params(rollout)
+    params = serve.build_gen_sampling_params(rollout, base={"logprobs": True, "global_steps": 1})
+    assert params["num_inference_steps"] == 50
+    assert params["noise_level"] == 0.0
+    assert params["logprobs"] is False
 
 
 def test_build_gen_sampling_params_lets_val_kwargs_win_over_the_train_config():
@@ -111,16 +115,20 @@ def test_build_gen_sampling_params_lets_val_kwargs_win_over_the_train_config():
     assert params["seed"] == 3
 
 
-def test_build_gen_sampling_params_still_rejects_zero_noise_when_training():
-    """The zero-noise guard exists to stop a *training* run from silently
-    emitting GEN rows with no log-probs; it must not be relaxed for training."""
+def test_build_gen_sampling_params_pins_ode_on_a_training_batch():
+    """Training used to refuse ``noise_level<=0``. Grain comes from that short SDE,
+    so a training batch gets the same 50-step ODE as validation."""
     rollout = SimpleNamespace(
         pipeline={"num_inference_steps": 10},
-        algo={"noise_level": 0.0},
+        algo={"noise_level": 0.7, "sde_window_size": 2},
         calculate_log_probs=True,
     )
-    with pytest.raises(ValueError, match="noise_level"):
-        serve.build_gen_sampling_params(rollout, base={"logprobs": True, "global_steps": 1})
+    params = serve.build_gen_sampling_params(
+        rollout, base={"logprobs": True, "num_inference_steps": 15, "noise_level": 0.7, "global_steps": 1}
+    )
+    assert params["num_inference_steps"] == 50
+    assert params["noise_level"] == 0.0
+    assert params["logprobs"] is False
 
 
 def test_build_gen_sampling_params_rejects_missing_calculate_log_probs():

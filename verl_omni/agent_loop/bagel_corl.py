@@ -916,14 +916,6 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
 
         rollout = self.config.actor_rollout_ref.rollout
         base = dict(getattr(self, "_sampling_params", None) or {})
-        # ``logprobs is False`` is the validate marker the val overlay sets (see
-        # ``validation_artifact_relpath``).  Validation decodes with ODE
-        # (``noise_level=0.0``), which has no SDE log-probs, so its rows legitimately
-        # carry no trajectory: they stay ``valid`` and keep their images, and the GEN
-        # *training* lane drops them (``_sample_has_gen_traj``).  Without this the stash
-        # failed closed on a missing ``log_probs`` and, because it raises *before*
-        # saving, validation produced no image at all.
-        is_validate = base.get("logprobs") is False
         rows: list[dict[str, Any]] = []
         timing = getattr(self, "_bagel_timing", None)
         # BagelPipeline reads text from the request prompt; encode the diffusion
@@ -969,8 +961,11 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                         step=getattr(self, "global_steps", None),
                     ),
                 )
+                # Each seed is its own 50-step ODE (``build_gen_sampling_params``),
+                # so there is no SDE trajectory to stash. Requiring one raised
+                # before the PNG was written and the image was lost.
                 row = stash_gen_row_from_diffusion_output(
-                    output, seed=int(seed), require_traj=not is_validate
+                    output, seed=int(seed), require_traj=False
                 )
                 row["cond_uid"] = cond_uid
                 row["cond_len"] = cond_len

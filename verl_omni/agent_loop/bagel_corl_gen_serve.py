@@ -39,6 +39,15 @@ _AR_ONLY_SAMPLING_KEYS = frozenset(
     }
 )
 
+# Every GEN call — each seed of each ``generate_image`` in a multi-turn trajectory —
+# decodes with a finished ODE. A 10/15-step SDE (``noise_level=0.7``) stops before
+# sigma reaches 0, and noise on that last step is baked into the PNG as grain.
+# 50 steps at ``noise_level=0`` is the official BAGEL inference schedule. Applied
+# per request, so K GEN calls in one episode are K independent 50-step ODEs, not
+# one 50-step budget shared across the trajectory.
+GEN_ODE_STEPS = 50
+GEN_ODE_NOISE_LEVEL = 0.0
+
 
 def config_to_sampling_dict(config: Any) -> dict[str, Any]:
     """Flatten OmegaConf / BaseConfig / dict / namespace into sampling kwargs."""
@@ -123,22 +132,16 @@ def build_gen_sampling_params(
             "bagel_corl GEN requires actor_rollout_ref.rollout.calculate_log_probs=True "
             "(refuse soft-skip of GEN diffusion_loss)."
         )
-    # ``base["logprobs"]`` is the per-phase answer: the worker sets it False for
-    # validation batches (``AgentLoopWorker.run``) and leaves it True for
-    # training.  A validation batch legitimately asks for a deterministic ODE
-    # decode with no SDE log-probs, so it must not trip the checks below; a
-    # training batch with ``noise_level <= 0`` still must.
-    wants_logprobs = (base or {}).get("logprobs") is not False
-    params["logprobs"] = wants_logprobs
-
-    noise_level = float(params.get("noise_level", 0.0) or 0.0)
-    if wants_logprobs and noise_level <= 0.0:
-        raise ValueError(
-            "bagel_corl GEN requires rollout.algo.noise_level > 0 so the SDE window "
-            f"records latents/logprobs (got noise_level={noise_level})."
-        )
-    if wants_logprobs and params.get("num_inference_steps") is None:
-        raise ValueError("bagel_corl GEN requires rollout.pipeline.num_inference_steps")
+    # Pin the decode *after* the train/val merge. Recipe ``GEN_STEPS`` (10 or 15)
+    # and ``noise_level=0.7`` are what left the Sep 2026 rollouts grainy: the SDE
+    # window's noise was not undone because the schedule never finished, and a
+    # missing window applied that noise on the terminal sigma=0 step. Neither the
+    # training config nor a validation overlay may shorten or re-noise this.
+    params["num_inference_steps"] = GEN_ODE_STEPS
+    params["noise_level"] = GEN_ODE_NOISE_LEVEL
+    # An ODE step has ``std_dev_t == 0``; asking for a Gaussian log-prob there is
+    # ``0/0``. The image is the GEN output. FlowGRPO's SDE stash does not apply.
+    params["logprobs"] = False
     if seed is not None:
         params["seed"] = int(seed)
     return params
