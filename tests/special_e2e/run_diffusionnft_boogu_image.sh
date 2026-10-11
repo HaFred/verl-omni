@@ -85,13 +85,6 @@ dummy_test_path=${VAL_FILES:-${DATA_DIR}/test.parquet}
 
 ENGINE=vllm_omni
 
-# boogu-image is an optional third-party dependency. Exit 5 (SKIP) rather than
-# fail so a deliberately minimal environment does not redden the shared smoke
-# suite for everyone.
-#
-# The CI GPU-smoke jobs install this package from .github/boogu_image_pin.txt and
-# set BOOGU_REQUIRED=1. There a skip means the install regressed and Boogu
-# coverage silently vanished again (issue #711), so it must fail instead.
 if ! python3 -c 'import boogu' >/dev/null 2>&1; then
     echo "SKIP: the boogu-image package is required for the training-side transformer."
     echo "Install it with: pip install 'boogu-image @ git+https://github.com/boogu-project/Boogu-Image.git@\$(cat .github/boogu_image_pin.txt)'"

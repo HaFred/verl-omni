@@ -19,11 +19,6 @@ On top of the [standard install](../../../docs/start/install.md):
 pip install "boogu-image @ git+https://github.com/boogu-project/Boogu-Image.git@$(cat .github/boogu_image_pin.txt)"
 ```
 
-CI installs this exact revision. Because `boogu-image` pins `torch<2.12`,
-`diffusers<0.39` and `kernels<0.15`, which all conflict with this repo's stack, the
-GPU-smoke job installs it with `--no-deps`; add `--no-deps` if you already have a
-working environment and do not want it perturbed.
-
 The training engine loads the checkpoint's canonical `BooguImageTransformer2DModel` through
 `diffusers.AutoModel` with `trust_remote_code=True`. The checkpoint's
 `transformer/transformer_boogu.py` is a shim that re-exports the class from the `boogu`
