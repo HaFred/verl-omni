@@ -42,6 +42,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     conditioning_uid,
     count_degenerate_und_turns,
     generate_retrying_engine_wake,
+    resolve_task_type,
     run_serial_episode,
     strip_reflection_tail,
     turn_histogram,
@@ -583,8 +584,13 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         ):
             # Re-render from the messages rather than patching the dataset's ids: the ``<tools>``
             # block belongs inside the system turn, ahead of its text.
+            #
+            # ``task_type`` decides whether the dataset's own system turn survives: plan rows must
+            # keep ``PLAN_SYSTEM_PROMPT`` (see ``with_reflection_system_prompt``), whose
+            # numbered-plan sentence is what makes ``R_plan`` / ``R_result`` reachable.
+            task_type = resolve_task_type(extra_info=kwargs.get("extra_info"), ground_truth=kwargs.get("ground_truth"))
             encoded = self.tokenizer.apply_chat_template(
-                _with_reflection_system_prompt(raw_prompt),
+                _with_reflection_system_prompt(raw_prompt, task_type=task_type),
                 tools=[GENERATE_IMAGE_TOOL_SCHEMA, JUDGE_IMAGE_TOOL_SCHEMA],
                 add_generation_prompt=True,
                 tokenize=True,

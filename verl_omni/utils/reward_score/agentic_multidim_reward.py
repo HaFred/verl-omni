@@ -597,25 +597,31 @@ def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
 
     judge_end = judges[-1][3]
     line_end = text.find("\n", judge_end)
+    # Prose anchor. No newline follows the verdict in the Bagel Co-RL transcript: the verdict is
+    # embedded *inside* the harness's forced ``Reflection`` line and the harness writes its stop
+    # cue after it, so everything past the verdict is harness context (``response_mask=0``), not
+    # policy prose. Anchoring at ``len(text)`` -- what the line-oriented rule does, and is right
+    # when the verdict ends a message -- hides the trailing policy ``Done.`` completely:
+    # ``terminal_done`` stayed False, so ``R_format`` lost its terminal check and ``R_result`` was
+    # pinned to 0 on every Bagel episode.
+    anchor = judge_end if line_end < 0 else line_end + 1
+    # Walk every cue forward, scanning from the verdict rather than from the prose anchor.
+    # ``build_forced_reflection`` writes ``...agentic_force_stop_max_passes=1
+    # agentic_stop_decision_required=1`` on the *same line* as the verdict it paraphrases, so
+    # starting the scan at ``line_end + 1`` skipped every cue and ``forced_context`` was a
+    # constant 0. That is load-bearing twice over: ``closed`` requires ``policy_reflection or
+    # forced_context``, so ``reward_done`` was 0 on every episode, and ``R_format``'s
+    # forced-context check could then only be satisfied by reading the harness's own
+    # ``Reflection:`` line as policy prose. Measured 2026-10-12
+    # (``bagel_corl_rm1_0123_20261012_084724``): ``forced_reflection_context`` and
+    # ``reward_done`` were 0 at all 150 validation steps on both val splits. The Mode-2a loops
+    # append ``agentic_forced_reflection=1`` on a later line, so the anchor still advances to the
+    # end of the harness text either way.
     forced_context = False
-    if line_end < 0:
-        # No newline follows the verdict. In the Bagel Co-RL transcript the verdict is
-        # embedded *inside* the harness's forced ``Reflection`` line and the harness writes its
-        # stop cue after it, so everything past the verdict is harness context
-        # (``response_mask=0``), not policy prose. Anchoring at ``len(text)`` -- what the
-        # line-oriented rule does, and is right when the verdict ends a message -- hides the
-        # trailing policy ``Done.`` completely: ``terminal_done`` stayed False, so ``R_format``
-        # lost its terminal check and ``R_result`` was pinned to 0 on every Bagel episode.
-        anchor = judge_end
-    else:
-        anchor = line_end + 1
-    # Walk every cue forward. ``build_forced_reflection`` writes ``...agentic_force_stop_max_passes=1
-    # agentic_stop_decision_required=1`` and the Mode-2a loops then append
-    # ``agentic_forced_reflection=1``, so the last cue is the end of the harness text either way.
     for marker in _FORCED_CONTEXT_CUE_RE.finditer(text):
-        if marker.start() < anchor:
+        if marker.start() < judge_end:
             continue
-        anchor = marker.end()
+        anchor = max(anchor, marker.end())
         forced_context = True
 
     suffix = _assistant_prose(text[anchor:])

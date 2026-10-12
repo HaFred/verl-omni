@@ -168,13 +168,43 @@ The brevity note on the user turn bounds your private thinking and your reflecti
 only — never let it shorten or water down a diffusion prompt."""
 
 
-def with_reflection_system_prompt(raw_prompt: Any) -> Any:
+def resolve_task_type(*, extra_info: Any = None, ground_truth: Any = None) -> Any:
+    """Return the row's ``task_type`` label from the rollout kwargs.
+
+    The label decides whether the dataset's own system turn survives rendering (see
+    ``with_reflection_system_prompt``), and it lives in whichever of the two metadata
+    dicts the caller populated. ``extra_info`` wins because it is the per-rollout
+    metadata the loop is built with; ``ground_truth`` is the dataset-side fallback the
+    reward scorer also reads.
+    """
+    for source in (extra_info, ground_truth):
+        if isinstance(source, dict):
+            label = source.get("task_type")
+            if label:
+                return label
+    return None
+
+
+def with_reflection_system_prompt(raw_prompt: Any, *, task_type: Any = None) -> Any:
     """Replace the dataset system turn with the reflection protocol.
 
     UniCoT parquet rows carry a short protocol. The longer rewrite rules make later UND
     turns reflections, not a second copy of the user request. Non-message prompts are
     left unchanged.
+
+    ``task_type="plan"`` rows are returned untouched. Their system turn is the dataset's
+    ``PLAN_SYSTEM_PROMPT`` ("Write a short numbered plan ..."), and that sentence is the only
+    thing that makes the numbered ``Plan:`` block get written. Overwriting it with the
+    reflection protocol deleted the instruction, so ``Plan:`` appeared in 0 of 731 dumped
+    transcripts (and "plan" in 0 of 731 rendered prompts) and ``_extract_plan_lines`` always
+    returned ``[]``. ``R_plan`` was therefore pinned to 0 on all 1107 ``unicot_breakdown``
+    rows -- and ``R_result`` with it, since it needs ``successful_generates ==
+    expected_num_images``, knowable only from the plan -- leaving 40% of that lane's score
+    unreachable and ``val-core/unicot_breakdown/reward/mean@1`` pinned near 0.46 across all
+    150 steps (measured 2026-10-12, ``bagel_corl_rm1_0123_20261012_084724``).
     """
+    if str(task_type or "").strip().lower() == "plan":
+        return raw_prompt
     if not isinstance(raw_prompt, list | tuple) or not raw_prompt:
         return raw_prompt
     messages = [dict(m) if isinstance(m, dict) else m for m in raw_prompt]
