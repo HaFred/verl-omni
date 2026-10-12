@@ -1,0 +1,150 @@
+# BAGEL Co-RL (joint UND + GEN) training
+
+Last updated: 10/12/2026
+
+Multi-turn agentic co-RL on one BAGEL-7B-MoT actor. The UND text path is a Hermes
+tool-calling agent loop and the GEN path (`*_moe_gen`) is its own `generate_image` tool;
+both are trained in one composite optimizer step (UND token GRPO + GEN FlowGRPO) behind
+the single `python3 -m verl_omni.trainer.main_omni` entrypoint. See the
+[design RFC](https://github.com/verl-project/verl-omni/issues/453).
+
+Rollout is sequential and multi-turn. Per episode the actor samples UND turns and, when a
+turn calls `generate_image`, fans out the GEN denoise group; the optimizer is one
+composite step after the sibling gather.
+
+| Symbol | Meaning |
+| --- | --- |
+| `J` | UND policy turns in one episode |
+| `K` | `generate_image` calls in the same episode |
+| `S` | FlowGRPO seeds per `generate_image` call |
+| `N` | Sibling episodes per dataset task for token GRPO (`rollout.n`) |
+
+Episodes may be paired (`J == K`), mixed (`J > K >= 1`, reflection-only turns) or gen-off
+(`K == 0`, UND-only).
+
+Fail-closed rules:
+
+- UND must be the published BAGEL checkpoint emitting Hermes `<tool_call>`. If dual-role
+  serving cannot be proven, stop; do not fall back to a Qwen actor or image sidecar.
+- Do not edit the Mode (2a) recipe
+  `examples/agenticllmgrpo_trainer/agent_llm/run_agenticrpco_grpo_lora.sh`.
+- No mid-episode weight sync, and no update before the N-sibling gather completes.
+
+## Prerequisites
+
+- Install VeRL-Omni (see the [installation guide](../../../docs/start/install.md)).
+- 4 GPUs or more. Run commands from the repository root.
+- Download the checkpoint:
+
+  ```bash
+  huggingface-cli download ByteDance-Seed/BAGEL-7B-MoT --local-dir ~/models/ByteDance-Seed/BAGEL-7B-MoT
+  ```
+
+## Prepare the data
+
+The recipe builds the UniCoT train/val parquet automatically; `REBUILD_UNICOT=1` forces a
+rebuild. The parquet must carry `extra_info.reference_image_path` (UniCoT references for
+the reward model); re-stamp with `stamp_unicot_reference_paths.py` when the reference set
+changes. RPCO reward weights are build-time flags: `--w_reflect/--w_plan/--w_format/--w_tool/--w_result`.
+
+## Tests
+
+```bash
+python -m pytest tests/agent_loop tests/trainer/omni tests/utils -q
+bash tests/gpu_smoke/run_gpu_smoke_core.sh
+```
+
+## Dual-role serving spike
+
+The trainer refuses to start without `agent.und_ar_serving_ready=True`. Prove the UND AR
+replica decodes Hermes tool calls before spending a long run:
+
+```bash
+# Terminal A: standalone UND AR server (bagel_think deploy, Hermes-capable)
+bash examples/agenticllmgrpo_trainer/bagel/run_bagel_und_ar_serve.sh
+
+# Terminal B: Hermes tool-call probe against the UND replica
+BAGEL_UND_URL=http://127.0.0.1:8094 \
+  python3 examples/agenticllmgrpo_trainer/bagel/spike_und_hermes.py \
+    --model-path "$BAGEL_MODEL_PATH"
+```
+
+A pass means UND decodes a `generate_image` tool call and the GEN replica stashes a
+FlowGRPO trajectory (latents, timesteps and log-probs all present). If the base model's
+tool-calling is too weak, the fix is an SFT pass, not a loosened parser.
+
+## Run training
+
+```bash
+# 4-GPU default
+bash examples/agenticllmgrpo_trainer/bagel/run_agentic_bagel_rpco_lora.sh
+
+# 1-GPU sanity (RM off by default — actor + Omni + RM cannot fit one card)
+CUDA_VISIBLE_DEVICES=3 bash examples/agenticllmgrpo_trainer/bagel/run_agentic_bagel_rpco_lora.sh
+```
+
+Ladder: run 1-GPU first (loop + composite step, RM off), then 2-GPU, then the 4-GPU
+acceptance run with `ENABLE_RM=1` (colocated Qwen RM, TP-sharded across the pool).
+`BAGEL_UND_AR_SERVING_READY=1` is the recipe default — set `0` to re-hear the fail-closed
+gate after any serving change. `ROLLOUT_TP` and the GEN deploy yaml are selected together
+from the pool size and read back before launch, so they cannot drift apart.
+
+## Default configuration
+
+| Env | Default | Effect |
+| --- | --- | --- |
+| `BAGEL_MODEL_PATH` | `$HOME/models/ByteDance-Seed/BAGEL-7B-MoT` | Published BAGEL-7B-MoT checkpoint (must be untied `lm_head`). |
+| `CUDA_VISIBLE_DEVICES` | `0,1,2,3` | All visible cards go to the actor+GEN hybrid pool; UND AR colocates on the same placement group. |
+| `UND_N_GPUS` | `2` (>2-GPU) | Width of the actor-PG slice the UND AR replica gets. Must cover every logical device its stages ask for (Thinker `0`, DiT `1`) and divide the actor pool. |
+| `ENABLE_RM` | `0` (1/2-GPU), `1` (>=4-GPU) | Colocated Qwen RM. `1` enables mid-loop scoring and image-grounded episode rewards; without it every step is `skip_gen=True` and the GEN lane is frozen. |
+| `REWARD_MODEL` | UnifiedReward-2.0-qwen3vl-2b | Reward model for `reward.reward_model.model_path`. |
+| `REWARD_TP` / `ROLLOUT_TP` | pool size / `2` for a >=4-card pool, else `1` | Tensor-parallel for RM / GEN rollout; the pool must divide both. `ROLLOUT_TP` shards the GEN checkpoint, and each value is paired with a matching deploy yaml (`bagel_corl_deploy.yaml` for TP=1, `bagel_corl_deploy_tp2.yaml` for TP=2) whose stage `devices` length must equal it. |
+| `ROLLOUT_GPU_MEM_UTIL` / `UND_GPU_MEM_UTIL` | `0.25` / `0.40` (>2-GPU) | GEN / UND AR Thinker budgets. Only `ROLLOUT_TP` shards the GEN weights, and the AR budget sizes the Thinker KV cache above its init floor, so neither is a placement knob. |
+| `BAGEL_UND_AR_SERVING_READY` | `1` | Fail-closed gate; set `0` to re-prove the spike. |
+| `S` / `N` / `LORA_RANK` / `LORA_ALPHA` / `GEN_STEPS` / `GEN_HW` / `TRAIN_BSZ` | see script | Seeds per call / siblings / LoRA shape / denoise steps / generation size / batch. |
+| `ENABLE_PEC` | `1` | Turns on the GEN conditioning cache and its routing affinity as one pair (see below). |
+| `AGENT_WORKERS` | `8` | Agent-loop workers; also sizes `PEC_SIZE`. |
+| `MAX_PROMPT_LEN` | `2048` (>=4-GPU), `1024` (2-GPU), `512` (1-GPU) | Pins `data.max_prompt_length`/`max_response_length` **and** `rollout.prompt_length`/`response_length`; the pairs must match. |
+| `MAX_UND_TURNS` | `8` | Episode UND turn cap, in practice bounded by `2 x MAX_PROMPT_LEN`. |
+| `REBUILD_UNICOT` | `1` | Rebuild train/val parquet before launch. |
+| `ROLLOUT_TEMPERATURE` / `ROLLOUT_TOP_P` / `ROLLOUT_TOP_K` / `ROLLOUT_REPETITION_PENALTY` | `0.7` / `0.9` / `50` / `1.05` | UND AR sampling, mirroring `bagel_corl_deploy_ar.yaml`. The agent loop sends all four explicitly, so leaving them unset overrides the deploy defaults. |
+| `RUN_TS` / `RUN_NAME` / `RUN_DIR` | `date +%Y%m%d_%H%M%S` / `bagel_corl_$RUN_TS` / `outputs/$RUN_NAME` | Hydra run dir (`hydra.run.dir`), holding `.hydra/` and `main_omni.log`. Hydra refuses an existing dir, so pass the original stamp or point `RUN_DIR` at it. |
+| `DEFAULT_LOCAL_DIR` | unset | Checkpoint dir; unset shares `checkpoints/${project_name}/${experiment_name}` across runs. |
+| `BAGEL_CORL_TRACE_DUMP` | `1` | Per-episode trajectory dump under `<e2e_root>/<experiment_name>/rollout_trajectories/step_XXXXXX/`. `0` opts out. |
+
+Training-side knobs (in the launch command): `actor.optim.lr` (UND),
+`+actor_rollout_ref.model.lr_gen=3e-5` (GEN group), `loss_weight_und/gen`, `loss_mode`
+(`flow_grpo`, or `grpo_guard` for GRPO-Guard ratio normalization) and `gen_regularizer`
+(`latent_kl`). CFG is off in training (`cfg_text_scale=1.0`); re-enable for eval only via
+val kwargs.
+
+## GEN conditioning reuse
+
+`generate_image` submits `S` seeds that share one conditioning, and each seed otherwise
+re-encodes it. The conditioning cache amortizes that so one encode serves the whole group.
+All three knobs must be passed to Hydra as `+key=value` (append), because the fields live
+on `DiffusionRolloutConfig` and are only grafted on at run time.
+
+1. **The knobs are a pair.** `enable_prompt_embed_cache` turns the cache on and
+   `enable_prompt_embed_cache_routing_affinity` pins one S-group to one replica; without
+   the pin, seeds 2..S scatter across workers holding no entry. Both come from
+   `ENABLE_PEC=1`.
+2. **`prompt_embed_cache_size` covers the live working set**, hence the
+   `S * N * AGENT_WORKERS` default. Too small and a group evicts its own entry mid-group.
+3. **The identity is derived, never hand-set.** `cond_uid` is a SHA-256 over the
+   conditioning token ids the GEN stage encodes; the UND row carries the episode's
+   distinct `gen_cond_uids`.
+
+Per-step metrics are read from the engine's own cache counters, and are omitted entirely
+when the engine exposes none:
+
+| Metric | Definition | Target |
+| --- | --- | --- |
+| `gen/cond_recompute_ratio` | conditioning prefills / `generate_image` calls | `1/S` |
+| `gen/prompt_embed_cache_hit_rate` | hits / (hits + misses); bypasses excluded | `1 - 1/S` |
+| `gen/cond_amortization` | `1 / cond_recompute_ratio` | `S` |
+
+The engine's conditioning cache is invalidated at every weight publish (in addition to the
+LoRA request cache), because an entry is a function of `(tokens, weights)` and a new merged
+weight version is published each composite step. Serving a stale entry would condition on a
+different policy than the one being trained.

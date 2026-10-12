@@ -1,0 +1,522 @@
+# Bagel UND+GEN Co-RL (joint training) recipe, PR1 correctness.
+# Entry: ${_PY} -m verl_omni.trainer.main_omni
+#
+# Fail-closed: UND must be the published Bagel checkpoint (Hermes tool-call), never
+# Qwen3-VL; the UniCoT parquet must carry extra_info.reference_image_path; vllm-omni >=
+# 0.24 requires model.lora.merge=True (fused MoT gen experts cannot bind *_moe_gen
+# adapters). Do not edit the Mode (2a) recipe run_agenticrpco_grpo_lora.sh.
+# Shell tracing is opt-in: DEBUG=1 adds the "+ ..." lines.
+if [[ "${DEBUG:-}" == "1" ]]; then
+  set -x
+fi
+# Prefer local verl checkout (tokenizer package layout) over site-packages flat tokenizer.py.
+_SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+_REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
+_LOCAL_VERL="${_LOCAL_VERL:-${_REPO_ROOT}/../verl}"
+if [[ -d "${_LOCAL_VERL}/verl" ]]; then
+  export PYTHONPATH="${_LOCAL_VERL}:${_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+else
+  export PYTHONPATH="${_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+fi
+# Same interpreter convention as run_bagel_und_ar_serve.sh: prefer this repo's venv, fall back to PATH.
+_PY="${_REPO_ROOT}/.venv/bin/python3"
+if [[ ! -x "${_PY}" ]]; then
+  _PY="$(command -v python3)"
+fi
+
+_HF_HUB="${HF_HOME:-$HOME/.cache/huggingface}/hub"
+
+TOTAL_STEPS="${TOTAL_STEPS:-200}"
+
+# Flattened, self-describing Hydra run dir (RUN_TS is computed once; override it to
+# re-launch into an existing folder). Checkpoints stay in the shared
+# checkpoints/<project_name>/<experiment_name> unless DEFAULT_LOCAL_DIR is set.
+RUN_TS="${RUN_TS:-$(date +%Y%m%d_%H%M%S)}"
+RUN_NAME="${RUN_NAME:-bagel_corl_${RUN_TS}}"
+RUN_DIR="${RUN_DIR:-${_REPO_ROOT}/outputs/${RUN_NAME}}"
+DEFAULT_LOCAL_DIR="${DEFAULT_LOCAL_DIR:-}"
+echo "[INFO] bagel_corl run dir: ${RUN_DIR} (RUN_TS=${RUN_TS})"
+
+# UND AR sampling: the published Bagel checkpoint degenerates under vLLM defaults
+# (temp 1.0, top_p 1, top_k -1, no repetition penalty), so pin anti-repetition sampling.
+ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.7}"
+ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.9}"
+ROLLOUT_TOP_K="${ROLLOUT_TOP_K:-50}"
+ROLLOUT_REPETITION_PENALTY="${ROLLOUT_REPETITION_PENALTY:-1.05}"
+
+export BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:-$HOME/models/ByteDance-Seed/BAGEL-7B-MoT}"
+WORKSPACE=${WORKSPACE:-$HOME}
+# Default to the same cards as run_bagel_und_ar_serve.sh (0,1,2,3) and never
+# hard-assign: an unconditional export would clobber a caller's job allocation.
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
+
+# flashinfer JIT needs nvcc; this box's toolkits live under /cm/shared, not /usr/local/cuda.
+if [[ -z "${CUDA_HOME:-}" ]]; then
+  for _cand in /cm/shared/apps/cuda-latest/toolkit/current /usr/local/cuda; do
+    if [[ -x "${_cand}/bin/nvcc" ]]; then
+      export CUDA_HOME="${_cand}"
+      break
+    fi
+  done
+fi
+if [[ -n "${CUDA_HOME:-}" && ":${PATH}:" != *":${CUDA_HOME}/bin:"* ]]; then
+  export PATH="${CUDA_HOME}/bin:${PATH}"
+fi
+
+# The driver tops out at CUDA 12.2 while the venv's torch is cu13: prepend the cuda-compat
+# shim + cu13 runtime when present, and let torch answer is_available() from NVML.
+_cuda_compat="${_REPO_ROOT}/.venv/cuda-compat"
+_cu13_lib="${_REPO_ROOT}/.venv/lib/python3.12/site-packages/nvidia/cu13/lib"
+if [[ -d "${_cuda_compat}" ]]; then
+  export LD_LIBRARY_PATH="${_cuda_compat}:${_cu13_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  export PYTORCH_NVML_BASED_CUDA_CHECK="${PYTORCH_NVML_BASED_CUDA_CHECK:-1}"
+fi
+
+model_name=${BAGEL_MODEL_PATH:-$HOME/models/ByteDance-Seed/BAGEL-7B-MoT}
+reward_model_name=${REWARD_MODEL:-${_HF_HUB}/models--CodeGoat24--UnifiedReward-2.0-qwen3vl-2b/snapshots/64b2f51d68a2fa583b194784b6cce3aeb12ed7df}
+
+# These MUST keep their :- defaults: without them the parquet build aborts on empty
+# --mix_ratio/--reflect_ratio/--seed from a clean shell.
+UNICOT_REFLECTION_DIR=${UNICOT_REFLECTION_DIR:-${_HF_HUB}/datasets--Fr0zencr4nE--UniCoT-Self-Reflection-6K}
+UNICOT_BREAKDOWN_DIR=${UNICOT_BREAKDOWN_DIR:-${_HF_HUB}/datasets--Fr0zencr4nE--UniCoT-Breakdown-3K}
+UNICOT_MIX_RATIO=${UNICOT_MIX_RATIO:-0.5}
+UNICOT_VAL_RATIO=${UNICOT_VAL_RATIO:-0.05}
+UNICOT_SPLIT_SEED=${UNICOT_SPLIT_SEED:-42}
+UNICOT_TRAIN_SIZE=${UNICOT_TRAIN_SIZE:-}
+UNICOT_VAL_SIZE=${UNICOT_VAL_SIZE:-}
+
+TRAIN_FILE=${UNICOT_TRAIN:-"${_REPO_ROOT}/outputs/data/agentic_unicot/train.parquet"}
+VAL_FILE=${UNICOT_TEST:-"${_REPO_ROOT}/outputs/data/agentic_unicot/val.parquet"}
+# Build the mixed UniCoT train/val parquet unless both exist (REBUILD_UNICOT=1 forces a rebuild).
+if [[ "${REBUILD_UNICOT:-1}" == "1" || ! -f "$TRAIN_FILE" || ! -f "$VAL_FILE" ]]; then
+  "${_PY}" -m verl_omni.utils.dataset.visual_reflection.build_unicot_agentic_rl \
+      --breakdown_dir "$UNICOT_BREAKDOWN_DIR" \
+      --reflection_dir "$UNICOT_REFLECTION_DIR" \
+      --local_save_dir "$(dirname "$TRAIN_FILE")" \
+      --mix_ratio "$UNICOT_MIX_RATIO" \
+      --val_ratio "$UNICOT_VAL_RATIO" \
+      --seed "$UNICOT_SPLIT_SEED" \
+      ${UNICOT_TRAIN_SIZE:+--train_size "$UNICOT_TRAIN_SIZE"} \
+      ${UNICOT_VAL_SIZE:+--val_size "$UNICOT_VAL_SIZE"} || {
+    echo "[ERROR] UniCoT parquet build failed (traceback above). Refusing to launch:" >&2
+    echo "[ERROR] without 'set -e' the trainer would otherwise keep going and train on a" >&2
+    echo "[ERROR] stale ${TRAIN_FILE} (or none at all) while silently ignoring any dataset change." >&2
+    exit 1
+  }
+else
+  echo "[INFO] reusing existing UniCoT parquet: $TRAIN_FILE / $VAL_FILE (set REBUILD_UNICOT=1 to rebuild)"
+fi
+
+# All visible cards join the actor+GEN pool; UND AR is colocated on the same PG.
+_count_visible_gpus() {
+  if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+    local n=0 id
+    IFS=',' read -ra _ids <<< "${CUDA_VISIBLE_DEVICES}"
+    for id in "${_ids[@]}"; do
+      id="${id#"${id%%[![:space:]]*}"}"
+      id="${id%"${id##*[![:space:]]}"}"
+      [[ -n "$id" ]] && n=$((n + 1))
+    done
+    echo "$n"
+    return
+  fi
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi -L 2>/dev/null | wc -l
+    return
+  fi
+  echo 1
+}
+N_VISIBLE="$(_count_visible_gpus)"
+N_VISIBLE="${N_VISIBLE//[[:space:]]/}"
+if [[ -z "$N_VISIBLE" || "$N_VISIBLE" -lt 1 ]]; then
+  echo "Need at least 1 visible GPU (got CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset})." >&2
+  exit 1
+fi
+NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS_ACTOR_ROLLOUT_REWARD:-$N_VISIBLE}
+# UND AR takes the first UND_N_GPUS slices of the actor pool and must span TWO cards:
+# bagel_corl_deploy_ar.yaml puts Thinker on logical 0 and DiT on logical 1. It must also
+# divide the pool (split_resource_pool asserts an exact split). Raise UND_N_GPUS only
+# together with the stage devices in that yaml; the mismatch is caught at launch.
+UND_N_GPUS=${UND_N_GPUS:-2}
+# UND AR Thinker KV budget; below ~0.393 vLLM aborts init with "No available memory for the cache blocks". Cannot buy GEN headroom.
+UND_GPU_MEM_UTIL=${UND_GPU_MEM_UTIL:-0.40}
+BAGEL_UND_DEPLOY_CONFIG=${BAGEL_UND_DEPLOY_CONFIG:-"$(dirname "$0")/bagel_corl_deploy_ar.yaml"}
+# Fail-closed: reject a stale UND_N_GPUS<2 / UND_GPU_MEM_UTIL<0.40 from an earlier shell (bypass with UND_AR_ALLOW_TIGHT=1).
+if [[ "${UND_AR_ALLOW_TIGHT:-0}" != "1" && "${NUM_GPUS_ACTOR_ROLLOUT_REWARD}" -ge 2 ]]; then
+  if (( UND_N_GPUS < 2 )); then
+    echo "UND_N_GPUS=${UND_N_GPUS} cannot cover bagel_corl_deploy_ar.yaml (Thinker on logical \"0\", DiT on \"1\")." >&2
+    echo "Use UND_N_GPUS=2, or put both stages on \"0\" in the yaml for a 1-GPU smoke test." >&2
+    exit 1
+  fi
+  if awk "BEGIN {exit !(${UND_GPU_MEM_UTIL} < 0.40)}"; then
+    echo "UND_GPU_MEM_UTIL=${UND_GPU_MEM_UTIL} is below the ~0.393 AR engine-init floor" >&2
+    echo "(28.16GiB consumed + 2.96GiB peak over a 27.54GiB checkpoint on a 79.66GiB card)." >&2
+    echo "0.30 and 0.35 abort _init_und with 'No available memory for the cache blocks'." >&2
+    exit 1
+  fi
+fi
+# Optional live Hermes proof: STOP run_bagel_und_ar_serve.sh first — its AR engine pins GPU 0, which the colocated UND AR needs.
+BAGEL_UND_AR_SERVING_READY=${BAGEL_UND_AR_SERVING_READY:-1}
+echo "bagel_corl 4-device e2e: actor+GEN=${NUM_GPUS_ACTOR_ROLLOUT_REWARD} UND_AR_colocated=${UND_N_GPUS} visible=${N_VISIBLE} und_ready=${BAGEL_UND_AR_SERVING_READY} und_util=${UND_GPU_MEM_UTIL}"
+# ROLLOUT_TP and the GEN deploy yaml's per-replica device template move together: the
+# stage's devices list length must equal its world_size ("0,1" -> replica 0: 0,1; replica 1: 2,3).
+if [[ "${NUM_GPUS_ACTOR_ROLLOUT_REWARD}" -ge 4 ]]; then
+  ROLLOUT_TP=${ROLLOUT_TP:-2}
+  _GEN_DEPLOY_DEFAULT="$(dirname "$0")/bagel_corl_deploy_tp2.yaml"
+else
+  ROLLOUT_TP=${ROLLOUT_TP:-1}
+  _GEN_DEPLOY_DEFAULT="$(dirname "$0")/bagel_corl_deploy.yaml"
+fi
+BAGEL_DEPLOY_CONFIG=${BAGEL_DEPLOY_CONFIG:-$_GEN_DEPLOY_DEFAULT}
+# One colocated RM tensor-parallel across the pool (not N copies of Qwen). Override REWARD_TP=1 for per-GPU workers.
+REWARD_TP=${REWARD_TP:-$NUM_GPUS_ACTOR_ROLLOUT_REWARD}
+REWARD_ENGINE=${REWARD_ENGINE:-vllm}
+if (( NUM_GPUS_ACTOR_ROLLOUT_REWARD % ROLLOUT_TP != 0 )); then
+  echo "n_gpus_per_node=${NUM_GPUS_ACTOR_ROLLOUT_REWARD} must be divisible by ROLLOUT_TP=${ROLLOUT_TP}." >&2
+  exit 1
+fi
+if (( NUM_GPUS_ACTOR_ROLLOUT_REWARD % REWARD_TP != 0 )); then
+  echo "n_gpus_per_node=${NUM_GPUS_ACTOR_ROLLOUT_REWARD} must be divisible by REWARD_TP=${REWARD_TP}." >&2
+  exit 1
+fi
+# split_resource_pool asserts an exact split, so UND_N_GPUS must divide the actor pool.
+if (( NUM_GPUS_ACTOR_ROLLOUT_REWARD % UND_N_GPUS != 0 )); then
+  echo "n_gpus_per_node=${NUM_GPUS_ACTOR_ROLLOUT_REWARD} must be divisible by UND_N_GPUS=${UND_N_GPUS}" >&2
+  echo "(the UND AR slice comes from split_resource_pool, which requires an exact split)." >&2
+  exit 1
+fi
+# The GEN deploy yaml's stage must name exactly ROLLOUT_TP devices; read it back, do not trust the pairing above.
+"${_PY}" - "$BAGEL_DEPLOY_CONFIG" "$ROLLOUT_TP" <<'PY' || exit 1
+import sys
+
+import yaml
+
+path, tp = sys.argv[1], int(sys.argv[2])
+try:
+    stages = yaml.safe_load(open(path)).get("stages") or []
+except OSError as exc:
+    sys.exit(f"GEN deploy config {path!r} is unreadable: {exc}")
+if not stages:
+    sys.exit(f"GEN deploy config {path!r} declares no stages")
+for stage in stages:
+    devices = [d for d in str(stage.get("devices", "")).split(",") if d.strip()]
+    if len(devices) != tp:
+        sys.exit(
+            f"GEN deploy config {path!r}: stage {stage.get('stage_id')} names {len(devices)} "
+            f"device(s) {devices} but ROLLOUT_TP={tp}. A diffusion stage's device list is a "
+            f"per-replica template whose length must equal tensor_parallel_size; pass a "
+            f"matching yaml (bagel_corl_deploy.yaml for TP=1, bagel_corl_deploy_tp2.yaml for "
+            f"TP=2) or clear ROLLOUT_TP."
+        )
+PY
+# RM default: off for 1-2 GPUs (actor+Omni+UND cannot fit), on for >=4 so GEN gets an rm_score; ENABLE_RM=0 forces it off.
+if [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -eq 1 ]]; then
+  ENABLE_RM=${ENABLE_RM:-0}
+  REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.08}
+  ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.18}
+  TRAIN_BSZ=${TRAIN_BSZ:-1}
+  MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-512}
+  GEN_STEPS=${GEN_STEPS:-4}
+  GEN_HW=${GEN_HW:-256}
+  CFG_TEXT_SCALE=${CFG_TEXT_SCALE:-1.0}
+  # Canonical image guidance; inert while CFG_TEXT_SCALE <= 1.0, pinned anyway to keep both sides equal.
+  CFG_IMG_SCALE=${CFG_IMG_SCALE:-1.5}
+  LORA_RANK=${LORA_RANK:-4}
+  LORA_ALPHA=${LORA_ALPHA:-8}
+elif [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -le 2 ]]; then
+  ENABLE_RM=${ENABLE_RM:-0}
+  REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.12}
+  ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.30}
+  TRAIN_BSZ=${TRAIN_BSZ:-2}
+  MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1024}
+  # 15 mirrors the canonical BAGEL FlowGRPO recipes (rollout 15, val 50).
+  GEN_STEPS=${GEN_STEPS:-15}
+  GEN_HW=${GEN_HW:-512}
+  CFG_TEXT_SCALE=${CFG_TEXT_SCALE:-1.0}
+  CFG_IMG_SCALE=${CFG_IMG_SCALE:-1.5}
+  LORA_RANK=${LORA_RANK:-8}
+  LORA_ALPHA=${LORA_ALPHA:-16}
+else
+  # >=4 GPUs: RM on by default — see the branch comment above. GEN cannot train without it.
+  ENABLE_RM=${ENABLE_RM:-1}
+  REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.15}
+  # This bounds only the GEN lane's KV/workspace, not its checkpoint footprint; keep 0.25.
+  ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.25}
+  TRAIN_BSZ=${TRAIN_BSZ:-2}
+  MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-2048}
+  # pr634 UniGRPO SDE kernel: noise 0.8, SDE on the first ~20% of the schedule (window fixed at 0).
+  GEN_STEPS=${GEN_STEPS:-10}
+  NOISE_LEVEL=${NOISE_LEVEL:-0.8}
+  SDE_WINDOW_SIZE=${SDE_WINDOW_SIZE:-2}
+  SDE_WINDOW_RANGE=${SDE_WINDOW_RANGE:-[0,2]}
+  GEN_HW=${GEN_HW:-512}
+  # Canonical BAGEL text CFG (4.0), the fix for washed GEN images; costs one extra forward
+  # per enabled scale. Set 1.0 to restore cheaper CFG-free rollouts.
+  CFG_TEXT_SCALE=${CFG_TEXT_SCALE:-4.0}
+  # MUST be pinned: rollout defaults 1.5 vs training's model.pipeline.cfg_img_scale 1.0; the
+  # trainer copies this dict onto model.pipeline, so setting it here fixes both sides.
+  CFG_IMG_SCALE=${CFG_IMG_SCALE:-1.5}
+  LORA_RANK=${LORA_RANK:-8}
+  LORA_ALPHA=${LORA_ALPHA:-16}
+fi
+if [[ "$ENABLE_RM" != "1" ]]; then
+  ENABLE_RM=0
+fi
+
+# Reward-pool boot knobs, kept off the colocated actor: pin max_model_len to the episode
+# window (not the RM's 262144) and kv_cache_memory_bytes so vLLM skips its memory-profiling
+# snapshot comparison (a deterministic boot, decoupled from REWARD_GPU_MEM_UTIL).
+REWARD_MAX_MODEL_LEN=${REWARD_MAX_MODEL_LEN:-8192}
+REWARD_KV_CACHE_BYTES=${REWARD_KV_CACHE_BYTES:-2147483648}  # pinned KV per RM GPU
+# Sidecar is an opt-in fallback when the RM lane is off; the router shadows it when ENABLE_RM=1.
+JUDGE_SERVER=${JUDGE_SERVER:-0}  # external judge is opt-in; the RM pool scores by default
+JUDGE_URL=${JUDGE_URL:-http://127.0.0.1:8093}
+JUDGE_VLLM_URL=""
+[[ "$JUDGE_SERVER" == "1" ]] && JUDGE_VLLM_URL="$JUDGE_URL"
+JUDGE_GOOD_ENOUGH_THRESHOLD=${JUDGE_GOOD_ENOUGH_THRESHOLD:-0.80}
+# GEN-lane reward backend (agentic_image_gen.score_backend); default unified_reward_rubric.
+PICKSCORE_GOOD_ENOUGH_THRESHOLD=${PICKSCORE_GOOD_ENOUGH_THRESHOLD:-1.0}
+# The judge shares the last visible device (the emptiest); override JUDGE_GPU to move it.
+if [[ -z "${JUDGE_GPU:-}" ]]; then
+  JUDGE_GPU="${CUDA_VISIBLE_DEVICES##*,}"
+fi
+# JUDGE_IMAGE_MODEL normally comes from JUDGE_ENV_FILE; read just that var in a subshell
+# (sourcing the file would clobber this recipe's state).
+if [[ -z "${JUDGE_IMAGE_MODEL:-}" && -n "${JUDGE_ENV_FILE:-}" ]]; then
+  JUDGE_IMAGE_MODEL="$(bash -c "source '${JUDGE_ENV_FILE}' >/dev/null 2>&1; printf '%s' \"\${JUDGE_IMAGE_MODEL:-}\"")"
+fi
+JUDGE_IMAGE_MODEL="${JUDGE_IMAGE_MODEL:-${_HF_HUB}/models--Qwen--Qwen3.5-9B/snapshots/c202236235762e1c871ad0ccb60c8ee5ba337b9a}"
+
+_judge_ready() { curl -fsS -m 2 "${JUDGE_URL%/}/v1/models" >/dev/null 2>&1; }
+JUDGE_SERVER_PID=""
+if [[ "$JUDGE_SERVER" == "1" ]]; then
+  if _judge_ready; then
+    echo "[INFO] image judge already serving at ${JUDGE_URL}; reusing it"
+  else
+    if [[ ! -e "${JUDGE_IMAGE_MODEL}" ]]; then
+      echo "[ERROR] JUDGE_IMAGE_MODEL=${JUDGE_IMAGE_MODEL} does not exist." >&2
+      exit 1
+    fi
+    # NOT under $RUN_DIR: Hydra refuses to write into a run dir that already exists.
+    JUDGE_LOG="/tmp/bagel_judge_${RUN_TS}.log"
+    echo "[INFO] starting image judge on GPU ${JUDGE_GPU} (mem-util ${AGENTIC_REFLECT_GPU_MEM_UTIL:-0.32}); log ${JUDGE_LOG}"
+    # Keep ONLY assignments on these continuation lines: a # comment terminates the command
+    # and drops the rest. PYTHONPATH/PATH/LD_LIBRARY_PATH are needed by the sidecar exec.
+    CUDA_VISIBLE_DEVICES="$JUDGE_GPU" \
+      JUDGE_IMAGE_MODEL="$JUDGE_IMAGE_MODEL" \
+      AGENTIC_REFLECT_GPU_MEM_UTIL="${AGENTIC_REFLECT_GPU_MEM_UTIL:-0.32}" \
+      AGENTIC_REFLECT_MAX_NUM_SEQS="${AGENTIC_REFLECT_MAX_NUM_SEQS:-2}" \
+      AGENTIC_REFLECT_MAX_MODEL_LEN="${AGENTIC_REFLECT_MAX_MODEL_LEN:-4096}" \
+      PYTHONPATH="${_SCRIPT_DIR}/../agent_llm${PYTHONPATH:+:${PYTHONPATH}}" \
+      PATH="${_REPO_ROOT}/.venv/bin:${PATH}" \
+      LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
+      PYTORCH_NVML_BASED_CUDA_CHECK="${PYTORCH_NVML_BASED_CUDA_CHECK:-1}" \
+      bash "${_SCRIPT_DIR}/../agent_llm/run_judge_image_tool_server.sh" >"$JUDGE_LOG" 2>&1 &
+    JUDGE_SERVER_PID=$!
+    for _ in $(seq 1 240); do
+      _judge_ready && break
+      if ! kill -0 "$JUDGE_SERVER_PID" 2>/dev/null; then
+        echo "[ERROR] image judge exited during startup; last lines of ${JUDGE_LOG}:" >&2
+        tail -n 40 "$JUDGE_LOG" >&2 || true
+        exit 1
+      fi
+      sleep 2
+    done
+    if ! _judge_ready; then
+      echo "[ERROR] image judge not ready at ${JUDGE_URL} after 480s; see ${JUDGE_LOG}" >&2
+      exit 1
+    fi
+    echo "[INFO] image judge ready at ${JUDGE_URL} (pid ${JUDGE_SERVER_PID})"
+    trap 'kill "${JUDGE_SERVER_PID}" 2>/dev/null || true' EXIT INT TERM
+  fi
+elif [[ "$ENABLE_RM" == "1" ]]; then
+  # Internal path: a stale JUDGE_URL is harmless (the router wins) and its absence is expected.
+  if _judge_ready; then
+    echo "[INFO] image judge detected at ${JUDGE_URL} but unused: the reward pool's router scores"
+  else
+    echo "[INFO] ENABLE_RM=1: image rewards and Yes/No signals come from the reward loop manager's"
+    echo "[INFO]   own router (reward_router_address -> ${REWARD_MODEL:-<reward.reward_model.model_path>})"
+  fi
+fi
+
+# data.val_batch_size only sets the batch; the V1 val path still iterates the whole val set
+# (val_max_samples defaults to -1), so cap it — raise or set -1 to test validation itself.
+VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-8}
+
+# Smoke defaults: N = sibling episodes (>=2 required for GEN training), S = seeds per call
+# (default 1). Do not let a stale J/K from the shell leak in.
+if [[ -z "${N:-}" ]]; then
+  if [[ -n "${J:-}" ]]; then N=$J; else N=2; fi
+fi
+if [[ -z "${S:-}" ]]; then
+  if [[ -n "${K:-}" && "$K" -ge 2 ]]; then
+    S=$K
+  else
+    S=1
+  fi
+fi
+if [[ "$S" -lt 1 ]]; then
+  echo "gen_samples_per_call S must be >= 1 (one image per call; got S=$S)." >&2
+  exit 1
+fi
+if [[ "$N" -lt 1 ]]; then
+  echo "rollout.n N must be >= 1 (got N=$N)." >&2
+  exit 1
+fi
+echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runtime)"
+
+# Launch divisibility is checked on the episode count (ppo_mini_batch_size x N); the authoritative check is validate_bagel_corl_config.
+PPO_MINI=${PPO_MINI:-$TRAIN_BSZ}
+PPO_MICRO=${PPO_MICRO:-1}
+if (( TRAIN_BSZ % PPO_MINI != 0 )); then
+  echo "data.train_batch_size=${TRAIN_BSZ} must be divisible by ppo_mini_batch_size=${PPO_MINI}." >&2
+  exit 1
+fi
+EPISODES_PER_UPDATE=$(( PPO_MINI * N ))
+if (( EPISODES_PER_UPDATE % NUM_GPUS_ACTOR_ROLLOUT_REWARD != 0 )); then
+  echo "(ppo_mini_batch_size=${PPO_MINI} x N=${N})=${EPISODES_PER_UPDATE} must be divisible by" >&2
+  echo "n_gpus_per_node=${NUM_GPUS_ACTOR_ROLLOUT_REWARD}." >&2
+  exit 1
+fi
+PER_RANK_EPISODES=$(( EPISODES_PER_UPDATE / NUM_GPUS_ACTOR_ROLLOUT_REWARD ))
+if (( PPO_MICRO > 0 && PER_RANK_EPISODES % PPO_MICRO != 0 )); then
+  echo "(ppo_mini_batch_size x N / n_gpus_per_node)=${PER_RANK_EPISODES} must be divisible by" >&2
+  echo "ppo_micro_batch_size_per_gpu=${PPO_MICRO}." >&2
+  exit 1
+fi
+
+# R2 conditioning cache: enable_prompt_embed_cache and *_routing_affinity are a pair (the
+# pin keeps an S-group on one replica). All three are passed as +key=value because the
+# composed RolloutConfig node lacks these DiffusionRolloutConfig fields at compose time.
+AGENT_WORKERS=${AGENT_WORKERS:-8}
+ENABLE_PEC=${ENABLE_PEC:-1}
+PEC_SIZE=${PEC_SIZE:-$(( S * N * AGENT_WORKERS ))}
+if (( PEC_SIZE < 32 )); then PEC_SIZE=32; fi
+if [[ "${ENABLE_PEC}" == "1" ]]; then
+  PEC_FLAG=True
+  PEC_AFFINITY=True
+else
+  # Affinity without a cache is incoherent and is rejected in validate_bagel_corl_config.
+  PEC_FLAG=False
+  PEC_AFFINITY=False
+fi
+echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} size=${PEC_SIZE} (S*N*workers=${S}x${N}x${AGENT_WORKERS})"
+
+# UniGRPO-aligned launch knobs (RFC 453 §2/§4.4): per-expert LRs, lane weights, GRPO-Guard ablation.
+# Keep comment lines OUTSIDE the backslash-continued launch command below.
+#
+# * data.max_* and rollout.prompt/response_length are pinned from MAX_PROMPT_LEN and must match.
+# * val_kwargs is explicit so validation does not inherit the stochastic training rollout
+#   (the '+' prefix is required; the schema has no pipeline/algo subtree there).
+# * SYNC_REFILL_FAILED_GROUPS=1 refills all-failed groups instead of raising (0 fails loud).
+# * agentic_image_gen.run_dir is pinned to $RUN_DIR so runs cannot overwrite each other's dumps.
+# * BAGEL_CORL_GEN_DECODE=sde records the latents/log-probs FlowGRPO needs; ode disables the GEN loss.
+export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
+"${_PY}" -m verl_omni.trainer.main_omni \
+    hydra.run.dir=$RUN_DIR \
+    agentic_image_gen.run_dir=$RUN_DIR \
+    agentic_image_gen.vllm_url=$JUDGE_VLLM_URL \
+    agentic_image_gen.good_enough_threshold=$JUDGE_GOOD_ENOUGH_THRESHOLD \
+    agentic_image_gen.score_backend=${SCORE_BACKEND:-unified_reward_rubric} \
+    agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.62} \
+    agentic_image_gen.pickscore_good_enough_threshold=$PICKSCORE_GOOD_ENOUGH_THRESHOLD \
+    trainer.v1.trainer_mode=bagel_corl_sync \
+    trainer.v1.sampler.sync_refill_failed_groups=${SYNC_REFILL_FAILED_GROUPS:-True} \
+    data.train_files=$TRAIN_FILE \
+    data.val_files=$VAL_FILE \
+    data.train_batch_size=$TRAIN_BSZ \
+    data.max_prompt_length=$MAX_PROMPT_LEN \
+    data.max_response_length=$MAX_PROMPT_LEN \
+    data.trust_remote_code=True \
+    actor_rollout_ref.model.path=$model_name \
+    actor_rollout_ref.model.tokenizer_path=$model_name \
+    +actor_rollout_ref.model.algorithm=flow_grpo \
+    actor_rollout_ref.model.model_type=diffusion_model \
+    +actor_rollout_ref.model.composite_mode=bagel_corl \
+    +actor_rollout_ref.model.architecture=OmniBagelForConditionalGeneration \
+    actor_rollout_ref.model.trust_remote_code=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.lora_rank=$LORA_RANK \
+    actor_rollout_ref.model.lora_alpha=$LORA_ALPHA \
+    actor_rollout_ref.model.lora_dtype=bfloat16 \
+    actor_rollout_ref.model.lora.merge=True \
+    actor_rollout_ref.model.target_modules="['q_proj','k_proj','v_proj','o_proj','mlp.gate_proj','mlp.up_proj','mlp.down_proj','q_proj_moe_gen','k_proj_moe_gen','v_proj_moe_gen','o_proj_moe_gen','mlp_moe_gen.gate_proj','mlp_moe_gen.up_proj','mlp_moe_gen.down_proj']" \
+    actor_rollout_ref.model.fsdp_layer_prefixes="['layers.']" \
+    actor_rollout_ref.actor.optim.lr=1e-4 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
+    +actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_grpo \
+    +actor_rollout_ref.model.lr_gen=3e-5 \
+    +actor_rollout_ref.actor.diffusion_loss.loss_weight_und=1.0 \
+    +actor_rollout_ref.actor.diffusion_loss.loss_weight_gen=1.0 \
+    actor_rollout_ref.rollout.name=vllm_omni \
+    actor_rollout_ref.rollout.n=$N \
+    actor_rollout_ref.rollout.gpu_memory_utilization=$ROLLOUT_GPU_MEM_UTIL \
+    actor_rollout_ref.rollout.enforce_eager=True \
+    actor_rollout_ref.rollout.free_cache_engine=True \
+    actor_rollout_ref.rollout.layered_summon=True \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.rollout.max_model_len=$MAX_PROMPT_LEN \
+    actor_rollout_ref.rollout.prompt_length=$MAX_PROMPT_LEN \
+    actor_rollout_ref.rollout.response_length=$MAX_PROMPT_LEN \
+    +actor_rollout_ref.rollout.pipeline.height=$GEN_HW \
+    +actor_rollout_ref.rollout.pipeline.width=$GEN_HW \
+    +actor_rollout_ref.rollout.pipeline.num_inference_steps=$GEN_STEPS \
+    +actor_rollout_ref.rollout.pipeline.max_sequence_length=$MAX_PROMPT_LEN \
+    +actor_rollout_ref.rollout.pipeline.cfg_text_scale=$CFG_TEXT_SCALE \
+    +actor_rollout_ref.rollout.pipeline.cfg_img_scale=$CFG_IMG_SCALE \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.temperature=$ROLLOUT_TEMPERATURE \
+    actor_rollout_ref.rollout.top_p=$ROLLOUT_TOP_P \
+    actor_rollout_ref.rollout.top_k=$ROLLOUT_TOP_K \
+    actor_rollout_ref.rollout.repetition_penalty=$ROLLOUT_REPETITION_PENALTY \
+    +actor_rollout_ref.rollout.enable_prompt_embed_cache=$PEC_FLAG \
+    +actor_rollout_ref.rollout.enable_prompt_embed_cache_routing_affinity=$PEC_AFFINITY \
+    +actor_rollout_ref.rollout.prompt_embed_cache_size=$PEC_SIZE \
+    actor_rollout_ref.rollout.agent.num_workers=$AGENT_WORKERS \
+    +actor_rollout_ref.rollout.algo.noise_level=${NOISE_LEVEL:-0.7} \
+    +actor_rollout_ref.rollout.algo.sde_window_size=${SDE_WINDOW_SIZE:-2} \
+    +actor_rollout_ref.rollout.algo.sde_window_range=${SDE_WINDOW_RANGE:-[0,7]} \
+    +actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=${VAL_GEN_STEPS:-50} \
+    +actor_rollout_ref.rollout.val_kwargs.algo.noise_level=${VAL_NOISE_LEVEL:-0.0} \
+    actor_rollout_ref.rollout.agent.default_agent_loop=bagel_multiturn_agent \
+    +actor_rollout_ref.rollout.agent.gen_samples_per_call=$S \
+    +actor_rollout_ref.rollout.agent.max_generate_passes=${MAX_GENERATE_PASSES:-3} \
+    +actor_rollout_ref.rollout.agent.max_und_turns=${MAX_UND_TURNS:-8} \
+    +actor_rollout_ref.rollout.agent.und_ar_serving_ready=$BAGEL_UND_AR_SERVING_READY \
+    +actor_rollout_ref.rollout.agent.und_deploy_config=$BAGEL_UND_DEPLOY_CONFIG \
+    +actor_rollout_ref.rollout.agent.und_n_gpus=$UND_N_GPUS \
+    +actor_rollout_ref.rollout.agent.und_gpu_memory_utilization=$UND_GPU_MEM_UTIL \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.deploy_config=$BAGEL_DEPLOY_CONFIG \
+    reward.num_workers=$(( ENABLE_RM == 1 ? NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP : 0 )) \
+    reward.reward_model.enable=$ENABLE_RM \
+    reward.reward_model.model_path=$reward_model_name \
+    reward.reward_model.rollout.name=$REWARD_ENGINE \
+    reward.custom_reward_function.path=pkg://verl_omni.utils.reward_score.bagel_rm_image_scorer \
+    reward.custom_reward_function.name=compute_score \
+    reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_TP \
+    reward.reward_model.rollout.gpu_memory_utilization=$REWARD_GPU_MEM_UTIL \
+    reward.reward_model.rollout.enforce_eager=True \
+    reward.reward_model.rollout.free_cache_engine=False \
+    reward.reward_model.rollout.skip_tokenizer_init=False \
+    reward.reward_model.rollout.max_model_len=$REWARD_MAX_MODEL_LEN \
+    +reward.reward_model.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=$REWARD_KV_CACHE_BYTES \
+    trainer.val_before_train=True \
+    trainer.test_freq=${TEST_FREQ:-30} \
+    data.val_batch_size=${VAL_BSZ:-$TRAIN_BSZ} \
+    data.val_max_samples=$VAL_MAX_SAMPLES \
+    trainer.total_epochs=1 \
+    trainer.total_training_steps="$TOTAL_STEPS" \
+    trainer.logger="['console','wandb']" \
+    trainer.project_name=${PROJECT_NAME:-bagel_corl} \
+    trainer.experiment_name=${EXPERIMENT_NAME:-bagel_corl_pr1} \
+    trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
+    trainer.nnodes=1 \
+    ${DEFAULT_LOCAL_DIR:+trainer.default_local_dir="$DEFAULT_LOCAL_DIR"} \
+    "$@"
