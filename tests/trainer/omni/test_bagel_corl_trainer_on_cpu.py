@@ -167,10 +167,10 @@ def test_rewrite_bagel_corl_configs_strips_omni_model_keys():
     assert trainer.config.data.continuous_token.enable is False
 
 
-def test_seeds_s_must_be_at_least_two():
-    with pytest.raises(ValueError, match="gen_samples_per_call >= 2"):
+def test_seeds_s_must_be_at_least_one():
+    with pytest.raises(ValueError, match="gen_samples_per_call >= 1"):
         validate_bagel_corl_config(
-            _corl_cfg(actor_rollout_ref={"rollout": {"n": 8, "agent": {"gen_samples_per_call": 1}}})
+            _corl_cfg(actor_rollout_ref={"rollout": {"n": 8, "agent": {"gen_samples_per_call": 0}}})
         )
 
 
@@ -374,6 +374,52 @@ def test_build_gen_proto_packs_traj_for_diffusion_engine():
     gen_data = materialize_gen_train_batch(adv_proto.batch, {"num_gen_rows": 2})
     assert "all_latents" in gen_data.keys()
     assert "advantages" in gen_data.keys()
+
+
+def _gen_row(call_uid, score, *, task_uid="task0", seed=0):
+    return {
+        "gen_group_uid": call_uid,
+        "gen_sample_uid": f"{call_uid}:{seed}",
+        "und_group_uid": task_uid,
+        "rollout_log_probs": [0.1, 0.2],
+        "rm_score": float(score),
+        "all_latents": torch.randn(2, 4),
+        "timesteps": torch.tensor([999.0, 500.0]),
+        "prompt_token_ids": [1, 2, 3],
+    }
+
+
+def test_single_image_calls_group_across_sibling_episodes():
+    """S=1: a call is a singleton, whose FlowGRPO advantage is identically zero.
+
+    Grouping the N siblings' images of one task instead gives a nonzero advantage, and
+    two tasks must not share a group.
+    """
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import apply_gen_flowgrpo_advantage
+
+    rows = [
+        _gen_row("ep0:call0", 0.2),
+        _gen_row("ep0:call1", 0.6),
+        _gen_row("ep1:call0", 0.5),
+        _gen_row("ep2:call0", 0.9, task_uid="task1"),
+        _gen_row("ep3:call0", 0.1, task_uid="task1"),
+    ]
+    proto, _ = apply_gen_flowgrpo_advantage(rows, adv_estimator="flow_grpo", global_std=False)
+    assert list(proto.non_tensor_batch["uid"]) == ["task:task0"] * 3 + ["task:task1"] * 2
+    assert list(proto.non_tensor_batch["gen_group_uid"]) == [r["gen_group_uid"] for r in rows]
+    adv = proto.batch["advantages"][:, 0]
+    assert torch.all(adv.abs() > 0)
+    assert adv[0] < 0 < adv[1] and adv[2] > 0 and adv[3] > 0 > adv[4]
+
+
+def test_multi_seed_calls_keep_their_own_group():
+    """S>=2: the seeds of one call (same prompt, different noise) stay one group."""
+    from verl_omni.trainer.omni.bagel_corl_gen_adv import build_gen_flowgrpo_proto
+
+    rows = [_gen_row("call0", 0.1, seed=0), _gen_row("call0", 0.5, seed=1), _gen_row("call1", 0.3, seed=0),
+            _gen_row("call1", 0.7, seed=1)]
+    proto = build_gen_flowgrpo_proto(rows)
+    assert list(proto.non_tensor_batch["uid"]) == ["call0", "call0", "call1", "call1"]
 
 
 def test_und_train_loss_data_satisfies_the_ppo_loss_contract(monkeypatch):
@@ -1370,6 +1416,42 @@ def test_rewrite_honours_recipe_cfg_text_scale_override():
     assert pipeline.cfg_img_scale == pytest.approx(1.5), "image guidance override lost"
     assert model.pipeline.cfg_img_scale == pytest.approx(1.5), "model image guidance not mirrored"
     assert model.pipeline.cfg_img_scale == pytest.approx(pipeline.cfg_img_scale)
+
+
+def test_rewrite_mirrors_rollout_sde_algo_onto_model():
+    """Training must score GEN transitions with the noise level rollout sampled them at.
+
+    ``DiffusionModelConfig.algo`` defaults to ``noise_level=1.0``; left unmirrored, a
+    0.7-noise rollout was scored at 1.0 and every GEN ratio sat at ~1.28 (fully clipped).
+    """
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.config = OmegaConf.create(
+        {
+            "data": {"train_files": "/tmp/train.parquet"},
+            "actor_rollout_ref": {
+                "model": {"path": "/tmp/bagel", "lora_rank": 64, "target_modules": list(_BAGEL_LORA_TARGETS)},
+                "actor": {},
+                "rollout": {
+                    "name": "vllm_omni",
+                    "response_length": 512,
+                    "algo": {"noise_level": 0.7, "sde_window_size": 2, "sde_window_range": [0, 7]},
+                    "agent": {
+                        "default_agent_loop": "bagel_multiturn_agent",
+                        "gen_samples_per_call": 2,
+                        "max_generate_passes": 1,
+                        "max_und_turns": 8,
+                    },
+                },
+            },
+        }
+    )
+    trainer._rewrite_bagel_corl_configs()
+    model_algo = trainer.config.actor_rollout_ref.model.algo
+    rollout_algo = trainer.config.actor_rollout_ref.rollout.algo
+    assert model_algo._target_ == "verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig"
+    for key in ("noise_level", "sde_type", "sde_window_size", "sde_window_range"):
+        assert model_algo[key] == rollout_algo[key], key
+    assert model_algo.noise_level == pytest.approx(0.7)
 
 
 def test_rewrite_defaults_cfg_img_scale_so_parity_never_lacks_the_key():

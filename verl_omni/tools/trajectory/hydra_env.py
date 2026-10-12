@@ -55,6 +55,7 @@ SCORER_KNOB_KEYS: tuple[str, ...] = (
     "good_enough_threshold",
     "score_backend",
     "unified_good_enough_threshold",
+    "pickscore_good_enough_threshold",
 )
 
 _YAML_PATH = Path(__file__).resolve().parents[2] / "trainer" / "config" / "agentic" / "image_gen_tools.yaml"

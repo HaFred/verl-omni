@@ -15,7 +15,8 @@
 
 UND token GRPO stays on verl V1 ``_compute_advantage``. This module is the GEN
 slice: same ``compute_advantage`` helper the diffusion trainers use, grouped by
-``gen_group_uid`` (K samples from one ``generate_image`` call).
+``gen_group_uid`` (the S seeds of one ``generate_image`` call) when S >= 2, and by
+task (``und_group_uid``: every image the N sibling episodes drew) when S == 1.
 """
 
 from __future__ import annotations
@@ -87,6 +88,29 @@ def _stack_padded(tensors: list[torch.Tensor], *, pad_value: float = 0.0) -> tor
         pad = tensor.new_full(pad_shape, pad_value)
         padded.append(torch.cat([tensor, pad], dim=0))
     return torch.stack(padded, dim=0)
+
+
+def _flowgrpo_group_index(usable: list[tuple[Mapping[str, Any], Any, float, str, Any, Any]]) -> list[str]:
+    """FlowGRPO group id per usable GEN row.
+
+    A ``generate_image`` call with ``S >= 2`` seeds is its own group (same diffusion
+    prompt, different noise). A call with a single image cannot be: ``flow_grpo`` sets a
+    singleton group's mean to its own score, so its advantage is identically zero. Such
+    rows are grouped with every other single-image row of the same task
+    (``und_group_uid``), i.e. the images the N sibling episodes drew for one user request
+    across all of their turns.
+    """
+    call_sizes: dict[str, int] = {}
+    for item in usable:
+        call_sizes[item[3]] = call_sizes.get(item[3], 0) + 1
+    index: list[str] = []
+    for row, _, _, call_uid, _, _ in usable:
+        task_uid = row.get("und_group_uid")
+        if call_sizes[call_uid] >= 2 or not task_uid:
+            index.append(call_uid)
+        else:
+            index.append(f"task:{task_uid}")
+    return index
 
 
 def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | None:
@@ -173,7 +197,7 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
     for index, (_, logprob, _, _, _, _) in enumerate(usable):
         old_log_probs[index, : logprob.numel()] = logprob
     scores = torch.tensor([[item[2]] for item in usable], dtype=torch.float32)
-    uids = np.array([item[3] for item in usable], dtype=object)
+    uids = np.array(_flowgrpo_group_index(usable), dtype=object)
     batch_tensors: dict[str, torch.Tensor] = {
         "old_log_probs": old_log_probs,
         "rm_scores": scores,
@@ -220,7 +244,7 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
 
     non_tensor: dict[str, Any] = {
         "uid": uids,
-        "gen_group_uid": uids,
+        "gen_group_uid": np.array([item[3] for item in usable], dtype=object),
         "prompt_token_ids": prompt_token_ids_arr,
     }
     return DataProto(batch=batch, non_tensor_batch=non_tensor)
@@ -265,7 +289,7 @@ def apply_gen_flowgrpo_advantage(
     global_std: bool = True,
     algo_config: Any = None,
 ) -> tuple[DataProto | None, dict[str, float]]:
-    """RFC GenAdv: FlowGRPO within each K-sample ``gen_group_uid``.
+    """RFC GenAdv: FlowGRPO within each group of ``_flowgrpo_group_index``.
 
     Returns ``(None, skip metrics)`` when there is no GEN view (``K=0``). Rows that
     claim GEN without latents raise — refuse soft-skip of ``diffusion_loss``.

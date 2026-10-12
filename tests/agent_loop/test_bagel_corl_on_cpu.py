@@ -140,7 +140,7 @@ def test_hermes_generate_image_is_bagel_not_qwen():
 
 
 def test_unsupported_tool_is_fail_closed():
-    text = '<tool_call>{"name": "judge_image", "arguments": {}}</tool_call>'
+    text = '<tool_call>{"name": "web_search", "arguments": {}}</tool_call>'
     with pytest.raises(ValueError, match="unsupported tool"):
         lib.und_turn_kind(text)
 
@@ -191,10 +191,10 @@ def test_fenced_payload_with_language_tag_and_role_echo_is_accepted():
     assert lib.und_turn_kind(text) == "generate_image"
 
 
-def test_fenced_judge_image_is_inert():
+def test_fenced_judge_image_is_a_judge_call():
     text = 'Content Request: \n```\n{"name": "judge_image", "arguments": {}}\n```'
     assert lib.parse_und_tool_call(text)["name"] == "judge_image"
-    assert lib.und_turn_kind(text) == "continue"
+    assert lib.und_turn_kind(text) == "judge_image"
 
 
 def test_one_fenced_object_per_step_finds_the_call_in_a_later_fence():
@@ -241,11 +241,11 @@ def test_fenced_example_inside_a_prose_plan_is_not_a_tool_call():
     assert lib.und_turn_kind(text) == "continue"
 
 
-def test_bare_judge_image_is_inert_but_tagged_is_fatal():
-    """The recipe's prompt asks for a judge turn after the last image; the RM does the judging."""
-    assert lib.und_turn_kind('ASSISTANT\n {"name": "judge_image", "arguments": {}}<|im_end|>') == "continue"
-    with pytest.raises(ValueError, match="unsupported tool"):
-        lib.und_turn_kind('<tool_call>{"name": "judge_image", "arguments": {}}</tool_call>')
+def test_judge_image_is_a_loop_tool_in_every_dialect():
+    """Mode 2a: the policy calls ``judge_image`` after each image and the loop answers it with
+    the in-loop RM verdict, so every dialect must classify it as the judge call."""
+    assert lib.und_turn_kind('ASSISTANT\n {"name": "judge_image", "arguments": {}}<|im_end|>') == "judge_image"
+    assert lib.und_turn_kind('<tool_call>{"name": "judge_image", "arguments": {}}</tool_call>') == "judge_image"
 
 
 def test_done_payload_is_the_terminal_signal_in_every_dialect():
@@ -403,11 +403,10 @@ def test_tools_schema_echo_is_not_a_tool_call():
     assert lib.und_turn_kind(text) == "continue"
 
 
-def test_tools_judge_image_is_inert():
-    """``<tools>`` is a dialect of the checkpoint, not of Hermes, so the judge turn stays inert."""
+def test_tools_judge_image_is_a_judge_call():
     text = 'Plan done.\n<tools>\n{"name": "judge_image", "arguments": {}}\n</tools>\n'
     assert lib.parse_und_tool_call(text)["name"] == "judge_image"
-    assert lib.und_turn_kind(text) == "continue"
+    assert lib.und_turn_kind(text) == "judge_image"
 
 
 def test_tools_tagged_call_without_arguments_is_not_a_call():
@@ -450,11 +449,10 @@ def test_native_array_takes_the_first_actionable_call():
     assert lib.parse_und_tool_call(text)["name"] == "judge_image"
 
 
-def test_native_judge_image_is_inert():
-    """The native tag is a checkpoint dialect, not Hermes, so its judge turn stays inert."""
+def test_native_judge_image_is_a_judge_call():
     text = '<|start of ToolCall|>[{"name": "judge_image", "arguments": {}}]<|end of ToolCall|>'
     assert lib.parse_und_tool_call(text)["name"] == "judge_image"
-    assert lib.und_turn_kind(text) == "continue"
+    assert lib.und_turn_kind(text) == "judge_image"
 
 
 def test_native_tag_without_a_named_call_is_not_a_tool_call():
@@ -767,17 +765,24 @@ def test_serial_episode_await_und_then_gen():
     assert episode.response_mask[-1] == 1
 
 
+def _mode2a_turn_text(context: str, prompt: str = "cat") -> str:
+    """The Mode-2a policy turn for ``context``: generate, judge the new image, then obey the
+    reflection (``Done.`` on a stop cue, a rewritten ``generate_image`` otherwise)."""
+    tail = context[context.rfind("<tool_response>") :] if "<tool_response>" in context else ""
+    if "agentic_stop_decision_required=1" in tail:
+        return "Done."
+    if "generated the requested image" in tail:
+        return '<tool_call>{"name": "judge_image", "arguments": {}}</tool_call>'
+    return '<tool_call>{"name": "generate_image", "arguments": {"prompt": "' + prompt + '"}}</tool_call>'
+
+
 def test_forced_reflection_masks_and_observation_encoding():
     tok = _FakeTokenizer()
     gen_calls = {"n": 0}
 
     async def und_decode(**kwargs):
-        if "Reflection:" in tok.decode(kwargs["response_ids"]):
-            return {"token_ids": tok.encode("Done."), "text": "Done."}
-        return {
-            "token_ids": tok.encode('<tool_call>{"name": "generate_image", "arguments": {"prompt": "cat"}}</tool_call>'),
-            "text": '<tool_call>{"name": "generate_image", "arguments": {"prompt": "cat"}}</tool_call>',
-        }
+        text = _mode2a_turn_text(tok.decode(kwargs["response_ids"]))
+        return {"token_ids": tok.encode(text), "text": text}
 
     async def gen_fn(**kwargs):
         gen_calls["n"] += 1
@@ -845,9 +850,7 @@ def test_observation_and_forced_tokens_get_no_fabricated_rollout_log_prob():
         return {"token_ids": ids, "text": text, "log_probs": [sampled] * len(ids)}
 
     async def und_decode(**kwargs):
-        if "Reflection:" in tok.decode(kwargs["response_ids"]):
-            return step("Done.")
-        return step('<tool_call>{"name": "generate_image", "arguments": {"prompt": "cat"}}</tool_call>')
+        return step(_mode2a_turn_text(tok.decode(kwargs["response_ids"])))
 
     async def gen_fn(**kwargs):
         return [{"valid": True, "image_path": "/tmp/obs.png"} for _ in kwargs["seeds"]]
@@ -886,10 +889,8 @@ def test_good_enough_latch_blocks_second_generate():
     gen_calls = {"n": 0}
 
     async def und_decode(**kwargs):
-        return {
-            "token_ids": tok.encode('<tool_call>{"name": "generate_image", "arguments": {"prompt": "p"}}</tool_call>'),
-            "text": '<tool_call>{"name": "generate_image", "arguments": {"prompt": "p"}}</tool_call>',
-        }
+        text = _mode2a_turn_text(tok.decode(kwargs["response_ids"]), prompt="p")
+        return {"token_ids": tok.encode(text), "text": text}
 
     async def gen_fn(**kwargs):
         gen_calls["n"] += 1
@@ -957,6 +958,126 @@ def test_good_enough_latch_blocks_second_generate():
     assert blocked_ep.gen_samples == []
 
 
+def test_not_good_enough_runs_the_mode2a_judge_reflect_regenerate_loop():
+    """``good_enough=NO`` must keep the episode going: judge -> reflection -> a new
+    ``generate_image``, until a YES or the pass cap forces ``Done.``.
+
+    Measured 2026-10-12 (``bagel_corl_rm1_0123_20261012_050746`` step 12): the RM said NO,
+    but the observation and reflection were spliced in without the chat template, the
+    policy closed the turn with ``<|im_end|>`` and the episode ended after one image.
+    """
+    tok = _FakeTokenizer()
+    prompts = iter(["cat v1", "cat v2", "cat v3"])
+    gen_prompts: list[str] = []
+
+    async def und_decode(**kwargs):
+        text = _mode2a_turn_text(tok.decode(kwargs["response_ids"]), prompt="{prompt}")
+        if "{prompt}" in text:
+            text = text.replace("{prompt}", next(prompts))
+        return {"token_ids": tok.encode(text), "text": text}
+
+    async def gen_fn(**kwargs):
+        gen_prompts.append(kwargs["prompt"])
+        return [{"valid": True, "image_path": f"/tmp/p{len(gen_prompts)}_{s}.png"} for s in kwargs["seeds"]]
+
+    def score_fn(samples):
+        for s in samples:
+            s.rm_score = 0.3
+            s.good_enough = False
+            s.rm_axes = {"alignment": 2.0, "coherence": 4.0, "style": 3.0}
+        return samples
+
+    async def _run():
+        tool = lib.BagelGenerateImageTool(gen_samples_per_call=2, max_generate_passes=3, generate_fn=gen_fn)
+        return await lib.run_serial_episode(
+            dataset_task_uid="task",
+            policy_version=1,
+            prompt_ids=[1],
+            und_decode=und_decode,
+            generate_tool=tool,
+            score_fn=score_fn,
+            tokenizer=tok,
+            max_und_turns=12,
+        )
+
+    episode = asyncio.run(_run())
+    assert gen_prompts == ["cat v1", "cat v2", "cat v3"]
+    assert len(episode.gen_samples) == 6
+    text = tok.decode(episode.response_ids)
+    assert text.count("<|im_start|>user\n<tool_response>\nvLLM-Omni generated the requested image.") == 3
+    assert text.count("VL judge on the last generated image:") == 3
+    assert text.count("Rewriting the diffusion prompt next.") == 2
+    assert "agentic_stop_decision_required=1" in text
+    assert "good_enough=NO" in text and "alignment is weakest" in text
+    assert text.endswith("Done.")
+    assert episode.stop_required is True
+    kinds = [r.get("kind") for r in episode.turn_trace if r.get("record") == "und_turn"]
+    assert kinds == ["generate_image", "judge_image"] * 3 + ["done"]
+
+
+def test_response_never_exceeds_max_response_tokens():
+    """The agent loop pads each response to ``response_length`` and never truncates."""
+    tok = _FakeTokenizer()
+
+    async def und_decode(**kwargs):
+        text = _mode2a_turn_text(tok.decode(kwargs["response_ids"]))
+        return {"token_ids": tok.encode(text), "text": text, "log_probs": [-0.1] * len(tok.encode(text))}
+
+    async def gen_fn(**kwargs):
+        return [{"valid": True, "image_path": "/tmp/r.png"} for _ in kwargs["seeds"]]
+
+    def score_fn(samples):
+        for s in samples:
+            s.rm_score = 0.2
+            s.good_enough = False
+        return samples
+
+    async def _run():
+        tool = lib.BagelGenerateImageTool(gen_samples_per_call=2, max_generate_passes=3, generate_fn=gen_fn)
+        return await lib.run_serial_episode(
+            dataset_task_uid="task",
+            policy_version=1,
+            prompt_ids=[1],
+            und_decode=und_decode,
+            generate_tool=tool,
+            score_fn=score_fn,
+            tokenizer=tok,
+            max_und_turns=12,
+            max_response_tokens=600,
+        )
+
+    episode = asyncio.run(_run())
+    assert len(episode.response_ids) <= 600
+    assert len(episode.response_mask) == len(episode.response_ids) == len(episode.rollout_log_probs)
+
+
+def test_judge_image_before_any_image_gets_an_error_observation():
+    tok = _FakeTokenizer()
+    turns = iter(['<tool_call>{"name": "judge_image", "arguments": {}}</tool_call>', "Done."])
+
+    async def und_decode(**kwargs):
+        text = next(turns)
+        return {"token_ids": tok.encode(text), "text": text}
+
+    async def gen_fn(**kwargs):
+        raise AssertionError("no GEN call expected")
+
+    async def _run():
+        tool = lib.BagelGenerateImageTool(gen_samples_per_call=2, max_generate_passes=2, generate_fn=gen_fn)
+        return await lib.run_serial_episode(
+            dataset_task_uid="task",
+            policy_version=1,
+            prompt_ids=[1],
+            und_decode=und_decode,
+            generate_tool=tool,
+            tokenizer=tok,
+        )
+
+    episode = asyncio.run(_run())
+    assert "call generate_image first" in tok.decode(episode.response_ids)
+    assert episode.gen_samples == []
+
+
 def _load_config_mod():
     root = Path(__file__).resolve().parents[2]
     _ensure_pkg("verl_omni", root / "verl_omni")
@@ -976,11 +1097,11 @@ def test_seeds_s_fail_closed_when_below_two():
             "trainer": {"resume_mode": "disable", "v1": {"trainer_mode": "bagel_corl_sync"}},
             "actor_rollout_ref": {
                 "model": {"path": "/models/ByteDance-Seed/BAGEL-7B-MoT", "lora_rank": 64},
-                "rollout": {"n": 8, "agent": {"gen_samples_per_call": 1, "max_generate_passes": 1}},
+                "rollout": {"n": 8, "agent": {"gen_samples_per_call": 0, "max_generate_passes": 3}},
             },
         }
     )
-    with pytest.raises(ValueError, match="gen_samples_per_call >= 2"):
+    with pytest.raises(ValueError, match="gen_samples_per_call >= 1"):
         cfg_mod.validate_bagel_corl_config(cfg)
 
 
@@ -1459,7 +1580,7 @@ def test_und_stop_sequences_target_the_invented_tool_output():
     """``<output>`` is how the checkpoint role-plays the tool's side; stopping there cuts the
     spiral at the call boundary, and the template's own wrapper is ``<tool_response>``, so no
     legitimate content is truncated."""
-    assert lib.UND_STOP_SEQUENCES == ("<output>",)
+    assert lib.UND_STOP_SEQUENCES == ("<output>", "</tool_call>", "</tools>")
 
 
 # ---------------------------------------------------------------------------

@@ -421,6 +421,12 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         # A bare ``{"cfg_text_scale": 1.0}`` dict here would instead replace the dataclass
         # default and then fail every ``model_config.pipeline.<attr>`` read.
         filtered["pipeline"] = dict(pipeline)
+        # Same reasoning for the SDE kernel: the training adapter scores each recorded
+        # transition with ``model.algo.noise_level``, and ``DiffusionModelConfig.algo``
+        # otherwise falls back to ``DiffusionRolloutAlgoConfig``'s 1.0 while rollout
+        # samples at 0.7. That scored every GEN transition under the wrong Gaussian, a
+        # constant log-ratio of ~+0.25 that clipped every GEN update.
+        filtered["algo"] = {**algo, "_target_": "verl_omni.workers.config.diffusion.DiffusionRolloutAlgoConfig"}
 
         with open_dict(self.config):
             self.config.actor_rollout_ref.model = OmegaConf.create(filtered)

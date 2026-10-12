@@ -121,6 +121,7 @@ class _BagelSchedulerAdapter:
         self._base_noise_level: float = 0.0
         self._base_return_logprobs: bool = True
         self._step_counter: int = 0
+        self._tp_divergence_reported: bool = False
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -207,10 +208,40 @@ class _BagelSchedulerAdapter:
         )
         self._step_counter += 1
         prev_sample, log_prob = out[0], out[1]
+        if cur_noise_level > 0.0:
+            prev_sample = self._sync_tp_sample(prev_sample, i)
         prev_sample = prev_sample.squeeze(0)
         if log_prob is not None:
             log_prob = log_prob.reshape(())
         return _AdapterStepOutput(prev_sample=prev_sample, log_prob=log_prob)
+
+    def _sync_tp_sample(self, prev_sample: torch.Tensor, step: int) -> torch.Tensor:
+        """Make every tensor-parallel rank continue from TP rank 0's noisy sample.
+
+        Each TP rank runs the whole denoise loop and draws its own SDE noise. The
+        DiT's sharded attention/MLP all-reduce partial results computed from each
+        rank's *own* latent, so ranks whose noise differs feed mismatched inputs
+        into one forward and the decoded image comes out grainy (ODE steps are
+        deterministic and never diverge). Rank 0's sample, and therefore its
+        recorded log-prob, is left unchanged. Every rank must reach this call on
+        the same steps, which ``_tp_shared_sde_window`` guarantees.
+        """
+        tp_group = _tp_tensor_parallel_group()
+        if tp_group is None:
+            return prev_sample
+        if not self._tp_divergence_reported:
+            checksum = prev_sample.detach().double().sum().reshape(1)
+            checksums = tp_group.all_gather(checksum, dim=0)
+            if not torch.allclose(checksums, checksums[0].expand_as(checksums)):
+                self._tp_divergence_reported = True
+                logger.warning(
+                    "BagelPipelineWithLogProb: SDE sample diverged across TP ranks at step %d "
+                    "(per-rank checksums %s); broadcasting TP rank 0's sample.",
+                    step,
+                    checksums.tolist(),
+                )
+        prev_sample = prev_sample.contiguous()
+        return tp_group.broadcast(prev_sample, src=0)
 
 
 def _pick_sde_window(
@@ -281,6 +312,33 @@ def _pick_sde_window(
     rng = random.Random(seed)
     begin = rng.randint(low, high_inclusive)
     return (begin, begin + size)
+
+
+def _tp_tensor_parallel_group():
+    """Return vLLM's TP group when the engine runs with TP > 1, else ``None``."""
+    from vllm.distributed import get_tensor_model_parallel_world_size, get_tp_group
+    from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+    if not model_parallel_is_initialized() or get_tensor_model_parallel_world_size() <= 1:
+        return None
+    return get_tp_group()
+
+
+def _tp_shared_sde_window(sde_window: tuple[int, int]) -> tuple[int, int]:
+    """Use TP rank 0's SDE window on every tensor-parallel rank of the engine.
+
+    ``_pick_sde_window`` seeds from ``LOCAL_RANK``, which differs between the TP
+    workers of one engine. Each worker runs the full denoise loop, so differing
+    windows put noise on different steps per rank, the sharded DiT all-reduces
+    partial results computed from diverged latents, and the image comes out grainy.
+    """
+    tp_group = _tp_tensor_parallel_group()
+    if tp_group is None:
+        return sde_window
+    window = torch.tensor(sde_window, dtype=torch.int64, device=tp_group.device)
+    window = tp_group.broadcast(window, src=0)
+    begin, end = window.tolist()
+    return (int(begin), int(end))
 
 
 @VllmOmniPipelineBase.register("OmniBagelForConditionalGeneration", algorithm="flow_grpo")
@@ -454,6 +512,7 @@ class BagelPipelineWithLogProb(BagelPipeline):
                 seed=int(os.environ["LOCAL_RANK"]),
                 num_denoise_steps=num_denoise_steps,
             )
+            sde_window = _tp_shared_sde_window(sde_window)
 
         # Pass scheduler kwargs; _BagelSchedulerAdapter overrides noise_level
         # and return_logprobs per-step based on the SDE window.

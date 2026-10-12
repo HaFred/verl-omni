@@ -50,9 +50,15 @@ def _load_gen_serve():
 serve = _load_gen_serve()
 
 
-def test_build_gen_sampling_params_merges_pipeline_algo():
+def test_build_gen_sampling_params_keeps_the_sde_training_kernel():
+    """The default decode is the trained SDE kernel, not a pinned ODE.
+
+    A pinned ODE has no ``std_dev_t`` and therefore no log-probs, so the GEN row
+    carries no trajectory and ``_sample_has_gen_traj`` drops it: the whole GEN lane
+    (loss and gradient) silently disappears. The default must keep SDE.
+    """
     rollout = SimpleNamespace(
-        pipeline=SimpleNamespace(height=256, width=256, num_inference_steps=4, output_type="image"),
+        pipeline=SimpleNamespace(height=256, width=256, num_inference_steps=15, output_type="image"),
         algo=SimpleNamespace(noise_level=0.7, sde_window_size=2, sde_window_range=[0, 7]),
         calculate_log_probs=True,
     )
@@ -61,27 +67,40 @@ def test_build_gen_sampling_params_merges_pipeline_algo():
         base={"temperature": 0.7, "top_p": 0.9, "global_steps": 3},
         seed=11,
     )
-    # Train config may say 4 steps / noise 0.7; the request is still a finished ODE.
-    assert params["num_inference_steps"] == serve.GEN_ODE_STEPS
-    assert params["noise_level"] == serve.GEN_ODE_NOISE_LEVEL
+    assert params["num_inference_steps"] == 15
+    assert params["noise_level"] == 0.7
     assert params["sde_window_size"] == 2
-    assert params["logprobs"] is False
+    assert params["sde_window_range"] == [0, 7]
+    assert params["logprobs"] is True, "training must record SDE log-probs for FlowGRPO"
     assert params["seed"] == 11
     assert params["global_steps"] == 3
     assert "temperature" not in params
 
 
-def test_build_gen_sampling_params_pins_ode_even_when_config_is_short_sde():
-    """A 4-step, noise-0.7 config must not reach the diffusion request."""
+def test_build_gen_sampling_params_ode_knob_pins_a_finished_ode(monkeypatch):
+    """``BAGEL_CORL_GEN_DECODE=ode`` trades the GEN loss for a deterministic decode."""
+    monkeypatch.setenv(serve.GEN_DECODE_ENV, "ode")
     rollout = SimpleNamespace(
         pipeline={"num_inference_steps": 4},
-        algo={"noise_level": 0.7},
+        algo={"noise_level": 0.7, "sde_window_size": 2},
         calculate_log_probs=True,
     )
     params = serve.build_gen_sampling_params(rollout, base={"logprobs": True, "global_steps": 1})
-    assert params["num_inference_steps"] == 50
-    assert params["noise_level"] == 0.0
+    assert params["num_inference_steps"] == serve.GEN_ODE_STEPS
+    assert params["noise_level"] == serve.GEN_ODE_NOISE_LEVEL
     assert params["logprobs"] is False
+
+
+def test_build_gen_sampling_params_rejects_an_unknown_decode_knob(monkeypatch):
+    """A typo must not silently pick a decode that drops the GEN lane."""
+    monkeypatch.setenv(serve.GEN_DECODE_ENV, "sdee")
+    rollout = SimpleNamespace(
+        pipeline={"num_inference_steps": 15},
+        algo={"noise_level": 0.7, "sde_window_size": 2},
+        calculate_log_probs=True,
+    )
+    with pytest.raises(ValueError, match=serve.GEN_DECODE_ENV):
+        serve.build_gen_sampling_params(rollout, base={"logprobs": True})
 
 
 def test_build_gen_sampling_params_lets_val_kwargs_win_over_the_train_config():
@@ -115,16 +134,40 @@ def test_build_gen_sampling_params_lets_val_kwargs_win_over_the_train_config():
     assert params["seed"] == 3
 
 
-def test_build_gen_sampling_params_pins_ode_on_a_training_batch():
-    """Training used to refuse ``noise_level<=0``. Grain comes from that short SDE,
-    so a training batch gets the same 50-step ODE as validation."""
+def test_build_gen_sampling_params_rejects_a_training_batch_without_an_sde_window():
+    """No window => noise on every step including the terminal sigma->0 step, and
+    nothing removes it afterwards. That is the grainy-image path, so fail loud."""
     rollout = SimpleNamespace(
-        pipeline={"num_inference_steps": 10},
+        pipeline={"num_inference_steps": 15},
+        algo={"noise_level": 0.7},
+        calculate_log_probs=True,
+    )
+    with pytest.raises(ValueError, match="sde_window_size"):
+        serve.build_gen_sampling_params(rollout, base={"logprobs": True, "global_steps": 1})
+
+
+def test_build_gen_sampling_params_still_rejects_zero_noise_when_training():
+    """The zero-noise guard exists to stop a *training* run from silently emitting
+    GEN rows with no log-probs; it must not be relaxed for training."""
+    rollout = SimpleNamespace(
+        pipeline={"num_inference_steps": 15},
+        algo={"noise_level": 0.0, "sde_window_size": 2},
+        calculate_log_probs=True,
+    )
+    with pytest.raises(ValueError, match="noise_level"):
+        serve.build_gen_sampling_params(rollout, base={"logprobs": True, "global_steps": 1})
+
+
+def test_build_gen_sampling_params_lets_a_val_batch_use_a_windowless_ode():
+    """A val batch (``logprobs=False``) legitimately decodes ODE with no window."""
+    rollout = SimpleNamespace(
+        pipeline={"num_inference_steps": 15},
         algo={"noise_level": 0.7, "sde_window_size": 2},
         calculate_log_probs=True,
     )
     params = serve.build_gen_sampling_params(
-        rollout, base={"logprobs": True, "num_inference_steps": 15, "noise_level": 0.7, "global_steps": 1}
+        rollout,
+        base={"logprobs": False, "noise_level": 0.0, "num_inference_steps": 50},
     )
     assert params["num_inference_steps"] == 50
     assert params["noise_level"] == 0.0

@@ -162,6 +162,22 @@ def parse_rm_result(
     return scores, flags
 
 
+def parse_rm_axes(result: Any, image_paths: list[str]) -> list[dict[str, float] | None]:
+    """Per-image RM axis breakdown (``reward_extra_info["sample_axes"]``), ``None`` when absent.
+
+    Only the UnifiedReward backend reports axes. They describe the verdict in the judge
+    observation and never change the reward, so a missing or misaligned list degrades to
+    ``None`` instead of failing the episode.
+    """
+    extra = result.get("reward_extra_info") if isinstance(result, dict) else None
+    axes = extra.get("sample_axes") if isinstance(extra, dict) else None
+    if not isinstance(axes, list | tuple) or len(axes) != len(image_paths):
+        return [None] * len(image_paths)
+    return [
+        {str(k): float(v) for k, v in row.items()} if isinstance(row, dict) else None for row in axes
+    ]
+
+
 def _default_data_builder(payload: dict[str, Any], *, output_type: str = "image") -> Any:
     """Wrap the payload in the one-row ``DataProto`` the reward manager consumes.
 
@@ -273,9 +289,11 @@ def make_rm_score_fn(
         if get_image_prompt is not None:
             payload["image_prompt"] = str(get_image_prompt() or "")
         data = data_builder(payload)
-        scores, flags = parse_rm_result(await _invoke(data), payload["image_paths"])
+        result = await _invoke(data)
+        scores, flags = parse_rm_result(result, payload["image_paths"])
         by_path = dict(zip(payload["image_paths"], scores, strict=True))
         flag_by_path = dict(zip(payload["image_paths"], flags, strict=True))
+        axes_by_path = dict(zip(payload["image_paths"], parse_rm_axes(result, payload["image_paths"]), strict=True))
         for sample in samples:
             if not getattr(sample, "valid", False) or not getattr(sample, "image_path", None):
                 continue
@@ -283,6 +301,9 @@ def make_rm_score_fn(
             flag = flag_by_path.get(str(sample.image_path))
             if flag is not None:
                 sample.good_enough = flag
+            axes = axes_by_path.get(str(sample.image_path))
+            if axes is not None and hasattr(sample, "rm_axes"):
+                sample.rm_axes = axes
         return samples
 
     return score

@@ -64,24 +64,40 @@ __all__ = ["BAGEL_RM_EXTRA_INFO_KEY", "compute_score"]
 # ``(mean(1-5 axes) - 1) / 4``. ``good_enough_threshold`` (used by the facet judge,
 # 0.8 on a 6-level grid) must NOT be reused here: it is a different scale.
 #
-# Calibrated against the judge it is paired with, not chosen a priori. UnifiedReward
-# 2.0 on this GEN lane emits a ceiling near 0.49: across 663 episodes in the
-# ``bagel_corl_rm1_*`` runs the per-episode score spanned 0.213..0.490
-# (p50=0.346, p85=0.394, p90=0.406). The original 0.6 sat *above that ceiling*, so
-# every single episode read ``good_enough=NO`` -- 663/663 -- and the stop cue the
-# loop branches on was a constant, carrying no GRPO signal and never reinforcing the
-# terminal ``Done``. 0.41 is the measured p90: YES fires on ~8-10% of episodes, rare
-# enough to mean something and reachable enough to learn from.
+# Calibrated against the judge it is paired with, not chosen a priori, and the same
+# knob has now failed in *both* directions:
+#   * 0.6 sat above the older ceiling of 0.49 (663 episodes in ``bagel_corl_rm1_*``,
+#     p50=0.346, p85=0.394, p90=0.406), so every episode read ``good_enough=NO`` --
+#     663/663 -- and the stop cue the loop branches on was a constant, carrying no
+#     GRPO signal and never reinforcing the terminal ``Done``.
+#   * the re-calibrated 0.41 then sat *below* the new distribution: the 2026-10-11
+#     ``bagel_corl_reflect_k3`` run emitted 0.367..0.674 (n=811 images, p50=0.561,
+#     p90=0.623), so 0.41 read YES on 99.3% of *first* images -- the cue was a
+#     constant again, this time always YES, every episode stopped at J=1/K=1 and the
+#     ``max_generate_passes`` reflection loop was dead by construction.
+# 0.62 is the p90 of that second distribution: ~11% YES, so the stop is a real event
+# yet still reachable by a rewrite, which is what makes J/K vary instead of pinning.
 #
 # This is a curriculum knob, not a quality bar. Raise it toward ``good_enough_threshold``
 # as the GEN lane actually improves; the calibration above is re-derivable from any run
 # dir with ``tools/_verify_bagel_episode_reward.py``.
-DEFAULT_UNIFIED_GOOD_ENOUGH = 0.41
+DEFAULT_UNIFIED_GOOD_ENOUGH = 0.62
 
 # Wire key shared with the producer (verl_omni/agent_loop/bagel_corl_rm.py). Spelled
 # out in both modules rather than imported so this module stays importable in
 # isolation (the CPU test loads it by path without the agent_loop package).
 BAGEL_RM_EXTRA_INFO_KEY = "bagel_corl"
+
+# ``good_enough`` cut for the ``pickscore`` backend, on PickScore's ``raw / 26`` scale
+# (see ``pickscore_reward._PickScoreInferencer.score``). PickScore is *relative* by
+# design -- it ranks candidates against a prompt -- so unlike
+# ``DEFAULT_UNIFIED_GOOD_ENOUGH`` this is not calibrated against a measured
+# distribution yet, and it is deliberately conservative so the stop cue cannot fire on
+# every first image (the failure mode ``DEFAULT_UNIFIED_GOOD_ENOUGH`` documents at
+# length). Calibrate it from ``reward_extra_info["per_image"][*]["score"]`` on the first
+# run and lower it toward the observed p90, the same way the unified cut was derived.
+DEFAULT_PICKSCORE_GOOD_ENOUGH = 1.0
+
 
 
 def _mid_loop_payload(extra_info: Any) -> dict[str, Any] | None:
@@ -130,8 +146,12 @@ def _resolve_judge_endpoint(knobs: dict[str, Any], manager_kwargs: dict[str, Any
 
 def _score_image_unified(
     *, path: str, caption: str, knobs: dict[str, Any]
-) -> tuple[float, bool] | None:
-    """Score one image with UnifiedReward 2.0; ``(normalized_score, good_enough)`` or None.
+) -> tuple[float, bool, dict[str, float]] | None:
+    """Score one image with UnifiedReward 2.0; ``(normalized_score, good_enough, axes)`` or None.
+
+    ``axes`` is the raw 1-5 ``alignment`` / ``coherence`` / ``style`` breakdown; the Co-RL
+    loop renders it into the ``judge_image`` observation so the reflection has per-axis
+    findings to act on.
 
     Reuses the canonical prompt/parse/aggregate helpers from
     ``unified_reward.py`` so this path and the plain ``compute_score_unified_reward``
@@ -190,7 +210,63 @@ def _score_image_unified(
         normalized,
         normalized >= threshold,
     )
-    return float(normalized), bool(normalized >= threshold)
+    return float(normalized), bool(normalized >= threshold), {k: float(v) for k, v in axes.items()}
+
+
+# PickScore handle, cached per process: the RM worker scores every GEN image of every
+# episode, so the CLIP pair is loaded once, not once per image.
+_PICKSCORE_INFERENCER: Any = None
+
+
+def _pickscore_inferencer(device: str | None = None) -> Any:
+    """Build (once) and return this process's PickScore inferencer.
+
+    Reuses ``pickscore_reward._PickScoreInferencer`` -- the same object the standalone
+    ``flowgrpo_trainer/bagel`` PickScore recipe trains against -- so the repo has one
+    PickScore implementation, not two that can drift.
+    """
+    global _PICKSCORE_INFERENCER
+    if _PICKSCORE_INFERENCER is None:
+        from verl_omni.utils.reward_score.pickscore_reward import _PickScoreInferencer
+
+        _PICKSCORE_INFERENCER = _PickScoreInferencer(device=device)
+    return _PICKSCORE_INFERENCER
+
+
+def _score_image_pickscore(
+    *, path: str, caption: str, knobs: dict[str, Any]
+) -> tuple[float, bool] | None:
+    """Score one image with PickScore; ``(score, good_enough)`` or ``None`` on failure.
+
+    Unlike ``_score_image_unified`` this runs the reward model in-process on the RM
+    worker's own GPU (no judge HTTP route): PickScore *is* the model, so there is
+    nothing to proxy. ``good_enough`` therefore keys off
+    ``pickscore_good_enough_threshold`` rather than the judge's facet grid, whose
+    degenerate 0.0 floor is exactly why the unified backend exists.
+
+    Returns ``None`` (caller records a failure and raises) when the file is gone or the
+    model cannot score it. Never zero-fills: a zeroed GEN call is the degenerate reward
+    this backend is meant to avoid.
+    """
+    from PIL import Image
+
+    try:
+        image = Image.open(path).convert("RGB")
+    except (OSError, ValueError) as exc:
+        logger.warning("pickscore reward: cannot read image %s: %s", path, exc)
+        return None
+    try:
+        inferencer = _pickscore_inferencer(device=knobs.get("pickscore_device"))
+        score = float(inferencer.score([caption], [image])[0])
+    except Exception as exc:  # noqa: BLE001 - a load/OOM failure must not zero-fill
+        logger.warning("pickscore reward: scoring %s failed: %s", path, exc)
+        return None
+
+    threshold = float(knobs.get("pickscore_good_enough_threshold", DEFAULT_PICKSCORE_GOOD_ENOUGH))
+    logger.debug(
+        "pickscore reward %s: score=%.3f good_enough=%s", path, score, score >= threshold
+    )
+    return score, bool(score >= threshold)
 
 
 def compute_score(
@@ -266,25 +342,28 @@ def compute_score(
     # Reward backend. ``vlm_judge`` is the original discrete facet-grid judge
     # (correctness/aesthetics snapped to 0.0/0.2/.../1.0). ``unified_reward`` scores
     # the image against its prompt on UnifiedReward 2.0's 1-5 Alignment/Coherence/Style
-    # axes and normalizes to [0, 1] -- a *continuous* score.
+    # axes and normalizes to [0, 1] -- a *continuous* score. ``pickscore`` scores it
+    # with PickScore_v1 instead, in-process, for a GEN reward closer to the one the
+    # canonical Bagel FlowGRPO recipes train against.
     #
-    # Why the continuous path exists (measured 2026-09-22): the facet judge put every
+    # Why the continuous paths exist (measured 2026-09-22): the facet judge put every
     # GEN image on the 0.0 floor, so every sample in a FlowGRPO group scored identically
     # and the group advantage was exactly zero (``actor/loss: 0.0`` on every step). The
     # judge was not broken -- a probe showed it could describe the image accurately, and
     # it returned 0.0 on both the 6-level grid and a free 0-100 scale. A reward with no
     # within-group variance cannot train a policy no matter how correct it is.
     backend = str(knobs.get("score_backend") or "unified_reward").strip().lower()
-    if backend not in ("unified_reward", "vlm_judge"):
+    if backend not in ("unified_reward", "vlm_judge", "pickscore"):
         raise ValueError(
             f"bagel_rm_image_scorer: unknown score_backend {backend!r}; "
-            "expected 'unified_reward' or 'vlm_judge'"
+            "expected 'unified_reward', 'vlm_judge' or 'pickscore'"
         )
     caption = image_prompt or user_request
 
     scores: list[float] = []
     flags: list[bool] = []
     per_image: list[dict[str, Any]] = []
+    sample_axes: list[dict[str, float]] = []
     failed: list[str] = []
     for path in image_paths:
         if backend == "vlm_judge":
@@ -304,12 +383,19 @@ def compute_score(
             facets = [correctness, aesthetics] + ([float(match)] if match is not None else [])
             score = sum(facets) / len(facets)
             good_enough = bool(judged.get("good_enough", False))
+        elif backend == "pickscore":
+            picked = _score_image_pickscore(path=path, caption=caption, knobs=knobs)
+            if picked is None:
+                failed.append(path)
+                continue
+            score, good_enough = picked
         else:
             unified = _score_image_unified(path=path, caption=caption, knobs=knobs)
             if unified is None:
                 failed.append(path)
                 continue
-            score, good_enough = unified
+            score, good_enough, axes = unified
+            sample_axes.append(axes)
         scores.append(score)
         flags.append(good_enough)
         per_image.append({"image_path": path, "score": score, "good_enough": good_enough})
@@ -324,10 +410,13 @@ def compute_score(
     # every key into reward_extra_info, which is where parse_rm_result looks for
     # sample_scores / sample_good_enough. Nesting these under reward_extra_info
     # here would KeyError on "score" before scoring ever returns.
-    return {
+    result = {
         "score": float(reward_score),
         "sample_scores": scores,
         "sample_good_enough": flags,
         "good_enough": all(flags),
         "per_image": per_image,
     }
+    if backend == "unified_reward":
+        result["sample_axes"] = sample_axes
+    return result

@@ -395,17 +395,94 @@ def test_unified_backend_fails_loud_when_the_reply_has_no_axes(monkeypatch, tmp_
 
 
 def test_default_unified_good_enough_is_reachable_by_the_judge():
-    """The stop cue must be reachable, or it is a constant and carries no GRPO signal.
+    """The stop cue must vary, or it is a constant and carries no GRPO signal.
 
-    Regression guard for the original ``0.6``: across 663 measured episodes in the
+    Regression guard for *both* directions the knob has failed in. The original
+    ``0.6`` sat above the older ceiling: across 663 episodes in the
     ``bagel_corl_rm1_*`` runs the per-episode UnifiedReward score never exceeded
-    ``0.490``, so ``good_enough`` read ``NO`` 663/663 times and the branch the loop
-    keys on never varied. The calibrated default is the measured p90 (0.41).
+    ``0.490``, so ``good_enough`` read ``NO`` 663/663 times. The re-calibrated
+    ``0.41`` then sat below the newer distribution: on the 2026-10-11
+    ``bagel_corl_reflect_k3`` run the score spanned 0.367..0.674 (p50 0.561,
+    p90 0.623), so 0.41 read ``YES`` on 99.3% of first images and every episode
+    stopped at J=1/K=1. The calibrated default is the p90 of that run (0.62).
     """
-    measured_max = 0.490
-    measured_p90 = 0.406
+    measured_max = 0.674
+    measured_p90 = 0.623
     assert scorer.DEFAULT_UNIFIED_GOOD_ENOUGH < measured_max, (
         "an unreachable threshold makes good_enough a constant (the 0.6 regression)"
     )
     # Non-trivial: still above the bulk of the distribution, so YES stays a real event.
     assert scorer.DEFAULT_UNIFIED_GOOD_ENOUGH > measured_p90 - 0.02
+    # And not so low that it fires on almost every first image, which is the mirror
+    # regression (the 0.41 run): the stop cue must leave the reflection loop room to
+    # run, i.e. NO has to be the common case.
+    assert scorer.DEFAULT_UNIFIED_GOOD_ENOUGH > 0.55, (
+        "a sub-median threshold makes good_enough always YES (the 0.41 regression)"
+    )
+
+
+class _FakePickScore:
+    """Stand-in for ``pickscore_reward._PickScoreInferencer`` (no CLIP, no CUDA)."""
+
+    def __init__(self, scores):
+        self._scores = list(scores)
+        self.calls = []
+
+    def score(self, prompts, images):
+        self.calls.append((list(prompts), list(images)))
+        return self._scores
+
+
+def _png(tmp_path, name="a.png"):
+    from PIL import Image
+
+    path = tmp_path / name
+    Image.new("RGB", (4, 4), color=(10, 20, 30)).save(path)
+    return path
+
+
+def test_pickscore_backend_scores_with_its_own_cut_not_the_judge_grid(monkeypatch, tmp_path):
+    """``score_backend: pickscore`` runs PickScore in-process against the GEN prompt."""
+    path = _png(tmp_path)
+    fake = _FakePickScore([0.93])
+    monkeypatch.setattr(scorer, "_pickscore_inferencer", lambda device=None: fake)
+
+    payload = _payload(
+        image_paths=[str(path)],
+        scorer_knobs={"score_backend": "pickscore", "pickscore_good_enough_threshold": 0.9},
+    )
+    result = scorer.compute_score(**_kwargs(payload))
+
+    assert result["sample_scores"] == [pytest.approx(0.93)]
+    assert result["sample_good_enough"] == [True]
+    # PickScore compares the image to the *diffusion* prompt, not the raw user request.
+    assert fake.calls[0][0] == ["a castle at dusk"]
+
+
+def test_pickscore_backend_defaults_to_a_conservative_stop_cut(monkeypatch, tmp_path):
+    """Uncalibrated by design: a good-but-not-top score must not fire YES."""
+    path = _png(tmp_path)
+    fake = _FakePickScore([0.93])
+    monkeypatch.setattr(scorer, "_pickscore_inferencer", lambda device=None: fake)
+
+    payload = _payload(image_paths=[str(path)], scorer_knobs={"score_backend": "pickscore"})
+    result = scorer.compute_score(**_kwargs(payload))
+
+    assert scorer.DEFAULT_PICKSCORE_GOOD_ENOUGH > 0.93
+    assert result["sample_good_enough"] == [False]
+
+
+def test_pickscore_backend_fails_loud_on_an_unreadable_image(tmp_path):
+    payload = _payload(
+        image_paths=[str(tmp_path / "missing.png")],
+        scorer_knobs={"score_backend": "pickscore", "pickscore_good_enough_threshold": 0.9},
+    )
+    with pytest.raises(ValueError, match="refusing zero-fill"):
+        scorer.compute_score(**_kwargs(payload))
+
+
+def test_unknown_score_backend_is_rejected():
+    payload = _payload(scorer_knobs={"score_backend": "pickcore"})
+    with pytest.raises(ValueError, match="unknown score_backend"):
+        scorer.compute_score(**_kwargs(payload))
+

@@ -1058,7 +1058,8 @@ agentic_image_gen:
   judge_enable_thinking: false
   good_enough_threshold: 0.8
   score_backend: unified_reward
-  unified_good_enough_threshold: 0.41
+  unified_good_enough_threshold: 0.62
+  pickscore_good_enough_threshold: 1.0
   block_generate_after_yes: true
   block_generate_after_max_passes: true
   max_generate_image_passes: 3

@@ -64,17 +64,32 @@ good_enough_threshold: 0.80
 
 # Numeric reward backend for the Bagel GEN lane: "unified_reward" scores the image
 # against its prompt on UnifiedReward 2.0's 1-5 Alignment/Coherence/Style axes and
-# normalizes to [0, 1] (continuous, so a GRPO group keeps variance); "vlm_judge"
-# uses the discrete correctness/aesthetics facet grid.
+# normalizes to [0, 1] (continuous, so a GRPO group keeps variance); "pickscore"
+# scores it with PickScore_v1 in-process on the reward worker, matching the reward the
+# canonical Bagel FlowGRPO recipes train against; "vlm_judge" uses the discrete
+# correctness/aesthetics facet grid.
 score_backend: unified_reward
 
 # Min normalized UnifiedReward score for client-side good_enough=YES. Not the same
 # scale as good_enough_threshold (that one is the facet judge's 6-level grid).
-# Calibrated to the judge's actual ceiling: 0.6 was never reached in 663 measured
-# episodes (max 0.490), so YES never fired and the stop cue was a constant.
-# 0.41 is the measured p90 -> ~8-10% YES. Raise toward good_enough_threshold as the
-# GEN lane improves.
-unified_good_enough_threshold: 0.41
+# Calibrated to the judge this lane actually runs, not chosen a priori. Two measured
+# points bracket the failure modes: 0.41 was the p90 of the older rollouts (ceiling
+# 0.490) and fired ~8-10% YES; on the 2026-10-11 ``bagel_corl_reflect_k3`` run
+# UnifiedReward 2.0 emitted 0.367..0.674 (p50 0.561, p90 0.623), so 0.41 read YES on
+# 99.3% of first images -- the stop cue was a constant the other way, every episode
+# broke at J=1/K=1 and the reflection loop never iterated. 0.62 is this run's p90 ->
+# ~11% YES: high enough that YES is an achievement, low enough that a rewrite can
+# reach it. Re-derive from any run dir with tools/_verify_bagel_episode_reward.py and
+# raise toward good_enough_threshold as the GEN lane improves.
+unified_good_enough_threshold: 0.62
+
+# Min PickScore for client-side good_enough=YES when ``score_backend: pickscore``. On
+# PickScore's ``raw / 26`` scale. Unlike ``unified_good_enough_threshold`` this is not
+# calibrated against a measured distribution yet -- PickScore is a *relative* ranker,
+# so read ``reward_extra_info["per_image"][*]["score"]`` from the first run and set
+# this near the observed p90. Conservative by default so the stop cue cannot fire on
+# every first image (the failure mode documented above).
+pickscore_good_enough_threshold: 1.0
 
 # Block further generate_image after good_enough=YES.
 block_generate_after_yes: true

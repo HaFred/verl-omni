@@ -431,9 +431,18 @@ else
   # Keep it at 0.25 and let it size the GEN lane's own KV / workspace.
   ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.25}
   TRAIN_BSZ=${TRAIN_BSZ:-2}
-  MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-1024}
-  # See the 2-GPU branch: 15 matches the canonical BAGEL FlowGRPO training rollout.
-  GEN_STEPS=${GEN_STEPS:-15}
+  # A Mode-2a pass (generate call, tool response, judge call, judge response, reflection)
+  # is ~400-600 Bagel tokens (judge_image calls echo the request), so MAX_GENERATE_PASSES=3
+  # measured ~1.8k response tokens on step 0 of bagel_corl_rm1_0123_20261012_064307.
+  MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-2048}
+  # The pr634 UniGRPO SDE kernel (bagel_unigrpo_pr634_7gpu_marathon, clean rollouts):
+  # 10 schedule points (9 denoise steps), noise 0.8, and SDE on denoise steps [0, 1]
+  # only -- the first ~20% of the schedule, identical on every rank and sample. A size-2
+  # window whose start range is [0, 2] can only begin at 0, so it is fixed, not drawn.
+  GEN_STEPS=${GEN_STEPS:-10}
+  NOISE_LEVEL=${NOISE_LEVEL:-0.8}
+  SDE_WINDOW_SIZE=${SDE_WINDOW_SIZE:-2}
+  SDE_WINDOW_RANGE=${SDE_WINDOW_RANGE:-[0,2]}
   GEN_HW=${GEN_HW:-512}
   # Canonical BAGEL classifier-free guidance (cfg_text_scale=4.0). This branch has the
   # headroom for the doubled per-step cost, and it is the fix for the wall of washed GEN
@@ -512,6 +521,19 @@ JUDGE_VLLM_URL=""
 # Mirrors the schema default of ``agentic_image_gen.good_enough_threshold``; pinning it
 # here just makes the value the run actually used visible in the recipe.
 JUDGE_GOOD_ENOUGH_THRESHOLD=${JUDGE_GOOD_ENOUGH_THRESHOLD:-0.80}
+# GEN-lane numeric reward backend (``agentic_image_gen.score_backend``). Options:
+#   unified_reward (default) -- UnifiedReward 2.0, served by the reward pool's router.
+#   pickscore                -- PickScore_v1, run in-process on the reward worker.
+#                               Closer to the reward the canonical Bagel FlowGRPO
+#                               recipes train against; needs the CLIP + PickScore
+#                               weights reachable from HF_HOME (both are cached).
+#   vlm_judge                -- the original discrete facet grid (degenerate: it put
+#                               every GEN image on the 0.0 floor; see the scorer
+#                               docstring before reaching for it).
+# PickScore is a *relative* ranker, so its stop cut is a separate, uncalibrated knob:
+# start at the conservative default and lower it toward the p90 of the first run's
+# per-image scores (``reward_extra_info["per_image"][*]["score"]``).
+PICKSCORE_GOOD_ENOUGH_THRESHOLD=${PICKSCORE_GOOD_ENOUGH_THRESHOLD:-1.0}
 # Share a card the actor already owns. The 9B judge needs ~26GiB at mem-util 0.32 and the
 # run's own cards hold ~29GiB, so the LAST visible device is the emptiest -- the GEN rank
 # sits there while the actor's FSDP shards and the UND AR stages take the first ones.
@@ -611,12 +633,11 @@ VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-8}
 
 # Smoke defaults. N = sibling episodes (Token GRPO); S = seeds per generate_image (FlowGRPO).
 # In-episode J (UND turns) and K (GEN calls) are runtime with J>=K — not these env vars.
-# Production example: N=8 S=4. S must be >= 2.
-# S is the FlowGRPO group: a 2-seed group collapses the advantage to
-# ``sign(score0 - score1)``, and the two seeds' UnifiedReward scores were frequently
-# inside the judge's own noise (measured stdev 0.107 across 173 episodes). >=4-GPU runs
-# at the canonical production value 4; the 1/2-GPU branches keep 2 as a memory
-# concession, the same way they lower GEN_STEPS/GEN_HW.
+# Default S=1: one image per generate_image call. K (calls per episode) is capped by
+# MAX_GENERATE_PASSES (default 3). With S=1 a call is a singleton FlowGRPO group (zero
+# advantage), so ``build_gen_flowgrpo_proto`` groups single-image rows by task: all
+# images the N siblings drew for one request. N must therefore be >= 2 for GEN to train.
+# S>=2 makes each call its own seed group instead (same prompt, different noise).
 # Do not inherit stale K=1 from an old shell (`S=${K:-...}` would still pick K=1).
 if [[ -z "${N:-}" ]]; then
   if [[ -n "${J:-}" ]]; then N=$J; else N=2; fi
@@ -624,15 +645,12 @@ fi
 if [[ -z "${S:-}" ]]; then
   if [[ -n "${K:-}" && "$K" -ge 2 ]]; then
     S=$K
-  elif [[ "${NUM_GPUS_ACTOR_ROLLOUT_REWARD}" -ge 4 ]]; then
-    S=4
   else
-    # 1/2-GPU: one seed fewer, the same memory concession GEN_STEPS/GEN_HW make above.
-    S=2
+    S=1
   fi
 fi
-if [[ "$S" -lt 2 ]]; then
-  echo "gen_samples_per_call S must be >= 2 (FlowGRPO seeds; got S=$S). Use S=4 or unset stale K." >&2
+if [[ "$S" -lt 1 ]]; then
+  echo "gen_samples_per_call S must be >= 1 (one image per call; got S=$S)." >&2
   exit 1
 fi
 if [[ "$N" -lt 1 ]]; then
@@ -792,13 +810,26 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
 #   $RUN_DIR/hermes_actions/step_*.jsonl
 # The node exists in the frozen schema (``agentic/image_gen_tools@agentic_image_gen``
 # declares ``run_dir: null``), so no '+' prefix is needed.
+#
+# GEN decode kernel for the TRAINING lane, read by ``build_gen_sampling_params`` via
+# ``BAGEL_CORL_GEN_DECODE`` (an env knob, so it can never leak into the OpenAI/vLLM-Omni
+# sampling params). ``sde`` (default) is what trains GEN: the bounded SDE window
+# (NOISE_LEVEL / SDE_WINDOW_SIZE / SDE_WINDOW_RANGE on the launch line below) is what
+# records the latents + log-probs FlowGRPO needs, and the window is what keeps that
+# noise off the terminal sigma->0 step -- an unset window is the grainy-image fallback,
+# and ``build_gen_sampling_params`` now fails loud on it instead of graining the run.
+# ``ode`` pins a 50-step deterministic decode and therefore disables the GEN loss: that
+# is an image-quality trade, not a training config. Validation is unaffected either way
+# -- the val overlay always asks for ODE (VAL_GEN_STEPS / VAL_NOISE_LEVEL below).
+export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
 "${_PY}" -m verl_omni.trainer.main_omni \
     hydra.run.dir=$RUN_DIR \
     agentic_image_gen.run_dir=$RUN_DIR \
     agentic_image_gen.vllm_url=$JUDGE_VLLM_URL \
     agentic_image_gen.good_enough_threshold=$JUDGE_GOOD_ENOUGH_THRESHOLD \
     agentic_image_gen.score_backend=${SCORE_BACKEND:-unified_reward} \
-    agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.41} \
+    agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.62} \
+    agentic_image_gen.pickscore_good_enough_threshold=$PICKSCORE_GOOD_ENOUGH_THRESHOLD \
     trainer.v1.trainer_mode=bagel_corl_sync \
     trainer.v1.sampler.sync_refill_failed_groups=${SYNC_REFILL_FAILED_GROUPS:-True} \
     data.train_files=$TRAIN_FILE \
@@ -866,7 +897,7 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
     +actor_rollout_ref.rollout.val_kwargs.algo.noise_level=${VAL_NOISE_LEVEL:-0.0} \
     actor_rollout_ref.rollout.agent.default_agent_loop=bagel_multiturn_agent \
     +actor_rollout_ref.rollout.agent.gen_samples_per_call=$S \
-    +actor_rollout_ref.rollout.agent.max_generate_passes=1 \
+    +actor_rollout_ref.rollout.agent.max_generate_passes=${MAX_GENERATE_PASSES:-3} \
     +actor_rollout_ref.rollout.agent.max_und_turns=${MAX_UND_TURNS:-8} \
     +actor_rollout_ref.rollout.agent.und_ar_serving_ready=$BAGEL_UND_AR_SERVING_READY \
     +actor_rollout_ref.rollout.agent.und_deploy_config=$BAGEL_UND_DEPLOY_CONFIG \
@@ -892,9 +923,9 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
     data.val_max_samples=$VAL_MAX_SAMPLES \
     trainer.total_epochs=1 \
     trainer.total_training_steps="$TOTAL_STEPS" \
-    trainer.logger="['console']" \
-    trainer.project_name=bagel_corl \
-    trainer.experiment_name=bagel_corl_pr1 \
+    trainer.logger="['console','wandb']" \
+    trainer.project_name=${PROJECT_NAME:-bagel_corl} \
+    trainer.experiment_name=${EXPERIMENT_NAME:-bagel_corl_pr1} \
     trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
     trainer.nnodes=1 \
     ${DEFAULT_LOCAL_DIR:+trainer.default_local_dir="$DEFAULT_LOCAL_DIR"} \

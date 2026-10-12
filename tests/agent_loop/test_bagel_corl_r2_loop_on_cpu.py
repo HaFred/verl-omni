@@ -98,7 +98,7 @@ def _stub_gen_serve(monkeypatch) -> None:
     monkeypatch.setattr(
         loop_mod,
         "stash_gen_row_from_diffusion_output",
-        lambda output, *, seed: {"scene_stub": output, "seed": seed},
+        lambda output, *, seed, require_traj=True: {"scene_stub": output, "seed": seed},
     )
 
 

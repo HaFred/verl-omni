@@ -66,14 +66,19 @@ def validate_bagel_corl_config(config: Any) -> None:
         raise ValueError("rollout.n and gen_samples_per_call must be integers") from exc
     if n_int < 1:
         raise ValueError(f"bagel_corl_sync requires rollout.n >= 1 (sibling episodes N), got n={n_int}")
-    if s_int < 2:
+    # One image per ``generate_image`` call. Sibling episodes (``rollout.n`` > 1) are the
+    # GRPO group; a 4-seed fan-out is not required for a within-group advantage.
+    if s_int < 1:
         raise ValueError(
-            f"bagel_corl_sync requires gen_samples_per_call >= 2 (FlowGRPO seeds S), got S={s_int}"
+            f"bagel_corl_sync requires gen_samples_per_call >= 1 (images per call), got S={s_int}"
         )
 
-    max_passes = _select(config, "actor_rollout_ref.rollout.agent.max_generate_passes", default=1)
-    if int(max_passes) != 1:
-        raise ValueError("PR1 bagel_corl_sync requires max_generate_passes=1 (bounds in-episode K)")
+    max_passes = _select(config, "actor_rollout_ref.rollout.agent.max_generate_passes", default=3)
+    if int(max_passes) < 1 or int(max_passes) > 3:
+        raise ValueError(
+            "bagel_corl_sync requires max_generate_passes in 1..3 "
+            f"(in-episode K cap, matching the agentic loop), got {max_passes}"
+        )
 
     lora_rank = _select(config, "actor_rollout_ref.model.lora_rank") or _select(
         config, "actor_rollout_ref.model.lora.rank", default=0

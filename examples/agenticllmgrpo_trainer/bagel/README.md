@@ -3,8 +3,10 @@
 Multi-turn agentic Co-RL (Joint-Training) on one Bagel-7B-MoT actor: the UND text path is the
 Hermes tool-calling agent, the GEN path (`*_moe_gen`) is its own `generate_image`
 tool, both trained in one composite optimizer step (UND token GRPO + GEN
-FlowGRPO). Design: RFC [#453](https://github.com/verl-project/verl-omni/issues/453)
-(v3 refactor + implementation plan on the fork under `outputs/`).
+FlowGRPO). 
+
+Design: RFC [#453](https://github.com/verl-project/verl-omni/issues/453)
+(v3 refactor + implementation plan on the fork under `outputs/`). Taxonomy RFC: #302.
 
 **Fail-closed rules — do not violate:**
 
@@ -18,9 +20,9 @@ FlowGRPO). Design: RFC [#453](https://github.com/verl-project/verl-omni/issues/4
 
 | Symbol | Meaning |
 | --- | --- |
-| `J` | UND policy turns inside one episode (`J >= K`) |
-| `K` | `generate_image` calls inside the same episode (spike default caps `K` at 1) |
-| `S` | FlowGRPO seeds per `generate_image` call (`agent.gen_samples_per_call`, must be >= 2) |
+| `J` | UND policy turns inside one episode |
+| `K` | `generate_image` calls inside the same episode (spike default caps `K` at 1, for real run `J >= K`, `K >= 1`) |
+| `S` | FlowGRPO seeds per `generate_image` call (can be 1 only at this point) |
 | `N` | Sibling episodes per dataset task for token GRPO (`rollout.n`) |
 
 Episode patterns the stack must accept: paired (`J == K`), mixed (`J > K >= 1`,

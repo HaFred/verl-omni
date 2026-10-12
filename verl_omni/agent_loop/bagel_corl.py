@@ -33,6 +33,8 @@ from verl.utils.tokenizer import normalize_token_ids
 from verl_omni.agent_loop.bagel_corl_gen_serve import build_gen_sampling_params, stash_gen_row_from_diffusion_output
 from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     GENERATE_IMAGE_TOOL_SCHEMA,
+    JUDGE_IMAGE_TOOL_SCHEMA,
+    with_reflection_system_prompt as _with_reflection_system_prompt,
     UND_STOP_SEQUENCES,
     BagelGenerateImageTool,
     EpisodeRollout,
@@ -326,6 +328,10 @@ def dump_episode_trace(
                     ]
                 )
                 continue
+            if record.get("record") in ("env_obs", "reflection"):
+                lines.append(f"  {record.get('record')} turn={record.get('turn')} (mask 0)")
+                lines.extend(f"      {line}" for line in str(record.get("text") or "").splitlines() or [""])
+                continue
             header = (
                 f"  turn={record.get('turn')} kind={record.get('kind')} "
                 f"req_ctx={record.get('req_ctx')} out_tokens={record.get('out_tokens')} "
@@ -596,8 +602,8 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             # Re-render from the messages rather than patching the dataset's ids: the ``<tools>``
             # block belongs inside the system turn, ahead of its text.
             encoded = self.tokenizer.apply_chat_template(
-                raw_prompt,
-                tools=[GENERATE_IMAGE_TOOL_SCHEMA],
+                _with_reflection_system_prompt(raw_prompt),
+                tools=[GENERATE_IMAGE_TOOL_SCHEMA, JUDGE_IMAGE_TOOL_SCHEMA],
                 add_generation_prompt=True,
                 tokenize=True,
             )
@@ -643,6 +649,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         # ``max_model_len`` is sized against that same sum. The turn loop therefore has
         # to stop there -- see ``run_serial_episode``'s ``max_context_tokens``.
         max_context_tokens = int(rollout_cfg.prompt_length) + int(rollout_cfg.response_length)
+        max_response_tokens = int(rollout_cfg.response_length)
         self._bagel_cond_affinity = bool(
             getattr(rollout_cfg, "enable_prompt_embed_cache", False)
             and getattr(rollout_cfg, "enable_prompt_embed_cache_routing_affinity", False)
@@ -711,11 +718,14 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                 _context_used = len(_decode_kwargs["prompt_ids"]) + len(_decode_kwargs["response_ids"])
                 _turn_max = und_turn_max_tokens(
                     context_used=_context_used,
-                    max_context_tokens=max_context_tokens,
+                    max_context_tokens=min(
+                        max_context_tokens, len(_decode_kwargs["prompt_ids"]) + max_response_tokens
+                    ),
                 )
                 if _turn_max > 0:
                     und_params["max_tokens"] = _turn_max
                 und_params.setdefault("stop", list(UND_STOP_SEQUENCES))
+                und_params.setdefault("include_stop_str_in_output", True)
                 # UND must hit the AR replica (BagelDualRoleLLMServerClient routes on role /
                 # absence of diffusion keys). Never send num_inference_steps here.
                 for _k in (
@@ -838,6 +848,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                 tokenizer=self.tokenizer,
                 max_und_turns=max_und_turns,
                 max_context_tokens=max_context_tokens,
+                max_response_tokens=max_response_tokens,
                 non_image_reward=float(non_image_reward) if non_image_reward is not None else None,
                 good_enough_threshold=good_enough_threshold,
                 good_enough_reduction=good_enough_reduction,
@@ -916,6 +927,14 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
 
         rollout = self.config.actor_rollout_ref.rollout
         base = dict(getattr(self, "_sampling_params", None) or {})
+        # ``logprobs is False`` is the validate marker the val overlay sets (see
+        # ``validation_artifact_relpath``).  Validation decodes with ODE
+        # (``noise_level=0.0``), which has no SDE log-probs, so its rows legitimately
+        # carry no trajectory: they stay ``valid`` and keep their images, and the GEN
+        # *training* lane drops them (``_sample_has_gen_traj``).  Without this the stash
+        # failed closed on a missing ``log_probs`` and, because it raises *before*
+        # saving, validation produced no image at all.
+        is_validate = base.get("logprobs") is False
         rows: list[dict[str, Any]] = []
         timing = getattr(self, "_bagel_timing", None)
         # BagelPipeline reads text from the request prompt; encode the diffusion
@@ -961,11 +980,12 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                         step=getattr(self, "global_steps", None),
                     ),
                 )
-                # Each seed is its own 50-step ODE (``build_gen_sampling_params``),
-                # so there is no SDE trajectory to stash. Requiring one raised
-                # before the PNG was written and the image was lost.
+                # Training packs the FlowGRPO trajectory and fails closed without it;
+                # validation decodes ODE (``noise_level=0.0``) so it has no SDE
+                # log-probs and must not be required to carry one. See
+                # ``stash_gen_row_from_diffusion_output`` for the split.
                 row = stash_gen_row_from_diffusion_output(
-                    output, seed=int(seed), require_traj=False
+                    output, seed=int(seed), require_traj=not is_validate
                 )
                 row["cond_uid"] = cond_uid
                 row["cond_len"] = cond_len
