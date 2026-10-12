@@ -1015,6 +1015,21 @@ def test_not_good_enough_runs_the_mode2a_judge_reflect_regenerate_loop():
     assert kinds == ["generate_image", "judge_image"] * 3 + ["done"]
 
 
+def test_judge_text_quotes_the_rubric_verdict_of_the_weakest_seed():
+    def sample(i, c, a, findings):
+        s = lib.GenSample(gen_sample_uid=str(i), gen_group_uid="g", seed_index=i, valid=True, prompt_token_ids=[])
+        s.rm_score = (c + a) / 2
+        s.good_enough = False
+        s.rm_judge = {"correctness": c, "aesthetics": a, "findings": findings, "suggested_fixes": f"fix {i}"}
+        return s
+
+    text = lib.judge_text_from_gen_samples([sample(0, 0.8, 0.6, "good"), sample(1, 0.4, 0.2, "no towers")])
+    assert "correctness=0.6000 aesthetics=0.4000 good_enough=NO" in text
+    assert "findings: no towers" in text and "suggested_fixes: fix 1" in text
+    reflection, stop = lib.build_forced_reflection(text, generate_pass=1, max_passes=3)
+    assert "no towers" in reflection and "fix 1" in reflection and stop is False
+
+
 def test_response_never_exceeds_max_response_tokens():
     """The agent loop pads each response to ``response_length`` and never truncates."""
     tok = _FakeTokenizer()

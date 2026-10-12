@@ -347,3 +347,17 @@ def test_a_plain_dict_result_is_not_mistaken_for_a_ref(monkeypatch):
     score_fn = rm.make_rm_score_fn(handle, data_builder=lambda payload: payload)
     out = asyncio.run(score_fn([_sample(0, path="/a.png")]))
     assert out[0].rm_score == pytest.approx(0.4)
+
+
+def test_rubric_verdict_lands_on_each_sample():
+    result = {
+        "reward_score": 0.5,
+        "reward_extra_info": {
+            "sample_scores": [0.5],
+            "sample_good_enough": [False],
+            "sample_judge": [{"correctness": 0.6, "aesthetics": 0.4, "findings": "no towers"}],
+        },
+    }
+    assert rm.parse_rm_judges(result, ["/a"]) == [{"correctness": 0.6, "aesthetics": 0.4, "findings": "no towers"}]
+    assert rm.parse_rm_judges(result, ["/a", "/b"]) == [None, None]
+    assert rm.parse_rm_judges({"reward_score": 0.5}, ["/a"]) == [None]

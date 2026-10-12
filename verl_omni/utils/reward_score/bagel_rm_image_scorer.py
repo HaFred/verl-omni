@@ -269,6 +269,19 @@ def _score_image_pickscore(
     return score, bool(score >= threshold)
 
 
+def _rubric_row(judged: dict[str, Any]) -> dict[str, Any]:
+    """The parts of a Mode-2a rubric verdict the loop's ``judge_image`` response quotes."""
+    return {
+        "correctness": float(judged.get("correctness", 0.0)),
+        "aesthetics": float(judged.get("aesthetics", 0.0)),
+        "findings": str(judged.get("findings") or ""),
+        "suggested_fixes": str(judged.get("suggested_fixes") or ""),
+        "rubber_stamp": bool(judged.get("rubber_stamp", False)),
+        "correctness_scores": dict(judged.get("correctness_scores") or {}),
+        "aesthetics_scores": dict(judged.get("aesthetics_scores") or {}),
+    }
+
+
 def compute_score(
     data_source: str = "",
     solution_str: str = "",
@@ -353,17 +366,24 @@ def compute_score(
     # it returned 0.0 on both the 6-level grid and a free 0-100 scale. A reward with no
     # within-group variance cannot train a policy no matter how correct it is.
     backend = str(knobs.get("score_backend") or "unified_reward").strip().lower()
-    if backend not in ("unified_reward", "vlm_judge", "pickscore"):
+    if backend not in ("unified_reward", "unified_reward_rubric", "vlm_judge", "pickscore"):
         raise ValueError(
             f"bagel_rm_image_scorer: unknown score_backend {backend!r}; "
-            "expected 'unified_reward', 'vlm_judge' or 'pickscore'"
+            "expected 'unified_reward', 'unified_reward_rubric', 'vlm_judge' or 'pickscore'"
         )
-    caption = image_prompt or user_request
+    # ``unified_reward_rubric``: the reward stays UnifiedReward's point score, and the same
+    # reward-pool model is asked the Mode-2a C/A rubric a second time, for the
+    # ``judge_image`` response and the stop verdict only.
+    with_rubric = backend == "unified_reward_rubric"
+    # The user's request is the fixed target across rewrite passes; the policy's own
+    # diffusion prompt would move it every pass.
+    caption = user_request or image_prompt
 
     scores: list[float] = []
     flags: list[bool] = []
     per_image: list[dict[str, Any]] = []
     sample_axes: list[dict[str, float]] = []
+    sample_judge: list[dict[str, Any] | None] = []
     failed: list[str] = []
     for path in image_paths:
         if backend == "vlm_judge":
@@ -383,6 +403,7 @@ def compute_score(
             facets = [correctness, aesthetics] + ([float(match)] if match is not None else [])
             score = sum(facets) / len(facets)
             good_enough = bool(judged.get("good_enough", False))
+            sample_judge.append(_rubric_row(judged))
         elif backend == "pickscore":
             picked = _score_image_pickscore(path=path, caption=caption, knobs=knobs)
             if picked is None:
@@ -396,6 +417,22 @@ def compute_score(
                 continue
             score, good_enough, axes = unified
             sample_axes.append(axes)
+            if with_rubric:
+                judged = call_reflect_vlm(
+                    user_request=user_request,
+                    image_prompt=image_prompt,
+                    notes=notes,
+                    image_path=path,
+                    extra_info=dict(knobs),
+                )
+                if judged is not None and judged.get("ok"):
+                    sample_judge.append(_rubric_row(judged))
+                    good_enough = bool(judged.get("good_enough", False))
+                else:
+                    # The reward is already scored; an unparsed rubric only costs this
+                    # image its written verdict, so fall back to the axes text.
+                    logger.warning("unified_reward_rubric: rubric judge failed for %s; using axes", path)
+                    sample_judge.append(None)
         scores.append(score)
         flags.append(good_enough)
         per_image.append({"image_path": path, "score": score, "good_enough": good_enough})
@@ -417,6 +454,10 @@ def compute_score(
         "good_enough": all(flags),
         "per_image": per_image,
     }
-    if backend == "unified_reward":
+    if backend in ("unified_reward", "unified_reward_rubric"):
         result["sample_axes"] = sample_axes
+    if backend in ("vlm_judge", "unified_reward_rubric"):
+        # The Mode-2a rubric verdict per image (C/A, facet grid, findings, fixes), so the
+        # loop's ``judge_image`` response carries the judge's own words, not a template.
+        result["sample_judge"] = sample_judge
     return result

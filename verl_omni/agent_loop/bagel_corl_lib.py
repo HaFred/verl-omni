@@ -1107,6 +1107,9 @@ class GenSample:
     # ``alignment`` / ``coherence`` / ``style`` on 1-5). Feeds the judge observation only;
     # ``rm_score`` stays the reward.
     rm_axes: dict[str, float] | None = None
+    # Mode-2a rubric verdict (``vlm_judge`` backend): ``correctness`` / ``aesthetics`` on
+    # [0, 1], ``findings``, ``suggested_fixes``, ``rubber_stamp`` and the facet grids.
+    rm_judge: dict[str, Any] | None = None
     # RFC §4.4.2a conditioning identity. Derived by the GEN path from the token
     # slice it actually encodes; constant across the S seeds of one call (that is
     # the reuse group R2 exploits) and equal across calls whose conditioning
@@ -1327,8 +1330,18 @@ def judge_text_from_gen_samples(
             sample.good_enough = good_enough
     correctness, aesthetics = mean, mean
     findings, fixes = "", ""
+    rubber_stamp = False
+    judges = [s.rm_judge for s in samples if s.valid and s.rm_judge]
     axes = _mean_rm_axes(samples)
-    if axes is not None:
+    if judges:
+        correctness = float(np.mean([float(j.get("correctness", 0.0)) for j in judges]))
+        aesthetics = float(np.mean([float(j.get("aesthetics", 0.0)) for j in judges]))
+        # With S > 1 seeds, explain the weakest image: that is the one the rewrite must fix.
+        worst = min(judges, key=lambda j: float(j.get("correctness", 0.0)) + float(j.get("aesthetics", 0.0)))
+        findings = str(worst.get("findings") or "")
+        fixes = str(worst.get("suggested_fixes") or "")
+        rubber_stamp = any(bool(j.get("rubber_stamp")) for j in judges)
+    elif axes is not None:
         correctness, aesthetics, findings, fixes = _judge_facets_from_axes(axes)
     return format_rm_scores_as_judge_text(
         correctness=correctness,
@@ -1336,6 +1349,7 @@ def judge_text_from_gen_samples(
         good_enough=good_enough,
         findings=findings,
         suggested_fixes=fixes,
+        rubber_stamp=rubber_stamp,
         similarity=None,
     )
 

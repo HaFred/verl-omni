@@ -522,14 +522,22 @@ JUDGE_VLLM_URL=""
 # here just makes the value the run actually used visible in the recipe.
 JUDGE_GOOD_ENOUGH_THRESHOLD=${JUDGE_GOOD_ENOUGH_THRESHOLD:-0.80}
 # GEN-lane numeric reward backend (``agentic_image_gen.score_backend``). Options:
-#   unified_reward (default) -- UnifiedReward 2.0, served by the reward pool's router.
+#   unified_reward_rubric (default)
+#                            -- reward = UnifiedReward 2.0 point score (1-5 Alignment/
+#                               Coherence/Style vs the user request); the same reward-pool
+#                               model is then asked the Mode-2a C/A rubric (10 facet
+#                               questions, findings, suggested_fixes), which answers
+#                               ``judge_image`` and sets good_enough. Two calls per image,
+#                               one model, no extra GPUs. Probed 2026-10-12 on the 2B
+#                               checkpoint: valid rubric JSON 8/8, image-specific findings.
+#   unified_reward           -- the point score alone; ``judge_image`` shows the 3 axes.
+#   vlm_judge                -- the rubric alone, for both the reward and ``judge_image``
+#                               (0.2-grid reward; the 2B model tends to copy one value
+#                               across all five facets).
 #   pickscore                -- PickScore_v1, run in-process on the reward worker.
 #                               Closer to the reward the canonical Bagel FlowGRPO
 #                               recipes train against; needs the CLIP + PickScore
 #                               weights reachable from HF_HOME (both are cached).
-#   vlm_judge                -- the original discrete facet grid (degenerate: it put
-#                               every GEN image on the 0.0 floor; see the scorer
-#                               docstring before reaching for it).
 # PickScore is a *relative* ranker, so its stop cut is a separate, uncalibrated knob:
 # start at the conservative default and lower it toward the p90 of the first run's
 # per-image scores (``reward_extra_info["per_image"][*]["score"]``).
@@ -827,7 +835,7 @@ export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
     agentic_image_gen.run_dir=$RUN_DIR \
     agentic_image_gen.vllm_url=$JUDGE_VLLM_URL \
     agentic_image_gen.good_enough_threshold=$JUDGE_GOOD_ENOUGH_THRESHOLD \
-    agentic_image_gen.score_backend=${SCORE_BACKEND:-unified_reward} \
+    agentic_image_gen.score_backend=${SCORE_BACKEND:-unified_reward_rubric} \
     agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.62} \
     agentic_image_gen.pickscore_good_enough_threshold=$PICKSCORE_GOOD_ENOUGH_THRESHOLD \
     trainer.v1.trainer_mode=bagel_corl_sync \

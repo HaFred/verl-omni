@@ -70,6 +70,7 @@ def _normalize_scored(data: dict, *, backend: str) -> dict | None:
         },
         "match": max(0.0, min(1.0, match)),
         "good_enough": bool(data.get("good_enough", False)),
+        "rubber_stamp": bool(data.get("rubber_stamp", False)),
         "findings": str(data.get("findings") or ""),
         "suggested_fixes": str(data.get("suggested_fixes") or "none"),
         "backend": str(data.get("backend") or backend),

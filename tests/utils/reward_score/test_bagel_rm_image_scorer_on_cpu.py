@@ -202,6 +202,33 @@ def test_compute_score_happy_path_aligns_per_image_outputs(monkeypatch):
     assert knobs_seen[0]["vllm_url"] == "http://rm:8000"
 
 
+def test_rubric_backend_returns_the_judge_verdict_per_image(monkeypatch):
+    """The Mode-2a rubric's own findings/fixes ride back so ``judge_image`` can quote them."""
+    asked: list[dict] = []
+
+    def fake_judge(**kwargs):
+        asked.append(kwargs)
+        return {
+            "ok": True,
+            "correctness": 0.6,
+            "aesthetics": 0.4,
+            "good_enough": False,
+            "rubber_stamp": False,
+            "findings": "the castle has no towers",
+            "suggested_fixes": "ask for four round towers",
+            "correctness_scores": {"subject_entities": 0.6},
+            "aesthetics_scores": {"lighting": 0.4},
+        }
+
+    monkeypatch.setattr(client, "call_reflect_vlm", fake_judge)
+    result = scorer.compute_score(**_kwargs(_payload()))
+    assert asked[0]["user_request"] == "draw a castle"
+    assert asked[0]["image_prompt"] == "a castle at dusk"
+    assert [j["findings"] for j in result["sample_judge"]] == ["the castle has no towers"] * 2
+    assert result["sample_judge"][0]["correctness_scores"] == {"subject_entities": 0.6}
+    assert "sample_axes" not in result
+
+
 def test_compute_score_fails_loud_when_any_image_unscored(monkeypatch):
     def fake_judge(**kwargs):
         if kwargs["image_path"] == "/b.png":
@@ -357,6 +384,41 @@ def test_unified_reward_is_the_default_backend(monkeypatch, tmp_path):
     assert calls[0]["vllm_url"] == "http://rm:8000"
 
 
+def test_unified_reward_rubric_keeps_the_point_reward_and_takes_the_rubric_verdict(monkeypatch, tmp_path):
+    """Reward from the point score vs the user request; judge text and stop bit from the rubric."""
+    posts: list[dict] = []
+
+    def fake_post(**kwargs):
+        posts.append(kwargs)
+        return "Alignment Score: 4\nCoherence Score: 4\nStyle Score: 3\n", None
+
+    verdicts = iter(
+        [
+            {"ok": True, "correctness": 0.6, "aesthetics": 0.4, "good_enough": False, "findings": "no towers"},
+            None,
+        ]
+    )
+    monkeypatch.setattr(sys.modules["verl_omni.utils.agentic.vllm_chat"], "post_vllm_chat", fake_post)
+    monkeypatch.setattr(client, "call_reflect_vlm", lambda **kwargs: next(verdicts))
+    paths = []
+    for name in ("a", "b"):
+        path = tmp_path / f"{name}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n")
+        paths.append(str(path))
+
+    payload = _payload(image_paths=paths)
+    payload["scorer_knobs"] = {**payload["scorer_knobs"], "score_backend": "unified_reward_rubric"}
+    result = scorer.compute_score(**_kwargs(payload))
+
+    assert result["sample_scores"] == [pytest.approx(2 / 3)] * 2
+    assert "Text Caption: [draw a castle]" in posts[0]["prompt_text"]
+    assert result["sample_judge"][0]["findings"] == "no towers"
+    assert result["sample_judge"][1] is None
+    # The rubric's NO overrides the point score's YES; a failed rubric keeps the point verdict.
+    assert result["sample_good_enough"] == [False, True]
+    assert len(result["sample_axes"]) == 2
+
+
 def test_unified_good_enough_threshold_override_moves_the_stop_cue(monkeypatch, tmp_path):
     """``unified_good_enough_threshold`` is the unified knob; the same axes flip with it."""
     def fake_post(**kwargs):
@@ -455,8 +517,8 @@ def test_pickscore_backend_scores_with_its_own_cut_not_the_judge_grid(monkeypatc
 
     assert result["sample_scores"] == [pytest.approx(0.93)]
     assert result["sample_good_enough"] == [True]
-    # PickScore compares the image to the *diffusion* prompt, not the raw user request.
-    assert fake.calls[0][0] == ["a castle at dusk"]
+    # Scored against the user request: the rewritten diffusion prompt moves every pass.
+    assert fake.calls[0][0] == ["draw a castle"]
 
 
 def test_pickscore_backend_defaults_to_a_conservative_stop_cut(monkeypatch, tmp_path):

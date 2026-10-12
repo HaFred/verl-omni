@@ -178,6 +178,19 @@ def parse_rm_axes(result: Any, image_paths: list[str]) -> list[dict[str, float] 
     ]
 
 
+def parse_rm_judges(result: Any, image_paths: list[str]) -> list[dict[str, Any] | None]:
+    """Per-image rubric verdicts (``reward_extra_info["sample_judge"]``), ``None`` when absent.
+
+    Only the ``vlm_judge`` backend reports them. Like the axes they shape the judge
+    observation, not the reward, so a missing or misaligned list degrades to ``None``.
+    """
+    extra = result.get("reward_extra_info") if isinstance(result, dict) else None
+    judges = extra.get("sample_judge") if isinstance(extra, dict) else None
+    if not isinstance(judges, list | tuple) or len(judges) != len(image_paths):
+        return [None] * len(image_paths)
+    return [dict(row) if isinstance(row, dict) else None for row in judges]
+
+
 def _default_data_builder(payload: dict[str, Any], *, output_type: str = "image") -> Any:
     """Wrap the payload in the one-row ``DataProto`` the reward manager consumes.
 
@@ -294,6 +307,9 @@ def make_rm_score_fn(
         by_path = dict(zip(payload["image_paths"], scores, strict=True))
         flag_by_path = dict(zip(payload["image_paths"], flags, strict=True))
         axes_by_path = dict(zip(payload["image_paths"], parse_rm_axes(result, payload["image_paths"]), strict=True))
+        judge_by_path = dict(
+            zip(payload["image_paths"], parse_rm_judges(result, payload["image_paths"]), strict=True)
+        )
         for sample in samples:
             if not getattr(sample, "valid", False) or not getattr(sample, "image_path", None):
                 continue
@@ -304,6 +320,9 @@ def make_rm_score_fn(
             axes = axes_by_path.get(str(sample.image_path))
             if axes is not None and hasattr(sample, "rm_axes"):
                 sample.rm_axes = axes
+            judge = judge_by_path.get(str(sample.image_path))
+            if judge is not None and hasattr(sample, "rm_judge"):
+                sample.rm_judge = judge
         return samples
 
     return score
