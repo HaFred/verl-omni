@@ -13,11 +13,12 @@
 #
 # Requires: vllm-omni (>= Boogu support), the `boogu-image` package (canonical
 #   transformer for the training side; the checkpoint's transformer_boogu.py
-#   is a re-export shim), and a locally cached Boogu/Boogu-Image-0.1-Base --
-#   the tiny checkpoint is built from it below (processor/scheduler are
-#   copied verbatim). Base and Edit share the pipeline architecture, so one
-#   tiny checkpoint serves both modes. Point SOURCE_MODEL at a local
-#   directory when the base checkpoint is not in the Hugging Face cache.
+#   is a re-export shim). The tiny checkpoint is built below with
+#   processor/scheduler copied verbatim from Boogu/Boogu-Image-0.1-Base
+#   (taken from the Hugging Face cache, or downloaded on a cache miss; only
+#   those subfolders, no weights). Base and Edit share the pipeline
+#   architecture, so one tiny checkpoint serves both modes. Point SOURCE_MODEL
+#   at a local directory to skip the Hub entirely.
 set -euo pipefail
 
 # Preserve worker diagnostics, including failures before the ready pipe is sent.
