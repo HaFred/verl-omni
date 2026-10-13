@@ -266,9 +266,9 @@ def test_hermes_row_records_the_k0_signature(tmp_path, monkeypatch):
 def test_hermes_row_points_at_the_materialized_image_not_the_scratch_file(tmp_path, monkeypatch):
     """The row must name the ``rollout_images/`` copy, matching the sibling agentic lane.
 
-    The trajectory JSON records the ``/tmp`` scratch path because that is what the GEN
-    tool returned; the images are then copied into ``rollout_images/<relpath>/``. The
-    index is what a reviewer reads, so it has to name the durable copy.
+    The GEN tool returns a ``/tmp`` scratch path; the images are then copied into
+    ``rollout_images/<relpath>/``. The index is what a reviewer reads, so it has to name
+    the durable copy.
     """
     _bind_hermes(tmp_path, monkeypatch)
     scratch = tmp_path / "scratch"
@@ -417,6 +417,89 @@ def test_episode_path_produces_all_three_artifact_trees(tmp_path, monkeypatch):
     row = _hermes_rows(tmp_path, "step_000009")[0]
     assert sorted(Path(p).name for p in row["image_paths"]) == ["gen_seed0.png", "gen_seed1.png"]
     assert all((run_root / "rollout_images" / relpath / Path(p).name).is_file() for p in row["image_paths"])
+
+
+def _bind_project(tmp_path, monkeypatch):
+    """Make ``tmp_path`` the project root, with the run tree under it."""
+    _bind_hermes(tmp_path, monkeypatch)
+    monkeypatch.setattr(loop_mod, "resolve_run_dir", lambda: tmp_path)
+    monkeypatch.setenv("VERLOMNI_ROOT", str(tmp_path))
+
+
+def test_trajectory_names_the_project_relative_copy_not_the_scratch_file(tmp_path, monkeypatch):
+    """The trajectory JSON/TXT must point at the durable ``rollout_images/`` copy.
+
+    Measured 2026-10-13 on ``bagel_corl_rm1_0123_20261013_084015``: every ``gen_call`` in
+    ``rollout_trajectories/`` read ``/tmp/bagel_corl_gen/gen_*.png`` -- a host-local file
+    the next run's scratch dir can overwrite -- while the copy sat beside the trajectory.
+    """
+    _bind_project(tmp_path, monkeypatch)
+    episode = _gen_episode(tmp_path / "scratch")
+    relpath = "step_000009/sample_2.01"
+
+    dump_episode_trace(episode=episode, relpath=relpath, step=9, sample_index=2)
+    dump_episode_images(episode=episode, relpath=relpath, step=9)
+
+    payload = json.loads((tmp_path / "rollout_trajectories" / f"{relpath}.json").read_text())
+    expected = [f"rollout_images/{relpath}/gen_seed0.png", f"rollout_images/{relpath}/gen_seed1.png"]
+    assert payload["gen_calls"][0]["image_paths"] == expected
+    trace_call = next(r for r in payload["turn_trace"] if r["record"] == "gen_call")
+    assert trace_call["image_paths"] == expected
+    assert all((tmp_path / p).is_file() for p in expected), "the named copies must exist"
+    assert all("scratch" in p for p in trace_call["source_image_paths"])
+
+    text = (tmp_path / "rollout_trajectories" / f"{relpath}.txt").read_text()
+    assert f"image: rollout_images/{relpath}/gen_seed0.png" in text
+    image_lines = [line for line in text.splitlines() if line.strip().startswith("image:")]
+    assert len(image_lines) == 2 and not any("scratch" in line for line in image_lines)
+    # Observation text is what the policy was conditioned on, so it stays verbatim.
+    obs = next(r for r in payload["turn_trace"] if r["record"] == "env_obs")
+    assert "scratch" in obs["text"]
+    # The episode itself keeps the scratch paths: the GEN lane still reads those files.
+    live = next(r for r in episode.turn_trace if r["record"] == "gen_call")
+    assert all("scratch" in p for p in live["image_paths"])
+
+
+def test_hermes_row_and_meta_are_project_relative(tmp_path, monkeypatch):
+    _bind_project(tmp_path, monkeypatch)
+    episode = _gen_episode(tmp_path / "scratch")
+    relpath = "step_000009/sample_2.01"
+
+    dump_episode_hermes_action(episode=episode, relpath=relpath, step=9, sample_index=2)
+    dump_episode_images(episode=episode, relpath=relpath, step=9)
+
+    row = _hermes_rows(tmp_path, "step_000009")[0]
+    assert row["image_dir"] == f"rollout_images/{relpath}"
+    assert row["image_paths"] == [f"rollout_images/{relpath}/gen_seed{i}.png" for i in range(2)]
+    meta = json.loads((tmp_path / "rollout_images" / relpath / "meta.json").read_text())
+    assert meta["image_paths"] == row["image_paths"]
+
+
+def test_validation_paths_follow_the_val_prefix_the_images_are_copied_under(tmp_path, monkeypatch):
+    """Validation PNGs land under ``rollout_images/val/<relpath>/``, so every record must say so."""
+    _bind_project(tmp_path, monkeypatch)
+    episode = _gen_episode(tmp_path / "scratch")
+    relpath = "step_000030/sample_5.01"
+    image_relpath = f"val/{relpath}"
+
+    dump_episode_trace(episode=episode, relpath=relpath, step=30, image_relpath=image_relpath)
+    dump_episode_hermes_action(episode=episode, relpath=relpath, step=30, image_relpath=image_relpath)
+    dump_episode_images(episode=episode, relpath=image_relpath, step=30)
+
+    payload = json.loads((tmp_path / "rollout_trajectories" / f"{relpath}.json").read_text())
+    row = _hermes_rows(tmp_path, "step_000030")[0]
+    for paths in (payload["gen_calls"][0]["image_paths"], row["image_paths"]):
+        assert all(p.startswith(f"rollout_images/{image_relpath}/") for p in paths)
+        assert all((tmp_path / p).is_file() for p in paths)
+
+
+def test_project_relpath_keeps_paths_outside_the_project_absolute(tmp_path, monkeypatch):
+    from verl_omni.tools.trajectory.paths import project_relpath
+
+    monkeypatch.setenv("VERLOMNI_ROOT", str(tmp_path / "repo"))
+
+    assert project_relpath(tmp_path / "repo" / "outputs" / "a.png") == "outputs/a.png"
+    assert project_relpath("/tmp/bagel_corl_gen/x.png") == "/tmp/bagel_corl_gen/x.png"
 
 
 def test_episode_image_dump_is_a_noop_for_a_k0_episode(tmp_path, monkeypatch):

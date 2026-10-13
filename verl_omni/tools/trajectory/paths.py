@@ -29,6 +29,8 @@ __all__ = [
     "build_artifact_id",
     "build_trajectory_relpath",
     "clear_run_artifacts",
+    "project_relpath",
+    "project_root",
     "resolve_rollout_images_root",
     "run_name",
     "resolve_run_dir",
@@ -43,17 +45,46 @@ _diffusion_image_dir: Path | None = None
 _run_dir_override: Path | None = None
 
 
+def project_root() -> Path:
+    """Return the verl-omni checkout root (honours ``VERLOMNI_ROOT`` when set).
+
+    Returns:
+        Absolute repo root.
+    """
+    verlomni = os.getenv("VERLOMNI_ROOT", "").strip()
+    if verlomni:
+        return Path(verlomni).expanduser().resolve()
+    # <repo>/verl_omni/tools/trajectory/this_file.py → parents[3] == repo root
+    return Path(__file__).resolve().parents[3]
+
+
+def project_relpath(path: str | Path) -> str:
+    """Render ``path`` relative to the project root for artifact records.
+
+    Artifacts written under the checkout (``outputs/<run>/...``) stay valid after the
+    checkout moves or is reviewed on another host. A path outside the checkout has no
+    project-relative form, so it is returned absolute rather than as a ``../`` chain.
+
+    Args:
+        path: File or directory path.
+
+    Returns:
+        POSIX path relative to ``project_root()``, or the absolute path when outside it.
+    """
+    resolved = Path(path).expanduser().resolve()
+    try:
+        return resolved.relative_to(project_root()).as_posix()
+    except ValueError:
+        return str(resolved)
+
+
 def default_e2e_root() -> Path:
     """Return the default e2e artifact root.
 
     Returns:
         Absolute ``outputs/e2e`` path (honours ``VERLOMNI_ROOT`` when set).
     """
-    verlomni = os.getenv("VERLOMNI_ROOT", "").strip()
-    if verlomni:
-        return Path(verlomni).expanduser().resolve() / "outputs" / "e2e"
-    # <repo>/verl_omni/tools/trajectory/this_file.py → parents[3] == repo root
-    return Path(__file__).resolve().parents[3] / "outputs" / "e2e"
+    return project_root() / "outputs" / "e2e"
 
 
 def clear_run_artifacts() -> None:
