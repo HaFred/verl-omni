@@ -108,6 +108,9 @@ from the pool size and read back before launch, so they cannot drift apart.
 | `MAX_UND_TURNS` | `8` | Episode UND turn cap, in practice bounded by `2 x MAX_PROMPT_LEN`. |
 | `REBUILD_UNICOT` | `1` | Rebuild train/val parquet before launch. |
 | `ROLLOUT_TEMPERATURE` / `ROLLOUT_TOP_P` / `ROLLOUT_TOP_K` / `ROLLOUT_REPETITION_PENALTY` | `0.7` / `0.9` / `50` / `1.05` | UND AR sampling, mirroring `bagel_corl_deploy_ar.yaml`. The agent loop sends all four explicitly, so leaving them unset overrides the deploy defaults. |
+| `NORM_ADV_BY_STD` | `False` | Dr.GRPO: the advantage is the raw centred reward, so the update scales with the signal instead of the group std (at `N=2`, std division makes every gap a fixed-amplitude push). Read on both lanes. |
+| `LR_WARMUP_RATIO` / `LR_SCHEDULER` / `MIN_LR_RATIO` | `0.05` / `cosine` / `0.1` | Actor LR schedule: 5% warmup, then cosine decay to 10% of the `1e-4` peak, so the late steps move ~10x less. |
+| `VAL_MAX_SAMPLES` | `8` | Caps the V1 val pass (`val_max_samples` defaults to `-1`, i.e. the whole val set). Raise it before reading a binary dim: one episode moves `reward_done` by ~0.17. |
 | `RUN_TS` / `RUN_NAME` / `RUN_DIR` | `date +%Y%m%d_%H%M%S` / `bagel_corl_$RUN_TS` / `outputs/$RUN_NAME` | Hydra run dir (`hydra.run.dir`), holding `.hydra/` and `main_omni.log`. Hydra refuses an existing dir, so pass the original stamp or point `RUN_DIR` at it. |
 | `DEFAULT_LOCAL_DIR` | unset | Checkpoint dir; unset shares `checkpoints/${project_name}/${experiment_name}` across runs. |
 | `BAGEL_CORL_TRACE_DUMP` | `1` | Per-episode trajectory dump under `<e2e_root>/<experiment_name>/rollout_trajectories/step_XXXXXX/`. `0` opts out. |
@@ -117,6 +120,30 @@ Training-side knobs (in the launch command): `actor.optim.lr` (UND),
 (`flow_grpo`, or `grpo_guard` for GRPO-Guard ratio normalization) and `gen_regularizer`
 (`latent_kl`). CFG is off in training (`cfg_text_scale=1.0`); re-enable for eval only via
 val kwargs.
+
+## Reward dimensions and divergence
+
+The episode scalar is the weighted composite from `agentic_multidim_reward`:
+`reflect`, `plan`, `format`, `tool`, `result`, plus the three dims that carry the judge's
+magnitude and the episode's closure. All three publish as metrics, so a flat value is
+visible in the validation row rather than inferred from the scalar:
+
+- `reward_image` (weight 3.0) — the final trusted C/A verdict plus the capped rewrite gain,
+  `min(1, max(0, final - first))`. It is the only dim with a continuous, task-specific
+  magnitude, so it is weighted above the protocol dims rather than averaged with them.
+- `reward_protocol` (1.0) — "nothing silently failed": every call block parsed, no
+  `agentic_judge ok=0`, no hard block. Deliberately disjoint from `R_format`, which only
+  checks that the trajectory has the right *shape*.
+- `reward_done` (1.0) — the episode closed on a terminal verdict **and** a stop cue. Two
+  Bagel-dialect details are load-bearing: the harness appends its stop cue to the verdict's
+  *own line* (`... good_enough=YES. <prose> agentic_stop_decision_required=1`), and the
+  checkpoint answers the forced reflection with `{"name": "Done"}`, not prose `Done.`.
+
+`bagel_corl/divergence_warning` (plus a WARNING log, once per excursion) is raised by
+`OmniBagelCoRLTrainerSync._divergence_tripwire` when `rollout_corr/kl` exceeds 20,
+`actor/grad_norm` exceeds 100, or a reading is `nan`. Both limits are an order of magnitude
+above any healthy run measured to date and below the readings that made a collapsing run
+unrecoverable; `BAGEL_CORL_DIVERGENCE_ABORT=1` makes the step fatal instead of warning.
 
 ## GEN conditioning reuse
 

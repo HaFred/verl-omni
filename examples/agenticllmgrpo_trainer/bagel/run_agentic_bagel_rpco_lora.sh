@@ -341,7 +341,27 @@ fi
 
 # data.val_batch_size only sets the batch; the V1 val path still iterates the whole val set
 # (val_max_samples defaults to -1), so cap it — raise or set -1 to test validation itself.
+# 8 samples cannot resolve a binary dim either: one episode moves it by ~0.17, so a val
+# pass that wants to trend ``reward_done`` needs the prompt count raised, not the batch.
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-8}
+
+# Advantage normalization. ``False`` is Dr.GRPO (arXiv:2503.20783): the advantage is the raw
+# centred reward, so the update scales with the actual signal and a near-tie is nearly a
+# no-op. Stock GRPO divides by the group std, which is *gap-independent* — at N=2 every gap
+# becomes +/-1/sqrt(2), i.e. a full-amplitude push on a coin flip. Read on both lanes: UND
+# token GRPO (``compute_advantage_for_multi_trajectories``) and GEN FlowGRPO
+# (``apply_gen_flowgrpo_advantage``).
+NORM_ADV_BY_STD=${NORM_ADV_BY_STD:-False}
+
+# Actor (UND) LR schedule. This recipe ran ``optim.lr=1e-4`` *constant* for the whole
+# budget (``lr_warmup_steps_ratio=0.0``, ``lr_scheduler_type=constant``): peak LR at step 0
+# and still peak at the last step, with no warmup to survive the first off-policy batches.
+# Warm up over the first 5% and cosine-decay to 10% of the peak, so the late steps — where a
+# bad update is unrecoverable — move ~10x less. ``trainer.total_training_steps`` reaches
+# ``actor.optim.total_training_steps``, so the schedule is anchored to the real step budget.
+LR_WARMUP_RATIO=${LR_WARMUP_RATIO:-0.05}
+LR_SCHEDULER=${LR_SCHEDULER:-cosine}
+MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
 
 # Smoke defaults: N = sibling episodes (>=2 required for GEN training), S = seeds per call
 # (default 1). Do not let a stale J/K from the shell leak in.
@@ -421,6 +441,7 @@ export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
     agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.62} \
     agentic_image_gen.pickscore_good_enough_threshold=$PICKSCORE_GOOD_ENOUGH_THRESHOLD \
     trainer.v1.trainer_mode=bagel_corl_sync \
+    algorithm.norm_adv_by_std_in_grpo=$NORM_ADV_BY_STD \
     trainer.v1.sampler.sync_refill_failed_groups=${SYNC_REFILL_FAILED_GROUPS:-True} \
     data.train_files=$TRAIN_FILE \
     data.val_files=$VAL_FILE \
@@ -443,6 +464,9 @@ export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
     actor_rollout_ref.model.target_modules="['q_proj','k_proj','v_proj','o_proj','mlp.gate_proj','mlp.up_proj','mlp.down_proj','q_proj_moe_gen','k_proj_moe_gen','v_proj_moe_gen','o_proj_moe_gen','mlp_moe_gen.gate_proj','mlp_moe_gen.up_proj','mlp_moe_gen.down_proj']" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['layers.']" \
     actor_rollout_ref.actor.optim.lr=1e-4 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=$LR_WARMUP_RATIO \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=$LR_SCHEDULER \
+    actor_rollout_ref.actor.optim.min_lr_ratio=$MIN_LR_RATIO \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO \
     actor_rollout_ref.actor.strategy=fsdp2 \

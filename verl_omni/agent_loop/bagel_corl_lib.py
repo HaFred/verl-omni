@@ -1697,9 +1697,9 @@ async def run_serial_episode(
         forced = True
         _ = forced_reflection_text
 
-    image_scores = [float(s.rm_score) for s in gen_samples if s.valid and s.rm_score is not None]
-    if image_scores:
-        und_reward = float(np.mean(image_scores))
+    image_credit = image_credit_reward(gen_samples)
+    if image_credit is not None:
+        und_reward = image_credit
     elif non_image_reward is not None:
         # Pattern 3 (K=0): use the non-image UND scalar (RFC und/no_image_credit),
         # never a hard-coded 0 that would zero out token GRPO signal.
@@ -1760,21 +1760,66 @@ class FlattenResult:
     metrics: dict[str, float]
 
 
+def image_credit_reward(samples: list[GenSample]) -> float | None:
+    """RFC ``und/no_image_credit`` image credit: the **final** pass plus the rewrite gain.
+
+    Replaces the mean over *every* rated seed, which diluted a successful rewrite until the
+    UND token-GRPO signal could not tell it apart from two mediocre passes: an episode that
+    went ``0.2 -> 0.8`` across two ``generate_image`` calls scored ``0.5``, the same as
+    ``0.4 -> 0.6``. The image the user is finally shown is the *last* call's, so that call is
+    what is scored, plus ``max(0, final - first)`` (capped at 1) for the gain the rewrite
+    bought. One call is scored on its own quality -- it is never penalised for having no
+    rewrite to improve on -- and a rewrite that made the image worse keeps only its lower
+    final quality.
+
+    Seeds of a single call are still averaged. With ``S >= 2`` they are one prompt at
+    different noise, so no seed is "final" and the mean *is* that call's quality; ordering
+    calls by ``gen_group_uid`` first appearance reproduces the order the loop made them in.
+
+    The bonus is capped at 1, the *total* is not: a good rewrite is the one thing this lane
+    exists to reward, and clamping the sum would make two siblings that both improved
+    saturate to the same number, i.e. exactly the zero-advantage group the reward is meant to
+    avoid. ``rm_score`` is not guaranteed to be in ``[0, 1]`` either (``pickscore`` divides a
+    raw model score), so only the bonus has a defensible bound.
+
+    Returns ``None`` when no seed was rated, so the caller can fall back to the non-image
+    UND scalar (pattern 3, ``K = 0``). The composite trajectory scorer's parse-level terms
+    (``R_protocol`` / ``R_done`` / ``R_image`` in ``agentic_multidim_reward``) are *not*
+    available on this lane: it scores pixels mid-loop and never decodes the episode to text.
+
+    Both reward consumers call this (``run_serial_episode`` for the episode field,
+    ``episode_und_reward`` for the TQ and flatten rows), so the rule cannot drift.
+    """
+    ordered: dict[str, list[float]] = {}
+    for sample in samples or []:
+        score = sample.rm_score
+        if not sample.valid or score is None:
+            continue
+        ordered.setdefault(str(sample.gen_group_uid), []).append(float(score))
+    if not ordered:
+        return None
+    calls = [float(np.mean(scores)) for scores in ordered.values()]
+    final = calls[-1]
+    improvement = max(0.0, final - calls[0]) if len(calls) > 1 else 0.0
+    return float(final + min(1.0, improvement))
+
+
 def episode_und_reward(episode: EpisodeRollout) -> tuple[float, bool]:
     """RFC ``und/no_image_credit``: the episode reward carried on the UND row.
 
-    Returns ``(reward, used_non_image_scalar)``. The reward is the mean of the *rated* GEN seeds
-    (``valid`` and ``rm_score`` set) when the RM scored images, else the non-image UND scalar the
-    loop recorded -- pattern 3 (K=0) episodes must not have their token-GRPO signal zeroed.
+    Returns ``(reward, used_non_image_scalar)``. The reward is ``image_credit_reward`` over the
+    episode's *rated* GEN seeds -- final call quality plus the rewrite gain -- when the RM
+    scored images, else the non-image UND scalar the loop recorded (pattern 3, ``K = 0``
+    episodes must not have their token-GRPO signal zeroed).
 
     This is the single source of truth for both reward consumers: the TQ row the v1 advantage
     reads (``bagel_corl_tq.und_row_reward``) and the flatten row
     (``flatten_multiturn_rollouts``' ``token_level_scores``). Keeping them on one derivation is
     what stops UND and GEN from training against different numbers for the same episode.
     """
-    image_scores = [float(s.rm_score) for s in episode.gen_samples if s.valid and s.rm_score is not None]
-    if image_scores:
-        return float(np.mean(image_scores)), False
+    image_credit = image_credit_reward(episode.gen_samples)
+    if image_credit is not None:
+        return image_credit, False
     return float(episode.und_reward), True
 
 

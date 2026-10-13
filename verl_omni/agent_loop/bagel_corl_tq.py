@@ -346,9 +346,9 @@ def und_row_reward(episode: EpisodeRollout, response_mask: Any) -> torch.Tensor:
       ``bagel_corl_lib.und_episode_rm_scores`` for why ``as_dict``'s ``[-1]`` is wrong here).
 
     With the served RM disabled (``ENABLE_RM=0`` in the recipe, until Hermes + composite step are
-    green) the reward is the RFC ``und/no_image_credit`` scalar: the mean of the valid GEN seeds'
-    RM scores when the RM ran, else the non-image UND scalar -- exactly the value
-    ``flatten_multiturn_rollouts`` writes to ``token_level_scores``.
+    green) the reward is the RFC ``und/no_image_credit`` scalar: the final rated
+    ``generate_image`` call plus the rewrite gain when the RM ran, else the non-image UND
+    scalar -- exactly the value ``flatten_multiturn_rollouts`` writes to ``token_level_scores``.
     """
     reward, _ = episode_und_reward(episode)
     return torch.tensor(und_episode_rm_scores(response_mask, reward), dtype=torch.float32)
