@@ -29,6 +29,7 @@ from verl_omni.tools.trajectory import (
     resolve_rollout_images_root,
     resolve_run_dir,
 )
+from verl_omni.tools.trajectory.paths import project_relpath
 from verl_omni.utils.agentic.image_gen_rollout_parse import (
     extract_generate_image_prompts,
     last_user_prompt,
@@ -556,7 +557,7 @@ def dump_bagel_corl_episode_images(
                     # Per-episode: ``written`` accumulates across episodes, so using
                     # it here listed every earlier episode's images in each folder's
                     # meta.json.
-                    "image_paths": ep_written,
+                    "image_paths": [project_relpath(p) for p in ep_written],
                     "source": "bagel_corl_gen_samples",
                 }
             )

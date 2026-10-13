@@ -63,7 +63,12 @@ from verl_omni.tools.trajectory.context import (
     set_active_user_prompt,
 )
 from verl_omni.tools.trajectory.hydra_env import agentic_get, agentic_scorer_knobs_from_config
-from verl_omni.tools.trajectory.paths import build_trajectory_relpath, resolve_rollout_images_root, resolve_run_dir
+from verl_omni.tools.trajectory.paths import (
+    build_trajectory_relpath,
+    project_relpath,
+    resolve_rollout_images_root,
+    resolve_run_dir,
+)
 from verl_omni.utils.agentic.image_gen_rollout_parse import last_user_prompt
 
 logger = logging.getLogger(__name__)
@@ -237,6 +242,35 @@ def _trace_dump_enabled() -> bool:
     return os.getenv("BAGEL_CORL_TRACE_DUMP", "1") not in ("0", "false", "False", "")
 
 
+def materialized_image_path(source: Any, image_relpath: str) -> str:
+    """Name the ``rollout_images/<image_relpath>/`` copy of a GEN scratch PNG.
+
+    ``dump_episode_images`` copies each scratch file to that folder under its own basename,
+    so the destination is a pure function of the two and can be named before the copy runs.
+    Rendered project-relative so the record stays valid when the checkout moves.
+    """
+    return project_relpath(resolve_rollout_images_root() / image_relpath / Path(str(source)).name)
+
+
+def _materialized_turn_trace(turn_trace: list[dict[str, Any]], image_relpath: str) -> list[dict[str, Any]]:
+    """Copy ``turn_trace`` with each ``gen_call`` naming the materialized images.
+
+    The scratch locations move to ``source_image_paths`` for provenance. The episode's own
+    records are left untouched: the GEN lane still reads the scratch files.
+    """
+    out = []
+    for record in turn_trace:
+        if record.get("record") == "gen_call":
+            sources = list(record.get("image_paths") or [])
+            record = {
+                **record,
+                "image_paths": [materialized_image_path(p, image_relpath) for p in sources],
+                "source_image_paths": sources,
+            }
+        out.append(record)
+    return out
+
+
 def dump_episode_trace(
     *,
     episode: EpisodeRollout,
@@ -246,6 +280,7 @@ def dump_episode_trace(
     user_prompt: str = "",
     prompt_ids: list[int] | None = None,
     tokenizer: Any | None = None,
+    image_relpath: str | None = None,
 ) -> str | None:
     """Write one finished Co-RL episode to ``rollout_trajectories/<relpath>``.
 
@@ -258,6 +293,10 @@ def dump_episode_trace(
     flat 0. Nothing downstream records *why*, because the reason lives in the raw UND text
     of each turn. That text is kept here verbatim.
 
+    ``gen_call`` image paths name the project-relative ``rollout_images/<image_relpath>/``
+    copies (``image_relpath`` defaults to ``relpath``; validation passes its ``val/`` form),
+    with the scratch files kept as ``source_image_paths``.
+
     Never raises: a diagnostics write must not be able to fail a rollout that the trainer
     otherwise could have used.
     """
@@ -269,8 +308,9 @@ def dump_episode_trace(
         trajectory_dir = resolve_run_dir() / "rollout_trajectories" / step_dir
         trajectory_dir.mkdir(parents=True, exist_ok=True)
 
-        turns = [r for r in episode.turn_trace if r.get("record") == "und_turn"]
-        gen_calls = [r for r in episode.turn_trace if r.get("record") == "gen_call"]
+        turn_trace = _materialized_turn_trace(episode.turn_trace, image_relpath or relpath)
+        turns = [r for r in turn_trace if r.get("record") == "und_turn"]
+        gen_calls = [r for r in turn_trace if r.get("record") == "gen_call"]
         kind_counts: dict[str, int] = {}
         for record in turns:
             key = str(record.get("kind"))
@@ -309,7 +349,7 @@ def dump_episode_trace(
             "turn_kind_counts": kind_counts,
             "degenerate_und_turns": degenerate_und_turns,
             "gen_calls": gen_calls,
-            "turn_trace": episode.turn_trace,
+            "turn_trace": turn_trace,
         }
         (trajectory_dir / f"{name}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
 
@@ -323,7 +363,7 @@ def dump_episode_trace(
             f"user_prompt: {user_prompt}",
             "assistant_rollout:",
         ]
-        for record in episode.turn_trace:
+        for record in turn_trace:
             if record.get("record") == "gen_call":
                 lines.extend(
                     [
@@ -360,6 +400,7 @@ def dump_episode_hermes_action(
     step: Any = None,
     sample_index: Any = None,
     user_prompt: str = "",
+    image_relpath: str | None = None,
 ) -> str | None:
     """Append one compact action row to ``hermes_actions/step_XXXXXX.jsonl``.
 
@@ -374,10 +415,10 @@ def dump_episode_hermes_action(
     ``BagelCorlAgentLoopWorkerTQ``, which does not inherit that worker.
 
     ``image_paths`` records the **materialized** destinations under
-    ``<rollout_images_root>/<relpath>/``, not the ``/tmp`` scratch files: the copy is
-    performed by ``dump_bagel_corl_episode_images`` and the destination is a pure
-    function of ``relpath`` + basename, so it can be named here without racing the
-    copy. ``source_image_paths`` keeps the scratch location.
+    ``<rollout_images_root>/<image_relpath>/`` (project-relative), not the ``/tmp`` scratch
+    files: the copy is performed by ``dump_bagel_corl_episode_images`` and the destination
+    is a pure function of ``image_relpath`` + basename, so it can be named here without
+    racing the copy. ``source_image_paths`` keeps the scratch location for provenance.
 
     Appends with a single ``os.write`` on an ``O_APPEND`` fd. Episodes are dumped from
     several agent-loop workers into one per-step file, and O_APPEND makes a single
@@ -400,13 +441,13 @@ def dump_episode_hermes_action(
                 kind = str(record.get("kind"))
                 kind_counts[kind] = kind_counts.get(kind, 0) + 1
 
+        image_relpath = image_relpath or relpath
         source_paths = [p for call in gen_calls for p in (call.get("image_paths") or [])]
-        image_dir = resolve_rollout_images_root() / relpath
-        image_paths = [str(image_dir / Path(str(p)).name) for p in source_paths]
+        image_paths = [materialized_image_path(p, image_relpath) for p in source_paths]
 
         row = {
             "trajectory_relpath": relpath,
-            "image_dir": str(image_dir),
+            "image_dir": project_relpath(resolve_rollout_images_root() / image_relpath),
             "step": step,
             "sample_index": sample_index,
             "episode_uid": episode.episode_uid,
@@ -427,7 +468,7 @@ def dump_episode_hermes_action(
                     "prompt": call.get("prompt"),
                     "num_samples": call.get("num_samples"),
                     "num_valid": call.get("num_valid"),
-                    "image_paths": [str(image_dir / Path(str(p)).name) for p in (call.get("image_paths") or [])],
+                    "image_paths": [materialized_image_path(p, image_relpath) for p in (call.get("image_paths") or [])],
                 }
                 for call in gen_calls
             ],
@@ -840,6 +881,9 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         # ``BAGEL_CORL_DEBUG`` -- reaches disk without being routed through the training
         # row's ``extra_fields``. K=0 episodes are the point: they write no GEN keys and no
         # images, so this file is the only artifact describing what the UND lane emitted.
+        # Validation episodes land under ``val/`` so the deterministic ODE reference is never
+        # merged with the stochastic training rollout -- see ``validation_artifact_relpath``.
+        image_relpath = validation_artifact_relpath(relpath, getattr(self, "_sampling_params", None))
         episode.trace_dump_path = dump_episode_trace(
             episode=episode,
             relpath=relpath,
@@ -848,6 +892,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             user_prompt=user_prompt_text,
             prompt_ids=list(prompt_ids),
             tokenizer=self.tokenizer,
+            image_relpath=image_relpath,
         )
         # Action-level index beside the trajectory (and the PNGs the image dumper copies
         # under the same ``relpath``). Written from the episode because the bagel TQ
@@ -859,17 +904,11 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             step=global_steps,
             sample_index=session_id,
             user_prompt=user_prompt_text,
+            image_relpath=image_relpath,
         )
         # Same reason: copy the GEN PNGs out of the scratch dir into the run's
-        # ``rollout_images`` tree, next to this episode's trajectory. Validation
-        # episodes land under ``val/`` so the deterministic ODE reference is never
-        # merged with the stochastic training rollout -- see
-        # ``validation_artifact_relpath``.
-        dump_episode_images(
-            episode=episode,
-            relpath=validation_artifact_relpath(relpath, getattr(self, "_sampling_params", None)),
-            step=global_steps,
-        )
+        # ``rollout_images`` tree, next to this episode's trajectory.
+        dump_episode_images(episode=episode, relpath=image_relpath, step=global_steps)
         # RFC §4.4.4 R2: engine-measured conditioning reuse for this episode. Empty
         # whenever the engine exposed no counters, so nothing is fabricated.
         r2 = getattr(self, "_bagel_r2", None) or {}
