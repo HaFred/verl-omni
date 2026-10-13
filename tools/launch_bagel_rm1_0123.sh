@@ -12,6 +12,44 @@
 #   UND  strip_reflection_tail() -- the checkpoint appended its in-turn
 #        "Short reflection: ..." text to the diffusion prompt
 #
+# N=4 siblings per task (recipe default is 2). The 2026-10-12 `_084724` run at N=2 could not
+# converge: with two episodes in the token-GRPO group the normalized advantage is a constant
+# +-1/sqrt(2) at every step (`critic/advantages/{min,max}` = -/+0.7071), so the *magnitude* of
+# a better episode carried no gradient -- only its sign. Four siblings make the advantages
+# graded. `episode_und_reward` was also rewritten (2026-10-13) from the mean of every rated
+# image to the final call plus the rewrite gain, so a successful prompt rewrite is no longer
+# diluted by the bad image it replaced.
+#
+# Three more fixes (2026-10-13) close the drift that killed `_084724` after step ~47, where
+# `actor/grad_norm` ran 0.32 -> 310 and `rollout_corr/kl` 0.03 -> 175 with `actor/entropy`
+# collapsing to 0.02:
+#   * NORM_ADV_BY_STD=False -- stock GRPO's std division is *gap-independent* (any N=2 gap
+#     gives +/-0.7071), i.e. a full-amplitude push on a coin flip every step. Raw centred
+#     advantage (Dr.GRPO) scales with the real reward gap instead. Recipe §6.
+#   * LR_WARMUP_RATIO / LR_SCHEDULER / MIN_LR_RATIO -- the actor ran `lr=1e-4` constant for
+#     all 200 steps with no warmup; now 5% warmup + cosine decay to 10% of peak.
+#   * Divergence tripwire (`OmniBagelCoRLTrainerSync._divergence_tripwire`) -- fails loud/
+#     warns the step `rollout_corr/kl` > 20 or `actor/grad_norm` > 100 instead of silently
+#     burning the remaining budget. Set `BAGEL_CORL_DIVERGENCE_ABORT=1` to make it fatal.
+#
+# Reward-scorer fix (2026-10-13), from `_024557` step 30 -- `reward_done` was pinned to 0.0 on
+# all 450 val rows while `terminal_done` read 0.75. Two defects in `_terminal_decision`:
+#   * the harness appends its stop cue to the *verdict's own line*, and the cue loop floored on
+#     `line_end + 1`, so the cue was always discarded and `forced_context` never became True;
+#     `closed` needs `(policy_reflection or forced_context)`, so the dim was unreachable.
+#   * `build_forced_reflection` says the next action "must be exactly Done.", but the
+#     checkpoint answers in its tool grammar with `{"name": "Done"}` glued to the cue; only
+#     prose `Done.` was accepted, so those 48/260 terminations scored as never terminating,
+#     also zeroing `reward_result` and docking `reward_format` (0.4 vs 0.8).
+# Rescoring one such episode: composite 0.550 -> 0.706. Tests:
+# tests/utils/reward_score/test_agentic_multidim_reward_on_cpu.py::test_bagel_*.
+#
+# VAL_MAX_SAMPLES=32 here (recipe default 8 is sized for plumbing runs). `_051218` was stopped at
+# step 60 because 8 val prompts could not resolve the effect being measured: one episode moves a
+# binary dim (`reward_done`, `terminal_done`) by ~0.17, while `val-core` only moved
+# 0.835 -> 0.814 -> 0.837 over steps 0/30/60. 32 prompts cut that granularity to ~0.03 at ~4x the
+# per-pass val cost (every TEST_FREQ=30 steps).
+#
 # Logging: console + remote wandb. The WANDB_* credentials are read from WANDB_ENV_FILE
 # (only the WANDB_* exports -- sourcing the whole operator env would clobber the
 # recipe's state). The full console log is saved as logs/<run_name>.console.log, with a
@@ -39,6 +77,9 @@ WANDB_ENV_FILE="${WANDB_ENV_FILE:-/home/fq9hpsac/fq9hpsacuser11/fred/fred_verlom
 TS="$(date +%Y%m%d_%H%M%S)"
 RUN_NAME="bagel_corl_rm1_0123_${TS}"
 RUN_DIR="$REPO/outputs/$RUN_NAME"
+# Sibling episodes per task. 4 (>2) so the token-GRPO group has a graded advantage; see the
+# header. `N=2` left `critic/advantages` pinned at +-1/sqrt(2) on the 2026-10-12 `_084724` run.
+N="${N:-4}"
 # Not under $RUN_DIR: the recipe keeps that dir for Hydra to create.
 LOG="$REPO/logs/${RUN_NAME}.console.log"
 mkdir -p "$WD" "$REPO/logs"
@@ -63,9 +104,11 @@ cd "$REPO" || exit 1
 
 setsid nohup env \
   CUDA_VISIBLE_DEVICES="${BAGEL_DEVICES:-0,1,2,3}" \
+  N="$N" \
   ENABLE_RM="${ENABLE_RM:-1}" \
   ENABLE_PEC="${ENABLE_PEC:-0}" \
   TOTAL_STEPS="${TOTAL_STEPS:-200}" \
+  VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-32}" \
   RUN_TS="$TS" \
   RUN_NAME="$RUN_NAME" \
   RUN_DIR="$RUN_DIR" \

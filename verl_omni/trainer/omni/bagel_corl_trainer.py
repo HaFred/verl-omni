@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import fields
 from typing import Any
@@ -208,6 +209,41 @@ def _index_column(col, i: int):
     if isinstance(value, NonTensorData):
         return value.data
     return value
+
+
+def _metric_scalar(metrics: dict, key: str) -> float | None:
+    """Read ``metrics[key]`` as a float, or ``None`` when it is absent/not scalar.
+
+    The step ``metrics`` dict is heterogeneous by construction: the engine layer writes
+    plain floats (``actor/grad_norm`` via ``engine_workers.py:212``), ``rollout_corr/*``
+    arrives as ``float`` from ``compute_rollout_correction_and_add_to_batch``, and the
+    composite loss writes ``verl.utils.metric.Metric`` objects (which carry ``.values``,
+    not ``.value``). A tripwire that assumed one of the three would silently read
+    ``None`` on the run it exists to catch, so unwrap all of them.
+    """
+    value = metrics.get(key)
+    if value is None:
+        return None
+    aggregate = getattr(value, "aggregate", None)
+    if callable(aggregate):
+        try:
+            value = aggregate()
+        except (TypeError, ValueError):
+            return None
+    if hasattr(value, "numel") and hasattr(value, "item"):
+        # Duck-typed rather than ``isinstance(value, torch.Tensor)``: this module does not
+        # import torch (it is a Trainer, not a worker), and a scalar tensor would otherwise
+        # raise out of ``float(...)`` below.
+        try:
+            if value.numel() != 1:
+                return None
+            value = value.item()
+        except (RuntimeError, TypeError, ValueError):
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _actor_merges_lora(model) -> bool:
@@ -1044,7 +1080,86 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             metrics.get("episode/K"),
             metrics.get("episode/K_zero"),
         )
-        return super()._update_actor(batch, metrics)
+        updated = super()._update_actor(batch, metrics)
+        # ``metrics`` now carries ``actor/*`` (renamed by ``trainer_base._update_actor``)
+        # alongside this step's ``rollout_corr/*``. See ``_divergence_tripwire``.
+        self._divergence_tripwire(metrics)
+        return updated
+
+    #: Runaway-policy tripwire thresholds (see ``_divergence_tripwire``).
+    #:
+    #: Both sit an order of magnitude above anything a healthy run reaches and below the
+    #: readings that made the ``_084724`` collapse unrecoverable. Measured across the
+    #: 20261012 device-0-3 runs: every run that stopped before step 47 held
+    #: ``rollout_corr/kl`` < 0.7 and ``actor/grad_norm`` < 2.3, while
+    #: ``bagel_corl_rm1_0123_20261012_084724`` reached kl 9.3 / grad_norm 3.4 by step 51,
+    #: 92 / 156 by step 90, and 175 / 310 by step 200 without anything in the logs saying
+    #: so. ``rollout_corr/kl`` is the diagnostic the collapse shows in first.
+    DIVERGENCE_KL_LIMIT = 20.0
+    DIVERGENCE_GRAD_NORM_LIMIT = 100.0
+
+    def _divergence_tripwire(self, metrics: dict) -> None:
+        """Warn -- or abort -- the step the actor leaves its trust region.
+
+        ``bagel_corl_rm1_0123_20261012_084724`` (devices 0-3) spent its last ~150 steps
+        producing an unusable policy and said nothing: ``actor/grad_norm`` 0.32 -> 310 and
+        ``rollout_corr/kl`` 0.03 -> 175 while ``actor/entropy`` fell to 0.02 and
+        ``rollout_corr/training_ppl`` overflowed to ``inf`` (the training forward assigning
+        ~``e^-65`` to tokens the rollout engine sampled at p~0.92). Neither number is
+        trended anywhere, so the only way to notice was to read the run afterwards.
+
+        This recipe has no KL anchor (``use_kl_loss=false``) and no entropy bonus
+        (``entropy_coeff=0``), so a step that has already left the region cannot come back
+        on its own -- the point of the tripwire is to make that visible on the step it
+        happens rather than after the budget is spent. Default is a loud WARNING plus
+        ``bagel_corl/divergence_warning`` in the metrics; set
+        ``BAGEL_CORL_DIVERGENCE_ABORT=1`` to fail the run instead (a checkpoint this far out
+        of the region is not a usable starting point for a restart).
+
+        Called after ``super()._update_actor``, so both keys are already on ``metrics``:
+        ``actor/grad_norm`` is the *pre-clip* norm the engine reports, and
+        ``rollout_corr/kl`` is the rollout-vs-training log-prob gap computed once per step
+        from the same batch. Both are per-step diagnostics, so the thresholds are exact
+        rather than a heuristic on a trend.
+        """
+        kl = _metric_scalar(metrics, "rollout_corr/kl")
+        grad_norm = _metric_scalar(metrics, "actor/grad_norm")
+
+        def _runaway(value: float | None, limit: float) -> bool:
+            if value is None:
+                return False
+            # ``nan`` comparisons are always False, but a non-finite grad norm or KL is the
+            # loudest possible divergence signal -- do not let it slip through the ``>``.
+            return math.isnan(value) or value > limit
+
+        triggers = []
+        if _runaway(kl, self.DIVERGENCE_KL_LIMIT):
+            triggers.append(f"rollout_corr/kl={kl:.4g} > {self.DIVERGENCE_KL_LIMIT:g}")
+        if _runaway(grad_norm, self.DIVERGENCE_GRAD_NORM_LIMIT):
+            triggers.append(f"actor/grad_norm={grad_norm:.4g} > {self.DIVERGENCE_GRAD_NORM_LIMIT:g}")
+
+        metrics["bagel_corl/divergence_warning"] = 1.0 if triggers else 0.0
+        if not triggers:
+            self._divergence_warned = False
+            return
+        if getattr(self, "_divergence_warned", False):
+            # One warning per excursion: the metric above keeps the series complete, and a
+            # collapsing run would otherwise repeat this on every remaining step.
+            return
+        self._divergence_warned = True
+        step = getattr(self, "global_steps", None)
+        entropy = _metric_scalar(metrics, "actor/entropy")
+        message = (
+            f"bagel_corl_sync step={step}: actor has left its trust region "
+            f"({'; '.join(triggers)}"
+            + (f"; actor/entropy={entropy:.4g}" if entropy is not None else "")
+            + "). This recipe has no KL anchor and no entropy bonus, so the policy cannot "
+            "recover by itself -- check NORM_ADV_BY_STD / loss_weight_* / optim.lr, and treat "
+            "any checkpoint past this step as unusable."
+        )
+        if os.environ.get("BAGEL_CORL_DIVERGENCE_ABORT", "0") == "1":
+            raise RuntimeError(message)
+        logger.warning("%s Set BAGEL_CORL_DIVERGENCE_ABORT=1 to fail instead of warn.", message)
 
     def _und_deploy_config_path(self) -> str | None:
         agent = self.config.actor_rollout_ref.rollout.get("agent") or {}

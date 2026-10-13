@@ -83,7 +83,8 @@ def main() -> int:
         result = compute_score(ground_truth=gt, solution_str=text, extra_info={})
         print(
             "  -> score=%.4f method=%s calls=%s generates=%s judge_ok=%s "
-            "done=%s reflect=%.4f plan=%.4f format=%.4f tool=%.4f result=%.4f"
+            "done=%s protocol_ok=%s reflect=%.4f plan=%.4f format=%.4f protocol=%.4f "
+            "tool=%.4f result=%.4f image=%.4f"
             % (
                 result["score"],
                 result["method"],
@@ -91,11 +92,14 @@ def main() -> int:
                 result["n_successful_generates"],
                 result["judge_parse_ok"],
                 result["terminal_done"],
+                result["protocol_ok"],
                 result["reward_reflect"],
                 result["reward_plan"],
                 result["reward_format"],
+                result["reward_protocol"],
                 result["reward_tool"],
                 result["reward_result"],
+                result["reward_image"],
             )
         )
     return 0

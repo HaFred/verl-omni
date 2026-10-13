@@ -698,8 +698,9 @@ def test_the_und_reward_lands_on_the_last_trainable_token_not_a_masked_tail():
 def test_the_und_reward_survives_the_flatten_contract():
     """TQ row and flatten row must carry the same number, or UND and GEN see different rewards.
 
-    Both consumers go through ``episode_und_reward``; deriving the mean-of-rated-seeds in two
-    places is what let them drift.
+    Both consumers go through ``episode_und_reward``; deriving the image credit in two
+    places is what let them drift. Both seeds here share one ``gen_group_uid``, so they are
+    one call and the credit is their mean -- the rewrite-aware rule only separates *calls*.
     """
     episode = _reward_episode(mask=[1, 1, 1], und_reward=0.1, rm_scores=[0.4, 0.6])
     flattened = flatten_multiturn_rollouts([episode], expected_s=2)

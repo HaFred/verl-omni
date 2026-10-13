@@ -1181,6 +1181,66 @@ def test_flatten_propagates_episode_und_reward_for_no_image():
     assert result.und_batch[0]["token_level_scores"] == pytest.approx(0.73)
 
 
+def _gen_sample(*, call: str, index: int, score: float | None, valid: bool = True) -> lib.GenSample:
+    return lib.GenSample(
+        gen_sample_uid=lib.gen_sample_uid(call, index),
+        gen_group_uid=call,
+        seed_index=index,
+        valid=valid,
+        prompt_token_ids=[1],
+        rm_score=score,
+    )
+
+
+def test_und_image_credit_rewards_the_final_call_plus_the_rewrite_gain():
+    """A rewrite that fixed the image must beat two mediocre passes.
+
+    Under the replaced mean-of-all-rated-seeds rule both of these episodes scored 0.5, so
+    the UND token-GRPO signal could not tell the successful rewrite from the flat one:
+    the 0.2 image the rewrite replaced was averaged back into the reward.
+    """
+    improved = [_gen_sample(call="pass0", index=0, score=0.2), _gen_sample(call="pass1", index=0, score=0.8)]
+    flat = [_gen_sample(call="pass0", index=0, score=0.4), _gen_sample(call="pass1", index=0, score=0.6)]
+    assert lib.image_credit_reward(improved) == pytest.approx(1.4)  # 0.8 + (0.8 - 0.2)
+    assert lib.image_credit_reward(flat) == pytest.approx(0.8)  # 0.6 + 0.2
+    assert lib.image_credit_reward(improved) > lib.image_credit_reward(flat)
+
+    # One call is scored on its own quality -- never penalised for having no rewrite.
+    assert lib.image_credit_reward([_gen_sample(call="pass0", index=0, score=0.2)]) == pytest.approx(0.2)
+
+
+def test_und_image_credit_does_not_pay_for_a_degraded_rewrite():
+    degraded = [_gen_sample(call="pass0", index=0, score=0.8), _gen_sample(call="pass1", index=0, score=0.2)]
+    # The gain term is one-sided: a worse rewrite keeps only its lower final quality.
+    assert lib.image_credit_reward(degraded) == pytest.approx(0.2)
+
+
+def test_und_image_credit_averages_the_seeds_of_one_call():
+    """``S >= 2`` seeds are one prompt at different noise, so no seed is "final"."""
+    seeds = [_gen_sample(call="call0", index=0, score=0.4), _gen_sample(call="call0", index=1, score=0.6)]
+    assert lib.image_credit_reward(seeds) == pytest.approx(0.5)
+
+
+def test_und_image_credit_skips_unrated_and_invalid_seeds():
+    samples = [
+        _gen_sample(call="pass0", index=0, score=None),
+        _gen_sample(call="pass0", index=0, score=0.9, valid=False),
+        _gen_sample(call="pass1", index=0, score=0.3),
+    ]
+    assert lib.image_credit_reward(samples) == pytest.approx(0.3)
+    # No rated seed at all -> None, so the caller falls back to the non-image scalar.
+    assert lib.image_credit_reward([]) is None
+    assert lib.image_credit_reward([_gen_sample(call="c", index=0, score=None)]) is None
+
+
+def test_flatten_carries_the_rewrite_gain_to_token_level_scores():
+    """The UND row the v1 advantage reads is the same rewrite-aware scalar, not the mean."""
+    gens = [_gen_sample(call="pass0", index=0, score=0.2), _gen_sample(call="pass1", index=0, score=0.8)]
+    result = lib.flatten_multiturn_rollouts([_episode(uid="t0", gens=gens, used_image=True)], expected_s=1)
+    assert result.und_batch[0]["token_level_scores"] == pytest.approx(1.4)
+    assert result.metrics["und/no_image_credit"] == 0.0
+
+
 def test_k2_episode_keeps_both_calls():
     """RFC: every generate_image call contributes its S seeds — K=2 must yield 2xS
     GEN rows (the old code replaced gen_samples per call and silently dropped the
@@ -1237,8 +1297,9 @@ def test_k2_episode_keeps_both_calls():
     assert len({row["gen_group_uid"] for row in flat.gen_batch}) == 2
     assert flat.metrics["gen/dropped_incomplete_groups"] == 0.0
     assert flat.metrics["und/no_image_credit"] == 0.0
-    # Episode scalar averages over both calls' seeds: (0.2*2 + 0.9*2) / 4.
-    assert episode.und_reward == pytest.approx(0.55)
+    # Two calls, so the episode scalar is the final call's quality (0.9) plus the gain
+    # the rewrite bought (0.9 - 0.2). It is no longer the mean over all four seeds.
+    assert episode.und_reward == pytest.approx(1.6)
 
 
 def test_judge_text_reduction_modes():

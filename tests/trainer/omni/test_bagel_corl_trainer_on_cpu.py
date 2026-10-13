@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 import types
 
@@ -3450,3 +3451,110 @@ def test_gen_pass_rereslice_leaves_scalars_and_blobs_alone():
         assert tu.get_non_tensor_data(micro_batch, "skip_gen", default=None) is False
         # ``bagel_corl_gen`` reports a length too, but it is one blob, not a column.
         assert len(tu.get_non_tensor_data(micro_batch, "bagel_corl_gen", default=None)) == rows
+
+
+def _tripwire_trainer():
+    trainer = OmniBagelCoRLTrainerSync.__new__(OmniBagelCoRLTrainerSync)
+    trainer.global_steps = 51
+    return trainer
+
+
+def test_metric_scalar_unwraps_floats_tensors_and_metric_objects():
+    """The step metrics dict mixes all three; a tripwire that read one would miss the run."""
+    from verl.utils.metric import Metric
+
+    from verl_omni.trainer.omni.bagel_corl_trainer import _metric_scalar
+
+    metrics = {
+        "plain": 0.5,
+        "tensor": torch.tensor(2.0),
+        "metric": Metric(value=3.0, aggregation="mean"),
+        "non_scalar_tensor": torch.zeros(2),
+        "not_a_number": "n/a",
+    }
+    assert _metric_scalar(metrics, "plain") == 0.5
+    assert _metric_scalar(metrics, "tensor") == 2.0
+    assert _metric_scalar(metrics, "metric") == 3.0
+    assert _metric_scalar(metrics, "non_scalar_tensor") is None
+    assert _metric_scalar(metrics, "not_a_number") is None
+    assert _metric_scalar(metrics, "absent") is None
+
+
+def test_divergence_tripwire_warns_on_kl_and_publishes_the_metric(caplog):
+    """``_084724`` ran 150 steps of this without saying anything; the tripwire must say so."""
+    trainer = _tripwire_trainer()
+    metrics = {"rollout_corr/kl": trainer.DIVERGENCE_KL_LIMIT + 1.0, "actor/grad_norm": 1.5}
+
+    with caplog.at_level(logging.WARNING):
+        trainer._divergence_tripwire(metrics)
+
+    assert metrics["bagel_corl/divergence_warning"] == 1.0
+    assert "left its trust region" in caplog.text
+    assert "rollout_corr/kl=21" in caplog.text
+
+
+def test_divergence_tripwire_warns_on_grad_norm_alone(caplog):
+    trainer = _tripwire_trainer()
+    metrics = {"rollout_corr/kl": 0.4, "actor/grad_norm": trainer.DIVERGENCE_GRAD_NORM_LIMIT + 1.0}
+
+    with caplog.at_level(logging.WARNING):
+        trainer._divergence_tripwire(metrics)
+
+    assert metrics["bagel_corl/divergence_warning"] == 1.0
+    assert "actor/grad_norm" in caplog.text
+
+
+def test_divergence_tripwire_reports_nan_as_runaway():
+    """``nan > limit`` is False, so a non-finite reading must be caught explicitly."""
+    trainer = _tripwire_trainer()
+    metrics = {"rollout_corr/kl": float("nan"), "actor/grad_norm": 1.5}
+
+    trainer._divergence_tripwire(metrics)
+
+    assert metrics["bagel_corl/divergence_warning"] == 1.0
+
+
+def test_divergence_tripwire_stays_quiet_and_clears_when_healthy(caplog):
+    trainer = _tripwire_trainer()
+    hot = {"rollout_corr/kl": trainer.DIVERGENCE_KL_LIMIT + 1.0}
+    with caplog.at_level(logging.WARNING):
+        trainer._divergence_tripwire(hot)
+    assert trainer._divergence_warned is True
+
+    # Same excursion: keep the series, do not repeat the line every step.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        trainer._divergence_tripwire(hot)
+    assert "left its trust region" not in caplog.text
+
+    healthy = {"rollout_corr/kl": 0.4, "actor/grad_norm": 1.2}
+    trainer._divergence_tripwire(healthy)
+    assert healthy["bagel_corl/divergence_warning"] == 0.0
+    assert trainer._divergence_warned is False
+
+    # A second excursion after recovery warns again.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        trainer._divergence_tripwire(hot)
+    assert "left its trust region" in caplog.text
+
+
+def test_divergence_tripwire_aborts_only_when_opted_in(monkeypatch):
+    hot = {"rollout_corr/kl": _tripwire_trainer().DIVERGENCE_KL_LIMIT + 1.0}
+
+    # Default is warn-only: a run this far out is useless, but killing it is the operator's call.
+    default = _tripwire_trainer()
+    default._divergence_tripwire(dict(hot))
+    assert default._divergence_warned is True
+
+    monkeypatch.setenv("BAGEL_CORL_DIVERGENCE_ABORT", "1")
+    with pytest.raises(RuntimeError, match="left its trust region"):
+        _tripwire_trainer()._divergence_tripwire(dict(hot))
+
+
+def test_divergence_tripwire_ignores_missing_keys():
+    """A step that skipped the actor (or a CPU-only test) has neither key."""
+    trainer = _tripwire_trainer()
+    metrics = {}
+    trainer._divergence_tripwire(metrics)
+    assert metrics["bagel_corl/divergence_warning"] == 0.0

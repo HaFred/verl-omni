@@ -22,8 +22,11 @@ from verl_omni.agent_loop.rpco_turn_protocol import (
     format_rm_scores_as_judge_text,
 )
 from verl_omni.utils.reward_score.agentic_multidim_reward import (
+    DEFAULT_DIM_WEIGHTS,
     DIMS,
     REWARD_COMPONENTS,
+    _normalize_trajectory_dialect,
+    _terminal_decision,
     compute_score,
 )
 
@@ -82,6 +85,49 @@ def _reflect_trajectory(
             "Reflection: The headline is legible and the composition is balanced. Done.",
         )
     )
+
+
+def _bagel_trajectory(
+    *,
+    terminal: str = '{"name": "Done"}',
+    cue_present: bool = True,
+    cue_on_verdict_line: bool = True,
+) -> str:
+    """A transcript in the Bagel Co-RL dialect, as the scorer actually receives it.
+
+    Two details are load-bearing and were taken off a real episode
+    (``_024557/step_000000/sample_7856b187``): the harness appends its stop cue to the
+    **verdict's own line**, and the checkpoint glues its terminal marker straight after that
+    cue with no separating newline.
+    """
+    generate = '<tools>\n{"name": "generate_image", "arguments": {"prompt": "A vertical cafe poster."}}\n</tools>'
+    generate_obs = (
+        "vLLM-Omni generated the requested image. path=/tmp/bagel_00.png "
+        "agentic_tool ok=1 images=1 backend=vllm_omni"
+    )
+    judge = (
+        '<tools>\n{"name": "judge_image", "arguments": '
+        '{"user_request": "req", "image_prompt": "A vertical cafe poster."}}\n</tools>'
+    )
+    judge_obs = (
+        "VL judge on the last generated image:\n"
+        "  path=/tmp/bagel_00.png\n"
+        "agentic_judge ok=1 correctness=0.8000 aesthetics=0.8000 "
+        "good_enough=YES rubber_stamp=False\n"
+        "findings: legible and balanced\n"
+    )
+    cue = "agentic_stop_decision_required=1"
+    reflection = (
+        "Reflection: VL judge reports correctness=0.8000, aesthetics=0.8000, good_enough=YES. "
+        "rubber_stamp=False. The image shows a poster. Suggested fixes: none. "
+    )
+    if not cue_present:
+        tail = reflection + "\n" + terminal
+    elif cue_on_verdict_line:
+        tail = reflection + cue + terminal
+    else:
+        tail = reflection + "\n" + cue + "\n" + terminal
+    return "\n".join((generate, generate_obs, judge, judge_obs, tail))
 
 
 def _ground_truth(task_type: str = "reflect", expected: int = 1, **extra) -> dict:
@@ -176,7 +222,12 @@ def test_format_reward_is_structural_check_ratio():
 
     assert complete["reward_format"] == 1.0
     assert 0.0 < open_loop["reward_format"] < 1.0
-    assert open_loop["protocol_ok"] == 0
+    # ``protocol_ok`` is the parse-level term (``R_protocol``), not a synonym for a
+    # structurally complete trajectory: this open loop parses cleanly, it just never
+    # terminated. That is what ``reward_format`` is for.
+    assert open_loop["protocol_ok"] == 1
+    assert open_loop["reward_protocol"] == 1.0
+    assert open_loop["reward_done"] == 0.0
 
 
 def test_tool_reward_requires_successful_generate_and_trusted_judge():
@@ -253,9 +304,14 @@ def test_weighted_total_uses_only_the_task_active_set():
         w_result=1.0,
     )
     output = compute_score(solution_str=text, ground_truth=ground_truth)
+    # ``w_plan`` is supplied but the row is a reflect row, so the active set is every
+    # other dim -- including the composite terms, which default to
+    # ``DEFAULT_DIM_WEIGHTS`` (``image`` is the deliberately heavy one).
+    active = ("format", "protocol", "tool", "result", "image", "done")
     expected = (
-        2 * output["reward_reflect"] + output["reward_format"] + output["reward_tool"] + output["reward_result"]
-    ) / 5
+        2.0 * output["reward_reflect"]
+        + sum(DEFAULT_DIM_WEIGHTS[dim] * output[f"reward_{dim}"] for dim in active)
+    ) / (2.0 + sum(DEFAULT_DIM_WEIGHTS[dim] for dim in active))
 
     assert output["score"] == pytest.approx(expected)
     without_plan_weight = compute_score(
@@ -292,6 +348,91 @@ def test_done_indicator_requires_successful_judge_and_terminal_decision():
 
     assert open_output["reward_done"] == 0.0
     assert closed_output["reward_done"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# the Bagel dialect: the harness's stop cue rides the verdict's own line, and the
+# checkpoint terminates by emitting a JSON ``{"name": "Done"}`` tool call.
+#
+# Both were invisible before 2026-10-13: the cue floor was ``line_end + 1``, so a cue
+# sitting *between* the verdict and the end of its own line was discarded and
+# ``forced_context`` never became True; and only prose ``Done.`` satisfied the trailing
+# check, so the JSON form scored as "never terminated". Together they pinned
+# ``reward_done`` to 0.0 on all 450 val rows (``terminal_done`` was 0.75 at the same
+# time) and zeroed ``reward_result`` while docking ``reward_format``.
+# ---------------------------------------------------------------------------
+
+
+def test_bagel_json_done_closes_the_episode():
+    output = compute_score(
+        solution_str=_bagel_trajectory(terminal='{"name": "Done"}'),
+        ground_truth=_ground_truth(),
+    )
+
+    assert output["terminal_done"] == 1, "the JSON Done is a termination in this grammar"
+    assert output["reward_done"] == 1.0
+
+
+def test_bagel_prose_done_still_closes_the_episode():
+    output = compute_score(
+        solution_str=_bagel_trajectory(terminal="Done."),
+        ground_truth=_ground_truth(),
+    )
+
+    assert output["reward_done"] == 1.0
+
+
+def test_bagel_stop_cue_on_the_verdict_line_marks_forced_context():
+    normalized = _normalize_trajectory_dialect(_bagel_trajectory())
+
+    terminal_done, policy_reflection, forced_context = _terminal_decision(normalized)
+
+    assert forced_context is True, (
+        "the Bagel harness writes its stop cue on the verdict's own line; flooring on the "
+        "end of that line discards it and makes reward_done unreachable"
+    )
+    assert terminal_done is True
+    assert policy_reflection is False, "the Reflection is harness context, not policy prose"
+
+
+def test_bagel_stop_cue_after_the_verdict_line_is_still_recognised():
+    normalized = _normalize_trajectory_dialect(_bagel_trajectory(cue_on_verdict_line=False))
+
+    terminal_done, _, forced_context = _terminal_decision(normalized)
+
+    assert forced_context is True
+    assert terminal_done is True
+
+
+def test_bagel_stop_cue_from_an_earlier_turn_is_ignored():
+    """The cue floor still excludes cues left over from before the last verdict."""
+    normalized = _normalize_trajectory_dialect(_bagel_trajectory(cue_present=False))
+    # a stale cue, written before the final judge verdict, must not mark forced context
+    stale = "agentic_stop_decision_required=1\n" + normalized
+
+    _, _, forced_context = _terminal_decision(stale)
+
+    assert forced_context is False
+
+
+def test_bagel_cue_does_not_expose_harness_prose_as_policy_text():
+    """Advancing the anchor must not move it backwards into the harness's own prose."""
+    output = compute_score(
+        solution_str=_bagel_trajectory(),
+        ground_truth=_ground_truth(),
+    )
+
+    assert output["terminal_policy_reflection"] == 0
+
+
+def test_bagel_episode_without_a_stop_cue_is_not_closed():
+    """An episode that just runs out of turns earns neither done nor result."""
+    output = compute_score(
+        solution_str=_bagel_trajectory(cue_present=False, terminal=""),
+        ground_truth=_ground_truth(),
+    )
+
+    assert output["reward_done"] == 0.0
 
 
 def test_rewrite_after_first_yes_breaks_done_indicator():
@@ -422,8 +563,10 @@ def test_all_paths_emit_stable_schema_and_metric_contract():
         "reward_reflect",
         "reward_plan",
         "reward_format",
+        "reward_protocol",
         "reward_tool",
         "reward_result",
+        "reward_image",
         "reward_done",
         "reward_tool_call",
     )

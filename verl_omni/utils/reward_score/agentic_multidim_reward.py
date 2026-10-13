@@ -21,18 +21,34 @@ their agent-loop or dataset modules.
 Wire with ``reward.reward_manager.name=naive`` so verl passes ``solution_str``.
 ``VisualRewardManager``'s ``solution_image`` is the wrong modality and raises.
 
-The active reward set is ``{reflect, plan, format, tool, result}``. ``plan`` is
-active only for plan rows. ``done`` and ``tool_call`` reproduce the PR1
-closed-loop indicators for metrics, but are not additional score dimensions.
-Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
-receive score zero and ``rollout_valid=0``. ``task_type`` is required.
+The active reward set is ``{reflect, plan, format, protocol, tool, result,
+image, done}``. ``plan`` is active only for plan rows. ``tool_call`` reproduces
+the PR1 closed-loop indicator for metrics and is not a score dimension. Invalid
+rollouts (no parsed ``generate_image`` call or no successful PNG) receive score
+zero and ``rollout_valid=0``, which is what keeps a text-only trajectory out of
+the image dim: the dims below are only reached once an image exists. ``task_type``
+is required.
+
+``R_image`` / ``R_done`` / ``R_protocol`` are what make the scalar *composite*,
+and each replaces a term that used to be metric-only or second-hand:
+
+* ``R_image`` is the first-class image-quality dim: it scores the **final**
+  trusted verdict, plus a bonus for the **improvement** a rewrite bought
+  (``max(0, final - first)``, capped at 1). Before this dim the judge's C/A
+  magnitude entered only inside ``R_reflect`` (halved, then averaged over five
+  dims), so a rewrite that fixed the image barely moved the scalar.
+* ``R_done`` is the Done credit: the ``closed`` indicator (trusted judge, no
+  hard block, no rewrite after YES, a terminal ``Done.``) is now scored rather
+  than reported, so properly terminating is worth reward.
+* ``R_protocol`` is parse-level validity: every ``<tool_call>`` block parsed,
+  no ``agentic_judge ok=0``, and no hard block. ``protocol_ok`` reports it.
 
 Judge C/A is trusted only after a parsed ``judge_image`` ``<tool_call>`` and the
 tool observation header. Coverage is token F1 (not recall-only), so dumping
 reference words into a long blob does not max ``R_reflect`` / ``R_plan``.
-Rewrite-after-YES zeros ``R_result`` as well as the Done indicator. Reflect
-``R_result`` requires a terminal trusted YES. ``R_tool`` needs a successful
-PNG generate plus a trusted judge (not merely a parsed tool call).
+Rewrite-after-YES zeros ``R_result``, ``R_image`` and the Done indicator.
+Reflect ``R_result`` requires a terminal trusted YES. ``R_tool`` needs a
+successful PNG generate plus a trusted judge (not merely a parsed tool call).
 
 The Bagel Co-RL (Joint-Training) loop is the second producer of this reward and
 speaks a different observation dialect: calls ride ``<tools>{...}</tools>``, a
@@ -50,10 +66,26 @@ import json
 import re
 from typing import Any
 
-DIMS = ("reflect", "plan", "format", "tool", "result")
-# Names consumed by AgenticMetricsAgentLoopManager when PR1 and PR3 are
-# composed. Keeping them here lets this independent PR specify that contract.
-REWARD_COMPONENTS = tuple(f"reward_{name}" for name in (*DIMS, "done", "tool_call"))
+DIMS = ("reflect", "plan", "format", "protocol", "tool", "result", "image", "done")
+#: Default weight per dim when the row carries no ``w_<dim>``. The five original
+#: dims keep 1.0 so existing recipes are not rescaled relative to each other;
+#: ``image`` is deliberately heavier because it is the only dim with a continuous,
+#: task-specific magnitude -- the rest are mostly protocol gates that saturate.
+#: ``done``/``protocol`` are 1.0 so termination and parse validity are trained at
+#: the same order of magnitude as the behaviour dims they replace.
+DEFAULT_DIM_WEIGHTS: dict[str, float] = {
+    "reflect": 1.0,
+    "plan": 1.0,
+    "format": 1.0,
+    "protocol": 1.0,
+    "tool": 1.0,
+    "result": 1.0,
+    "image": 3.0,
+    "done": 1.0,
+}
+#: Names consumed by AgenticMetricsAgentLoopManager when PR1 and PR3 are
+#: composed. Keeping them here lets this independent PR specify that contract.
+REWARD_COMPONENTS = tuple(f"reward_{name}" for name in (*DIMS, "tool_call"))
 
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNORECASE | re.DOTALL)
 _JUDGE_OK_RE = re.compile(r"\bagentic_judge\s+ok=1\b", re.IGNORECASE)
@@ -135,6 +167,15 @@ _FORCED_CONTEXT_CUE_RE = re.compile(
     r"\bagentic_(?:forced_reflection|force_stop_max_passes|stop_decision_required)=1(?!\d)",
     re.IGNORECASE,
 )
+# The terminal marker in the checkpoint's own dialect. ``build_forced_reflection`` tells the
+# policy its next action "must be exactly Done.", but the Bagel checkpoint answers in the
+# tool-call grammar it was trained on and emits ``{"name": "Done"}`` -- glued straight onto
+# the stop cue (``...agentic_stop_decision_required=1{"name": "Done"}``). Because that object
+# is not line-anchored, ``_normalize_trajectory_dialect`` does not wrap it in ``<tool_call>``
+# and ``_extract_tool_calls`` never sees it, so ``_terminal_decision`` is the only reader that
+# can recover the signal. Measured 2026-10-13 on ``_024557``: the policy terminated this way
+# in 48/260 episodes and was scored as never having terminated at all.
+_DONE_CALL_RE = re.compile(r'"name"\s*:\s*"Done"\s*\}', re.IGNORECASE)
 _TOOL_OBS_LINE_RE = re.compile(
     r"(?im)^(?!.*\bReflection\s*:).*\b("
     r"agentic_tool|agentic_reflect|agentic_judge|"
@@ -149,7 +190,6 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
     return {
         "score": 0.0,
         **{f"reward_{dim}": 0.0 for dim in DIMS},
-        "reward_done": 0.0,
         "reward_tool_call": 0.0,
         "num_hermes_tool_calls": 0,
         "num_generate_image_prompts": 0,
@@ -629,10 +669,27 @@ def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
     # Walk every cue forward. ``build_forced_reflection`` writes ``...agentic_force_stop_max_passes=1
     # agentic_stop_decision_required=1`` and the Mode-2a loops then append
     # ``agentic_forced_reflection=1``, so the last cue is the end of the harness text either way.
+    #
+    # Floor on ``judge_end``, *not* on ``anchor``. The Bagel harness writes the stop cue on the
+    # verdict's **own line** --
+    # ``Reflection: VL judge reports ... good_enough=YES. <prose> agentic_stop_decision_required=1``
+    # -- so the cue lands between ``judge_end`` and ``line_end``. A floor of ``line_end + 1``
+    # therefore discarded it on every Bagel episode, ``forced_context`` stayed False, and since
+    # ``reward_done`` is ``valid_terminal_context and terminal_done and (policy_reflection or
+    # forced_context)`` while the Bagel ``Reflection:`` is harness context (so
+    # ``policy_reflection`` is never True), the dim was pinned to 0.0 on all 450 val rows no
+    # matter how cleanly the episode closed. Measured 2026-10-13 on ``_024557`` step 30:
+    # ``terminal_done = 0.75`` but ``reward_done = 0.0`` exactly. Flooring on ``judge_end``
+    # keeps the property the old floor was buying -- a cue left over from an *earlier* turn
+    # still sits before the last verdict and is still ignored.
     for marker in _FORCED_CONTEXT_CUE_RE.finditer(text):
-        if marker.start() < anchor:
+        if marker.start() < judge_end:
             continue
-        anchor = marker.end()
+        # Only ever *advance* the anchor. A cue inside the verdict line has
+        # ``marker.end() < line_end + 1``, and moving the anchor back into that line would
+        # expose the harness's own ``rubber_stamp=`` / ``findings:`` prose as if it were
+        # policy text, which is what the trailing-``Done.`` check is trying not to read.
+        anchor = max(anchor, marker.end())
         forced_context = True
 
     suffix = _assistant_prose(text[anchor:])
@@ -644,6 +701,17 @@ def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
         terminal_done = bool(re.search(r"\bDone\.\s*$", suffix, re.IGNORECASE))
     else:
         terminal_done = bool(re.fullmatch(r"Done\.", suffix, re.IGNORECASE))
+    # Accept the checkpoint's own terminal form as well: ``{"name": "Done"}`` is the same
+    # statement as prose ``Done.`` in the grammar this checkpoint actually speaks, and the
+    # object's ``{`` is the last character before the anchor, so the suffix holds its tail
+    # (``"name": "Done" }``). Read it from the whole post-verdict region rather than from
+    # ``suffix``: when the policy puts the object on its own line,
+    # ``_normalize_trajectory_dialect`` wraps it in a ``<tool_call>`` block and
+    # ``_assistant_prose`` drops that block, so the marker would be invisible in ``suffix``
+    # (measured: the glued form in 48/260 ``_024557`` episodes, plus the wrapped form).
+    # Treating it as *not* a termination is what zeroed ``reward_done`` and ``reward_result``
+    # and docked ``reward_format`` (0.4 vs 0.8) on those episodes.
+    terminal_done = terminal_done or bool(_DONE_CALL_RE.search(text[anchor:]))
     return terminal_done, policy_reflection, forced_context
 
 
@@ -818,10 +886,76 @@ def _require_task_type(ground_truth: dict[str, Any], extra_info: dict[str, Any])
     return task_type
 
 
+def _protocol_reward(
+    *,
+    raw_blocks: int,
+    parsed_calls: int,
+    judge_ok: int,
+    judge_failed: int,
+    blocked: bool,
+) -> float:
+    """Parse-level protocol validity: every call block and every verdict parsed, no hard block.
+
+    Deliberately disjoint from ``R_format``, which owns the *structural* checks
+    (a generate happened, the verdict lands after the images it judged, the turn
+    ended in the terminal token). This dim is the "nothing silently failed" half:
+    an unparsed ``<tool_call>`` block, an ``agentic_judge ok=0``, or a
+    ``blocked_after_*`` stop all cost it. A transcript that is entirely empty is
+    not rewarded for having nothing to fail -- with no call at all there is no
+    protocol to be valid.
+    """
+    if parsed_calls < 1:
+        return 0.0
+    checks = [
+        raw_blocks > 0 and parsed_calls == raw_blocks,
+        judge_failed == 0,
+        judge_ok >= 1,
+        not blocked,
+    ]
+    return sum(checks) / len(checks)
+
+
+def _image_reward(
+    text: str,
+    *,
+    successful_generates: int,
+    blocked: bool,
+    rewrite_after_yes: int,
+) -> float:
+    """Image quality of the **final** pass plus the gain a rewrite bought.
+
+    Scores the last trusted verdict (mean of its C/A) and adds ``max(0, final -
+    first)`` when the episode ran more than one judged pass, capped at 1. A single
+    pass is scored on its own quality -- never penalised for not having a rewrite
+    to improve on -- and a rewrite that made the image worse earns no bonus, it
+    keeps only the (lower) final quality. Zero when the transcript carries no
+    trusted verdict, or when the episode hard-blocked or rewrote after a YES.
+    """
+    if successful_generates < 1 or blocked or rewrite_after_yes > 0:
+        return 0.0
+    qualities = [0.5 * (correctness + aesthetics) for correctness, aesthetics, _, _ in _successful_judges(text)]
+    if not qualities:
+        return 0.0
+    final = qualities[-1]
+    improvement = max(0.0, final - qualities[0]) if len(qualities) > 1 else 0.0
+    return min(1.0, final + improvement)
+
+
 def _active_weights(
-    ground_truth: dict[str, Any], extra_info: dict[str, Any], *, task_type: str
+    ground_truth: dict[str, Any],
+    extra_info: dict[str, Any],
+    *,
+    task_type: str,
 ) -> dict[str, float] | None:
-    """Return positive active-set weights, or None if a ``w_*`` value is garbage."""
+    """Return positive active-set weights, or None if a ``w_*`` value is garbage.
+
+    ``plan`` is active only for plan rows, mirroring the existing "a dim that does
+    not apply is not scored" rule. Every other dim -- including the composite
+    ``image``/``done``/``protocol`` -- is scored whenever this function is reached,
+    which already requires a confirmed ``generate_image`` (a transcript without one
+    returns a hard zero before the dims are computed). An absent ``w_<dim>`` falls
+    back to ``DEFAULT_DIM_WEIGHTS``.
+    """
     weights = {}
     for dim in DIMS:
         if dim == "plan" and task_type != "plan":
@@ -830,7 +964,7 @@ def _active_weights(
         if raw is None:
             raw = extra_info.get(f"w_{dim}")
         if raw is None:
-            value = 1.0
+            value = DEFAULT_DIM_WEIGHTS[dim]
         else:
             try:
                 value = float(raw)
@@ -870,9 +1004,6 @@ def compute_score(
     task_type = _require_task_type(gt, metadata)
     if task_type is None:
         return _zero_result(method="agentic_multidim_missing_task_type")
-    weights = _active_weights(gt, metadata, task_type=task_type)
-    if weights is None:
-        return _zero_result(method="agentic_multidim_bad_weights")
 
     try:
         expected = max(1, int(gt.get("expected_num_images", metadata.get("expected_num_images", 1))))
@@ -904,6 +1035,9 @@ def compute_score(
             re.IGNORECASE,
         )
     )
+    weights = _active_weights(gt, metadata, task_type=task_type)
+    if weights is None:
+        return _zero_result(method="agentic_multidim_bad_weights")
     rewrites_after_yes = _generates_after_first_yes(text, calls)
     tool_reward = float(successful_generates >= 1 and judge_ok >= 1)
 
@@ -930,6 +1064,13 @@ def compute_score(
 
     valid_terminal_context = judge_ok > 0 and not blocked and rewrites_after_yes == 0
     closed = valid_terminal_context and terminal_done and (policy_reflection or forced_context)
+    protocol_reward = _protocol_reward(
+        raw_blocks=len(_TOOL_CALL_RE.findall(text)),
+        parsed_calls=len(calls),
+        judge_ok=judge_ok,
+        judge_failed=judge_failed,
+        blocked=blocked,
+    )
     rewards = {
         "reflect": _reflection_reward(text, gt),
         "plan": _plan_reward(text, gt),
@@ -939,6 +1080,7 @@ def compute_score(
             successful_generates=successful_generates,
             forced_context=forced_context,
         ),
+        "protocol": protocol_reward,
         "tool": tool_reward,
         "result": _result_reward(
             text,
@@ -949,15 +1091,21 @@ def compute_score(
             blocked=blocked,
             rewrite_after_yes=rewrites_after_yes,
         ),
+        "image": _image_reward(
+            text,
+            successful_generates=successful_generates,
+            blocked=blocked,
+            rewrite_after_yes=rewrites_after_yes,
+        ),
+        "done": float(closed),
     }
     weight_sum = sum(weights.values())
     score = sum(weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
     result.update(
         score=float(min(1.0, score)),
         **{f"reward_{dim}": float(rewards[dim]) for dim in DIMS},
-        reward_done=float(closed),
         reward_tool_call=float(bool(calls)),
-        protocol_ok=int(rewards["format"] == 1.0),
+        protocol_ok=int(protocol_reward == 1.0),
         rollout_valid=1,
     )
     return result

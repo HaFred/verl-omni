@@ -665,6 +665,10 @@ if [[ "$N" -lt 1 ]]; then
   echo "rollout.n N must be >= 1 (got N=$N)." >&2
   exit 1
 fi
+if [[ "$S" -eq 1 && "$N" -lt 2 ]]; then
+  echo "S=1 groups GEN by task, so N must be >= 2 or every GEN advantage is zero (got N=$N)." >&2
+  exit 1
+fi
 echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runtime)"
 
 # RFC §4.8.4 launch divisibility (the two `pool % *_TP` checks above are the other
@@ -735,6 +739,38 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
 # lr_gen=3e-5), lane weights, and GRPO-Guard ratio normalization via
 # +actor_rollout_ref.actor.diffusion_loss.loss_mode=grpo_guard as an ablation.
 # NOTE: keep comment lines OUTSIDE the backslash-continued launch command below.
+#
+# GRPO advantage normalization (RFC 453 §2). Stock GRPO divides each sibling's
+# centred reward by the *group* std, which makes the advantage magnitude independent
+# of the reward gap: for a k=2 group std = |gap| / sqrt(2), so
+# (r - mean) / std = +/-1/sqrt(2) = +/-0.7071 for *every* gap -- a 0.001 judge-score
+# difference and a 0.9 one produce a byte-identical update. On a fine-grained rubric
+# reward that is a full-amplitude push on a coin flip, and it is what walked
+# `bagel_corl_rm1_0123_20261012_084724` (devices 0-3) out of the trust region:
+# `actor/grad_norm` 0.32 (step 1) -> 3.4 (step 51) -> 155 (step 101) -> 310 (step 200)
+# and `rollout_corr/kl` 0.03 -> 9.3 -> 92 -> 175, with `actor/entropy` collapsing to
+# 0.02 and `rollout_corr/training_ppl` going to `inf`. There is no KL anchor and no
+# entropy bonus in this recipe to hold it back (`use_kl_loss=false`, `entropy_coeff=0`),
+# so the schedule and the advantage scale are the only brakes.
+#
+# ``False`` is Dr.GRPO (arXiv 2503.20783): the advantage is the raw centred reward, so
+# the update scales with the actual signal and a near-tie is nearly a no-op. It is
+# bounded by the reward range (<= 1 here), which the std-normalized form is not. Read
+# on BOTH lanes -- UND token GRPO via `trainer_base.compute_advantage_for_multi_trajectories`
+# and GEN FlowGRPO via `apply_gen_flowgrpo_advantage` (`bagel_corl_trainer.py:942`).
+# Keep N > 2 so a group has more than the two points that make the gap binary above.
+NORM_ADV_BY_STD=${NORM_ADV_BY_STD:-False}
+#
+# Actor (UND) LR schedule. The recipe ran ``optim.lr=1e-4`` *constant* for the whole
+# 200-step budget (``lr_warmup_steps_ratio=0.0``, ``lr_scheduler_type=constant``): peak
+# LR at step 0 and still peak at the last step, with no warmup to survive the first
+# off-policy batches. Warm up over the first 5% and cosine-decay to 10% of the peak, so
+# the late steps -- where a bad update is unrecoverable -- move ~10x less.
+# ``trainer.total_training_steps`` reaches ``actor.optim.total_training_steps``
+# (`trainer_base.py:761-766`), so the schedule is anchored to the real step budget.
+LR_WARMUP_RATIO=${LR_WARMUP_RATIO:-0.05}
+LR_SCHEDULER=${LR_SCHEDULER:-cosine}
+MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
 #
 # Episode context budget. ``_und_decode`` hands the AR engine ``prompt_ids +
 # response_ids`` -- the whole episode so far -- so the decode prompt grows with every
@@ -839,6 +875,7 @@ export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
     agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.62} \
     agentic_image_gen.pickscore_good_enough_threshold=$PICKSCORE_GOOD_ENOUGH_THRESHOLD \
     trainer.v1.trainer_mode=bagel_corl_sync \
+    algorithm.norm_adv_by_std_in_grpo=$NORM_ADV_BY_STD \
     trainer.v1.sampler.sync_refill_failed_groups=${SYNC_REFILL_FAILED_GROUPS:-True} \
     data.train_files=$TRAIN_FILE \
     data.val_files=$VAL_FILE \
@@ -861,6 +898,9 @@ export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
     actor_rollout_ref.model.target_modules="['q_proj','k_proj','v_proj','o_proj','mlp.gate_proj','mlp.up_proj','mlp.down_proj','q_proj_moe_gen','k_proj_moe_gen','v_proj_moe_gen','o_proj_moe_gen','mlp_moe_gen.gate_proj','mlp_moe_gen.up_proj','mlp_moe_gen.down_proj']" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['layers.']" \
     actor_rollout_ref.actor.optim.lr=1e-4 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=$LR_WARMUP_RATIO \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=$LR_SCHEDULER \
+    actor_rollout_ref.actor.optim.min_lr_ratio=$MIN_LR_RATIO \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO \
     actor_rollout_ref.actor.strategy=fsdp2 \
