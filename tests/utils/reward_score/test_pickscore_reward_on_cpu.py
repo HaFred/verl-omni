@@ -16,10 +16,15 @@
 import asyncio
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 from PIL import Image
+from verl.protocol import DataProto
+
+from verl_omni.reward_loop.replica_dispatch import dispatch_reward_groups
+from verl_omni.reward_loop.reward_loop import OmniRewardLoopWorker
 
 
 def _load_module():
@@ -107,7 +112,133 @@ class _FakeInferencer:
 
     def score(self, prompts, images):
         self.batches.append((list(prompts), list(images)))
-        return torch.tensor([float(image.getpixel((0, 0))) for image in images])
+        return torch.tensor([float(image.convert("L").getpixel((0, 0))) for image in images])
+
+    def infer(self, prompts, images):
+        self.batches.append((list(prompts), list(images)))
+        values = torch.tensor([float(image.convert("L").getpixel((0, 0))) for image in images])
+        return {
+            "text_embeddings": torch.stack((values, torch.ones_like(values)), dim=-1),
+            "image_embeddings": torch.stack((torch.ones_like(values), values), dim=-1),
+            "logit_scale": torch.tensor(2.0),
+        }
+
+
+@pytest.mark.asyncio
+async def test_native_model_batches_inference_and_closes_instance_consumer(monkeypatch):
+    inferencer = _FakeInferencer()
+    init_kwargs = {}
+
+    def build_inferencer(**kwargs):
+        init_kwargs.update(kwargs)
+        return inferencer
+
+    monkeypatch.setattr(pickscore_reward, "_PickScoreInferencer", build_inferencer)
+    model = pickscore_reward.PickScoreNativeModel(model_path="/models/pickscore", device="cpu")
+
+    assert init_kwargs["model_path"] == "/models/pickscore"
+    assert init_kwargs["processor_path"] == pickscore_reward._PROCESSOR_PATH
+
+    result_batches = await asyncio.gather(
+        *(model.infer(["shared prompt"], [Image.new("L", (1, 1), index)]) for index in range(4))
+    )
+
+    assert [batch[0]["text_embeddings"].tolist() for batch in result_batches] == [
+        [0.0, 1.0],
+        [1.0, 1.0],
+        [2.0, 1.0],
+        [3.0, 1.0],
+    ]
+    assert len(inferencer.batches) == 1
+    assert inferencer.batches[0][0] == ["shared prompt"] * 4
+
+    await model.close()
+    assert not model._consumer_task
+    assert not hasattr(model, "_inferencer")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("dispatch_batch_size", "expected_rpc_sizes", "expected_infer_batch_sizes"),
+    [
+        (None, [40], [16, 16, 8]),
+        (4, [4] * 10, [4] * 10),
+        (8, [8] * 5, [8] * 5),
+        (16, [16, 16, 8], [16, 16, 8]),
+        (32, [32, 8], [16, 16, 8]),
+    ],
+)
+async def test_replica_dispatch_reaches_native_pickscore_consumer_with_batch_cap(
+    monkeypatch, dispatch_batch_size, expected_rpc_sizes, expected_infer_batch_sizes
+):
+    """Keep reward dispatch and PickScore's native forward cap independently covered."""
+    inferencer = _FakeInferencer()
+    monkeypatch.setattr(pickscore_reward, "_PickScoreInferencer", lambda **_kwargs: inferencer)
+    model = pickscore_reward.PickScoreNativeModel(model_path="/models/pickscore", device="cpu")
+    worker = object.__new__(OmniRewardLoopWorker)
+    rpc_sample_ids = []
+
+    async def compute_score(data):
+        sample_id = int(data.batch["sample_id"].item())
+        score = await pickscore_reward.compute_score_pickscore_native(
+            data_source="test",
+            solution_image=torch.full((3, 1, 1), sample_id, dtype=torch.uint8),
+            ground_truth=f"prompt-{sample_id}",
+            extra_info={"media_kind": "image"},
+            reward_model=model,
+        )
+        return {"reward_score": score["score"], "reward_extra_info": {"sample_id": sample_id}}
+
+    worker.compute_score = compute_score
+
+    async def compute_score_batch(data):
+        rpc_sample_ids.append(data.batch["sample_id"].tolist())
+        return await OmniRewardLoopWorker.compute_score_batch(worker, data)
+
+    remote_worker = SimpleNamespace(compute_score_batch=SimpleNamespace(remote=compute_score_batch))
+    data = DataProto.from_dict(tensors={"sample_id": torch.arange(40, dtype=torch.int64)})
+    batch_sizes = {} if dispatch_batch_size is None else {"pickscore": dispatch_batch_size}
+
+    try:
+        outputs = (await dispatch_reward_groups(data, {"pickscore": [remote_worker]}, batch_sizes))["pickscore"]
+    finally:
+        await model.close()
+
+    expected_sample_ids = list(range(40))
+    assert [item["reward_extra_info"]["sample_id"] for item in outputs] == expected_sample_ids
+    dispatched_ids = [sample_id for rpc in rpc_sample_ids for sample_id in rpc]
+    assert dispatched_ids == expected_sample_ids
+    assert [len(rpc) for rpc in rpc_sample_ids] == expected_rpc_sizes
+    infer_batch_sizes = [len(prompts) for prompts, _ in inferencer.batches]
+    assert infer_batch_sizes == expected_infer_batch_sizes
+    max_batch_size = 16 if dispatch_batch_size is None else min(dispatch_batch_size, 16)
+    assert all(size <= max_batch_size for size in infer_batch_sizes)
+
+
+@pytest.mark.asyncio
+async def test_native_reward_function_computes_score_from_model_output():
+    class _NativeModelHandle:
+        async def infer(self, prompts, images):
+            assert prompts == ["prompt"]
+            assert len(images) == 1
+            return [
+                {
+                    "text_embeddings": torch.tensor([3.0, 4.0]),
+                    "image_embeddings": torch.tensor([0.0, 5.0]),
+                    "logit_scale": torch.tensor(98.0),
+                }
+            ]
+
+    result = await pickscore_reward.compute_score_pickscore_native(
+        data_source="test",
+        solution_image=torch.zeros(3, 2, 2, dtype=torch.uint8),
+        ground_truth="prompt",
+        extra_info={"media_kind": "image"},
+        reward_model=_NativeModelHandle(),
+    )
+
+    expected_score = 98.0 * 0.8 / 26.0
+    assert result == {"score": pytest.approx(expected_score), "pickscore_raw": pytest.approx(expected_score)}
 
 
 @pytest.mark.asyncio
@@ -124,9 +255,9 @@ async def test_consumer_batches_burst_requests_and_preserves_order(monkeypatch):
         *(
             pickscore_reward.compute_score_pickscore(
                 data_source="test",
-                solution_image=Image.new("L", (1, 1), index),
+                solution_image=torch.full((3, 1, 1), index, dtype=torch.uint8),
                 ground_truth="shared prompt",
-                extra_info={},
+                extra_info={"media_kind": "image"},
                 device="cpu",
             )
             for index in range(4)
@@ -188,3 +319,120 @@ async def test_consumer_isolates_invalid_image_from_batch(monkeypatch):
     assert results[2] == 3.0
     assert len(inferencer.batches) == 1
     assert inferencer.batches[0][0] == ["prompt", "prompt"]
+
+
+@pytest.mark.asyncio
+async def test_engine_reward_posts_openai_embedding_payloads(monkeypatch):
+    requests = []
+
+    class _Response:
+        def __init__(self, embedding):
+            self.embedding = embedding
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        async def json(self):
+            return {"data": [{"embedding": self.embedding}]}
+
+    class _Session:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def post(self, url, json):
+            requests.append((url, json))
+            return _Response([3.0, 4.0] if len(requests) == 1 else [0.0, 5.0])
+
+    monkeypatch.setattr(pickscore_reward.aiohttp, "ClientSession", _Session)
+
+    result = await pickscore_reward.compute_score_pickscore_engine(
+        data_source="test",
+        solution_image=torch.zeros(3, 2, 2, dtype=torch.uint8),
+        ground_truth="prompt",
+        extra_info={"media_kind": "image"},
+        reward_router_address="router:8000",
+        model_name="pickscore",
+        logit_scale=98.0,
+    )
+
+    expected_score = 98.0 * 0.8 / 26.0
+    assert result == {"score": pytest.approx(expected_score), "pickscore_raw": pytest.approx(expected_score)}
+    assert [url for url, _ in requests] == ["http://router:8000/v1/embeddings"] * 2
+    assert requests[0][1] == {"model": "pickscore", "input": "prompt", "encoding_format": "float"}
+    assert requests[1][1]["encoding_format"] == "float"
+    assert requests[1][1]["input"][0]["content"][0]["type"] == "image_url"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["native", "engine"])
+@pytest.mark.parametrize("input_kind", ["tensor", "numpy", "pil", "latent"])
+async def test_pickscore_rejects_undeclared_input_before_model_or_http(monkeypatch, entrypoint, input_kind):
+    from verl_omni.pipelines.rollout_media import ArtifactContractError
+
+    image = torch.zeros(3, 2, 2, dtype=torch.uint8)
+    if input_kind == "numpy":
+        image = image.numpy()
+    elif input_kind == "pil":
+        image = Image.new("RGB", (2, 2))
+    elif input_kind == "latent":
+        image = torch.zeros(3, 2, 2)
+
+    class _NoInference:
+        async def infer(self, **kwargs):
+            pytest.fail("Undeclared media reached native inference")
+
+    def no_http(*args, **kwargs):
+        pytest.fail("Undeclared media reached HTTP session creation")
+
+    monkeypatch.setattr(pickscore_reward.aiohttp, "ClientSession", no_http)
+    kwargs = (
+        {"reward_model": _NoInference()}
+        if entrypoint == "native"
+        else {"reward_router_address": "router:8000", "model_name": "pickscore", "logit_scale": 98.0}
+    )
+    scorer = getattr(pickscore_reward, f"compute_score_pickscore_{entrypoint}")
+    with pytest.raises(ArtifactContractError, match="media_kind"):
+        await scorer(data_source="test", solution_image=image, ground_truth="prompt", extra_info={}, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["native", "engine"])
+@pytest.mark.parametrize("preview", [None, "latent"])
+async def test_pickscore_rejects_named_latent_before_model_or_http(monkeypatch, entrypoint, preview):
+    from verl_omni.pipelines.rollout_media import ArtifactContractError, MediaArtifact, MediaSpec
+
+    latent = torch.zeros(3, 2, 2)
+    info = {
+        "media_artifacts": {"latent": MediaArtifact(MediaSpec("image", "latent", "CHW"), latent)},
+        "preview_artifact": preview,
+    }
+
+    class _NoInference:
+        async def infer(self, **kwargs):
+            pytest.fail("Latent media reached native inference")
+
+    def no_http(*args, **kwargs):
+        pytest.fail("Latent media reached HTTP session creation")
+
+    monkeypatch.setattr(pickscore_reward.aiohttp, "ClientSession", no_http)
+    kwargs = (
+        {"reward_model": _NoInference()}
+        if entrypoint == "native"
+        else {"reward_router_address": "router:8000", "model_name": "pickscore", "logit_scale": 98.0}
+    )
+    scorer = getattr(pickscore_reward, f"compute_score_pickscore_{entrypoint}")
+    message = "preview artifact" if preview is None else "canonical decoded media"
+    with pytest.raises(ArtifactContractError, match=message):
+        await scorer(data_source="test", solution_image=latent, ground_truth="prompt", extra_info=info, **kwargs)

@@ -16,6 +16,7 @@ import asyncio
 from types import MethodType, SimpleNamespace
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict
@@ -110,6 +111,7 @@ async def test_single_turn_agent_forwards_all_multimodal_inputs():
     agent_loop.server_manager = SimpleNamespace(
         generate=AsyncMock(
             return_value=SimpleNamespace(
+                artifacts={},
                 diffusion_output=torch.zeros(1),
                 log_probs=None,
                 num_preempted=None,
@@ -125,6 +127,46 @@ async def test_single_turn_agent_forwards_all_multimodal_inputs():
     assert call["video_data"] == ["video"]
     assert call["audio_data"] == ["audio"]
     assert call["mm_processor_kwargs"] == {"fps": 24}
+
+
+@pytest.mark.asyncio
+async def test_single_turn_agent_accepts_numpy_negative_prompt():
+    agent_loop = object.__new__(DiffusionSingleTurnAgentLoop)
+    agent_loop.rollout_config = SimpleNamespace(
+        enable_prompt_embed_cache=False,
+        enable_prompt_embed_cache_routing_affinity=False,
+    )
+    agent_loop.extra_tokenizer_map = {"text_encoder": object()}
+    agent_loop.mm_processor_kwargs = {}
+    agent_loop.processor = None
+    agent_loop.process_multi_modal_info = AsyncMock(return_value={})
+    agent_loop.ct_build_initial_tokens = AsyncMock(return_value=[1, 2, 3])
+    agent_loop._tokenize_per_encoder = AsyncMock(return_value={"text_encoder": [1, 2, 3]})
+    agent_loop._assert_mm_supported = lambda _: None
+    agent_loop.server_manager = SimpleNamespace(
+        generate=AsyncMock(
+            return_value=SimpleNamespace(
+                diffusion_output=torch.zeros(1),
+                log_probs=None,
+                num_preempted=None,
+                extra_fields={},
+            )
+        )
+    )
+    raw_prompt = [{"role": "user", "content": "prompt"}]
+    raw_negative_prompt = np.array(
+        [
+            {"role": "system", "content": "negative"},
+            {"role": "user", "content": "blurry"},
+        ]
+    )
+
+    await agent_loop.run({}, raw_prompt=raw_prompt, raw_negative_prompt=raw_negative_prompt)
+
+    assert agent_loop.ct_build_initial_tokens.await_count == 2
+    assert agent_loop.ct_build_initial_tokens.await_args_list[1].args[0] is raw_negative_prompt
+    assert agent_loop._tokenize_per_encoder.await_count == 2
+    assert agent_loop._tokenize_per_encoder.await_args_list[1].args[0] is raw_negative_prompt
 
 
 @pytest.mark.parametrize(
@@ -212,7 +254,10 @@ async def test_tq_writer_preserves_allowlisted_non_tensor_trajectory_metadata(mo
         num_turns=2,
         extra_fields={
             "condition_image_latents": torch.zeros(1, 4096, 64),
+            "audio": torch.zeros(1, 1, 16),
+            "media_kind": "video",
             "img_shapes": img_shapes,
+            "audio_sample_rate": 32_000,
             "unrelated_metadata": "do-not-forward",
         },
     )
@@ -224,18 +269,71 @@ async def test_tq_writer_preserves_allowlisted_non_tensor_trajectory_metadata(mo
 
     monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_batch_put", fake_kv_batch_put)
 
-    await worker._write_trajectory_to_tq(
-        internal,
+    await worker._write_trajectories_to_tq(
+        [(0, internal)],
         uid="sample",
-        session_id=0,
         trajectory={"step": 3},
         validate=False,
     )
 
     field = captured["fields"][0]
-    assert field["extra_fields"]["img_shapes"] == img_shapes
+    assert field["extra_fields"] == {
+        "img_shapes": img_shapes,
+        "media_kind": "video",
+        "audio_sample_rate": 32_000,
+        "min_global_steps": 3,
+        "max_global_steps": 3,
+    }
     assert "unrelated_metadata" not in field["extra_fields"]
     assert field["condition_image_latents"].shape == (4096, 64)
+    assert field["audio"].shape == (1, 16)
+    assert captured["tags"][0]["response_shape"] == (3, 2, 2)
+
+
+@pytest.mark.asyncio
+async def test_tq_writer_batches_group_sessions_and_partitions_field_sets(monkeypatch):
+    worker_cls = DiffusionAgentLoopWorkerTQ.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    puts = []
+
+    def make_internal(with_reward: bool):
+        internal = SimpleNamespace(
+            prompt_ids=torch.tensor([[1, 2]]),
+            response_diffusion_output=torch.zeros(1, 3, 2, 2),
+            response_logprobs=None,
+            reward_score=0.5 if with_reward else None,
+            num_turns=1,
+            extra_fields={},
+        )
+        return internal
+
+    monkeypatch.setattr(diffusion_agent_loop_tq, "list_of_dict_to_tensordict", lambda rows: rows)
+
+    async def fake_kv_batch_put(*, keys, fields, tags, partition_id):
+        puts.append({"keys": keys, "fields": fields, "tags": tags, "partition_id": partition_id})
+
+    monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_batch_put", fake_kv_batch_put)
+
+    # Session 1 carries rm_scores, sessions 0/2 do not: rows split by field
+    # signature instead of crashing on missing keys.
+    await worker._write_trajectories_to_tq(
+        [(0, make_internal(False)), (1, make_internal(True)), (2, make_internal(False))],
+        uid="sample",
+        trajectory={"step": 7},
+        validate=False,
+        index=3,
+        gen_batch_seq=5,
+    )
+
+    assert [put["keys"] for put in puts] == [["sample_0_0", "sample_2_0"], ["sample_1_0"]]
+    assert "rm_scores" in puts[1]["fields"][0]
+    assert all("rm_scores" not in put["fields"][0] for put in puts[:1])
+    assert all(tag["global_steps"] == 7 for put in puts for tag in put["tags"])
+    # The prompt identity rides in the tags so the trainer can restore the
+    # v0 prompt-major row order: batch-local position plus the per-run
+    # generation-batch number.
+    assert all(tag["prompt_index"] == 3 for put in puts for tag in put["tags"])
+    assert all(tag["gen_batch_seq"] == 5 for put in puts for tag in put["tags"])
 
 
 def test_tq_batch_restores_non_tensor_trajectory_metadata(monkeypatch):
@@ -249,7 +347,10 @@ def test_tq_batch_restores_non_tensor_trajectory_metadata(monkeypatch):
         "kv_batch_get",
         lambda **kwargs: {
             "all_latents": torch.zeros(2, 4, 1024, 64),
-            "extra_fields": [{"img_shapes": value} for value in img_shapes],
+            "extra_fields": [
+                {"img_shapes": img_shapes[0], "media_kind": "video", "audio_sample_rate": 32_000},
+                {"img_shapes": img_shapes[1]},
+            ],
         },
     )
 
@@ -258,6 +359,8 @@ def test_tq_batch_restores_non_tensor_trajectory_metadata(monkeypatch):
     )
 
     assert data.non_tensor_batch["img_shapes"].tolist() == img_shapes
+    assert data.non_tensor_batch["media_kind"].tolist() == ["video", None]
+    assert data.non_tensor_batch["audio_sample_rate"].tolist() == [32_000, None]
     assert tu.get(data.to_tensordict(), "img_shapes") == img_shapes
 
 
@@ -283,6 +386,15 @@ async def test_run_prompt_publishes_failure_after_siblings_settle(monkeypatch):
     monkeypatch.setattr(diffusion_agent_loop_tq.tq, "async_kv_put", fake_kv_put)
     worker._run_agent_loop = MethodType(fake_run_agent_loop, worker)
 
+    written = []
+
+    async def fake_write(outputs, **kwargs):
+        del kwargs
+        lifecycle.append("written")
+        written.append(outputs)
+
+    worker._write_trajectories_to_tq = fake_write
+
     await worker._run_prompt(
         prompt={"uid": "sample", "agent_name": "diffusion_single_turn_agent"},
         sampling_params={},
@@ -290,7 +402,8 @@ async def test_run_prompt_publishes_failure_after_siblings_settle(monkeypatch):
         prompt_index=0,
     )
 
-    assert lifecycle == ["running", "sibling_settled", "failure"]
+    assert lifecycle == ["running", "sibling_settled", "written", "failure"]
+    assert [session_id for session_id, _output in written[0]] == [1]
 
 
 @pytest.mark.asyncio

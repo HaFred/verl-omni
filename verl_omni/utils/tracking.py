@@ -26,6 +26,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from verl_omni.pipelines.rollout_media import MediaArtifact, MediaSpec, resolve_is_video, validate_audio
 from verl_omni.utils.reward_score.reward_utils import normalize_video_tensor
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,25 @@ def batch_items(values: Any, batch_size: int, name: str) -> list[Any]:
     return [values] * batch_size
 
 
+def validate_audio_batch(audios: Any, rates: Any, count: int, *, context: str) -> tuple[list[Any], list[Any]]:
+    """Normalize audio/sample-rate pairs and validate every CT waveform before retention.
+
+    Args:
+        audios: Optional CT waveforms, as a batch or per-sample sequence.
+        rates: Optional scalar or per-sample sample rates.
+        count: Full sample count before export limits are applied.
+        context: Description included in waveform validation errors.
+
+    Returns:
+        Validated per-sample waveforms and sample rates.
+    """
+    audios = batch_items(audios, count, "audio")
+    rates = batch_items(rates, count, "audio_sample_rate")
+    for audio, rate in zip(audios, rates, strict=True):
+        validate_audio(audio, rate, context=context)
+    return audios, rates
+
+
 def _write_wav(audio: Any, sample_rate: Any, path: Path) -> None:
     waveform = torch.as_tensor(audio).detach().cpu().float()
     while waveform.ndim > 2 and waveform.shape[0] == 1:
@@ -58,8 +78,6 @@ def _write_wav(audio: Any, sample_rate: Any, path: Path) -> None:
         waveform = waveform.unsqueeze(0)
     elif waveform.ndim != 2:
         raise ValueError(f"Expected audio shape [T] or [C, T], got {tuple(waveform.shape)}.")
-    if waveform.shape[0] > 8 and waveform.shape[1] <= 8:
-        waveform = waveform.transpose(0, 1)
     if waveform.shape[0] > 2:
         waveform = waveform.mean(dim=0, keepdim=True)
 
@@ -74,9 +92,18 @@ def _write_wav(audio: Any, sample_rate: Any, path: Path) -> None:
         wav_file.writeframes(pcm.tobytes())
 
 
-def _video_tensor_to_rgb24(video: torch.Tensor) -> tuple[np.ndarray, int, int]:
+def _video_tensor_to_rgb24(video: torch.Tensor | MediaArtifact) -> tuple[np.ndarray, int, int]:
     """Return a contiguous RGB24 array from a supported RGB video layout."""
-    video = normalize_video_tensor(video)
+    if isinstance(video, MediaArtifact):
+        if (video.spec.modality, video.spec.representation) != ("video", "decoded"):
+            raise ValueError(f"Video export requires a decoded video artifact, got {video.spec}")
+        video = video.normalized(context="video export", name="preview").data
+        if video.shape[1] == 1:
+            video = video.expand(-1, 3, -1, -1)
+        elif video.shape[1] == 4:
+            video = video[:, :3]  # RGB24 has no alpha channel.
+    else:
+        video = normalize_video_tensor(video)
     frames = video.detach().permute(0, 2, 3, 1).to(device="cpu").contiguous().numpy()
     return frames, int(frames.shape[2]), int(frames.shape[1])
 
@@ -102,7 +129,10 @@ def _export_video(
 
         ffmpeg_exe = get_ffmpeg_exe()
 
-    fps = int(fps)
+    if isinstance(output, MediaArtifact) and output.spec.fps is not None:
+        fps = output.spec.fps
+    else:
+        fps = int(fps)
     if fps <= 0:
         raise ValueError(f"fps must be positive, got {fps}.")
 
@@ -165,32 +195,49 @@ def _export_video(
             audio_path.unlink(missing_ok=True)
 
 
-def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None):
-    """Wrap validation samples and prepare top-level ``wandb`` video media.
+def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None, media_kinds=None):
+    """Wrap validation samples and prepare top-level ``wandb`` media.
 
-    Video outputs in ``[T, C, H, W]``, ``[C, T, H, W]``, or ``[T, H, W, C]``
-    layouts are encoded to mp4 and passed to
-    ``wandb.Video`` by path. Provide ``output_dir`` to keep the media available
-    for asynchronous upload; otherwise a temp dir is returned for cleanup.
-    Optional tuple elements four and five carry audio and its sample rate. The
-    table stores a stable media key because offline ``wandb`` tables do not
-    reliably persist nested videos. Other outputs become ``wandb.Image``.
+    Declared ``media_kinds`` or artifact specs decide whether each output is an
+    image or video. Video outputs are normalized to ``[T, C, H, W]`` and encoded
+    to mp4 and passed to ``wandb.Video`` by path. Provide ``output_dir`` to keep
+    the media available for asynchronous upload; otherwise a temp dir is
+    returned for cleanup. Optional tuple elements four and five carry audio and
+    its sample rate. Media conversion failures are represented in the table and
+    logged instead of propagating into the training loop.
     """
     import wandb
 
+    samples = list(samples)
+    media_kinds = batch_items(media_kinds, len(samples), "media_kind")
     video_dir = output_dir
     video_tmp_dir = None
     wrapped = []
     media_to_log = {}
-    for sample in samples:
+    for sample, media_kind in zip(samples, media_kinds, strict=True):
         inp, out, score = sample[:3]
         audio = sample[3] if len(sample) > 3 else None
         audio_sample_rate = sample[4] if len(sample) > 4 else None
-        if hasattr(out, "ndim") and out.ndim == 5:
-            # Batched video [B, T, C, H, W], [B, C, T, H, W], or [B, T, H, W, C].
+        if isinstance(out, MediaArtifact):
+            out.validate(context="W&B", name="preview")
+            if out.spec.representation != "decoded" or out.spec.modality not in ("image", "video"):
+                raise ValueError(f"W&B requires a decoded visual artifact, got {out.spec}")
+            media_kind = out.spec.modality
+            if media_kind == "image":
+                out = out.normalized(context="W&B", name="preview").data
+        output_ndim = getattr(out, "ndim", -1)
+        is_video = resolve_is_video(media_kind)
+        if is_video and output_ndim == 5:
+            # Batched video [B, T, C, H, W]; TCHW is validated below.
             out = out[0]
-        if hasattr(out, "ndim") and out.ndim == 4:
+        if not isinstance(out, MediaArtifact):
+            MediaArtifact(
+                MediaSpec(media_kind, "decoded", "TCHW" if is_video else "CHW", fps=fps if is_video else None),
+                out,
+            ).validate(context="W&B", name="preview")
+        if is_video:
             try:
+                validate_audio(audio, audio_sample_rate, context="W&B")
                 if video_dir is None:
                     video_tmp_dir = tempfile.mkdtemp(prefix="val_video_")
                     video_dir = video_tmp_dir
@@ -205,9 +252,13 @@ def wrap_val_samples_for_wandb(samples, fps=24, output_dir=None):
                 logger.warning("Could not log validation sample %d video: %s", len(wrapped), error)
                 media = f"[validation media unavailable: {type(error).__name__}: {error}]"
         else:
-            if not isinstance(out, torch.Tensor) or out.dtype != torch.uint8:
-                raise ValueError(f"Expected a uint8 image tensor, got {getattr(out, 'dtype', type(out))}.")
-            media = wandb.Image(out, file_type="jpg")
+            try:
+                if not isinstance(out, torch.Tensor) or out.dtype != torch.uint8:
+                    raise ValueError(f"Expected a uint8 image tensor, got {getattr(out, 'dtype', type(out))}.")
+                media = wandb.Image(out, file_type="jpg")
+            except Exception as error:
+                logger.warning("Could not log validation sample %d image: %s", len(wrapped), error)
+                media = f"[validation media unavailable: {type(error).__name__}: {error}]"
         wrapped.append((inp, media, score))
     return wrapped, video_tmp_dir, media_to_log
 

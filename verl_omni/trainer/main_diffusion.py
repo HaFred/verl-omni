@@ -16,6 +16,7 @@
 import json
 import os
 import socket
+import warnings
 
 import hydra
 import ray
@@ -33,6 +34,7 @@ from verl_omni.trainer.diffusion.ray_diffusion_trainer import (
 from verl_omni.utils.config import validate_config
 from verl_omni.utils.diffusion_attention import validate_attention_consistency
 from verl_omni.utils.rl_insight import enable_rl_insight
+from verl_omni.workers.config.reward import reward_pool_is_separate, reward_role_required
 
 
 def _count_controller_capture_ranges(profile_steps: list[int], profile_continuous_steps: bool) -> int:
@@ -96,6 +98,34 @@ def _validate_grm_reward_function(config) -> None:
         )
 
 
+def uses_v1_trainer(config) -> bool:
+    """Return True unless the config selects offline direct preference training.
+
+    Offline DPO has no V1 equivalent and stays on the legacy trainer by design
+    (verl-project/verl-omni#389), mirroring ``main_omni.uses_v1_trainer``.
+    """
+    sample_source = OmegaConf.select(config, "algorithm.sample_source", default="online")
+    trainer_type = OmegaConf.select(config, "algorithm.trainer_type", default="policy_gradient")
+    return not (sample_source == "offline" and trainer_type == "direct_preference")
+
+
+def _deprecate_v0_trainer(config) -> None:
+    """Warn on legacy-trainer launches that have a V1 equivalent.
+
+    Always normalizes ``trainer.use_v1`` to False so validation and the printed
+    config reflect the code path this entrypoint actually runs.
+    """
+    if uses_v1_trainer(config):
+        warnings.warn(
+            "The legacy (v0) diffusion trainer is deprecated and will be removed in a future release. "
+            "The V1 trainer (TransferQueue + ReplayBuffer) is the default since v0.3.0; launch "
+            "`python -m verl_omni.trainer.main_diffusion_v1` to use it.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    config.trainer.use_v1 = False
+
+
 def run_diffusion(config, task_runner_class=None) -> None:
     """Initialize Ray and run distributed diffusion training.
 
@@ -106,6 +136,7 @@ def run_diffusion(config, task_runner_class=None) -> None:
         task_runner_class: For recipe to change TaskRunner.
     """
     OmegaConf.resolve(config)
+    _deprecate_v0_trainer(config)
     validate_separate_config(config)
     enable_rl_insight(config)
     _validate_grm_reward_function(config)
@@ -223,15 +254,17 @@ class TaskRunner:
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
 
-        if config.reward.reward_model.enable_resource_pool:
-            if config.reward.reward_model.n_gpus_per_node <= 0:
+        if reward_role_required(config) and reward_pool_is_separate(config):
+            reward_gpus = config.reward.reward_model.n_gpus_per_node
+            reward_nnodes = config.reward.reward_model.nnodes
+            if reward_gpus <= 0:
                 raise ValueError("config.reward.reward_model.n_gpus_per_node must be greater than 0")
-            if config.reward.reward_model.nnodes <= 0:
+            if reward_nnodes <= 0:
                 raise ValueError("config.reward.reward_model.nnodes must be greater than 0")
 
-            reward_pool = [config.reward.reward_model.n_gpus_per_node] * config.reward.reward_model.nnodes
+            reward_pool = [reward_gpus] * reward_nnodes
             resource_pool_spec["reward_pool"] = reward_pool
-        else:
+        elif reward_role_required(config):
             config.reward.reward_model.nnodes = config.trainer.nnodes
             config.reward.reward_model.n_gpus_per_node = config.trainer.n_gpus_per_node
 
@@ -253,10 +286,10 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import Role
 
         if config.algorithm.sample_source == "online":
-            if config.reward.reward_model.enable:
+            if reward_role_required(config):
                 # we do not use reward model workers, so we only register reward model in resource pool
                 # without continue to register reward model worker in role mapping
-                if config.reward.reward_model.enable_resource_pool:
+                if reward_pool_is_separate(config):
                     self.mapping[Role.RewardModel] = "reward_pool"
                 else:
                     self.mapping[Role.RewardModel] = "global_pool"
