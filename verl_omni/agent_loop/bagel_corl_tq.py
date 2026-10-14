@@ -21,6 +21,7 @@ In-episode counters (RFC):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from dataclasses import dataclass, field
@@ -30,7 +31,7 @@ import ray
 import torch
 import transfer_queue as tq
 from verl.experimental.agent_loop import AgentLoopManager, AgentLoopOutput
-from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ
+from verl.trainer.ppo.v1.agent_loop_tq import AgentLoopWorkerTQ, _settle_session_tasks
 from verl.utils.ray_utils import auto_await
 from verl.utils.tensordict_utils import list_of_dict_to_tensordict
 
@@ -46,6 +47,7 @@ from verl_omni.agent_loop.bagel_corl_rm import bind_bagel_rm_handles
 from verl_omni.agent_loop.diffusion_agent_loop import _config_to_sampling_dict
 from verl_omni.tools.trajectory.hydra_env import bind_agentic_image_gen
 from verl_omni.tools.trajectory.paths import bind_run_artifacts
+from verl_omni.utils.agentic_val_viz import VAL_VIZ_PROMPT_KEY, resolve_agentic_val_viz_provider
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -121,6 +123,7 @@ __all__ = [
     "DualLanePack",
     "classify_episode_pattern",
     "episode_from_agent_extra",
+    "is_val_viz_prompt",
     "val_overlay_sampling_params",
     "gate_episode_jk",
     "gen_tq_key",
@@ -131,6 +134,26 @@ __all__ = [
     "und_row_reward",
     "und_tq_key",
 ]
+
+
+def is_val_viz_prompt(prompt: Mapping[str, Any]) -> bool:
+    """True when ``prompt`` is a holdout validation-visualization row.
+
+    The holdout is dispatched through this same worker (it needs the episode to run,
+    because the agent loop is what dumps the reference PNGs), but it is not a training
+    or validation *row*: see ``BagelCorlAgentLoopWorkerTQ._run_holdout_prompt``. The
+    marker column is what distinguishes the two, and it travels with the prompt from
+    ``AgenticValVizProvider.build_tensordict_batch``, so no worker-side state is needed.
+
+    Absent/blank/``0``/``False`` all read as "not a holdout"; a value this recipe never
+    writes (e.g. ``"False"`` from a YAML round-trip) must not switch the holdout on.
+    """
+    raw = prompt.get(VAL_VIZ_PROMPT_KEY)
+    if raw is None:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"", "0", "false", "none", "no"}
 
 
 def und_tq_key(*, dataset_task_uid: str, session_id: int | str, episode_index: int | str) -> str:
@@ -500,17 +523,87 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
         Mirrors ``diffusion_agent_loop_tq``, which performs this same overlay on the
         stock diffusion path (``composite_agent_loop`` and ``diffusion_agent_loop``
         likewise); the bagel loop was the one path missing it.
+
+        A holdout validation-visualization prompt (``AGENTIC_VAL_VIZ=1``) takes the
+        overlay *and* skips TransferQueue entirely: see ``_run_holdout_prompt``.
         """
         if trajectory.get("validate"):
             config = self.config.actor_rollout_ref.rollout
             sampling_params = val_overlay_sampling_params(sampling_params, config)
-        await super()._run_prompt(prompt, sampling_params, trajectory=trajectory, trace=trace)
+        if not is_val_viz_prompt(prompt):
+            await super()._run_prompt(prompt, sampling_params, trajectory=trajectory, trace=trace)
+            return
+        await self._run_holdout_prompt(prompt, sampling_params, trajectory=trajectory, trace=trace)
+
+    async def _run_holdout_prompt(
+        self, prompt: dict, sampling_params: dict, trajectory: dict, trace: bool = False
+    ) -> None:
+        """Run one holdout-viz prompt to completion without touching TransferQueue.
+
+        The base ``_run_prompt`` brackets every prompt with ``tq.async_kv_put`` status
+        markers in ``"train"``/``"val"``, and ``_agent_loop_postprocess`` then writes the
+        episode's rows into the same partition. Neither is the holdout's transport:
+        ``_validate`` samples ``"val"`` with ``batch_size=len(batch)``, so four extra rows
+        there either displace real validation rows or leave the buffer short, and nothing
+        ever waits on a holdout's status marker. The holdout's consumers are the PNGs and
+        the trajectory the episode dumps itself (``dump_episode_images`` /
+        ``dump_episode_trace``, called from ``BagelMultiturnAgentLoop.run``), so this path
+        exists to run the sessions and write **no** TransferQueue row at all.
+
+        Because this worker *does* still run the base's fire-and-forget dispatch, the
+        manager waits on :meth:`wait_for_background` before it lets the step advance.
+
+        ``n`` mirrors the base: a holdout is a validation batch, so it rolls out
+        ``rollout.val_kwargs.n`` siblings.
+        """
+        config = self.config.actor_rollout_ref.rollout
+        n = prompt.pop("__rollout_n__", config.val_kwargs.n)
+        prompt.pop("__do_sample__", None)
+        tasks = [
+            asyncio.create_task(
+                self._run_agent_loop(sampling_params, trajectory=trajectory, trace=trace, session_id=i, **prompt)
+            )
+            for i in range(n)
+        ]
+        for error in await _settle_session_tasks(tasks):
+            # Same contract as the base: one bad session must not abort its siblings, and
+            # a holdout failure must never take the validation pass down with it.
+            logger.error(
+                "holdout viz prompt failed uid=%s",
+                prompt.get("uid"),
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    async def wait_for_background(self) -> None:
+        """Block until every episode this worker has accepted has settled.
+
+        ``generate_sequences`` is fire-and-forget by design, so a holdout dispatched
+        through it is still decoding when the caller returns. The manager calls this once
+        per holdout so the step's reference PNGs exist *before* the trainer advances (and
+        re-syncs or sleeps the replicas out from under an in-flight episode).
+
+        The sibling validation batch the trainer is already blocked on is part of the
+        same task set and is simply waited on here too; no task can be added after that
+        batch because the trainer dispatches the next one only after ``sample`` returns.
+        """
+        while self.background_tasks:
+            await asyncio.gather(*list(self.background_tasks), return_exceptions=True)
 
     async def _agent_loop_postprocess(
         self, output: AgentLoopOutput | list[AgentLoopOutput], validate, **kwargs
     ) -> None:
         """Put one UND episode key plus zero-or-more GEN seed keys into TransferQueue."""
         uid, session_id = kwargs["uid"], kwargs["session_id"]
+        if is_val_viz_prompt(kwargs):
+            # Not a row: the episode's artifacts are already on disk (see
+            # ``_run_holdout_prompt``). Scoring it would spend a reward-model round trip on
+            # a number nothing logs, so the holdout stops here.
+            logger.info(
+                "bagel_corl holdout viz episode done uid=%s session=%s (artifacts dumped, no TQ row)",
+                uid,
+                session_id,
+            )
+            return
         outputs = output if isinstance(output, list) else [output]
         if not outputs:
             raise RuntimeError(f"Empty bagel Co-RL (Joint-Training) agent output for prompt {uid}_{session_id}")
@@ -729,6 +822,11 @@ class BagelCorlAgentLoopManagerTQ(AgentLoopManager):
             bind_agentic_image_gen(config)
         self.agent_loop_workers_class = BagelCorlAgentLoopWorkerTQ
         super().__init__(*args, **kwargs)
+        # ``AGENTIC_VAL_VIZ=1`` turns on the fixed holdout; ``None`` (the default) makes
+        # every method below a no-op. Read once here, in the driver process, so the
+        # workers never depend on the env of whoever spawned the Ray runtime.
+        self._val_viz_provider = resolve_agentic_val_viz_provider()
+        self._val_viz_done_steps: set[int] = set()
 
     @classmethod
     @auto_await
@@ -745,3 +843,76 @@ class BagelCorlAgentLoopManagerTQ(AgentLoopManager):
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
             ]
         )
+        self._maybe_run_val_viz(prompts)
+
+    def _maybe_run_val_viz(self, prompts) -> None:
+        """Run the fixed holdout once per validation step when ``AGENTIC_VAL_VIZ=1``.
+
+        ``val-core`` is a scalar mean over the whole val parquet, so a lane can collapse
+        into a degenerate-but-scoring mode and barely move it. Four *fixed* prompts --
+        samples 9001/9002 (cafe) and 9003/9004 (CN poster), each rendered by the
+        deterministic ODE validation kernel -- are the artifact that makes that visible,
+        which is what the Mode (2a) RPCO recipe dumps as
+        ``rollout_images/step_XXXXXX/sample_9001..9004``. Here they land under
+        ``rollout_images/val/step_XXXXXX/sample_900N.01/`` because the bagel lane's
+        episode dump prefixes every validation artifact with ``val/``.
+
+        Two details this method exists for:
+
+        * ``_validate`` calls this once per val *batch* (``data.val_max_samples`` /
+          ``val_batch_size``), so a per-pass guard keeps one holdout per step instead of
+          one per batch.
+        * the holdout must survive the call: the workers dispatch episodes
+          fire-and-forget, and the trainer may sleep or re-sync the replicas as soon as
+          this returns, so the wait is what keeps a reference image from being torn down
+          mid-denoise.
+
+        Nothing here may raise: this is an experiment-tracking fixture and the validation
+        pass it rides on is the training signal.
+        """
+        provider = self._val_viz_provider
+        if provider is None or not _is_validate_batch(prompts):
+            return
+        step = _batch_scalar(prompts, "global_steps")
+        try:
+            step_i = int(step) if step is not None else -1
+        except (TypeError, ValueError):
+            step_i = -1
+        if step_i in self._val_viz_done_steps:
+            return
+        try:
+            batch = provider.build_tensordict_batch(step)
+            chunkes = batch.chunk(len(self.agent_loop_workers))
+            ray.get(
+                [
+                    worker.generate_sequences.remote(chunk)
+                    for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=False)
+                ]
+            )
+            ray.get([worker.wait_for_background.remote() for worker in self.agent_loop_workers])
+            self._val_viz_done_steps.add(step_i)
+            logger.info("bagel_corl val holdout viz complete for step=%s", step_i)
+        except Exception as exc:  # noqa: BLE001 - a fixture must never fail the val pass
+            logger.warning("Failed to run the val holdout viz at step=%s: %s", step_i, exc)
+
+
+def _batch_scalar(prompts: Any, key: str) -> Any:
+    """Read a non-tensor V1 batch scalar (``NonTensorData``) without raising.
+
+    ``_validate`` stamps ``global_steps`` / ``validate`` with ``assign_non_tensor_data``,
+    which lands as ``NonTensorData`` holding the raw value (``.data``). A plain tensor or
+    a missing key both degrade to ``None`` -- this is called on the hot path of the
+    training loop, so it must not be the thing that raises.
+    """
+    try:
+        if key not in prompts:
+            return None
+        value = prompts[key]
+    except Exception:  # noqa: BLE001
+        return None
+    return getattr(value, "data", value)
+
+
+def _is_validate_batch(prompts: Any) -> bool:
+    """True when ``prompts`` is the validation batch ``_validate`` dispatches."""
+    return bool(_batch_scalar(prompts, "validate"))
