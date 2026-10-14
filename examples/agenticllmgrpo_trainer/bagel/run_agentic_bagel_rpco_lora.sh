@@ -9,19 +9,30 @@
 if [[ "${DEBUG:-}" == "1" ]]; then
   set -x
 fi
-# Prefer local verl checkout (tokenizer package layout) over site-packages flat tokenizer.py.
 _SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 _REPO_ROOT="$(cd "${_SCRIPT_DIR}/../../.." && pwd)"
-_LOCAL_VERL="${_LOCAL_VERL:-${_REPO_ROOT}/../verl}"
-if [[ -d "${_LOCAL_VERL}/verl" ]]; then
-  export PYTHONPATH="${_LOCAL_VERL}:${_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-else
-  export PYTHONPATH="${_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-fi
-# Same interpreter convention as run_bagel_und_ar_serve.sh: prefer this repo's venv, fall back to PATH.
+# Same interpreter convention as run_bagel_und_ar_serve.sh: prefer this repo's venv, fall
+# back to PATH. Resolved *before* PYTHONPATH because the sibling-verl probe below needs it.
 _PY="${_REPO_ROOT}/.venv/bin/python3"
 if [[ ! -x "${_PY}" ]]; then
   _PY="$(command -v python3)"
+fi
+# Prefer the sibling ``verl`` checkout (its tokenizer package layout predates the venv's
+# flat ``tokenizer.py``), but only when that checkout actually satisfies this tree's
+# imports. A *stale* sibling is worse than none: it takes PYTHONPATH precedence and
+# shadows the venv's installed ``verl``, so the run dies at import before any GPU is
+# touched -- measured 2026-10-12 on this box, whose ``../verl`` predates
+# ``build_rollout_dist_profiler`` being re-exported from ``verl.utils.profiler``:
+#   ImportError: cannot import name 'build_rollout_dist_profiler' from 'verl.utils.profiler'
+# The probe reproduces exactly that shadow (candidate first, venv site-packages behind it),
+# so a compatible sibling keeps working and an incompatible one degrades to the venv copy.
+_LOCAL_VERL="${_LOCAL_VERL:-${_REPO_ROOT}/../verl}"
+if [[ -d "${_LOCAL_VERL}/verl" ]] \
+  && PYTHONPATH="${_LOCAL_VERL}" "${_PY}" -c "from verl.utils.profiler import build_rollout_dist_profiler" >/dev/null 2>&1; then
+  export PYTHONPATH="${_LOCAL_VERL}:${_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+else
+  echo "[INFO] sibling verl checkout ${_LOCAL_VERL} is absent or too old for this tree; using the venv's installed verl" >&2
+  export PYTHONPATH="${_REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 
 _HF_HUB="${HF_HOME:-$HOME/.cache/huggingface}/hub"
@@ -210,6 +221,13 @@ for stage in stages:
         )
 PY
 # RM default: off for 1-2 GPUs (actor+Omni+UND cannot fit), on for >=4 so GEN gets an rm_score; ENABLE_RM=0 forces it off.
+#
+# ``GEN_N_DEFAULT`` is the sibling count (``rollout.n``) for this GPU budget. N is what
+# makes a GRPO advantage *estimable*: the baseline is the group mean over N siblings of the
+# same prompt, so a larger N buys a less noisy baseline on the same task, while
+# ``TRAIN_BSZ`` buys a more diverse task mix. Both are raised on the >=4-GPU branch, which
+# is the one whose batch was measured to have no trend.
+GEN_N_DEFAULT=2
 if [[ "$NUM_GPUS_ACTOR_ROLLOUT_REWARD" -eq 1 ]]; then
   ENABLE_RM=${ENABLE_RM:-0}
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.08}
@@ -242,7 +260,16 @@ else
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.15}
   # This bounds only the GEN lane's KV/workspace, not its checkpoint footprint; keep 0.25.
   ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.25}
-  TRAIN_BSZ=${TRAIN_BSZ:-2}
+  # 4 prompt groups x N=4 sibling episodes = 16 episodes per optimizer step, and PPO_MINI=4
+  # keeps them in ONE mini-batch (4 episodes per rank at PPO_MICRO=1). The reference run at
+  # 2 x N=4 (8 episodes/step) measured a training reward with no trend under this recipe's
+  # noise; every extra sibling episode is another sample of the same task distribution,
+  # whereas a smaller batch only re-rolls the same dice. Memory is not the constraint at
+  # this batch size: ppo_micro_batch_size_per_gpu=1 plus actor param/optimizer offload means
+  # the activations are per-episode, so doubling TRAIN_BSZ doubles the *step time*, not the
+  # peak (modulo the bounds the rollout/RM engines already carry via their mem-util knobs).
+  TRAIN_BSZ=${TRAIN_BSZ:-4}
+  GEN_N_DEFAULT=4
   MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-2048}
   # pr634 UniGRPO SDE kernel: noise 0.8, SDE on the first ~20% of the schedule (window fixed at 0).
   GEN_STEPS=${GEN_STEPS:-10}
@@ -341,9 +368,19 @@ fi
 
 # data.val_batch_size only sets the batch; the V1 val path still iterates the whole val set
 # (val_max_samples defaults to -1), so cap it — raise or set -1 to test validation itself.
-# 8 samples cannot resolve a binary dim either: one episode moves it by ~0.17, so a val
-# pass that wants to trend ``reward_done`` needs the prompt count raised, not the batch.
-VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-8}
+# 32, not 8: a binary dim is 1/val_max_samples wide, so 8 samples quantize ``val-core`` in
+# steps of 0.125 and a 0.03 jump is invisible, while 32 resolves it to 0.031. The val pass
+# is 50-step ODE (deterministic), so the extra prompts cost wall time, not signal.
+VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-32}
+
+# Fixed validation holdout: samples 9001/9002 (cafe poster, reflect + plan) and 9003/9004
+# (CN poster, reflect + plan) -- the same four the Mode (2a) RPCO recipe dumps. One
+# deterministic ODE render per validation step under ``rollout_images/val/step_XXXXXX/
+# sample_900N.01/``, because ``val-core`` is a scalar mean over the whole val parquet: a
+# lane can collapse into a degenerate but still-scoring mode and barely move it. These
+# rows are artifacts only -- the holdout writes no TransferQueue row (see
+# ``BagelCorlAgentLoopWorkerTQ._run_holdout_prompt``), so it cannot perturb the val batch.
+export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 
 # Advantage normalization. ``False`` is Dr.GRPO (arXiv:2503.20783): the advantage is the raw
 # centred reward, so the update scales with the actual signal and a near-tie is nearly a
@@ -364,9 +401,10 @@ LR_SCHEDULER=${LR_SCHEDULER:-cosine}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
 
 # Smoke defaults: N = sibling episodes (>=2 required for GEN training), S = seeds per call
-# (default 1). Do not let a stale J/K from the shell leak in.
+# (default 1). Do not let a stale J/K from the shell leak in. ``GEN_N_DEFAULT`` carries the
+# GPU-budget-appropriate N set above (2 for a smoke budget, 4 on >=4 GPUs).
 if [[ -z "${N:-}" ]]; then
-  if [[ -n "${J:-}" ]]; then N=$J; else N=2; fi
+  if [[ -n "${J:-}" ]]; then N=$J; else N=${GEN_N_DEFAULT:-2}; fi
 fi
 if [[ -z "${S:-}" ]]; then
   if [[ -n "${K:-}" && "$K" -ge 2 ]]; then
@@ -381,6 +419,13 @@ if [[ "$S" -lt 1 ]]; then
 fi
 if [[ "$N" -lt 1 ]]; then
   echo "rollout.n N must be >= 1 (got N=$N)." >&2
+  exit 1
+fi
+if [[ "$S" -eq 1 && "$N" -lt 2 ]]; then
+  # With one seed per call the FlowGRPO group for a call is the N siblings, so N=1 leaves
+  # every advantage identically zero (the group mean equals the lone member). Fail loud
+  # instead of training a zero GEN gradient for the whole run.
+  echo "S=1 groups GEN by task, so N must be >= 2 or every GEN advantage is zero (got N=$N)." >&2
   exit 1
 fi
 echo "bagel_corl smoke: N=$N siblings, S=$S seeds/call (in-episode J/K are runtime)"

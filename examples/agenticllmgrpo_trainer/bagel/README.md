@@ -83,6 +83,15 @@ bash examples/agenticllmgrpo_trainer/bagel/run_agentic_bagel_rpco_lora.sh
 CUDA_VISIBLE_DEVICES=3 bash examples/agenticllmgrpo_trainer/bagel/run_agentic_bagel_rpco_lora.sh
 ```
 
+The recipe runs `${_REPO_ROOT}/.venv/bin/python3` (never a bare `python3`, which can resolve
+to a different interpreter) and resolves `verl` from the venv's install. It also *offers*
+the sibling `../verl` checkout first — the layout that predates the venv's flat
+`tokenizer.py` — but only after probing that the candidate can satisfy this tree's imports.
+A stale sibling is worse than none: on `PYTHONPATH` it silently shadows the venv's `verl`
+and the run dies before touching a GPU with, e.g., `ImportError: cannot import name
+'build_rollout_dist_profiler' from 'verl.utils.profiler'`. Point `_LOCAL_VERL` at a specific
+checkout to force one, or at a path with no `verl/` in it to skip the probe.
+
 Ladder: run 1-GPU first (loop + composite step, RM off), then 2-GPU, then the 4-GPU
 acceptance run with `ENABLE_RM=1` (colocated Qwen RM, TP-sharded across the pool).
 `BAGEL_UND_AR_SERVING_READY=1` is the recipe default — set `0` to re-hear the fail-closed
@@ -101,7 +110,7 @@ from the pool size and read back before launch, so they cannot drift apart.
 | `REWARD_TP` / `ROLLOUT_TP` | pool size / `2` for a >=4-card pool, else `1` | Tensor-parallel for RM / GEN rollout; the pool must divide both. `ROLLOUT_TP` shards the GEN checkpoint, and each value is paired with a matching deploy yaml (`bagel_corl_deploy.yaml` for TP=1, `bagel_corl_deploy_tp2.yaml` for TP=2) whose stage `devices` length must equal it. |
 | `ROLLOUT_GPU_MEM_UTIL` / `UND_GPU_MEM_UTIL` | `0.25` / `0.40` (>2-GPU) | GEN / UND AR Thinker budgets. Only `ROLLOUT_TP` shards the GEN weights, and the AR budget sizes the Thinker KV cache above its init floor, so neither is a placement knob. |
 | `BAGEL_UND_AR_SERVING_READY` | `1` | Fail-closed gate; set `0` to re-prove the spike. |
-| `S` / `N` / `LORA_RANK` / `LORA_ALPHA` / `GEN_STEPS` / `GEN_HW` / `TRAIN_BSZ` | see script | Seeds per call / siblings / LoRA shape / denoise steps / generation size / batch. |
+| `S` / `N` / `LORA_RANK` / `LORA_ALPHA` / `GEN_STEPS` / `GEN_HW` / `TRAIN_BSZ` | see script | Seeds per call / siblings / LoRA shape / denoise steps / generation size / batch. On the >=4-card branch these are `S=1`, `N=4`, `TRAIN_BSZ=4` (with `PPO_MINI=TRAIN_BSZ`, `PPO_MICRO=1`), i.e. **16 episodes per optimizer step** in one mini-batch: siblings sharpen the group baseline, `TRAIN_BSZ` widens the task mix. `S=1` with `N<2` is rejected — the group mean then equals its only member and every GEN advantage is zero. |
 | `ENABLE_PEC` | `1` | Turns on the GEN conditioning cache and its routing affinity as one pair (see below). |
 | `AGENT_WORKERS` | `8` | Agent-loop workers; also sizes `PEC_SIZE`. |
 | `MAX_PROMPT_LEN` | `2048` (>=4-GPU), `1024` (2-GPU), `512` (1-GPU) | Pins `data.max_prompt_length`/`max_response_length` **and** `rollout.prompt_length`/`response_length`; the pairs must match. |
@@ -110,7 +119,8 @@ from the pool size and read back before launch, so they cannot drift apart.
 | `ROLLOUT_TEMPERATURE` / `ROLLOUT_TOP_P` / `ROLLOUT_TOP_K` / `ROLLOUT_REPETITION_PENALTY` | `0.7` / `0.9` / `50` / `1.05` | UND AR sampling, mirroring `bagel_corl_deploy_ar.yaml`. The agent loop sends all four explicitly, so leaving them unset overrides the deploy defaults. |
 | `NORM_ADV_BY_STD` | `False` | Dr.GRPO: the advantage is the raw centred reward, so the update scales with the signal instead of the group std (at `N=2`, std division makes every gap a fixed-amplitude push). Read on both lanes. |
 | `LR_WARMUP_RATIO` / `LR_SCHEDULER` / `MIN_LR_RATIO` | `0.05` / `cosine` / `0.1` | Actor LR schedule: 5% warmup, then cosine decay to 10% of the `1e-4` peak, so the late steps move ~10x less. |
-| `VAL_MAX_SAMPLES` | `8` | Caps the V1 val pass (`val_max_samples` defaults to `-1`, i.e. the whole val set). Raise it before reading a binary dim: one episode moves `reward_done` by ~0.17. |
+| `VAL_MAX_SAMPLES` | `32` | Caps the V1 val pass (`val_max_samples` defaults to `-1`, i.e. the whole val set). A binary dim is `1/VAL_MAX_SAMPLES` wide, so 8 samples quantize `val-core` in 0.125 steps and a 0.03 improvement is invisible; 32 resolves it to 0.031. |
+| `AGENTIC_VAL_VIZ` | `1` | Fixed validation holdout. Each val step also renders samples `9001`/`9002` (cafe poster, `reflect`/`plan`) and `9003`/`9004` (Chinese poster, `reflect`/`plan`) with the deterministic 50-step ODE val kernel, under `rollout_images/val/step_XXXXXX/sample_900N.01/` — the same four artifacts the Mode (2a) RPCO recipe dumps. They are artifacts only: the holdout writes **no** TransferQueue row, so it cannot displace or shorten the val batch. `0` opts out. |
 | `RUN_TS` / `RUN_NAME` / `RUN_DIR` | `date +%Y%m%d_%H%M%S` / `bagel_corl_$RUN_TS` / `outputs/$RUN_NAME` | Hydra run dir (`hydra.run.dir`), holding `.hydra/` and `main_omni.log`. Hydra refuses an existing dir, so pass the original stamp or point `RUN_DIR` at it. |
 | `DEFAULT_LOCAL_DIR` | unset | Checkpoint dir; unset shares `checkpoints/${project_name}/${experiment_name}` across runs. |
 | `BAGEL_CORL_TRACE_DUMP` | `1` | Per-episode trajectory dump under `<e2e_root>/<experiment_name>/rollout_trajectories/step_XXXXXX/`. `0` opts out. |
