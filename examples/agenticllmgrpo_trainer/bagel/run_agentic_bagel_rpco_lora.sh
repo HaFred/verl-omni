@@ -475,6 +475,17 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
 #   (the '+' prefix is required; the schema has no pipeline/algo subtree there).
 # * SYNC_REFILL_FAILED_GROUPS=1 refills all-failed groups instead of raising (0 fails loud).
 # * agentic_image_gen.run_dir is pinned to $RUN_DIR so runs cannot overwrite each other's dumps.
+# * rollout.repetition_penalty takes the '+' prefix. This tree requires the *installed* verl
+#   (the one with ``build_rollout_dist_profiler`` in ``verl.utils.profiler`` -- probe at the top),
+#   and that verl's ``trainer/config/rollout/rollout.yaml`` no longer declares the key: it kept
+#   ``temperature`` / ``top_p`` / ``top_k`` and moved the rest into the ``RolloutConfig``
+#   dataclass, which still carries ``repetition_penalty``. A plain override therefore dies in
+#   composition with ``Key 'repetition_penalty' is not in struct`` before any GPU work starts,
+#   and dropping it is not an option: the dataclass default of 1.0 is what
+#   ``composite_agent_loop`` stamps into every UND request, where the AR strategy's
+#   ``setdefault`` lets it win over ``bagel_corl_deploy_ar.yaml``'s 1.05 -- i.e. silently back
+#   to the untruncated, anti-repetition-free sampling that degenerates the checkpoint into
+#   ``assistant\nassistant\n...`` (see the ROLLOUT_REPETITION_PENALTY comment above).
 # * BAGEL_CORL_GEN_DECODE=sde records the latents/log-probs FlowGRPO needs; ode disables the GEN loss.
 export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
 "${_PY}" -m verl_omni.trainer.main_omni \
@@ -544,7 +555,7 @@ export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
     actor_rollout_ref.rollout.temperature=$ROLLOUT_TEMPERATURE \
     actor_rollout_ref.rollout.top_p=$ROLLOUT_TOP_P \
     actor_rollout_ref.rollout.top_k=$ROLLOUT_TOP_K \
-    actor_rollout_ref.rollout.repetition_penalty=$ROLLOUT_REPETITION_PENALTY \
+    +actor_rollout_ref.rollout.repetition_penalty=$ROLLOUT_REPETITION_PENALTY \
     +actor_rollout_ref.rollout.enable_prompt_embed_cache=$PEC_FLAG \
     +actor_rollout_ref.rollout.enable_prompt_embed_cache_routing_affinity=$PEC_AFFINITY \
     +actor_rollout_ref.rollout.prompt_embed_cache_size=$PEC_SIZE \
