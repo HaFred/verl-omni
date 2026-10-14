@@ -74,6 +74,24 @@ if [[ -n "${CUDA_HOME:-}" && ":${PATH}:" != *":${CUDA_HOME}/bin:"* ]]; then
   export PATH="${CUDA_HOME}/bin:${PATH}"
 fi
 
+# Same JIT-toolchain theme as nvcc above, but for ``ninja``: put the venv ``_PY`` was
+# resolved from on PATH.
+#
+# ``vllm``'s engine warm-up shells out to ``ninja`` to compile kernels:
+#   vllm/v1/engine/core.py:356 _initialize_kv_caches
+#     -> self.model_executor.compile_or_warm_up_model()
+#   FileNotFoundError: [Errno 2] No such file or directory: 'ninja'
+#   RuntimeError: Worker failed with error '[Errno 2] No such file or directory: 'ninja''
+# which surfaces as "Engine core initialization failed" and costs the entire startup
+# (measured 2026-10-14: ~6 min, at the reward engine, REWARD_TP=4). The venv ships
+# ``.venv/bin/ninja``, and nothing in this recipe ever added that directory to PATH --
+# the judge sidecar below sets PATH for itself only. Interactive launches had it by
+# accident (an activated venv), so the hole only opens for a launch from a bare shell
+# (a watchdog, ``nohup``/``setsid``, CI, or a login shell without ``activate``).
+if [[ -x "${_REPO_ROOT}/.venv/bin/ninja" && ":${PATH}:" != *":${_REPO_ROOT}/.venv/bin:"* ]]; then
+  export PATH="${_REPO_ROOT}/.venv/bin:${PATH}"
+fi
+
 # The driver tops out at CUDA 12.2 while the venv's torch is cu13: prepend the cuda-compat
 # shim + cu13 runtime when present, and let torch answer is_available() from NVML.
 _cuda_compat="${_REPO_ROOT}/.venv/cuda-compat"
