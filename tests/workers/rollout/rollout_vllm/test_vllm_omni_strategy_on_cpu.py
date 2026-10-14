@@ -1030,6 +1030,54 @@ def test_drop_defaulted_engine_args_keeps_only_explicit_overrides():
     assert filtered["reasoning_parser_plugin"] == "openai"
 
 
+def test_drop_defaulted_engine_args_treats_cli_none_as_unset():
+    """CLI ``None`` is the parser's *unset* sentinel, never an explicit value.
+
+    Reproduces the 2026-10-14 ``bagel_think`` init failure: the vLLM-Omni CLI
+    declares ``enable_lora``/``mm_device_do_normalize`` as ``bool | None``, so a
+    parsed namespace carries ``None`` for both while the resolved dataclass
+    defaults are ``False``/``True``. Equality-only filtering forwards them, and
+    vllm-omni's diffusion ingress validates key *presence*, so the UND AR
+    replica's stage 1 aborts with "Unknown diffusion config field(s) for stage
+    1: 'enable_lora', 'mm_device_do_normalize'" before any decode runs.
+    """
+    from dataclasses import asdict
+
+    from vllm.utils.argparse_utils import FlexibleArgumentParser
+    from vllm_omni.config.omni_config import normalize_and_validate_diffusion_engine_ingress_kwargs
+    from vllm_omni.engine.arg_utils import OmniEngineArgs
+    from vllm_omni.entrypoints.cli import serve
+
+    parser = FlexibleArgumentParser(description="vLLM-Omni CLI")
+    subparsers = parser.add_subparsers(required=False, dest="subparser")
+    for command in serve.cmd_init():
+        command.subparser_init(subparsers).set_defaults(dispatch_function=command.cmd)
+    parsed = parser.parse_args(args=["serve", "some-model"])
+
+    engine_args = asdict(OmniEngineArgs.from_cli_args(parsed))
+    # The parser really does hand over ``None`` for these two flags ...
+    assert engine_args["enable_lora"] is None
+    assert engine_args["mm_device_do_normalize"] is None
+    # ... while the resolved dataclass defaults are ``False``/``True``, never
+    # ``None``, so an equality-only comparison saw them as explicit overrides.
+    assert server_module._is_defaulted_value("enable_lora", None, False)
+    assert server_module._is_defaulted_value("mm_device_do_normalize", None, True)
+
+    filtered = server_module._drop_defaulted_engine_args(engine_args)
+    assert "enable_lora" not in filtered
+    assert "mm_device_do_normalize" not in filtered
+    # The surviving mapping must pass *every* stage's ingress, not just stage 0's.
+    normalize_and_validate_diffusion_engine_ingress_kwargs(filtered, stage_id=1)
+
+    # An explicitly requested value is still forwarded, so a non-merged LoRA
+    # recipe keeps reaching the engine that consumes it.
+    engine_args["enable_lora"] = True
+    engine_args["mm_device_do_normalize"] = False
+    filtered = server_module._drop_defaulted_engine_args(engine_args)
+    assert filtered["enable_lora"] is True
+    assert filtered["mm_device_do_normalize"] is False
+
+
 def test_ar_deploy_config_omits_text_encoder_tp_size_on_ar_stages(tmp_path, monkeypatch):
     """text_encoder_tp_size is diffusion-only; upstream rejects it on AR stages."""
     import yaml

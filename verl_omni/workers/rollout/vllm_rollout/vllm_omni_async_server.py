@@ -61,7 +61,21 @@ _ENGINE_ARGS_DEFAULTS: dict | None = None
 
 
 def _is_defaulted_value(key: str, value: Any, default: Any) -> bool:
-    """Return True if *value* matches the upstream default for *key*."""
+    """Return True if *value* matches the upstream default for *key*.
+
+    ``None`` counts as defaulted for every field: the vLLM-Omni CLI parser
+    emits ``None`` for the flags it declares ``bool | None`` (``enable_lora``,
+    ``mm_device_do_normalize``), so it is the parser's *unset* sentinel and can
+    never be an explicit value. The resolved dataclass defaults for those two
+    are ``False`` and ``True`` -- *not* ``None`` -- so equality alone forwards
+    them, and vllm-omni's diffusion stage ingress validates key *presence*:
+    stage 1 of the mixed ``bagel_think`` pipeline aborts engine init with
+    "Unknown diffusion config field(s) for stage 1: 'enable_lora',
+    'mm_device_do_normalize'". Dropping them restores the engine's own default
+    for the stage that consumes them.
+    """
+    if value is None:
+        return True
     if value == default:
         if isinstance(value, bool) != isinstance(default, bool):
             return False
