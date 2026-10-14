@@ -940,14 +940,17 @@ def test_diffusion_strategy_omits_audio_sample_rate_without_declared_spec(monkey
 
 
 @pytest.mark.parametrize(
-    ("strategy_cls", "priority", "expected_extra_keys"),
+    ("strategy_cls", "priority", "expected_extra_keys", "params_key"),
     [
-        (ARStrategy, 3, {"lora_request", "priority"}),
-        (DiffusionStrategy, 0, set()),
+        # A single-output AR stage takes one ``SamplingParams`` object under the
+        # singular ``sampling_params`` name, alongside the pinned egress modality.
+        (ARStrategy, 3, {"lora_request", "priority", "output_modalities"}, "sampling_params"),
+        # Diffusion stages always receive the per-stage sequence.
+        (DiffusionStrategy, 0, set(), "sampling_params_list"),
     ],
 )
 @pytest.mark.asyncio
-async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, priority, expected_extra_keys):
+async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, priority, expected_extra_keys, params_key):
     class _Engine:
         def generate(self, **kwargs):
             self.kwargs = kwargs
@@ -971,8 +974,51 @@ async def test_strategy_preserves_mode_specific_engine_call(strategy_cls, priori
 
     assert result == "last"
     assert engine.kwargs["request_id"] == "request-1"
+    assert engine.kwargs[params_key] == ["params"]
+    assert set(engine.kwargs) - {"prompt", "request_id", params_key} == expected_extra_keys
+
+
+@pytest.mark.asyncio
+async def test_ar_strategy_switches_to_stage_list_for_multi_output_pipelines():
+    """``_rollout_output_modalities`` flips the AR call back to the per-stage form.
+
+    Set only when a pipeline declares more than one egress, and the singular
+    ``sampling_params`` form raises ``ValueError: Expected <num_stages> sampling
+    params, got a single sampling params object`` on such a server.
+    """
+
+    class _Engine:
+        def generate(self, **kwargs):
+            self.kwargs = kwargs
+
+            async def _outputs():
+                yield "first"
+                yield "last"
+
+            return _outputs()
+
+    engine = _Engine()
+    strategy = ARStrategy(SimpleNamespace(engine=engine))
+    strategy._rollout_output_modalities = ["text"]
+    # The multi-output path retains each stage's raw output for the adapter to combine,
+    # so a stub combiner stands in for the registered pipeline adapter.
+    strategy._rollout_adapter = SimpleNamespace(
+        combine_engine_outputs=lambda outputs, prompt: ("combined", list(outputs))
+    )
+
+    result = await strategy.run_generation(
+        prompt={"prompt_token_ids": [1]},
+        params=["params"],
+        request_id="request-1",
+        lora_request="lora",
+        priority=0,
+    )
+
+    assert result == "combined"
+    assert strategy._rollout_fields_by_request_id["request-1"] == ["first", "last"]
     assert engine.kwargs["sampling_params_list"] == ["params"]
-    assert set(engine.kwargs) - {"prompt", "request_id", "sampling_params_list"} == expected_extra_keys
+    assert engine.kwargs["output_modalities"] == ["text"]
+    assert "sampling_params" not in engine.kwargs
 
 
 def test_drop_defaulted_engine_args_keeps_only_explicit_overrides():
@@ -1076,6 +1122,126 @@ def test_drop_defaulted_engine_args_treats_cli_none_as_unset():
     filtered = server_module._drop_defaulted_engine_args(engine_args)
     assert filtered["enable_lora"] is True
     assert filtered["mm_device_do_normalize"] is False
+
+
+def _write_deploy_config(tmp_path, stage_blocks):
+    import yaml
+
+    path = tmp_path / "deploy.yaml"
+    path.write_text(yaml.safe_dump({"pipeline": "bagel_think", "stages": stage_blocks}), encoding="utf-8")
+    return path
+
+
+def test_drop_defaulted_engine_args_yields_to_deploy_stage_pins(tmp_path):
+    """A RolloutConfig default must not outrank a deploy config's per-stage pin.
+
+    Reproduces the 2026-10-14 ``bagel_corl_prfix_t07`` init failure. ``RolloutConfig``
+    defaults ``max_num_seqs`` to 1024 while ``OmniEngineArgs`` defaults it to ``None``,
+    so ``_is_defaulted_value`` never saw it as unset and it travelled as a plain global
+    engine arg -- and a plain global arg beats a per-stage value. Every stage of
+    ``bagel_corl_deploy_ar.yaml`` pins ``max_num_seqs: 1``, so the DiT stage received
+    1024 and vLLM-Omni refused it:
+
+        ValueError: 'BagelPipeline' does not support request-level batching.
+        Use max_num_seqs=1 for serial request execution
+
+    which surfaced as ``StageDiffusionProc`` -> "Orchestrator initialization failed"
+    on four of the six attempts.
+    """
+    from verl.workers.config import RolloutConfig
+
+    source_default = RolloutConfig().max_num_seqs
+    assert source_default != 1, "the leak only exists while the source default is batched"
+
+    deploy_config = _write_deploy_config(
+        tmp_path,
+        [
+            {"stage_id": 0, "max_num_seqs": 1, "devices": "0"},
+            {"stage_id": 1, "max_num_seqs": 1, "devices": "1"},
+        ],
+    )
+
+    engine_args = {"model": "some-model", "max_num_seqs": source_default, "tensor_parallel_size": 2}
+    filtered = server_module._drop_defaulted_engine_args(engine_args, deploy_config=deploy_config)
+    # The unasked-for default is gone, so the stage's own ``max_num_seqs: 1`` wins ...
+    assert "max_num_seqs" not in filtered
+    # ... while identity and real overrides still travel.
+    assert filtered["model"] == "some-model"
+    assert filtered["tensor_parallel_size"] == 2
+
+    # An *explicit* request still rides in and overrides the pin, as documented for
+    # every plain engine arg; only a value indistinguishable from "unset" is dropped.
+    engine_args["max_num_seqs"] = 4
+    assert server_module._drop_defaulted_engine_args(engine_args, deploy_config=deploy_config)["max_num_seqs"] == 4
+
+
+def test_drop_defaulted_engine_args_against_the_real_ar_deploy_config():
+    """The shipped AR deploy config is what the failure hinged on, so pin it down."""
+    from pathlib import Path
+
+    deploy_config = (
+        Path(__file__).resolve().parents[4]
+        / "examples"
+        / "agenticllmgrpo_trainer"
+        / "bagel"
+        / "bagel_corl_deploy_ar.yaml"
+    )
+    assert deploy_config.is_file(), deploy_config
+
+    pinned = server_module._deploy_stage_pinned_keys(str(deploy_config))
+    # Pinned by both stages => fully determined by the deploy config.
+    assert "max_num_seqs" in pinned
+    assert "enable_prefix_caching" in pinned
+    # ``gpu_memory_utilization`` is pinned on the Thinker stage only, deliberately left
+    # out: dropping it would hand the DiT stage vLLM-Omni's own default (0.92) instead.
+    assert "gpu_memory_utilization" not in pinned
+
+    from verl.workers.config import RolloutConfig
+
+    engine_args = {"model": "m", "max_num_seqs": RolloutConfig().max_num_seqs}
+    filtered = server_module._drop_defaulted_engine_args(engine_args, deploy_config=str(deploy_config))
+    assert "max_num_seqs" not in filtered
+
+
+def test_drop_defaulted_engine_args_keeps_source_defaults_no_stage_pins(tmp_path):
+    """Only keys every stage pins may lose a source default; the rest degrade safely.
+
+    ``gpu_memory_utilization`` defaults to ``0.5`` in ``RolloutConfig`` and to ``0.92``
+    in ``OmniEngineArgs``. Dropping an unset 0.5 because *one* stage pins a budget would
+    silently re-budget every other stage upwards, so a partially-pinned key keeps
+    travelling exactly as before.
+    """
+    deploy_config = _write_deploy_config(
+        tmp_path,
+        [
+            {"stage_id": 0, "gpu_memory_utilization": 0.40, "devices": "0"},
+            {"stage_id": 1, "devices": "1"},
+        ],
+    )
+    assert "gpu_memory_utilization" not in server_module._deploy_stage_pinned_keys(deploy_config)
+
+    engine_args = {"model": "m", "gpu_memory_utilization": 0.5}
+    assert (
+        server_module._drop_defaulted_engine_args(engine_args, deploy_config=str(deploy_config))[
+            "gpu_memory_utilization"
+        ]
+        == 0.5
+    )
+
+
+def test_deploy_stage_pinned_keys_missing_or_malformed_config_degrades(tmp_path):
+    """An absent or unparsable deploy config must not change how args are filtered."""
+    assert server_module._deploy_stage_pinned_keys(None) == frozenset()
+    assert server_module._deploy_stage_pinned_keys(str(tmp_path / "nope.yaml")) == frozenset()
+
+    malformed = tmp_path / "malformed.yaml"
+    malformed.write_text("stages: [", encoding="utf-8")
+    assert server_module._deploy_stage_pinned_keys(str(malformed)) == frozenset()
+
+    engine_args = {"model": "m", "max_num_seqs": 1024}
+    absent_deploy_config = str(tmp_path / "nope.yaml")
+    assert server_module._drop_defaulted_engine_args(engine_args) == engine_args
+    assert server_module._drop_defaulted_engine_args(engine_args, deploy_config=absent_deploy_config) == engine_args
 
 
 def test_ar_deploy_config_omits_text_encoder_tp_size_on_ar_stages(tmp_path, monkeypatch):

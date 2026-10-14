@@ -13,11 +13,13 @@
 # limitations under the License.
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import os
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Optional
 
 import ray
@@ -58,6 +60,98 @@ _LORA_REQUEST_CACHE_MISS = object()
 # Lazily-computed upstream argument defaults, used to forward only explicitly
 # set engine arguments (see ``_drop_defaulted_engine_args``; tracked in vllm-omni#8503).
 _ENGINE_ARGS_DEFAULTS: dict | None = None
+
+# Lazily-computed ``RolloutConfig`` field defaults. These are the defaults of the
+# *source* schema the engine args are read from -- a different schema from
+# ``OmniEngineArgs``, with different defaults for the keys the two share.
+_SOURCE_CONFIG_DEFAULTS: dict | None = None
+
+# ``deploy_config path -> (mtime, keys pinned by every stage block)``.
+_DEPLOY_PINNED_KEYS: dict[str, tuple[float, frozenset[str]]] = {}
+
+
+def _source_config_defaults() -> dict:
+    """Field defaults of the rollout config the engine args are copied from.
+
+    ``OmniEngineArgs`` is not the only schema in play: ``RolloutConfig`` owns the
+    same keys with *different* defaults, and ``_is_defaulted_value`` only ever
+    compared against the former. Two of those disagreements are load-bearing on
+    this box:
+
+    * ``max_num_seqs`` defaults to ``1024`` here but to ``None`` there, so a
+      rollout that never asked for a batch size forwards ``1024`` as if it were
+      an explicit override;
+    * ``enable_prefix_caching`` defaults to ``True`` here and to ``None`` there,
+      which is what fed ``enable_prefix_caching=True`` into the DiT stage of
+      ``bagel_think`` and tripped ``_DiffusionConfigProjection``.
+
+    Both then reach *every* stage (the deploy-config path copies plain engine
+    args into each stage, where they beat that stage's own pin) -- so the
+    engine's ``BagelPipeline`` stage aborts engine init with "does not support
+    request-level batching. Use max_num_seqs=1", which is how the 2026-10-14
+    ``bagel_corl_prfix_t07`` attempts all died. See
+    ``_drop_defaulted_engine_args`` for when a source default may be dropped.
+    """
+    global _SOURCE_CONFIG_DEFAULTS
+    if _SOURCE_CONFIG_DEFAULTS is None:
+        defaults: dict = {}
+        for cls in reversed(RolloutConfig.__mro__):
+            if not dataclasses.is_dataclass(cls):
+                continue
+            for field in dataclasses.fields(cls):
+                if field.default is not dataclasses.MISSING:
+                    defaults[field.name] = field.default
+                elif field.default_factory is not dataclasses.MISSING:
+                    defaults[field.name] = field.default_factory()
+        _SOURCE_CONFIG_DEFAULTS = defaults
+    return _SOURCE_CONFIG_DEFAULTS
+
+
+def _deploy_stage_pinned_keys(deploy_config: Any) -> frozenset[str]:
+    """Keys that *every* ``stages[*]`` block of *deploy_config* pins explicitly.
+
+    Only keys pinned by all stages are returned: those are the ones whose value
+    the deploy config fully determines, so a plain global arg equal to a source
+    default cannot be carrying intent. A key pinned by *some* stages is left out
+    on purpose -- there the remaining stages would fall back to the engine's own
+    default, which is not always the safe direction (``gpu_memory_utilization``
+    is ``0.5`` in ``RolloutConfig`` and ``0.92`` in ``OmniEngineArgs``).
+
+    An unreadable or absent config returns the empty set, so callers degrade to
+    the pre-existing behaviour.
+    """
+    if not deploy_config:
+        return frozenset()
+    path = Path(deploy_config)
+    candidates = [path] if path.is_absolute() else [path, Path.cwd() / path]
+    for candidate in candidates:
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            continue
+        cached = _DEPLOY_PINNED_KEYS.get(str(candidate))
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        try:
+            import yaml
+
+            with open(candidate, encoding="utf-8") as handle:
+                document = yaml.safe_load(handle) or {}
+        except Exception:  # noqa: BLE001 - malformed configs are reported by vllm-omni
+            return frozenset()
+        stages = document.get("stages") or []
+        blocks = [stage for stage in stages if isinstance(stage, dict)]
+        if not blocks:
+            return frozenset()
+        pinned = set(blocks[0])
+        for block in blocks[1:]:
+            pinned &= set(block)
+        # Identity/plumbing keys are not engine arguments and never travel anyway.
+        pinned -= {"stage_id", "devices", "input_connectors", "default_sampling_params"}
+        result = frozenset(pinned)
+        _DEPLOY_PINNED_KEYS[str(candidate)] = (mtime, result)
+        return result
+    return frozenset()
 
 
 def _is_defaulted_value(key: str, value: Any, default: Any) -> bool:
@@ -106,18 +200,37 @@ def _restore_raw_compilation_config(engine_args: dict, args: Any) -> None:
         engine_args["compilation_config"] = raw_compilation_config
 
 
-def _drop_defaulted_engine_args(engine_args: dict) -> dict:
-    """Keep only explicitly-set engine arguments, dropping upstream defaults."""
+def _drop_defaulted_engine_args(engine_args: dict, deploy_config: Any = None) -> dict:
+    """Keep only explicitly-set engine arguments, dropping upstream defaults.
+
+    ``deploy_config`` is the vLLM-Omni deploy yaml this server is about to launch.
+    Its per-stage pins are authoritative for the keys it pins on *every* stage, so
+    a value that merely reproduces a ``RolloutConfig`` default is dropped rather
+    than forwarded on top of them (see ``_source_config_defaults`` and
+    ``_deploy_stage_pinned_keys``). Without a deploy config the filtering is
+    unchanged.
+    """
     global _ENGINE_ARGS_DEFAULTS
     if _ENGINE_ARGS_DEFAULTS is None:
         defaults = asdict(OmniEngineArgs(model=""))
         defaults.update(asdict(OrchestratorArgs()))
         _ENGINE_ARGS_DEFAULTS = defaults
     defaults = _ENGINE_ARGS_DEFAULTS
+    source_defaults = _source_config_defaults()
+    pinned_by_every_stage = _deploy_stage_pinned_keys(deploy_config)
+
+    def _is_default(key: str, value: Any) -> bool:
+        if _is_defaulted_value(key, value, defaults[key]):
+            return True
+        # A source-schema default is the caller saying "I never set this". It must
+        # not ride in as an explicit override and outrank the deploy config's own
+        # per-stage pin -- a plain global arg beats a per-stage value.
+        return key in pinned_by_every_stage and _is_defaulted_value(key, value, source_defaults.get(key))
+
     return {
         key: value
         for key, value in engine_args.items()
-        if key == "model" or key not in defaults or not _is_defaulted_value(key, value, defaults[key])
+        if key == "model" or key not in defaults or not _is_default(key, value)
     }
 
 
@@ -284,7 +397,11 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         _restore_raw_compilation_config(engine_args, args)
 
         # Forward only explicitly-set engine args; stage config rejects unowned defaults.
-        engine_args = _drop_defaulted_engine_args(engine_args)
+        # The deploy config's per-stage pins are authoritative for the keys it pins
+        # everywhere, so a value that only reproduces a ``RolloutConfig`` default is
+        # dropped instead of overriding them (``max_num_seqs=1024`` vs the AR deploy
+        # config's ``max_num_seqs: 1`` is what killed every BagelPipeline init).
+        engine_args = _drop_defaulted_engine_args(engine_args, deploy_config=getattr(args, "deploy_config", None))
         # This rollout setting is explicit even when its value matches the
         # OmniEngineArgs default, so restore it after default filtering.
         engine_args["log_stats"] = not self.config.disable_log_stats
