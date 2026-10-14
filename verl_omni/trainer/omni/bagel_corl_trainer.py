@@ -1393,6 +1393,18 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     "enforce_eager": True,
                     "free_cache_engine": True,
                     "enable_sleep_mode": True,
+                    # ``bagel_corl_deploy_ar.yaml`` pins *both* stages to
+                    # ``enable_prefix_caching: false``, but a plain top-level engine arg is
+                    # copied into every stage by the deploy-config path and beats the
+                    # per-stage value, so the upstream ``RolloutConfig`` default (True)
+                    # reaches the DiT stage and vllm-omni's ``_DiffusionConfigProjection``
+                    # rejects it:
+                    #   Value error, enable_prefix_caching=True requires
+                    #   diffusion_kv_mode='paged_scheduler'; set diffusion_kv_mode=
+                    #   'paged_scheduler' or disable enable_prefix_caching
+                    # Measured 2026-10-14 (bagel_corl_prfix_t07_20261014_061143_a1), after the
+                    # GEN lane already carried the same pin from the recipe (a16e0b2).
+                    "enable_prefix_caching": False,
                     "disable_log_stats": True,
                     "checkpoint_engine": ckpt_engine,
                     "disaggregation": {"enabled": False},
