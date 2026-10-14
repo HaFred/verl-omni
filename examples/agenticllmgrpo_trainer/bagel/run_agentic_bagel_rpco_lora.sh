@@ -61,14 +61,44 @@ WORKSPACE=${WORKSPACE:-$HOME}
 # hard-assign: an unconditional export would clobber a caller's job allocation.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 
-# flashinfer JIT needs nvcc; this box's toolkits live under /cm/shared, not /usr/local/cuda.
+# flashinfer JIT-compiles MM/attention kernels and needs nvcc. The CUDA toolkits on this
+# box live under /cm/shared, not the /usr/local/cuda default, so without this the engine
+# dies with:
+#   RuntimeError: Could not find nvcc and default cuda_home='/usr/local/cuda'
+# It also has to be a *recent* nvcc, which is the part a first-found-wins loop gets wrong.
+# flashinfer 0.6.18 builds its kernels with ``--compress-mode=size`` (an nvcc 12.8+ flag),
+# and pointing that build at 12.4 aborts the reward engine's init (measured 2026-10-14,
+# cold flashinfer cache under a vllm 0.30.0 / flashinfer 0.6.18.post1 venv):
+#   nvcc fatal   : Unknown option '--compress-mode=size'
+#   ninja: build stopped: subcommand failed.
+#   RuntimeError: Worker failed with error 'Ninja build failed. ...'
+# So do not stop at the first ``toolkit/current``: ``/cm/shared/apps/cuda-latest`` is stale
+# (its ``current`` symlink still points at 12.4.1), while 13.0 sits at
+# ``cuda13.0/toolkit/13.0`` with no ``current`` symlink for a probe to find -- and 13.0 is
+# the toolkit this venv's torch is built for (``torch 2.13.0+cu130``). Enumerate every
+# installed toolkit and keep the newest nvcc that accepts the flag flashinfer passes, i.e.
+# the property that actually decides whether the JIT build can succeed.
+_nvcc_release() {
+  "$1" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1
+}
+_nvcc_accepts_flashinfer_flags() {
+  "$1" --dryrun --compress-mode=size -c /dev/null -o "${TMPDIR:-/tmp}/.nvcc-compress-probe.o" 2>&1 \
+    | grep -q 'Unknown option' && return 1
+  return 0
+}
 if [[ -z "${CUDA_HOME:-}" ]]; then
-  for _cand in /cm/shared/apps/cuda-latest/toolkit/current /usr/local/cuda; do
-    if [[ -x "${_cand}/bin/nvcc" ]]; then
+  while read -r _nvcc_ver _cand; do
+    if [[ -n "${_cand}" ]] && _nvcc_accepts_flashinfer_flags "${_cand}/bin/nvcc"; then
       export CUDA_HOME="${_cand}"
       break
     fi
-  done
+  done < <(
+    ls -d /cm/shared/apps/cuda*/toolkit/*/ /usr/local/cuda 2>/dev/null \
+      | while read -r _d; do
+          [[ -x "${_d%/}/bin/nvcc" ]] && printf '%s %s\n' "$(_nvcc_release "${_d%/}/bin/nvcc")" "${_d%/}"
+        done \
+      | sort -rV
+  )
 fi
 if [[ -n "${CUDA_HOME:-}" && ":${PATH}:" != *":${CUDA_HOME}/bin:"* ]]; then
   export PATH="${CUDA_HOME}/bin:${PATH}"
