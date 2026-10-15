@@ -1236,6 +1236,51 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     # the language sub-config.
     UND_HF_SUBCONFIG = "llm_config.json"
 
+    # ``load_format`` for the UND AR replica's own config, and it is **not** a style
+    # choice -- ``dummy`` here means the Thinker decodes from randomly initialised
+    # weights for the whole run.
+    #
+    # The AR replica is a *separate* Ray actor over a slice of the actor pool
+    # (``init_colocated`` -> ``RolloutMode.COLOCATED``), so nothing in the training
+    # loop ever hands it weights: the V1 trainer forces
+    # ``checkpoint_engine.backend="naive"`` and ``CheckpointEngineManager.update_weights``
+    # early-returns for that backend after publishing through the *actor* to its own
+    # in-process GEN server (``verl/checkpoint_engine/base.py``). The only weights this
+    # engine ever has are the ones it loads at launch.
+    #
+    # Which is why the value has to be pinned *here*. ``verl`` 0.9.0.dev (the sibling
+    # checkout the 2026-10-13/14 runs resolved through ``PYTHONPATH``) promoted exactly
+    # this case in ``vllm_async_server.__init__``:
+    #
+    #     if self.rollout_mode != RolloutMode.HYBRID and self.config.load_format == "dummy":
+    #         logger.warning(f"rollout mode is {self.rollout_mode}, load_format is dummy, set to auto")
+    #         self.config.load_format = "auto"
+    #
+    # The installed ``verl`` 0.10.0.dev -- what the launcher now falls back to, because the
+    # sibling tree is too old for this tree -- dropped that promotion and passes
+    # ``load_format`` straight through. An unset key therefore resolves to
+    # ``RolloutConfig.load_format``'s default, ``"dummy"``, and the Thinker stage is
+    # launched with ``--load_format dummy``.
+    #
+    # Measured on 2026-10-15 (``bagel_corl_prfix_t07_20261015_170336_a1``, devices 4-7):
+    # ``actor/entropy`` 11.17 ~= ln(vocab) (a uniform distribution, i.e. no learned
+    # preference at all), ``episode/K=0.0``, ``episode/K_zero=1.0``,
+    # ``und/no_image_credit=1.0``, ``gen/skipped_no_groups=1.0``, ``has_complete_gen_groups=0.0``,
+    # ``rollout_corr/rollout_ppl`` 46.5 against ``training_ppl`` 247736, and all
+    # 36 val samples x 8 turns looping tokens like ``\tbuf_widget`` / ``💨third`` with no
+    # ``<tool_call>`` anywhere -- so the GEN lane gets no group to score and the whole
+    # Co-RL step optimises a zero advantage. A direct probe of the live replica
+    # (``http://<host>:35045/v1/chat/completions``, greedy, "Say hello in one short
+    # sentence.") answered " navigator prer navigator prer navigator prer ..."; the
+    # Thinker stage's engine log carries no checkpoint-loading line at all, while every
+    # engine that does load (the reward server, both DiT stages) logs its shard progress.
+    #
+    # ``auto`` is what the standalone AR gate (``run_bagel_und_ar_serve.sh`` -> ``vllm
+    # serve``, whose own default is ``auto``) has always used, so this pin restores the
+    # proven configuration. The GEN hybrid must keep ``dummy``: its weights are pushed by
+    # the actor, and loading the checkpoint there would only waste a copy.
+    UND_AR_LOAD_FORMAT = "auto"
+
     def _resolve_und_hf_config_path(self, model, agent) -> str | None:
         """HF config path for the UND AR replica (RFC §4.7).
 
@@ -1361,6 +1406,12 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 {
                     "_target_": "verl.workers.config.RolloutConfig",
                     "name": "vllm_omni",
+                    # The AR replica's engine is launched by this config and is never
+                    # handed weights by the trainer, so it has to load the checkpoint
+                    # itself -- leaving the key out resolves to ``RolloutConfig``'s
+                    # ``"dummy"`` and silently costs the run its UND lane. See
+                    # ``UND_AR_LOAD_FORMAT`` for the measurement and the ``verl`` history.
+                    "load_format": self.UND_AR_LOAD_FORMAT,
                     # ``tensor_model_parallel_size`` here is the replica's *width
                     # declaration*, not a stage-level parallelism knob. It is what makes
                     # the colocated server see more than one card:
@@ -1562,10 +1613,28 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 "(prove spike_und_hermes.py first)"
             )
 
-        gen_manager = self.llm_server_manager
         und_cfg = self._build_und_ar_entrypoint_config()
         und_rollout = und_cfg.actor_rollout_ref.rollout
         und_model = und_cfg.actor_rollout_ref.model
+        # Fail loud, not silently useless. This engine is the one replica nothing in the
+        # training loop can feed weights to (naive backend publishes through the actor to
+        # its own GEN server only), so a ``dummy`` load format here is not a default to
+        # inherit but a run-long decode from random weights: every UND turn becomes a
+        # token loop, ``episode/K`` stays 0, and the Co-RL step trains on a zero advantage.
+        # Checked before the first side effect of the dual-role init (no replica is created,
+        # no resource pool is split, no manager is touched), so a misconfigured launch dies
+        # immediately instead of after the GEN+UND stack has been brought up. See
+        # ``UND_AR_LOAD_FORMAT``.
+        und_load_format = str(und_rollout.get("load_format") or "").strip().lower()
+        if und_load_format in ("", "dummy"):
+            raise RuntimeError(
+                "bagel_corl_sync: the UND AR replica would be launched with "
+                f"load_format={und_load_format or '<unset>'}, but it is a COLOCATED replica that "
+                "the naive checkpoint backend never publishes to -- it would decode from random "
+                "weights for the whole run. Pin actor_rollout_ref.rollout.load_format to "
+                f"{self.UND_AR_LOAD_FORMAT!r} in _build_und_ar_entrypoint_config."
+            )
+        gen_manager = self.llm_server_manager
         agent = self.config.actor_rollout_ref.rollout.get("agent") or {}
         und_n_gpus = int(agent.get("und_n_gpus") or 1)
         if und_n_gpus < 1:
