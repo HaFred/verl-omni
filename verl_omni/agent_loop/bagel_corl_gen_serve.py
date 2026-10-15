@@ -39,6 +39,125 @@ _AR_ONLY_SAMPLING_KEYS = frozenset(
     }
 )
 
+# The values an AR request carries when nobody thought about this lane: vLLM's untruncated
+# decoding defaults, plus the ``repetition_penalty=1.0`` that ``verl``'s
+# ``AgentLoopWorkerTQ.generate_sequences`` *hardcodes*
+#
+#     sampling_params = dict(temperature=config.temperature, top_p=config.top_p,
+#                            top_k=config.top_k, repetition_penalty=1.0, ...)
+#
+# and never reads ``actor_rollout_ref.rollout.repetition_penalty`` from. That hardcode is
+# why ``ROLLOUT_REPETITION_PENALTY=1.05`` had no effect at all on this lane: the key is
+# present in the request, so the AR strategy's own
+# ``sampling_params.setdefault("repetition_penalty", self.server.config.repetition_penalty)``
+# (``vllm_omni_ar_strategy``) never fires, and the engine is handed 1.0 -- measured
+# 2026-10-15, ``bagel_corl_prfix_t07_20261015_162700_a1`` decoded ``temperature=0.7,
+# top_p=0.9, top_k=50, repetition_penalty=1.0`` and looped ``\tbuf_widget`` for every
+# turn of every episode (7/8 turns flagged degenerate, ``gen_lane_skipped=True``).
+#
+# So on the UND route these four values mean "unset", not "chosen": they are not a
+# preference anyone expressed, they are the collapse. A caller that genuinely wants one of
+# them can say so through the config, which always wins.
+UNTRAINED_AR_SAMPLING: dict[str, Any] = {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": -1,
+    "repetition_penalty": 1.0,
+}
+
+# Minimally-mitigated UND sampling, used only for the knobs above that are unset *and*
+# absent from the config.
+#
+# The published Bagel checkpoint answers the Hermes ``<tools>`` prompt only while the
+# top-p/top-k truncation and the anti-repetition penalty are actually in force. Under the
+# untruncated values it collapses onto a single token for the entire budget instead of
+# emitting ``<tool_call>``. Measured 2026-10-15 against the live AR replica, replaying the
+# exact ``prompt_text`` of a degenerate rollout from ``bagel_corl_prfix_t07_20261015_142346_a1``
+# (the run that reported ``episode/K: 0.0``, ``episode/K_zero: 1.0``,
+# ``und/no_image_credit: 1.0``):
+#
+#   untruncated -> '\n    }'                                        collapse, no tool call
+#   mitigated   -> '{"name": "generate_image", "arguments": {...}}'  correct
+#
+# The engine's own defaults are not mitigated either: the AR engine runs with
+# ``generation_config="vllm"``, which *replaces* the checkpoint's own
+# ``generation_config.json`` (0.7 / 0.8 / 20 / 1.05) with the untruncated set, so a request
+# that omits a knob decodes as-trained without anything going red.
+#
+# Hence the UND lane resolves every AR knob from ``actor_rollout_ref.rollout`` -- the
+# section the AR engine is launched with, and what the recipe's ``ROLLOUT_TEMPERATURE`` /
+# ``ROLLOUT_TOP_P`` / ``ROLLOUT_TOP_K`` / ``ROLLOUT_REPETITION_PENALTY`` pin -- and uses
+# the values below only when the config is silent. The deploy config's stage-0
+# ``default_sampling_params`` carries the same four numbers.
+UND_AR_SAMPLING_FALLBACK: dict[str, Any] = {
+    "temperature": 0.7,
+    "top_p": 0.9,
+    "top_k": 50,
+    "repetition_penalty": 1.05,
+}
+
+
+# Where the AR knobs can live, most specific first. ``generate`` is handed the *trainer*
+# config, and the values that actually decide the UND decode are the ones the AR engine was
+# launched with -- the recipe's ``actor_rollout_ref.rollout`` section, which
+# ``_build_und_ar_entrypoint_config`` copies into the replica config. The remaining entries
+# accept a caller that passes just the rollout section, or a bare mapping.
+_AR_SAMPLING_CONFIG_PATHS: tuple[tuple[str, ...], ...] = (
+    ("actor_rollout_ref", "rollout"),
+    ("rollout",),
+    (),
+)
+
+
+def _read_knob(src: Any, name: str) -> Any:
+    """Read one key off a DictConfig / plain dict / namespace, or ``None`` when absent."""
+    if src is None:
+        return None
+    if isinstance(src, dict):
+        return src.get(name)
+    value = getattr(src, name, None)
+    if value is None and hasattr(src, "get"):
+        try:
+            return src.get(name)
+        except Exception:  # noqa: BLE001 -- a config probe must never fail a rollout
+            return None
+    return value
+
+
+def config_sampling_value(config: Any, name: str) -> Any:
+    """Read one sampling knob off the rollout config, whatever shape the caller passed."""
+    for path in _AR_SAMPLING_CONFIG_PATHS:
+        src = config
+        for key in path:
+            src = _read_knob(src, key)
+            if src is None:
+                break
+        value = _read_knob(src, name)
+        if value is not None:
+            return value
+    return None
+
+
+def fill_und_ar_sampling_params(params: dict[str, Any], config: Any = None) -> dict[str, Any]:
+    """Pin the UND AR knobs to the configured recipe whenever the caller left them at the
+    untruncated defaults.
+
+    "Left them" covers both spellings: absent, and present-but-untruncated. The second one
+    is the one that bit: ``verl``'s generic AR worker always sends
+    ``repetition_penalty=1.0``, so the recipe's ``ROLLOUT_REPETITION_PENALTY`` could not
+    reach this lane and an "only fill what is missing" rule was a no-op on exactly the knob
+    the collapse is about. Any value that is *not* one of the untruncated defaults is taken
+    as deliberate and left alone.
+    """
+    for name, fallback in UND_AR_SAMPLING_FALLBACK.items():
+        current = params.get(name)
+        if current is not None and current != UNTRAINED_AR_SAMPLING[name]:
+            continue
+        value = config_sampling_value(config, name)
+        params[name] = fallback if value is None else value
+    return params
+
+
 # ``sde`` (default) keeps the trained FlowGRPO kernel from ``rollout.algo``
 # (``noise_level > 0`` + a bounded ``sde_window_*``). It is the only decode that
 # carries latents/log-probs, and therefore the only one the GEN loss can use.

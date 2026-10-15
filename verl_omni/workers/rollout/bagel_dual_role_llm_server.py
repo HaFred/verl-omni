@@ -30,7 +30,10 @@ from omegaconf import DictConfig
 from verl.workers.rollout.llm_server import LLMServerClient
 from verl.workers.rollout.replica import TokenOutput
 
-from verl_omni.agent_loop.bagel_corl_gen_serve import _AR_ONLY_SAMPLING_KEYS
+from verl_omni.agent_loop.bagel_corl_gen_serve import (
+    _AR_ONLY_SAMPLING_KEYS,
+    fill_und_ar_sampling_params,
+)
 
 # ``BAGEL_CORL_DEBUG=1`` adds one entry + one exit line per routed ``generate``.
 # The child client (``LLMServerClient.generate``) can sit inside its aborted-request
@@ -235,6 +238,11 @@ class BagelDualRoleLLMServerClient(LLMServerClient):
             for key in list(params):
                 if key in _GEN_SAMPLING_KEYS or key in {"bagel_role", "role"}:
                     params.pop(key, None)
+            # ...and then pin the AR knobs this lane *needs* to the configured recipe. Only
+            # stripping left whatever the caller sent, and the generic AR worker always sends
+            # ``repetition_penalty=1.0`` -- the as-trained collapse the checkpoint never
+            # recovers from (see ``UNTRAINED_AR_SAMPLING``).
+            params = fill_und_ar_sampling_params(params, self.config)
         else:
             for key in list(params):
                 if key in _AR_ONLY_SAMPLING_KEYS:

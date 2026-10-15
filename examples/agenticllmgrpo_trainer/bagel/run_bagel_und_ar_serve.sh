@@ -24,16 +24,62 @@ if [[ ! -x "${_VLLM_OMNI}" ]]; then
 fi
 
 # flashinfer JIT needs nvcc; this box's toolkits live under /cm/shared, not /usr/local/cuda.
+# It also has to be a *recent* nvcc, which a first-found-wins loop gets wrong: flashinfer
+# 0.6.18 builds with ``--compress-mode=size`` (nvcc 12.8+) and pointing at 12.4 aborts with
+#   nvcc fatal   : Unknown option '--compress-mode=size'
+#   ninja: build stopped: subcommand failed.
+#   RuntimeError: Engine core initialization failed
+# ``/cm/shared/apps/cuda-latest`` is stale (``current`` -> 12.4.1) while 13.0 -- the toolkit
+# this venv's ``torch 2.13.0+cu130`` is built for -- sits at ``cuda13.0/toolkit/13.0`` with no
+# ``current`` symlink. Keep this in sync with ``run_agentic_bagel_rpco_lora.sh``: enumerate
+# every installed toolkit and keep the newest nvcc that accepts the flag flashinfer passes.
+_nvcc_release() {
+  "$1" --version 2>/dev/null | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n 1
+}
+_nvcc_accepts_flashinfer_flags() {
+  "$1" --dryrun --compress-mode=size -c /dev/null -o "${TMPDIR:-/tmp}/.nvcc-compress-probe.o" 2>&1 \
+    | grep -q 'Unknown option' && return 1
+  return 0
+}
 if [[ -z "${CUDA_HOME:-}" ]]; then
-  for _cand in /cm/shared/apps/cuda-latest/toolkit/current /usr/local/cuda; do
-    if [[ -x "${_cand}/bin/nvcc" ]]; then
+  while read -r _nvcc_ver _cand; do
+    if [[ -n "${_cand}" ]] && _nvcc_accepts_flashinfer_flags "${_cand}/bin/nvcc"; then
       export CUDA_HOME="${_cand}"
       break
     fi
-  done
+  done < <(
+    ls -d /cm/shared/apps/cuda*/toolkit/*/ /usr/local/cuda 2>/dev/null \
+      | while read -r _d; do
+          [[ -x "${_d%/}/bin/nvcc" ]] && printf '%s %s\n' "$(_nvcc_release "${_d%/}/bin/nvcc")" "${_d%/}"
+        done \
+      | sort -rV
+  )
 fi
 if [[ -n "${CUDA_HOME:-}" && ":${PATH}:" != *":${CUDA_HOME}/bin:"* ]]; then
   export PATH="${CUDA_HOME}/bin:${PATH}"
+fi
+
+# flashinfer's JIT shell-outs to ``ninja`` to build its sampling kernels. The trainer
+# recipe gets this from the repo venv; without it the engine dies deep in warm-up with
+# ``FileNotFoundError: 'ninja'`` before the port ever opens.
+if [[ ":${PATH}:" != *":${_REPO_ROOT}/.venv/bin:"* ]]; then
+  export PATH="${_REPO_ROOT}/.venv/bin:${PATH}"
+fi
+
+# The node driver tops out at CUDA 12.2 while this venv's torch is cu13, so a bare shell
+# dies before the port opens with:
+#   RuntimeError: The NVIDIA driver on your system is too old (found version 12020)
+# from ``torch.cuda.get_device_name()`` during ``vllm_omni.diffusion.envs`` import (which
+# runs at ``--help`` time, not at engine init). ``run_agentic_bagel_rpco_lora.sh`` already
+# carries the fix and it is why the trainer boots on these cards: prepend the cuda-compat
+# shim (a real forward-compat libcuda, so cu13 userspace runs on the 535 kernel module) and
+# the cu13 runtime, and let torch answer ``is_available()`` from NVML. Keep these in sync
+# with the recipe -- this script is the gate for the same engine.
+_cuda_compat="${_REPO_ROOT}/.venv/cuda-compat"
+_cu13_lib="${_REPO_ROOT}/.venv/lib/python3.12/site-packages/nvidia/cu13/lib"
+if [[ -d "${_cuda_compat}" ]]; then
+  export LD_LIBRARY_PATH="${_cuda_compat}:${_cu13_lib}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+  export PYTORCH_NVML_BASED_CUDA_CHECK="${PYTORCH_NVML_BASED_CUDA_CHECK:-1}"
 fi
 
 export BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:-$HOME/models/ByteDance-Seed/BAGEL-7B-MoT}"
