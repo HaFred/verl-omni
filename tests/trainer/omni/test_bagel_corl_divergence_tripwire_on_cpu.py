@@ -27,7 +27,39 @@ import logging
 import pytest
 import torch
 
-from verl_omni.trainer.omni.bagel_corl_trainer import OmniBagelCoRLTrainerSync, _metric_scalar
+from verl_omni.trainer.omni.bagel_corl_trainer import (
+    OmniBagelCoRLTrainerSync,
+    _as_ray_actor_class,
+    _metric_scalar,
+)
+
+
+class _PlainActorFixture:
+    """Stands in for ``GlobalRequestLoadBalancer`` as the *installed* ``verl`` ships it."""
+
+
+def test_load_balancer_actor_class_is_decorated_only_when_the_class_is_plain():
+    """Both ``verl`` shapes must work, and neither may be decorated twice.
+
+    The installed ``verl`` ships ``GlobalRequestLoadBalancer`` as a *plain* class and wraps
+    it at instantiation itself -- ``ray.remote(GlobalRequestLoadBalancer).remote(...)`` in
+    ``verl.experimental.teacher_loop.teacher_model`` -- while the older sibling shipped it
+    already ``@ray.remote``-decorated. Calling ``.remote`` on the bare class is what
+    aborted ``on_init_end`` on devices 4-7 (``bagel_corl_prfix_t07_20261015_105824_a1``):
+
+        AttributeError: type object 'GlobalRequestLoadBalancer' has no attribute
+        'remote'. Did you mean: '_return_value'?
+
+    Re-decorating the decorated one fails too, so the presence of ``remote`` -- the only
+    difference between the two shapes -- has to be the version marker.
+    """
+    import ray
+
+    assert not hasattr(_PlainActorFixture, "remote"), "the fixture must start un-decorated"
+    assert hasattr(_as_ray_actor_class(_PlainActorFixture), "remote"), "plain class must be wrapped"
+
+    decorated = ray.remote(_PlainActorFixture)
+    assert _as_ray_actor_class(decorated) is decorated, "an actor class must not be re-decorated"
 
 
 def _tripwire_trainer():

@@ -267,6 +267,26 @@ def _actor_merges_lora(model) -> bool:
     return bool(getattr(lora_cfg, "merge", False))
 
 
+def _as_ray_actor_class(cls: Any) -> Any:
+    """Return ``cls`` as a Ray actor class, tolerating both ``verl`` shapes.
+
+    ``GlobalRequestLoadBalancer`` is ``@ray.remote``-decorated in the older sibling
+    ``verl``, but a *plain* class in the newer installed one, which wraps it at
+    instantiation time -- see ``verl.experimental.teacher_loop.teacher_model``, where the
+    same construction reads ``ray.remote(GlobalRequestLoadBalancer).remote(...)``. The
+    launch recipe picks whichever ``verl`` passes its probe (a stale sibling is rejected
+    outright, see ``run_agentic_bagel_rpco_lora.sh``), so both spellings have to work:
+    ``.remote`` is present only on the decorated class, and re-decorating an
+    already-decorated class is an error rather than a no-op. Only the *decorated* class
+    advertises ``remote``, so that attribute is the version marker.
+    """
+    if hasattr(cls, "remote"):
+        return cls
+    import ray
+
+    return ray.remote(cls)
+
+
 @register_trainer("bagel_corl_sync")
 class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     """Synchronous Bagel Co-RL (Joint-Training): serial J-episode gather, then one UND+GEN optimizer step.
@@ -1615,7 +1635,11 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             und_n_gpus,
         )
 
-        und_lb = GlobalRequestLoadBalancer.remote(
+        # ``GlobalRequestLoadBalancer`` is decorated in one ``verl`` and plain in the other;
+        # ``_as_ray_actor_class`` absorbs that difference (see its docstring). Getting this
+        # wrong kills ``on_init_end`` with
+        # "type object 'GlobalRequestLoadBalancer' has no attribute 'remote'".
+        und_lb = _as_ray_actor_class(GlobalRequestLoadBalancer).remote(
             servers={und_replica.server_address: und_replica.server_handle},
             max_cache_size=DEFAULT_ROUTING_CACHE_SIZE,
             full_determinism=bool(getattr(und_rollout, "full_determinism", False)),
