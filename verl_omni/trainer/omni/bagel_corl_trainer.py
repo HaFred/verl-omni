@@ -34,6 +34,7 @@ from verl_omni.trainer.omni.bagel_corl_gen_adv import (
     build_gen_flowgrpo_proto,
     fold_gen_prompt_token_ids,
 )
+from verl_omni.trainer.omni.bagel_corl_replay_buffer import install_auxiliary_row_filter
 from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.config.diffusion import DiffusionRolloutConfig, DiffusionSamplingConfig
@@ -555,12 +556,26 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         self.processor = model_config.processor
 
     def _build_replay_buffer(self):
+        # ``trainer_mode`` is temporarily "sync" so the base builds the sync
+        # ``ReplayBuffer`` (and resolves its knob set) while the *configured* mode stays
+        # ``bagel_corl_sync`` everywhere else; restore it in ``finally`` regardless.
         original_mode = self.trainer_mode
         self.trainer_mode = "sync"
         try:
-            return super()._build_replay_buffer()
+            buffer = super()._build_replay_buffer()
         finally:
             self.trainer_mode = original_mode
+        # The dual-lane writer tags every GEN seed row ``is_auxiliary`` so it stays out of a
+        # sampled batch: the GEN lane reaches the trainer through the UND row's
+        # ``child_gen_keys`` column, and the UND pass cannot score a seed row (no
+        # ``prompts``/``responses``). Sibling ``verl`` 0.9.0.dev enforces that in
+        # ``_materialize_batch``; the installed 0.10.0.dev has no such filter at all, so the
+        # first run with a healthy UND lane (K >= 1, i.e. GEN rows exist for the first time)
+        # died at step 0 with ``KeyError: 'prompts'`` inside ``_compute_reward_colocate`` --
+        # one requested UND field dropped by ``BatchMeta.select_fields`` because a GEN row was
+        # in the same batch. Apply the rule on this side rather than trusting the install; see
+        # ``bagel_corl_replay_buffer`` for the measurements.
+        return install_auxiliary_row_filter(buffer)
 
     def _init_resource_pool_mgr(self):
         """Use VeRL-Omni ``ActorRolloutRefWorker`` so Bagel FSDP + composite loss are available."""
