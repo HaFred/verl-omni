@@ -721,6 +721,26 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         """
         if self.node_rank != 0 or not isinstance(getattr(self, "_generate_strategy", None), DiffusionStrategy):
             return
+        # Nothing to flush while the cache is off, which is the shipped default (R2 is
+        # opt-in): ``install_prompt_embed_cache`` never ran, so the entry set is empty by
+        # construction and the RPC has no work to do. It is not a harmless no-op in the
+        # pinned vllm_omni, though -- the *worker* cannot serve it
+        # (``DiffusionWorkerWithvLLMOmniColocateWorkerExtension`` has no
+        # ``clear_prompt_embed_cache``; the method lives on ``DiffusionModelRunner`` and
+        # nothing bridges worker -> model_runner), so ``collective_rpc`` raises inside the
+        # stage's ``multiproc_executor`` and the diffusion stage counts that as a fatal
+        # init error:
+        #
+        #   AttributeError: 'DiffusionWorkerWithvLLMOmniColocateWorkerExtension' object
+        #   has no attribute 'clear_prompt_embed_cache'
+        #     -> RuntimeError: Orchestrator initialization failed
+        #
+        # ``trainer.init()`` reaches here on every run via ``set_global_steps``, so an
+        # unconditional flush tore down the very engine it was meant to protect (measured
+        # 2026-10-15, ``bagel_corl_prfix_t07_20261015_102119_a1``). Skipping when the
+        # cache is disabled costs nothing and keeps the flush honest when it is not.
+        if not getattr(self.config, "enable_prompt_embed_cache", False):
+            return
         if self._prompt_embed_cache_rpc_unsupported("clear_prompt_embed_cache"):
             return
         try:
