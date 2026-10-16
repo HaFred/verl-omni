@@ -547,6 +547,22 @@ echo "bagel_corl R2: prompt_embed_cache=${PEC_FLAG} affinity=${PEC_AFFINITY} siz
 #   validated against; no stage in either yaml wants prefix caching on.
 # * BAGEL_CORL_GEN_DECODE=sde records the latents/log-probs FlowGRPO needs; ode disables the GEN loss.
 export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
+
+# Fail the run the step the actor leaves its trust region, instead of only warning
+# (``OmniBagelCoRLTrainerSync._divergence_tripwire``, which reads these two env vars).
+#
+# Default is 1 here, not the class default of 0. This recipe sets no KL anchor
+# (``use_kl_loss`` stays false) and no entropy bonus (``entropy_coeff`` stays 0), so a step
+# that has already left the region cannot come back on its own: every remaining step spends
+# rollout + reward budget on a policy that will not be used. That is not a hypothetical --
+# ``bagel_corl_prfix_t07_20261016_023749_a1`` crossed ``rollout_corr/kl`` 41.8 against the
+# limit of 20 at step 84, kept going for another 115 steps, and produced nothing.
+#
+# Aborting is cheap *only because* this recipe saves no checkpoint for this run: a diverged
+# step forfeits the remaining budget either way, so stopping early loses no state and keeps
+# the operator's evidence fresh. If checkpointing is ever enabled here, re-read this
+# default -- an abort would then also stop a run that could have been resumed.
+export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
 "${_PY}" -m verl_omni.trainer.main_omni \
     hydra.run.dir=$RUN_DIR \
     agentic_image_gen.run_dir=$RUN_DIR \

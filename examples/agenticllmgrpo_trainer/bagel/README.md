@@ -153,7 +153,45 @@ visible in the validation row rather than inferred from the scalar:
 `OmniBagelCoRLTrainerSync._divergence_tripwire` when `rollout_corr/kl` exceeds 20,
 `actor/grad_norm` exceeds 100, or a reading is `nan`. Both limits are an order of magnitude
 above any healthy run measured to date and below the readings that made a collapsing run
-unrecoverable; `BAGEL_CORL_DIVERGENCE_ABORT=1` makes the step fatal instead of warning.
+unrecoverable.
+
+This recipe runs the tripwire **armed** — `run_agentic_bagel_rpco_lora.sh` exports
+`BAGEL_CORL_DIVERGENCE_ABORT=1` — so a diverged step fails the run instead of warning. That
+is deliberate here and only here: the recipe sets no KL anchor (`use_kl_loss` stays false)
+and no entropy bonus (`entropy_coeff` stays 0), so a step that leaves the region cannot come
+back on its own, and every remaining step would spend rollout + reward budget on a policy
+that never gets used. `bagel_corl_prfix_t07_20261016_023749_a1` is the measurement behind
+that default: `rollout_corr/kl` printed `41.8` against the limit of `20` at step 84 and the
+run continued for another 115 steps producing nothing. Aborting forfeits no state *only*
+because this recipe saves no checkpoint for the run — if checkpointing is ever enabled,
+re-read that default before trusting it.
+
+### Reading the training reward
+
+`critic/score/mean` is not a critic. With `adv_estimator=grpo` there is no value network —
+which is why `critic/advantages/mean == critic/returns/mean` to the digit — and `verl`'s
+`compute_data_metrics` defines the key as `token_level_scores.sum(-1).mean()` over the
+non-aborted episodes of that rollout batch. It is a **per-step sample mean over ~16–25
+heterogeneous episodes**, and on `bagel_corl_prfix_t07_20261016_023749_a1` it was dominated
+by rollout failure rather than policy quality: it correlated `-0.71` with `episode/K_zero`,
+carried a std of `0.088` against a total drift of `-0.014` over 76 updates, and its 20-update
+moving average never left `0.63–0.71` — while `val-core/unicot_reflection/reward/mean@1` rose
+`0.729 → 0.829` over the same span, led by `reward_image` (`+0.169`, weight 3.0) and
+`reward_done` (`+0.143`). Do not read a flat training scalar as a stalled policy.
+
+Every training update therefore also publishes:
+
+- `bagel_corl/reward_dim/<dim>/{mean,min,max}` — the same dims the validation pass logs as
+  `val-aux/...`, so a step's scalar swing is attributable to a named term.
+- `bagel_corl/reward_valid/{mean,count}` and `bagel_corl/reward_no_image/{mean,count}` — the
+  episode reward split by `used_image_credit`, separating "quality when the episode produced
+  a usable image" from "how often it did". `count` rides along because a mean over a
+  shrinking subset is not comparable on its own; watch it before reading a jump in
+  `reward_valid/mean` as progress.
+
+A dim absent from a batch publishes nothing rather than `0`, so a missing scorer stays
+distinguishable from a scorer that returned zero. `reward_plan` is `0` on these lanes by
+design: `agentic_multidim_reward` only fires it when `task_type == "plan"`.
 
 ## GEN conditioning reuse
 
