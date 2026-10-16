@@ -36,22 +36,14 @@ Build context is controlled by the repo-root [`.dockerignore`](https://github.co
 | ------------------- | ---------------------------------------------- | ------------------------------------------- |
 | `BASE_IMAGE`        | `verlai/verl:rocm7.14_torch2.12_release_0724`  | ROCm PyTorch stack, vLLM checkout, hipcc    |
 | `PYTORCH_ROCM_ARCH` | `gfx942;gfx950`                                | GPU architectures to compile vLLM kernels for |
-| `VLLM_VERSION`      | `v0.28.0`                                      | vLLM tag built from source                  |
+| `VLLM_VERSION`      | `v0.30.0`                                      | vLLM tag built from source                  |
 | `VERL_GIT_REF`      | [`.github/verl_pin.txt`](../../.github/verl_pin.txt) | verl commit to install                |
 
 ## Optional Dependencies
 
-The base image already provides `qwen-vl-utils` for vision-language training and
-`pytest`, `pytest-cov`, `pytest-asyncio`, and `pre-commit` for development, and
-the build adds `math-verify` and `latex2sympy2_extended`. Only these need
-installing inside the container:
-
-| Extra      | Install                     | When needed                             |
-| ---------- | --------------------------- | --------------------------------------- |
-| OCR reward | `pip install Levenshtein`   | FlowGRPO training with OCR-based reward |
-| Profiling  | `pip install py-spy`        | Sampling profiler for stack traces      |
-
-`PIP_CONSTRAINT` is baked into the image, so these cannot pull a CUDA `torch` over the ROCm build.
+| Extra      | Install                         | When needed                    |
+| ---------- | ------------------------------- | ------------------------------ |
+| OCR reward | `uv pip install -e ".[ocr]"`    | Training with OCR-based reward |
 
 
 ## Run
