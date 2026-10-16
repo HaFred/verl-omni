@@ -827,6 +827,13 @@ class BagelCorlAgentLoopManagerTQ(AgentLoopManager):
         # workers never depend on the env of whoever spawned the Ray runtime.
         self._val_viz_provider = resolve_agentic_val_viz_provider()
         self._val_viz_done_steps: set[int] = set()
+        # WARNING, not INFO: the TaskRunner has no handler below WARNING for this logger, so
+        # an INFO line here left a run with no holdout indistinguishable from one with it.
+        logger.warning(
+            "bagel_corl val holdout viz: %s (AGENTIC_VAL_VIZ=%r)",
+            "on" if self._val_viz_provider is not None else "off",
+            os.getenv("AGENTIC_VAL_VIZ"),
+        )
 
     @classmethod
     @auto_await
@@ -891,7 +898,7 @@ class BagelCorlAgentLoopManagerTQ(AgentLoopManager):
             )
             ray.get([worker.wait_for_background.remote() for worker in self.agent_loop_workers])
             self._val_viz_done_steps.add(step_i)
-            logger.info("bagel_corl val holdout viz complete for step=%s", step_i)
+            logger.warning("bagel_corl val holdout viz complete for step=%s", step_i)
         except Exception as exc:  # noqa: BLE001 - a fixture must never fail the val pass
             logger.warning("Failed to run the val holdout viz at step=%s: %s", step_i, exc)
 

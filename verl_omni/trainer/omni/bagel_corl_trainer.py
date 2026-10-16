@@ -1898,6 +1898,81 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         handles = getter() if callable(getter) else None
         return list(handles) if handles else None
 
+    # Row-scoped dataset fields ``VisualRewardManager`` dispatches on: ``data_source`` picks
+    # the scorer (``unicot_reflection`` / ``unicot_breakdown``), ``reward_model`` carries its
+    # ``ground_truth``.
+    REWARD_ROW_FIELDS = ("data_source", "reward_model")
+
+    def _compute_reward_colocate(self, batch, metrics: dict | None = None):
+        """Score a batch with the colocated RM, handing it the row fields the scorer needs.
+
+        The installed ``verl`` (0.10.0.dev) reads only ``prompts``/``responses``/``raw_prompt``
+        here, so every episode reached ``VisualRewardManager`` with ``data_source=''`` and no
+        ``ground_truth`` and scored a structural zero: ``critic/rewards/mean``,
+        ``critic/advantages/*`` and ``actor/pg_loss`` were exactly 0 for all 85 steps of
+        ``bagel_corl_prfix_t07_20261015_190942_a1`` (devices 4-7), with the RM pool warning
+        "episode row carries no reward_model.ground_truth (data_source='')". The older sibling
+        ``verl`` carried this selection locally, which is why the 2026-10-13 runs learned; the
+        recipe now rejects that checkout as too old, so the rule lives here instead.
+
+        With ``reward.reward_model.enable=1`` and no RM resource pool this is the only scorer
+        (``reward_loop_worker_handles`` is None), so the agent loop cannot cover for it.
+        """
+        import numpy as np
+        import torch
+        import transfer_queue as tq
+        from tensordict import TensorDict
+        from verl.protocol import DataProto
+        from verl.utils import tensordict_utils as tu
+
+        assert self.reward_loop_manager is not None, "RewardLoopManager is None"
+
+        fields = ["prompts", "responses", "raw_prompt", *self.REWARD_ROW_FIELDS]
+        data = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=fields)
+
+        prompt_lengths = data["prompts"].offsets().diff()
+        response_lengths = data["responses"].offsets().diff()
+        prompts = data["prompts"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+        responses = data["responses"].to_padded_tensor(padding=self.tokenizer.pad_token_id)
+        prompt_mask = self._lengths_to_mask(prompt_lengths, prompts.size(1))
+        response_mask = self._lengths_to_mask(response_lengths, responses.size(1))
+        attention_mask = torch.cat([prompt_mask, response_mask], dim=1)
+
+        raw_prompts = list(data["raw_prompt"])
+        raw_prompt_arr = np.empty(len(raw_prompts), dtype=object)
+        raw_prompt_arr[:] = raw_prompts
+        non_tensor_batch: dict[str, Any] = {"raw_prompt": raw_prompt_arr}
+        for key in self.REWARD_ROW_FIELDS:
+            values = data.pop(key, None)
+            if values is None:
+                continue
+            # TQ returns ``NonTensorData`` wrappers here; a wrapped ``reward_model`` has no
+            # ``ground_truth`` key and would score the same silent zero.
+            items = [tu.unwrap_non_tensor_data(value) for value in list(values)]
+            arr = np.empty(len(items), dtype=object)
+            arr[:] = items
+            non_tensor_batch[key] = arr
+
+        rm_input = DataProto(
+            batch=TensorDict(
+                {"prompts": prompts, "responses": responses, "attention_mask": attention_mask},
+                batch_size=len(batch),
+            ),
+            non_tensor_batch=non_tensor_batch,
+        )
+        rm_output = self.reward_loop_manager.compute_rm_score(rm_input)
+
+        padded_rm_scores = rm_output.batch["rm_scores"]
+        rm_scores = torch.nested.as_nested_tensor(
+            [padded_rm_scores[i, : response_lengths[i]] for i in range(len(batch))],
+            layout=torch.jagged,
+        )
+        write_back = {"rm_scores": rm_scores}
+        for key in rm_output.meta_info.get("reward_extra_keys", []):
+            write_back[key] = rm_output.non_tensor_batch[key]
+        tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=tu.get_tensordict(write_back))
+        return batch
+
     def on_init_end(self):
         # Build UND AR before the first weight publish so both pools see step-0 weights.
         self._ensure_dual_role_rollout()
