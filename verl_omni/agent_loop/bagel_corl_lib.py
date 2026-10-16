@@ -2039,6 +2039,163 @@ def aggregate_episode_metrics(records: list[Any]) -> dict[str, float]:
     return aggregated
 
 
+#: Reward dims republished on every *training* update.
+#:
+#: The validation pass already logs all of these as ``val-aux/<lane>/<dim>/mean@1``, but
+#: training published only the scalar ``critic/score/mean``. That scalar is a mean over
+#: ~16-25 heterogeneous episodes, and its step-to-step swing is dominated by how many
+#: rollouts failed outright rather than by policy quality: on
+#: ``bagel_corl_prfix_t07_20261016_023749_a1`` it correlates -0.71 with ``episode/K_zero``
+#: and carries a std of 0.088 against a total drift of -0.014 over 76 updates, so the
+#: trend is unreadable -- while ``val-core/unicot_reflection/reward/mean@1`` rose
+#: 0.729 -> 0.829 over the same span.
+#:
+#: Duplicated from ``agentic_multidim_reward.REWARD_COMPONENTS`` rather than imported so
+#: this module stays free of the reward-score package at import time;
+#: ``tests/agent_loop/test_bagel_corl_reward_breakdown_on_cpu.py`` pins the two together.
+TRAIN_REWARD_DIM_KEYS: tuple[str, ...] = (
+    "reward_reflect",
+    "reward_plan",
+    "reward_format",
+    "reward_protocol",
+    "reward_tool",
+    "reward_result",
+    "reward_image",
+    "reward_done",
+    "reward_tool_call",
+)
+
+
+def _record_fields(record: Any) -> dict[str, Any]:
+    """Fields of one TQ row, accepting the ``{"fields": ...}`` wrapper or a bare dict.
+
+    Production rows are always the wrapped shape -- both branches of ``_und_records_from_batch``
+    build ``{"fields": row}`` -- so the bare-dict fallback serves tests and direct callers.
+    A ``fields`` key holding a non-dict (``{"fields": None}``) is treated as a wrapper with
+    nothing in it, not as a field *named* ``fields``.
+    """
+    if not isinstance(record, dict):
+        return {}
+    fields = record.get("fields")
+    if isinstance(fields, dict):
+        return fields
+    return {} if "fields" in record else record
+
+
+def und_record_field_keys(records: list[Any], *, limit: int | None = None) -> list[str]:
+    """Field names the first UND row carries, for diagnosing an empty reward breakdown.
+
+    ``_reward_breakdown`` accepts two shapes -- a nested ``extra_fields.reward_extra_info``
+    and a flattened ``reward_extra_info`` -- and which one arrives depends on the carrier
+    that handed the batch over (``_und_records_from_batch`` has a ``child_gen_keys`` branch
+    and a TensorDict branch). When neither shape is present the breakdown comes back empty
+    and the step log silently reverts to the unattributable scalar it was meant to replace.
+    Naming the row's own keys is the difference between a one-line diagnosis and re-reading
+    the agent loop to find out which shape went missing.
+    """
+    if not records:
+        return []
+    keys = sorted(_record_fields(records[0]))
+    return keys[:limit] if limit is not None else keys
+
+
+def _episode_reward(fields: dict[str, Any]) -> float | None:
+    """The episode's scalar reward, from whichever spelling this row carries.
+
+    ``token_level_scores`` is what ``critic/score/mean`` sums, but it is *derived* after the
+    reward step and is not a field of the UND row the agent loop writes. ``und_reward`` is:
+    ``bagel_corl.episode_from_agent_extra`` stamps it on ``extra_fields`` alongside the
+    credit flag, so it is the one that is actually reachable here.
+    """
+    for key in ("token_level_scores", "und_reward"):
+        value = _as_float(fields.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _reward_breakdown(fields: dict[str, Any]) -> dict[str, Any] | None:
+    """The episode's per-dim reward blob, wherever the row carries it.
+
+    ``_agent_loop_postprocess`` nests it as ``extra_fields.reward_extra_info``; the
+    TensorDict branch of ``_und_records_from_batch`` flattens ``extra_fields`` keys onto
+    the row, so both shapes reach here.
+    """
+    nested = fields.get("extra_fields")
+    nested_blob = nested.get("reward_extra_info") if isinstance(nested, dict) else None
+    for candidate in (fields.get("reward_extra_info"), nested_blob):
+        if isinstance(candidate, dict):
+            return candidate
+    return None
+
+
+def _as_float(value: Any) -> float | None:
+    """``float(value)`` or ``None`` — a value that cannot be read is not a zero."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def aggregate_reward_breakdown_metrics(records: list[Any]) -> dict[str, float]:
+    """Batch-aggregate the per-episode reward breakdown into step-level logging values.
+
+    Keyed off the same UND rows ``aggregate_episode_metrics`` reads, and publishing two
+    views onto the *training* step log:
+
+    * ``bagel_corl/reward_dim/<dim>/{mean,min,max}`` -- the dims validation already logs,
+      so a step's scalar swing can be attributed to a named term instead of staying
+      opaque. This is what the training log was missing entirely.
+    * ``bagel_corl/reward_valid/{mean,count}`` and ``bagel_corl/reward_no_image/{mean,count}``
+      -- the episode reward split by ``used_image_credit``, separating "quality when the
+      episode produced a usable image" from "how often it did". ``count`` rides along
+      because a mean over a shrinking subset is not comparable on its own.
+
+    Rows carrying no measurement contribute nothing: an absent dim is never reported as a
+    zero, which is what keeps a missing scorer distinguishable from a scorer that scored 0.
+
+    The two views are read from different places on the row, which is why ``_episode_reward``
+    exists: the dims ride ``extra_fields.reward_extra_info`` (written by the agent loop's
+    ``_compute_score``), while the credit flag and ``und_reward`` are stamped by
+    ``bagel_corl.episode_from_agent_extra``. A row missing either half is counted in neither
+    view, so an absent measurement never enters a mean as a zero.
+    """
+    dim_values: dict[str, list[float]] = {key: [] for key in TRAIN_REWARD_DIM_KEYS}
+    with_image: list[float] = []
+    without_image: list[float] = []
+    for record in records:
+        fields = _record_fields(record)
+        if not fields:
+            continue
+        breakdown = _reward_breakdown(fields)
+        if breakdown is not None:
+            for key in TRAIN_REWARD_DIM_KEYS:
+                value = _as_float(breakdown.get(key))
+                if value is not None:
+                    dim_values[key].append(value)
+        score = _episode_reward(fields)
+        credit = fields.get("used_image_credit")
+        if score is None or credit is None:
+            continue
+        (with_image if bool(credit) else without_image).append(score)
+
+    aggregated: dict[str, float] = {}
+    for key in TRAIN_REWARD_DIM_KEYS:
+        values = dim_values[key]
+        if not values:
+            continue
+        metric = key.removeprefix("reward_")
+        aggregated[f"bagel_corl/reward_dim/{metric}/mean"] = float(sum(values) / len(values))
+        aggregated[f"bagel_corl/reward_dim/{metric}/min"] = float(min(values))
+        aggregated[f"bagel_corl/reward_dim/{metric}/max"] = float(max(values))
+    for name, values in (("valid", with_image), ("no_image", without_image)):
+        if not values:
+            continue
+        aggregated[f"bagel_corl/reward_{name}/mean"] = float(sum(values) / len(values))
+        aggregated[f"bagel_corl/reward_{name}/count"] = float(len(values))
+    return aggregated
+
+
 def _as_gen_sample(item: Any) -> GenSample | None:
     if isinstance(item, GenSample):
         return item

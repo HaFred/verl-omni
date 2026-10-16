@@ -27,7 +27,11 @@ from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1.trainer_base import register_trainer
 from verl.utils.config import omega_conf_to_dataclass
 
-from verl_omni.agent_loop.bagel_corl_lib import aggregate_episode_metrics
+from verl_omni.agent_loop.bagel_corl_lib import (
+    aggregate_episode_metrics,
+    aggregate_reward_breakdown_metrics,
+    und_record_field_keys,
+)
 from verl_omni.trainer.omni.bagel_corl_diff_v1 import DiffusionV1GenLane
 from verl_omni.trainer.omni.bagel_corl_gen_adv import (
     apply_gen_flowgrpo_advantage,
@@ -286,6 +290,44 @@ def _as_ray_actor_class(cls: Any) -> Any:
     import ray
 
     return ray.remote(cls)
+
+
+#: ``extra`` → step-log allowlist for the dual-lane bookkeeping. Explicit because the bus
+#: carries far more than should be logged, and every one of these was absent from the step
+#: log at some point (see the note inside ``_compute_advantage``).
+_BAGEL_CORL_STEP_METRIC_KEYS: tuple[str, ...] = (
+    "und/no_image_credit",
+    "gen/dropped_incomplete_groups",
+    "episode/J",
+    "episode/K",
+    "episode/K_zero",
+)
+
+#: Prefix form of the same allowlist, for the keys whose names are data-dependent: the
+#: per-dim reward breakdown is one key per dim present on the batch, so it cannot be
+#: spelled as a literal tuple (``bagel_corl_lib.aggregate_reward_breakdown_metrics``).
+_BAGEL_CORL_STEP_METRIC_PREFIXES: tuple[str, ...] = (
+    "bagel_corl/reward_dim/",
+    "bagel_corl/reward_valid/",
+    "bagel_corl/reward_no_image/",
+)
+
+
+def _bagel_corl_step_metric_keys(extra: dict) -> list[str]:
+    """Step-log keys ``extra`` is currently carrying, in a stable order.
+
+    Only present keys are returned, so a caller never has to re-test for ``None`` before
+    copying -- and an absent measurement stays absent rather than being published as one.
+    """
+    keys = [key for key in _BAGEL_CORL_STEP_METRIC_KEYS if extra.get(key) is not None]
+    keys.extend(
+        sorted(
+            key
+            for key, value in extra.items()
+            if value is not None and key.startswith(_BAGEL_CORL_STEP_METRIC_PREFIXES)
+        )
+    )
+    return keys
 
 
 @register_trainer("bagel_corl_sync")
@@ -731,6 +773,23 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             # fraction without image credit) — first-row-wins collapse hid every
             # episode but one (audit module A).
             aggregated = aggregate_episode_metrics(und_records)
+            # Reward breakdown + the ``used_image_credit`` split ride the same allowlist:
+            # training otherwise publishes only the scalar ``critic/score/mean``, whose
+            # swing tracks ``episode/K_zero`` at -0.71 and hides the dim that is moving.
+            breakdown = aggregate_reward_breakdown_metrics(und_records)
+            if not breakdown:
+                # An empty breakdown puts the step log back exactly where it was before the
+                # breakdown existed -- one unattributable scalar -- and it fails silently,
+                # because a missing key is indistinguishable from a step that simply did not
+                # publish it. Say so on the step it happens, naming the fields the rows
+                # actually carry, so the next reader is not left guessing which shape the
+                # agent loop handed over.
+                logger.warning(
+                    "bagel_corl reward breakdown EMPTY: und_records=%d row_field_keys=%s",
+                    len(und_records),
+                    und_record_field_keys(und_records, limit=24),
+                )
+            aggregated.update(breakdown)
             for key, value in aggregated.items():
                 if extra.get(key) is None:
                     extra[key] = value
@@ -988,15 +1047,8 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         metrics.update(gen_metrics)
         # Now that the gather has run, the dual-lane bookkeeping is on ``extra`` (see the note at the
         # top of this method); publish it so a skipped GEN lane is attributable from the step log.
-        for metric_key in (
-            "und/no_image_credit",
-            "gen/dropped_incomplete_groups",
-            "episode/J",
-            "episode/K",
-            "episode/K_zero",
-        ):
-            if extra.get(metric_key) is not None:
-                metrics.setdefault(metric_key, extra[metric_key])
+        for metric_key in _bagel_corl_step_metric_keys(extra):
+            metrics.setdefault(metric_key, extra[metric_key])
         has_complete = bool(gen_metrics.get("has_complete_gen_groups"))
         extra["has_complete_gen_groups"] = has_complete
         extra["skip_gen"] = not has_complete
@@ -1029,11 +1081,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             "has_complete_gen_groups",
             "num_gen_rows",
             "bagel_corl_gen",
-            "episode/J",
-            "episode/K",
-            "episode/K_zero",
-            "und/no_image_credit",
-            "gen/dropped_incomplete_groups",
+            *_bagel_corl_step_metric_keys(extra),
         ):
             if key in extra:
                 carried[key] = extra[key]
@@ -1050,9 +1098,8 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         extra["has_complete_gen_groups"] = has_complete
         if not has_complete:
             metrics["gen/skipped_no_groups"] = 1.0
-        for key in ("episode/J", "episode/K", "episode/K_zero", "und/no_image_credit"):
-            if extra.get(key) is not None:
-                metrics[key] = extra[key]
+        for key in _bagel_corl_step_metric_keys(extra):
+            metrics[key] = extra[key]
         # The flags have to ride on whatever carrier this trainer's bus uses, and ``_extra_info``
         # above already put them where the actor will look: the v1 bus hands us a ``KVBatchMeta``,
         # whose ``extra_info`` dict the TQ dispatch layer copies onto the actor's TensorDict as
