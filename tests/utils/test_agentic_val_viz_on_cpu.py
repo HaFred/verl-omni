@@ -203,3 +203,32 @@ def test_tensordict_batch_columns_are_what_the_tq_worker_extracts(monkeypatch):
     assert [str(uid) for uid in rows["dataset_task_uid"]] == [str(i) for i in EXPECTED_SAMPLE_INDICES]
     assert [info["task_type"] for info in rows["extra_info"]] == ["reflect", "plan", "reflect", "plan"]
     assert all("ground_truth" in reward_model for reward_model in rows["reward_model"])
+
+
+def test_holdout_raw_prompt_reaches_the_agent_loop_as_a_message_list():
+    """Each row's ``raw_prompt`` must be a ``list`` of messages after the worker unpacks it.
+
+    ``np.array`` turned the four equal-length message lists into a ``(4, 2)`` matrix, so a
+    row arrived as an ``ndarray`` and ``_messages_are_text_only`` rejected it. The Hermes
+    ``<tools>`` block was then never injected, the UND model never called ``generate_image``
+    (``num_gen_calls=0`` for samples 9001..9004), and no holdout PNG was written.
+    """
+    import os
+
+    from tensordict.tensorclass import NonTensorData, NonTensorStack
+
+    from verl_omni.agent_loop.bagel_corl import _messages_are_text_only
+    from verl_omni.utils.agentic_val_viz import resolve_agentic_val_viz_provider
+
+    os.environ["AGENTIC_VAL_VIZ"] = "1"
+    batch = resolve_agentic_val_viz_provider().build_tensordict_batch(0)
+    column = batch["raw_prompt"]
+    # Mirror ``AgentLoopWorkerTQ.generate_sequences``' per-row extraction.
+    rows = [column[i].data if isinstance(column, NonTensorStack) else column[i] for i in range(len(batch))]
+    rows = [row.data if isinstance(row, NonTensorData) else row for row in rows]
+
+    assert len(rows) == 4
+    for row in rows:
+        assert isinstance(row, list), type(row)
+        assert [m["role"] for m in row] == ["system", "user"]
+        assert _messages_are_text_only(row)

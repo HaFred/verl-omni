@@ -101,6 +101,21 @@ def _extra_info_for_case(case: ValVizCase) -> dict[str, Any]:
     }
 
 
+def _object_column(values: Sequence[Any]) -> np.ndarray:
+    """A 1-D object array holding ``values`` as-is, one element per row.
+
+    ``np.array(values, dtype=object)`` is not that: equal-length message lists collapse
+    into an ``(rows, messages)`` matrix, so each row's ``raw_prompt`` reaches the agent loop
+    as an ``ndarray`` of dicts. ``_messages_are_text_only`` accepts only a ``list``, so the
+    Hermes ``<tools>`` block was never injected and the UND model, told about
+    ``generate_image`` in prose only, wrote "I have generated an image" instead of calling
+    it: ``num_gen_calls=0`` on all four holdout episodes, hence no PNGs.
+    """
+    column = np.empty(len(values), dtype=object)
+    column[:] = list(values)
+    return column
+
+
 class AgenticValVizProvider:
     """Build a fixed batch of holdout validation-visualization prompts."""
 
@@ -135,7 +150,7 @@ class AgenticValVizProvider:
         from verl import DataProto
 
         non_tensor = self._column_dict()
-        batch = DataProto.from_single_dict({key: np.array(value, dtype=object) for key, value in non_tensor.items()})
+        batch = DataProto.from_single_dict({key: _object_column(value) for key, value in non_tensor.items()})
         batch.meta_info = {
             "global_steps": step,
             "validate": True,
@@ -171,7 +186,7 @@ class AgenticValVizProvider:
         from verl.utils.tensordict_utils import assign_non_tensor_data, get_tensordict
 
         non_tensor = self._column_dict()
-        batch_dict: dict[str, Any] = {key: np.array(value, dtype=object) for key, value in non_tensor.items()}
+        batch_dict: dict[str, Any] = {key: _object_column(value) for key, value in non_tensor.items()}
         step_tag = str(step) if step is not None else "unknown"
         batch_dict["uid"] = np.array(
             [f"{uid_prefix}-{step_tag}-{case.sample_index}" for case in self.cases],
