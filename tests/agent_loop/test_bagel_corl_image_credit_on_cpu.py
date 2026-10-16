@@ -133,3 +133,35 @@ def test_a_pattern_3_episode_still_falls_back_to_the_non_image_scalar():
 
     assert reward == pytest.approx(0.73)
     assert used_non_image is True
+
+
+def test_the_row_field_and_the_trained_signal_can_disagree():
+    """``und_reward`` on the row is NOT the reward the actor trains on.
+
+    ``bagel_corl_tq.episode_from_agent_extra`` builds the row's ``und_reward`` from
+    ``AgentLoopOutput.reward_score`` (the reward manager's composite over
+    ``reward_extra_info``), while ``episode_und_reward`` -- which the TQ ingest hands to
+    ``und_row_reward``, and ``trainer_base`` copies into ``token_level_scores`` --
+    recomputes ``image_credit_reward`` over ``gen_samples``. Those are different
+    quantities, and the trained one wins.
+
+    This matters for diagnostics rather than training: any metric that reads the row's
+    ``und_reward`` summarises the composite while claiming to describe the training
+    signal. On ``bagel_corl_prfix_t07_20261016_102501_a1`` that read
+    ``bagel_corl/reward_valid/mean`` 0.19 below ``critic/score/mean`` on every step, even
+    the steps where all 16 episodes had image credit.
+
+    The two derivations sharing a name is the trap; this pins the divergence so a reader
+    cannot assume the row field is the trained value.
+    """
+    gens = [_sample(call="pass0", index=0, score=0.2), _sample(call="pass1", index=0, score=0.8)]
+    # The reward manager scored the episode 0.5 (say, the composite of the text dims).
+    episode = _episode(gens=gens, und_reward=0.5)
+    trained, _ = episode_und_reward(episode)
+
+    assert trained == pytest.approx(1.4)  # image_credit_reward: 0.8 final + 0.6 gain
+    assert episode.und_reward == pytest.approx(0.5)
+    # Every dimension of the divergence, made explicit: the trained signal is not the
+    # stored field, not the composite, and not bounded by 1.
+    assert trained != pytest.approx(episode.und_reward)
+    assert trained > 1.0

@@ -121,11 +121,12 @@ def test_used_image_credit_splits_the_episode_reward():
 
 
 def test_the_split_works_on_the_row_shape_the_agent_loop_actually_writes():
-    """Regression: keyed off ``und_reward``, not the derived ``token_level_scores``.
+    """Regression: a row carrying only ``und_reward`` must still split.
 
-    An earlier revision read ``token_level_scores`` only, which is absent from the UND row
-    the agent loop writes -- the split would have published nothing at all while looking
-    correct against a hand-built fixture.
+    Rows come in several shapes. This one has the credit flag and ``und_reward`` but neither
+    ``rm_scores`` nor ``token_level_scores``, so the reward has to come from the fallback --
+    an earlier revision read ``token_level_scores`` only and would have published nothing at
+    all, while looking correct against a hand-built fixture.
     """
     metrics = aggregate_reward_breakdown_metrics(
         [
@@ -145,6 +146,58 @@ def test_token_level_scores_wins_when_both_spellings_are_present():
     """``token_level_scores`` is what ``critic/score/mean`` sums, so it is preferred."""
     metrics = aggregate_reward_breakdown_metrics([_record(score=0.8, und_reward=0.2, credit=True)])
     assert metrics["bagel_corl/reward_valid/mean"] == 0.8
+
+
+class TestTrainedRewardPrecedence:
+    """The split must summarise the reward the actor trains on, not a namesake field.
+
+    ``rm_scores`` is the column ``trainer_base`` copies into ``token_level_scores``, and
+    ``compute_data_metrics`` reduces it with ``.sum(-1)`` -- so a per-token vector is a
+    *single* episode reward that has to be summed, not a sequence of episodes and not a
+    value ``float()`` can read. Reading the wrong one is not cosmetic: it reported
+    ``bagel_corl/reward_valid/mean`` 0.19 below ``critic/score/mean`` on every step of
+    ``bagel_corl_prfix_t07_20261016_102501_a1``.
+    """
+
+    def test_rm_scores_is_summed_and_beats_every_other_spelling(self):
+        metrics = aggregate_reward_breakdown_metrics(
+            [
+                _record(
+                    credit=True, extra={"rm_scores": [0.0, 0.0, 0.7], "token_level_scores": 0.1, "und_reward": 0.2}
+                ),
+                _record(credit=True, extra={"rm_scores": [0.9], "token_level_scores": 0.1, "und_reward": 0.2}),
+            ]
+        )
+        assert metrics["bagel_corl/reward_valid/mean"] == pytest.approx(0.8)  # (0.7 + 0.9) / 2
+
+    def test_token_level_scores_is_summed_when_rm_scores_is_absent(self):
+        metrics = aggregate_reward_breakdown_metrics(
+            [_record(credit=True, extra={"token_level_scores": [0.25, 0.25], "und_reward": 0.9})]
+        )
+        assert metrics["bagel_corl/reward_valid/mean"] == pytest.approx(0.5)
+
+    def test_an_unreadable_training_column_falls_through_to_the_next(self):
+        """A present-but-unusable ``rm_scores`` must not shadow a readable one."""
+        metrics = aggregate_reward_breakdown_metrics(
+            [_record(credit=True, extra={"rm_scores": "not-a-vector", "token_level_scores": 0.6})]
+        )
+        assert metrics["bagel_corl/reward_valid/mean"] == pytest.approx(0.6)
+
+    def test_rm_scores_is_not_mistaken_for_a_sequence_of_episodes(self):
+        """Summing is what makes 16 tokens one episode; a mean would divide it by its length."""
+        one_token = aggregate_reward_breakdown_metrics([_record(credit=True, extra={"rm_scores": [0.6]})])
+        four_tokens = aggregate_reward_breakdown_metrics(
+            [_record(credit=True, extra={"rm_scores": [0.15, 0.15, 0.15, 0.15]})]
+        )
+        assert one_token["bagel_corl/reward_valid/mean"] == pytest.approx(0.6)
+        assert four_tokens["bagel_corl/reward_valid/mean"] == pytest.approx(0.6)
+
+    def test_a_boolean_is_not_a_reward(self):
+        """``bool`` is an ``int`` in Python; a flag must not be read as 1.0."""
+        metrics = aggregate_reward_breakdown_metrics(
+            [_record(credit=True, extra={"rm_scores": True, "und_reward": 0.4})]
+        )
+        assert metrics["bagel_corl/reward_valid/mean"] == pytest.approx(0.4)
 
 
 def test_a_row_without_the_credit_flag_is_not_assumed_to_lack_credit():

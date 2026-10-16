@@ -189,6 +189,16 @@ Every training update therefore also publishes:
   shrinking subset is not comparable on its own; watch it before reading a jump in
   `reward_valid/mean` as progress.
 
+Both are read from the **trained** reward, in the trainer's own order: `rm_scores` (the column
+`trainer_base` copies into `token_level_scores`, reduced with `.sum(-1)` because the reward
+rides on one trainable token), then `token_level_scores`, then — only as a fallback —
+`und_reward`. That last one is a trap: `bagel_corl_tq.episode_from_agent_extra` stamps
+`und_reward` from `AgentLoopOutput.reward_score` (the reward manager's composite over
+`reward_extra_info`), while the trained signal is recomputed as `episode_und_reward` →
+`image_credit_reward` over the GEN seeds. They are different numbers. Reading `und_reward` on
+`bagel_corl_prfix_t07_20261016_102501_a1` put `reward_valid/mean` 0.19 below
+`critic/score/mean` at every step, including the steps where all 16 episodes had image credit.
+
 A dim absent from a batch publishes nothing rather than `0`, so a missing scorer stays
 distinguishable from a scorer that returned zero. `reward_plan` is `0` on these lanes by
 design: `agentic_multidim_reward` only fires it when `task_type == "plan"`.

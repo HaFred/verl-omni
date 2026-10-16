@@ -2099,21 +2099,6 @@ def und_record_field_keys(records: list[Any], *, limit: int | None = None) -> li
     return keys[:limit] if limit is not None else keys
 
 
-def _episode_reward(fields: dict[str, Any]) -> float | None:
-    """The episode's scalar reward, from whichever spelling this row carries.
-
-    ``token_level_scores`` is what ``critic/score/mean`` sums, but it is *derived* after the
-    reward step and is not a field of the UND row the agent loop writes. ``und_reward`` is:
-    ``bagel_corl.episode_from_agent_extra`` stamps it on ``extra_fields`` alongside the
-    credit flag, so it is the one that is actually reachable here.
-    """
-    for key in ("token_level_scores", "und_reward"):
-        value = _as_float(fields.get(key))
-        if value is not None:
-            return value
-    return None
-
-
 def _reward_breakdown(fields: dict[str, Any]) -> dict[str, Any] | None:
     """The episode's per-dim reward blob, wherever the row carries it.
 
@@ -2135,6 +2120,63 @@ def _as_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _episode_score(value: Any) -> float | None:
+    """The episode scalar from a per-token score vector, mirroring the trainer's ``sum(-1)``.
+
+    ``trainer_base`` does ``batch["token_level_scores"] = batch["rm_scores"]`` and
+    ``compute_data_metrics`` then takes ``.sum(-1)``, so an episode's trained value is the
+    **sum** of its per-token vector (the reward rides on one trainable token, which is why
+    the sum and not the mean). A bare scalar is already that sum; a sequence is reduced.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return _as_float(value)
+    if isinstance(value, (str, bytes)) or value is None:
+        return None
+    try:
+        import numpy as np
+    except ImportError:  # numpy is a hard dependency of this tree; degrade rather than crash
+        return _as_float(value)
+    try:
+        array = np.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if array.size == 0:
+        return None
+    return float(array.sum())
+
+
+def _episode_reward(fields: dict[str, Any]) -> float | None:
+    """The episode's trained reward, read the way the trainer reads it.
+
+    Order matters and is ``rm_scores`` -> ``token_level_scores`` -> ``und_reward``:
+
+    * ``rm_scores`` is the column the ingest writes (``bagel_corl_tq``) and the one
+      ``trainer_base`` copies into ``token_level_scores``, so it IS the trained signal.
+    * ``token_level_scores`` is that same column after the copy, or the flatten row's own
+      copy of ``episode_und_reward``. Either way it is the trained signal.
+    * ``und_reward`` is **not** the trained signal, and is only a last resort.
+      ``bagel_corl_tq.episode_from_agent_extra`` stamps it from
+      ``AgentLoopOutput.reward_score`` -- the reward manager's composite over
+      ``reward_extra_info`` -- while the trained signal is recomputed as
+      ``episode_und_reward`` -> ``image_credit_reward`` over the GEN seeds. On
+      ``bagel_corl_prfix_t07_20261016_102501_a1`` reading this field reported
+      ``bagel_corl/reward_valid/mean`` 0.19 below ``critic/score/mean`` at every step,
+      including the steps where all 16 episodes had image credit. It is kept because a row
+      shape that carries neither training column should still publish something readable,
+      and ``tests/agent_loop/test_bagel_corl_image_credit_on_cpu.py`` pins that the two
+      derivations are genuinely different numbers.
+    """
+    for key in ("rm_scores", "token_level_scores"):
+        if key not in fields:
+            continue
+        value = _episode_score(fields.get(key))
+        if value is not None:
+            return value
+    return _as_float(fields.get("und_reward"))
 
 
 def aggregate_reward_breakdown_metrics(records: list[Any]) -> dict[str, float]:
