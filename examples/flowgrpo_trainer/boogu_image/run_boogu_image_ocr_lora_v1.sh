@@ -26,13 +26,14 @@
 # named transformer_blocks.*, so LoRA weight-sync collection gathers 0 params
 # without it.
 #
-# Reference throughput, 4xA800-80G, this configuration: 716 s/step for
+# Legacy throughput reference, 4xA800-80G, before tuning: 716 s/step for
 # 32x16 = 512 images, plus 2900 s per validation over the full 1018-prompt test
 # set. The rollout dominates until request-level packing is on -- without
 # max_num_seqs the engine clamps to one image per forward and gen alone costs 4x
 # more. Each checkpoint is ~21 GB; budget disk against save_freq.
 #
-# Validation images are written nowhere by default: log_val_generations only
+# In the legacy recipe, validation images are written nowhere by default:
+# log_val_generations only
 # builds the W&B table, and under WANDB_MODE=offline that cell holds the string
 # "Image" rather than the file. Set trainer.validation_data_dir=<path> to get
 # them on disk -- worth doing, because a rising OCR score says nothing about
@@ -57,7 +58,7 @@
 #
 # Reference (legacy v0 script):
 # verl-omni/examples/flowgrpo_trainer/boogu_image/run_boogu_image_ocr_lora.sh
-set -x
+set -ex
 
 # Set WORKSPACE to any writable directory; defaults to $HOME
 WORKSPACE=${WORKSPACE:-$HOME}
@@ -97,22 +98,23 @@ REQUEST_BATCH_MAX_WAIT_MS=${REQUEST_BATCH_MAX_WAIT_MS:-10}
 IMAGE_RESOLUTION=${IMAGE_RESOLUTION:-512}
 
 python3 -m verl_omni.trainer.main_diffusion_v1 \
-    data.train_files=$ocr_train_path \
-    data.val_files=$ocr_test_path \
+    "data.train_files=$ocr_train_path" \
+    "data.val_files=$ocr_test_path" \
     data.train_batch_size=32 \
     data.max_prompt_length=256 \
     actor_rollout_ref.model.algorithm=flow_grpo \
-    actor_rollout_ref.model.path=$model_name \
-    actor_rollout_ref.model.tokenizer_path=$model_name/processor \
+    "actor_rollout_ref.model.path=$model_name" \
+    "actor_rollout_ref.model.tokenizer_path=$model_name/processor" \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=128 \
     actor_rollout_ref.model.target_modules="['to_q','to_k','to_v','to_out.0','img_to_q','img_to_k','img_to_v','img_out','instruct_to_q','instruct_to_k','instruct_to_v','instruct_out','feed_forward.linear_1','feed_forward.linear_2','feed_forward.linear_3','img_feed_forward.linear_1','img_feed_forward.linear_2','img_feed_forward.linear_3']" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['double_stream_layers.','single_stream_layers.','context_refiner.','noise_refiner.','ref_image_refiner.']" \
-    actor_rollout_ref.actor.optim.lr=3e-4 \
+    actor_rollout_ref.actor.optim.lr=1e-4 \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=10 \
     actor_rollout_ref.actor.optim.weight_decay=0.0001 \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${MAX_NUM_SEQS} \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
@@ -138,21 +140,22 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${MAX_NUM_SEQS} \
     reward.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP)) \
     reward.reward_model.enable=True \
-    reward.reward_model.model_path=$reward_model_name \
+    "reward.reward_model.model_path=$reward_model_name" \
     reward.reward_model.rollout.name=$REWARD_ENGINE \
     reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_TP \
     reward.custom_reward_function.path=$reward_function_path \
     reward.custom_reward_function.name=compute_score_ocr \
     trainer.logger='["console", "wandb"]' \
     trainer.project_name=flow_grpo \
-    trainer.experiment_name=boogu_image_ocr_lora_v1 \
+    trainer.experiment_name=boogu_image_ocr_lora_v1_convergence \
+    "trainer.validation_data_dir=${WORKSPACE}/outputs/boogu_image_ocr_lora_v1_convergence/validation" \
     trainer.log_val_generations=8 \
     trainer.val_before_train=True \
     trainer.n_gpus_per_node=$NUM_GPUS_ACTOR_ROLLOUT_REWARD \
     trainer.nnodes=1 \
-    trainer.save_freq=30 \
-    trainer.test_freq=30 \
+    trainer.save_freq=50 \
+    trainer.test_freq=25 \
     trainer.total_epochs=15 \
-    trainer.total_training_steps=300 \
+    trainer.total_training_steps=100 \
     trainer.use_v1=true \
     trainer.v1.trainer_mode=sync "$@"
