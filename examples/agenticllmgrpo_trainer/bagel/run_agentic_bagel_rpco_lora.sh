@@ -438,15 +438,47 @@ export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 # (``apply_gen_flowgrpo_advantage``).
 NORM_ADV_BY_STD=${NORM_ADV_BY_STD:-False}
 
-# Actor (UND) LR schedule. This recipe ran ``optim.lr=1e-4`` *constant* for the whole
-# budget (``lr_warmup_steps_ratio=0.0``, ``lr_scheduler_type=constant``): peak LR at step 0
-# and still peak at the last step, with no warmup to survive the first off-policy batches.
-# Warm up over the first 5% and cosine-decay to 10% of the peak, so the late steps — where a
-# bad update is unrecoverable — move ~10x less. ``trainer.total_training_steps`` reaches
-# ``actor.optim.total_training_steps``, so the schedule is anchored to the real step budget.
+# Actor (UND) LR. The schedule below (5% warmup, cosine to 10% of peak) was already the
+# mitigation for the old constant-1e-4 run, but the *peak* stayed 1e-4 -- and every run that
+# reached the 60-85 step range still hit the divergence tripwire:
+#
+#   bagel_corl_prfix_t07_20261016_102501_a{1,2,3}: rollout_corr/kl 0.03 -> 14.8/16.9/13.7
+#   at steps 84/70/77, with actor/entropy collapsing 0.17 -> 0.085. The recipe has no KL
+#   anchor and no entropy bonus, so nothing pulls the actor back.
+#
+# A LoRA rank-8 actor on a 7B model does not need 1e-4; the comment that introduced the
+# cosine schedule already said the late steps should "move ~10x less". Make that the peak:
+# 1e-5 for UND, 1e-5 for the GEN lane (was 3e-5). ``ACTOR_LR``/``GEN_LR`` are knobs so a
+# sweep can move one lane without editing the file.
+ACTOR_LR=${ACTOR_LR:-1e-5}
+GEN_LR=${GEN_LR:-1e-5}
 LR_WARMUP_RATIO=${LR_WARMUP_RATIO:-0.05}
 LR_SCHEDULER=${LR_SCHEDULER:-cosine}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
+
+# GEN (FlowGRPO) importance-ratio trust band. ``DiffusionLossConfig.clip_ratio`` defaults to
+# 1e-4, and this recipe used to inherit it. Measured on
+# ``bagel_corl_prfix_t07_20261016_102501_a1``: ``actor/ratio_std`` is 2.7e-3 at every step,
+# i.e. ~27x the band, so ``actor/pg_clipfrac`` sat at 0.90-0.93 from step 1 (before any real
+# policy movement) and never changed -- nearly every GEN sample was clipped on numerical
+# noise rather than on policy change. 0.02 is ~7 sigma of that measured noise: wide enough
+# that the clip band means "the policy moved", not "two forwards disagreed".
+#
+# Verify on the next run: ``actor/pg_clipfrac`` must drop well below 0.9 at step 1 and start
+# tracking ``rollout_corr/*``. If it still pins at ~0.9, the ratio noise is a real engine
+# mismatch and the fix is the forward, not the band.
+GEN_CLIP_RATIO=${GEN_CLIP_RATIO:-0.02}
+
+# Checkpointing. ``trainer.save_freq`` defaults to -1 (save nothing) and this recipe never
+# overrode it, so every tripwire abort forfeited the whole run: the 20261016 session spent
+# 6.5h x 4 launches re-learning the same steps 1-80, which is why no reward trend survived
+# across attempts. Save every 25 steps (25 x ~5 min = ~2h of work) and keep two, so an abort
+# restarts from the last good policy instead of the base checkpoint.
+# ``resume_mode=auto`` reads ``checkpoints/<project>/<experiment>/latest_checkpointed_iteration.txt``;
+# the experiment name is stable across attempts of one supervision session.
+SAVE_FREQ=${SAVE_FREQ:-25}
+RESUME_MODE=${RESUME_MODE:-auto}
+MAX_CKPT_KEEP=${MAX_CKPT_KEEP:-2}
 
 # Smoke defaults: N = sibling episodes (>=2 required for GEN training), S = seeds per call
 # (default 1). Do not let a stale J/K from the shell leak in. ``GEN_N_DEFAULT`` carries the
@@ -558,10 +590,12 @@ export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
 # ``bagel_corl_prfix_t07_20261016_023749_a1`` crossed ``rollout_corr/kl`` 41.8 against the
 # limit of 20 at step 84, kept going for another 115 steps, and produced nothing.
 #
-# Aborting is cheap *only because* this recipe saves no checkpoint for this run: a diverged
-# step forfeits the remaining budget either way, so stopping early loses no state and keeps
-# the operator's evidence fresh. If checkpointing is ever enabled here, re-read this
-# default -- an abort would then also stop a run that could have been resumed.
+# Aborting is affordable because this recipe now checkpoints every ``SAVE_FREQ`` steps
+# (``trainer.save_freq`` + ``resume_mode=auto``): an abort costs at most the steps since the
+# last save, and the supervisor relaunch resumes from that checkpoint instead of step 0.
+# Without checkpointing the abort forfeits the remaining budget -- that was the 20261016
+# behaviour (4 launches, ~80 steps each, nothing accumulated), so do not set
+# ``SAVE_FREQ<=0`` together with ``BAGEL_CORL_DIVERGENCE_ABORT=1``.
 export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
 "${_PY}" -m verl_omni.trainer.main_omni \
     hydra.run.dir=$RUN_DIR \
@@ -594,7 +628,7 @@ export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
     actor_rollout_ref.model.lora.merge=True \
     actor_rollout_ref.model.target_modules="['q_proj','k_proj','v_proj','o_proj','mlp.gate_proj','mlp.up_proj','mlp.down_proj','q_proj_moe_gen','k_proj_moe_gen','v_proj_moe_gen','o_proj_moe_gen','mlp_moe_gen.gate_proj','mlp_moe_gen.up_proj','mlp_moe_gen.down_proj']" \
     actor_rollout_ref.model.fsdp_layer_prefixes="['layers.']" \
-    actor_rollout_ref.actor.optim.lr=1e-4 \
+    actor_rollout_ref.actor.optim.lr=$ACTOR_LR \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=$LR_WARMUP_RATIO \
     actor_rollout_ref.actor.optim.lr_scheduler_type=$LR_SCHEDULER \
     actor_rollout_ref.actor.optim.min_lr_ratio=$MIN_LR_RATIO \
@@ -605,7 +639,8 @@ export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
     actor_rollout_ref.actor.fsdp_config.model_dtype=bfloat16 \
     +actor_rollout_ref.actor.diffusion_loss.loss_mode=flow_grpo \
-    +actor_rollout_ref.model.lr_gen=3e-5 \
+    +actor_rollout_ref.actor.diffusion_loss.clip_ratio=$GEN_CLIP_RATIO \
+    +actor_rollout_ref.model.lr_gen=$GEN_LR \
     +actor_rollout_ref.actor.diffusion_loss.loss_weight_und=1.0 \
     +actor_rollout_ref.actor.diffusion_loss.loss_weight_gen=1.0 \
     actor_rollout_ref.rollout.name=vllm_omni \
@@ -669,6 +704,9 @@ export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
     data.val_max_samples=$VAL_MAX_SAMPLES \
     trainer.total_epochs=1 \
     trainer.total_training_steps="$TOTAL_STEPS" \
+    trainer.save_freq=$SAVE_FREQ \
+    trainer.resume_mode=$RESUME_MODE \
+    trainer.max_actor_ckpt_to_keep=$MAX_CKPT_KEEP \
     trainer.logger="['console','wandb']" \
     trainer.project_name=${PROJECT_NAME:-bagel_corl} \
     trainer.experiment_name=${EXPERIMENT_NAME:-bagel_corl_pr1} \
