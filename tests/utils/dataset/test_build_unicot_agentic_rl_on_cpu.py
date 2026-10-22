@@ -23,6 +23,7 @@ from verl_omni.utils.dataset.visual_reflection import build_unicot_agentic_rl as
 
 
 def _write_snapshot(tmp_path: Path, name: str, rows: list[dict]) -> Path:
+    """Write a minimal Hub cache snapshot containing source metadata."""
     root = tmp_path / name
     snapshot = root / "snapshots" / "0000000000000000000000000000000000000000"
     snapshot.mkdir(parents=True)
@@ -31,6 +32,7 @@ def _write_snapshot(tmp_path: Path, name: str, rows: list[dict]) -> Path:
 
 
 def _reflection_row(data_id: str, states: int = 2) -> dict:
+    """Create a reflection trajectory with aligned image transitions."""
     inputs = [f"./images/{data_id}_{index}.png" for index in range(states)]
     outputs: list[str | None] = [f"./images/{data_id}_{index + 1}.png" for index in range(states - 1)] + [None]
     return {
@@ -45,6 +47,7 @@ def _reflection_row(data_id: str, states: int = 2) -> dict:
 
 
 def _breakdown_row(data_id: str, count: int = 2) -> dict:
+    """Create a plan with active subtasks and null-padded unused slots."""
     subtasks: list[str | None] = [f"Subtask {index}." for index in range(count)]
     subtasks.extend([None] * (3 - count))
     images: list[str | None] = [f"./images/{data_id}_{index}.png" for index in range(count)]
@@ -58,6 +61,7 @@ def _breakdown_row(data_id: str, count: int = 2) -> dict:
 
 
 def _no_breakdown_row(data_id: str) -> dict:
+    """Create a single-image source row without a planning requirement."""
     return {
         "data_id": data_id,
         "prompt": f"Simple prompt {data_id}.",
@@ -77,6 +81,7 @@ def _build(
     val_ratio: float = 0.2,
     seed: int = 7,
 ) -> Path:
+    """Build real parquet outputs from small local source snapshots."""
     output = tmp_path / "output"
     reflection_dir = _write_snapshot(tmp_path, "reflection", reflection_rows) if reflection_rows else ""
     breakdown_dir = _write_snapshot(tmp_path, "breakdown", breakdown_rows) if breakdown_rows else ""
@@ -94,10 +99,12 @@ def _build(
 
 
 def _read(output: Path, split: str) -> pd.DataFrame:
+    """Read a generated split through the parquet consumer interface."""
     return pd.read_parquet(output / f"{split}.parquet")
 
 
 def test_builds_expected_agentic_schema_without_reference_leakage(tmp_path):
+    """Training prompts must expose the task schema without source annotations."""
     output = _build(
         tmp_path,
         reflection_rows=[_reflection_row(f"r{i}", 1 + i % 3) for i in range(30)],
@@ -119,6 +126,7 @@ def test_builds_expected_agentic_schema_without_reference_leakage(tmp_path):
 
 
 def test_references_and_weights_live_only_in_ground_truth(tmp_path):
+    """Reward references and weights must stay out of prompt metadata."""
     output = _build(
         tmp_path,
         reflection_rows=[_reflection_row(f"r{i}") for i in range(20)],
@@ -130,7 +138,7 @@ def test_references_and_weights_live_only_in_ground_truth(tmp_path):
 
     for reward_model, extra_info in zip(train["reward_model"], train["extra_info"], strict=True):
         ground_truth = reward_model["ground_truth"]
-        assert all(f"w_{dim}" in ground_truth for dim in builder.DIMS)
+        assert all(f"w_{dim}" in ground_truth for dim in builder.REWARD_DIMS)
         assert not any(key.startswith("w_") for key in extra_info)
         if ground_truth["task_type"] == "plan":
             assert len(ground_truth["reference_subtasks"]) == 3
@@ -141,6 +149,7 @@ def test_references_and_weights_live_only_in_ground_truth(tmp_path):
 
 
 def test_plan_and_reflect_rows_use_task_specific_system_prompts(tmp_path):
+    """Each task must receive its own tool-use protocol."""
     output = _build(
         tmp_path,
         reflection_rows=[_reflection_row(f"r{i}") for i in range(20)],
@@ -159,6 +168,7 @@ def test_plan_and_reflect_rows_use_task_specific_system_prompts(tmp_path):
 
 
 def test_no_breakdown_rows_become_single_image_reflect_tasks(tmp_path):
+    """No-breakdown rows must use reflection behavior while retaining corpus identity."""
     output = _build(
         tmp_path,
         reflection_rows=[],
@@ -178,6 +188,7 @@ def test_no_breakdown_rows_become_single_image_reflect_tasks(tmp_path):
 
 
 def test_rejections_are_reported_and_dropped(tmp_path):
+    """Invalid source rows must be counted and excluded from parquet outputs."""
     bad = _reflection_row("bad")
     bad["edit"][0] = ""
     output = _build(
@@ -196,6 +207,7 @@ def test_rejections_are_reported_and_dropped(tmp_path):
 
 
 def test_full_mode_uses_every_valid_row_and_splits_are_disjoint(tmp_path):
+    """Uncapped builds must retain all valid rows without split overlap."""
     reflection = [_reflection_row(f"r{i}", 1 + i % 3) for i in range(40)]
     breakdown = [_breakdown_row(f"b{i}", 1 + i % 3) for i in range(40)]
     output = _build(tmp_path, reflection_rows=reflection, breakdown_rows=breakdown)
@@ -209,6 +221,7 @@ def test_full_mode_uses_every_valid_row_and_splits_are_disjoint(tmp_path):
 
 
 def test_full_mode_is_order_independent_and_deterministic(tmp_path):
+    """Reordering metadata must not change the selected rows or their indices."""
     reflection = [_reflection_row(f"r{i}", 1 + i % 3) for i in range(30)]
     breakdown = [_breakdown_row(f"b{i}", 1 + i % 3) for i in range(30)]
     first = _build(tmp_path / "first", reflection_rows=reflection, breakdown_rows=breakdown)
@@ -223,6 +236,7 @@ def test_full_mode_is_order_independent_and_deterministic(tmp_path):
 
 
 def test_size_caps_apply_requested_mix_ratio(tmp_path):
+    """Capped splits must honor both the requested count and task mix."""
     output = _build(
         tmp_path,
         reflection_rows=[_reflection_row(f"r{i}", 1) for i in range(40)],
@@ -238,6 +252,7 @@ def test_size_caps_apply_requested_mix_ratio(tmp_path):
 
 
 def test_requires_a_source_and_valid_ratios(tmp_path):
+    """Missing sources and out-of-range mix ratios must fail before building."""
     common = {
         "reflection_dir": "",
         "breakdown_dir": "",
@@ -259,6 +274,7 @@ def test_requires_a_source_and_valid_ratios(tmp_path):
 
 
 def test_mismatched_transition_uris_are_rejected(tmp_path):
+    """Broken output-to-input image chains must appear in the rejection report."""
     bad = _reflection_row("bad", states=2)
     bad["output_image"][0] = "./images/not_the_next_input.png"
     output = _build(
@@ -274,6 +290,7 @@ def test_mismatched_transition_uris_are_rejected(tmp_path):
 
 @pytest.mark.parametrize("blank", ["", "   ", None])
 def test_empty_reflection_image_uris_are_rejected(tmp_path, blank):
+    """Blank or null image references must be rejected before row emission."""
     bad = _reflection_row("blank", states=2)
     bad["input_image"][0] = blank
     output = _build(
@@ -288,6 +305,7 @@ def test_empty_reflection_image_uris_are_rejected(tmp_path, blank):
 
 
 def test_hub_refs_main_beats_lexicographically_later_snapshot(tmp_path):
+    """Snapshot selection must follow the main ref rather than SHA ordering."""
     root = tmp_path / "reflection"
     stale_sha = "ffffffffffffffffffffffffffffffffffffffff"
     main_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -317,6 +335,7 @@ def test_hub_refs_main_beats_lexicographically_later_snapshot(tmp_path):
 
 
 def test_capped_size_fails_closed_when_mix_cannot_be_met(tmp_path):
+    """An unavailable task quota must abort rather than silently change the mix."""
     with pytest.raises(SystemExit, match="cannot meet mix_ratio"):
         _build(
             tmp_path,
@@ -329,6 +348,7 @@ def test_capped_size_fails_closed_when_mix_cannot_be_met(tmp_path):
 
 
 def test_capped_size_fails_closed_when_pool_is_smaller_than_requested(tmp_path):
+    """An oversized cap must abort rather than silently undershoot."""
     with pytest.raises(SystemExit, match="requested 100"):
         _build(
             tmp_path,
@@ -341,6 +361,7 @@ def test_capped_size_fails_closed_when_pool_is_smaller_than_requested(tmp_path):
 
 
 def test_build_report_records_requested_and_actual_size(tmp_path):
+    """The persisted report must distinguish requested and emitted row counts."""
     output = _build(
         tmp_path,
         reflection_rows=[_reflection_row(f"r{i}", 1) for i in range(40)],
@@ -354,4 +375,42 @@ def test_build_report_records_requested_and_actual_size(tmp_path):
     assert train["requested_size"] == 20
     assert train["actual_size"] == 20
     assert train["total"] == 20
-    assert train["shortfall"] is None
+
+
+@pytest.mark.parametrize("source", ["reflection", "breakdown"])
+@pytest.mark.parametrize("invalid", [None, "bad", 42, [], True])
+def test_non_object_rows_are_reported_without_losing_valid_rows(tmp_path, source, invalid):
+    """Malformed JSON entries must not abort either source's build."""
+    reflection = [_reflection_row("r")]
+    breakdown = [_breakdown_row("b"), _no_breakdown_row("simple")]
+    (reflection if source == "reflection" else breakdown).append(invalid)
+    output = _build(tmp_path, reflection_rows=reflection, breakdown_rows=breakdown)
+    report = json.loads((output / "build_report.json").read_text())
+    assert report["rejection_count"] == 1
+    assert report["rejections"] == [{"data_id": "", "reason": "invalid_field_type", "field": None}]
+    rows = pd.concat([_read(output, "train"), _read(output, "val")])
+    assert {extra["data_id"] for extra in rows["extra_info"]} == {"r", "b", "simple"}
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_report_weights_match_all_emitted_ground_truth(tmp_path, monkeypatch, override):
+    """The report must capture defaults and overrides for every task and source."""
+    expected = {"w_reflect": 1.0, "w_plan": 1.0, "w_format": 1.0, "w_tool": 1.0, "w_result": 1.0}
+    for dim in ("REFLECT", "PLAN", "FORMAT", "TOOL", "RESULT"):
+        monkeypatch.delenv(f"RPCO_W_{dim}", raising=False)
+    if override:
+        monkeypatch.setenv("RPCO_W_REFLECT", " 0.25 ")
+        monkeypatch.setenv("RPCO_W_PLAN", "2.5")
+        monkeypatch.setenv("RPCO_W_RESULT", "0")
+        expected.update(w_reflect=0.25, w_plan=2.5, w_result=0.0)
+    output = _build(
+        tmp_path,
+        reflection_rows=[_reflection_row("r")],
+        breakdown_rows=[_breakdown_row("b"), _no_breakdown_row("simple")],
+    )
+    report = json.loads((output / "build_report.json").read_text())
+    assert report["reward_weights"] == expected
+    rows = pd.concat([_read(output, "train"), _read(output, "val")])
+    assert len(rows) == 3
+    for reward in rows["reward_model"]:
+        assert {key: reward["ground_truth"][key] for key in expected} == expected

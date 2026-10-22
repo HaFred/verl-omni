@@ -25,6 +25,7 @@ from verl_omni.utils.dataset.visual_reflection.unicot_breakdown import (
 
 
 def _plan_row(count: int = 2, *, data_id: str = "fixture") -> dict:
+    """Create a valid breakdown plan with three aligned metadata slots."""
     subtasks: list[str | None] = [f"Subtask {index}." for index in range(count)]
     subtasks.extend([None] * (3 - count))
     images: list[str | None] = [f"./images/{data_id}_{index}.png" for index in range(count)]
@@ -38,6 +39,7 @@ def _plan_row(count: int = 2, *, data_id: str = "fixture") -> dict:
 
 
 def _reflect_row() -> dict:
+    """Create a no-breakdown record with empty image slots."""
     return {
         "data_id": "simple",
         "prompt": "A simple visual request.",
@@ -48,6 +50,7 @@ def _reflect_row() -> dict:
 
 @pytest.mark.parametrize("count", [1, 2, 3])
 def test_valid_plan_prefixes(count):
+    """One to three active subtasks must produce matching plan image counts."""
     parsed = parse_unicot_breakdown_record(_plan_row(count), manifest_id="manifest")
 
     assert parsed.task_type == "plan"
@@ -58,6 +61,7 @@ def test_valid_plan_prefixes(count):
 
 
 def test_no_breakdown_normalizes_to_reflect():
+    """Sentinel normalization must preserve the single-image reflection contract."""
     row = _reflect_row()
     row["subtasks"][0] = "  NO breakdown\nneeded. "
     parsed = parse_unicot_breakdown_record(row, manifest_id="manifest")
@@ -70,6 +74,7 @@ def test_no_breakdown_normalizes_to_reflect():
 
 
 def test_parser_does_not_mutate_source():
+    """Parsing must leave caller-owned source metadata unchanged."""
     row = _plan_row()
     before = copy.deepcopy(row)
     parse_unicot_breakdown_record(row, manifest_id="manifest")
@@ -77,12 +82,14 @@ def test_parser_does_not_mutate_source():
 
 
 def test_converter_config_is_versioned():
+    """Manifest settings must identify the parser version and public slot count."""
     config = breakdown_converter_config()
     assert config["unicot_breakdown_parser"] == "subtask_structure_v1"
     assert config["unicot_breakdown_max_subtask_slots"] == 3
 
 
 def test_source_record_override_must_match_data_id():
+    """Conflicting source identities must be rejected rather than reassigned."""
     with pytest.raises(VisualReflectionDataError) as error:
         parse_unicot_breakdown_record(
             _plan_row(data_id="source"),
@@ -112,6 +119,7 @@ def test_source_record_override_must_match_data_id():
     ],
 )
 def test_malformed_plan_rows_fail_closed(mutation, reason):
+    """Invalid fields and misaligned slots must produce specific rejection reasons."""
     row = _plan_row(1)
     mutation(row)
     with pytest.raises(VisualReflectionDataError) as error:
@@ -127,6 +135,7 @@ def test_malformed_plan_rows_fail_closed(mutation, reason):
     ],
 )
 def test_contradictory_no_breakdown_rows_fail_closed(mutation):
+    """No-breakdown rows must reject additional planning text and images."""
     row = _reflect_row()
     mutation(row)
     with pytest.raises(VisualReflectionDataError) as error:
@@ -135,6 +144,7 @@ def test_contradictory_no_breakdown_rows_fail_closed(mutation):
 
 
 def test_non_mapping_and_empty_manifest_fail_closed():
+    """Invalid record types and empty manifest identities must fail validation."""
     with pytest.raises(VisualReflectionDataError) as non_mapping:
         parse_unicot_breakdown_record("bad", manifest_id="manifest")  # type: ignore[arg-type]
     assert non_mapping.value.reason is RejectionReason.INVALID_FIELD_TYPE
