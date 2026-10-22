@@ -5,13 +5,13 @@
 # Algorithm: DanceGRPO (reuses FlowGRPO's advantage estimator and loss)
 # Reward: HPSv3 (Human Preference Score v3) - custom reward model
 #
-# This is the CUDA v1 counterpart of run_wan22_5b_t2v_hpsv3_auto.sh. It uses
+# This is the default CUDA recipe for Wan2.2 DanceGRPO. It uses
 # `verl_omni.trainer.main_diffusion_v1`, which selects
 # `PolicyGradientDiffusionTrainerV1Sync` via `trainer.v1.trainer_mode=sync`.
 # TransferQueue is force-enabled inside the runner, so it does not need to be
-# set on the CLI. NPU auto-detect remains on the v0 script.
+# set on the CLI. NPU auto-detect remains on the deprecated v0 script.
 #
-# Reference (legacy v0 script):
+# Reference (deprecated v0 script):
 # verl-omni/examples/dancegrpo_trainer/wan22/run_wan22_5b_t2v_hpsv3_auto.sh
 # Reference: https://github.com/XueZeyue/DanceGRPO and https://github.com/verl-project/verl-recipe/blob/main/dance_grpo/dance_grpo_mindspeed_mm/
 set -x
@@ -19,10 +19,10 @@ set -x
 DEVICE="gpu"
 ATTENTION_BACKEND='native'
 ROLLOUT_ATTN_BACKEND='TORCH_SDPA'
-NUM_GPUS_ACTOR_ROLLOUT_REWARD=8
-MICRO_BATCH_SIZE=4
-EXPERIMENT_NAME="wan22_5b_t2v_hpsv3_gpu_v1"
-PROJECT_NAME="dance_grpo"
+NUM_GPUS_ACTOR_ROLLOUT_REWARD=${NUM_GPUS_ACTOR_ROLLOUT_REWARD:-${NUM_GPUS:-8}}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-4}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-"wan22_5b_t2v_hpsv3_gpu_v1"}
+PROJECT_NAME=${PROJECT_NAME:-"dance_grpo"}
 
 WORKSPACE=${WORKSPACE:-$HOME}
 
@@ -88,6 +88,7 @@ python3 -m verl_omni.trainer.main_diffusion_v1 \
     reward.reward_model.enable=False \
     reward.custom_reward_function.path=$custom_reward_function_path \
     reward.custom_reward_function.name=compute_score_hpsv3 \
+    +reward.custom_reward_function.reward_kwargs.max_batch_size=4 \
     trainer.logger='["console", "tensorboard"]' \
     trainer.project_name=$PROJECT_NAME \
     trainer.experiment_name=$EXPERIMENT_NAME \

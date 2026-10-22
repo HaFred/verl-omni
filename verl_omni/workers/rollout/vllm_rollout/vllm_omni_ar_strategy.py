@@ -19,7 +19,6 @@ import tempfile
 from argparse import Namespace
 from typing import Any, Optional
 
-import torch
 import yaml
 from verl.utils.device import get_visible_devices_keyword
 from verl.workers.config import RolloutConfig
@@ -27,9 +26,11 @@ from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.vllm_rollout.utils import extract_prompt_logprobs
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 from vllm import SamplingParams
+from vllm_omni.config.stage_config import StageExecutionType
 from vllm_omni.lora.request import LoRARequest
 
 from verl_omni.pipelines.model_base import OmniRolloutPipelineBase
+from verl_omni.pipelines.rollout_request import OmniRolloutRequest
 from verl_omni.workers.config import OmniModelConfig
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_strategy_base import OmniStrategyBase
 
@@ -187,16 +188,21 @@ class ARStrategy(OmniStrategyBase):
         if visible_devices:
             device_count = len([device for device in visible_devices.split(",") if device.strip()])
             devices = ",".join(str(device_id) for device_id in range(device_count))
-            stage_ids = [stage.stage_id for stage in stages]
+            text_encoder_tp_size = getattr(self.server.config, "text_encoder_tp_size", 1)
             deploy_dict["stages"] = [
                 {
-                    "stage_id": stage_id,
+                    "stage_id": stage.stage_id,
                     "devices": devices,
                     "tensor_parallel_size": tp_size,
-                    "text_encoder_tp_size": getattr(self.server.config, "text_encoder_tp_size", 1),
-                    "engine_extras": stage_extras[stage_id],
+                    # Only diffusion stages own text_encoder_tp_size.
+                    **(
+                        {"text_encoder_tp_size": text_encoder_tp_size}
+                        if getattr(stage, "execution_type", None) == StageExecutionType.DIFFUSION
+                        else {}
+                    ),
+                    "engine_extras": stage_extras[stage.stage_id],
                 }
-                for stage_id in stage_ids
+                for stage in stages
             ]
         else:
             raise RuntimeError(
@@ -217,6 +223,10 @@ class ARStrategy(OmniStrategyBase):
         engine_kwargs["deploy_config"] = deploy_path
 
     def prepare_engine_args(self, engine_args: dict[str, Any], args: Namespace) -> None:
+        if engine_args.get("enable_lora"):
+            from verl_omni.utils.vllm_omni.patch import patch_vllm_omni_lora_config
+
+            patch_vllm_omni_lora_config()
         if self._rollout_output_modalities is not None:
             # The generated per-stage deploy config owns model_stage for
             # multi-output pipelines.
@@ -230,22 +240,32 @@ class ARStrategy(OmniStrategyBase):
             engine_args["compilation_config"] = _drop_none_mapping_values(engine_args["compilation_config"])
 
     def collective_rpc_stage_ids(self, method: Any) -> list[int] | None:
-        if method in {"set_pending_lora_peft_config", "update_weights_from_ipc"}:
+        if method in {"set_pending_lora_peft_config", "update_weights_from_ipc", "monkey_patch_model"}:
             return self._weight_sync_stage_ids
         return None
 
     def preprocess_input(
         self,
-        prompt_ids: list[int],
+        request: OmniRolloutRequest,
         sampling_params: dict[str, Any],
-        multi_modal_data: dict[str, Any],
         lora_request: Optional[LoRARequest],
-        negative_prompt_ids: Optional[list[int]],
-        prompt_mask: torch.BoolTensor | None = None,
-        mm_processor_kwargs: Optional[dict[str, Any]] = None,
-        extra_prompt_ids: Optional[dict[str, list[int]]] = None,
-        negative_extra_prompt_ids: Optional[dict[str, list[int]]] = None,
     ) -> tuple[dict[str, Any], SamplingParams | list[Any]]:
+        unsupported_fields = [
+            name
+            for name, value in (
+                ("prompt_mask", request.prompt.mask),
+                ("negative_prompt_ids", request.prompt.negative_token_ids),
+                ("extra_prompt_ids", request.prompt.extra_token_ids),
+                ("negative_extra_prompt_ids", request.prompt.negative_extra_token_ids),
+            )
+            if value is not None
+        ]
+        if unsupported_fields:
+            raise ValueError(f"ARStrategy does not support request fields: {', '.join(unsupported_fields)}")
+
+        prompt_ids = request.prompt.token_ids
+        multi_modal_data = request.multi_modal_data()
+        mm_processor_kwargs = request.prompt.mm_processor_kwargs
         if multi_modal_data:
             processor = getattr(self.server.model_config, "processor", None)
             if processor is not None and hasattr(processor, "dedup_pad_tokens"):
@@ -295,6 +315,8 @@ class ARStrategy(OmniStrategyBase):
         else:
             sampling_params["logprobs"] = None
         sampling_params.setdefault("repetition_penalty", getattr(self.server.config, "repetition_penalty", 1.0))
+        if getattr(self.server.config, "full_determinism", False):
+            sampling_params.setdefault("seed", getattr(self.server.config, "seed", 42))
         policy_params = SamplingParams(max_tokens=max_tokens, **sampling_params)
         if self._rollout_output_modalities is not None:
             default_stage_sampling_params = self.server.engine.default_sampling_params_list
