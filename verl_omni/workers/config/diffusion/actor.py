@@ -46,6 +46,13 @@ class DiffusionLossConfig(BaseConfig):
     dpo_beta: float = 2000.0
     kl_mask_threshold: float = 1e-5
     add_kl_coefficient: bool = True
+    dgpo_beta: float = 100.0
+    dgpo_clip_range: float = 0.01
+    # OmniNFT-only modality weights and reference regularization coefficients.
+    video_weight: float = 1.0
+    audio_weight: float = 1.0
+    video_ref_kl_coef: float = 0.0
+    audio_ref_kl_coef: float = 0.0
 
     def __post_init__(self):
         """Validate diffusion loss configuration."""
@@ -54,7 +61,10 @@ class DiffusionLossConfig(BaseConfig):
             "flow_dppo",
             "grpo_guard",
             "diffusion_nft",
+            "omni_nft",
+            "dgpo",
             "dpo",
+            "dmd2",
             "dance_grpo",
             "distill_kl",
             "distill_fm_mse",
@@ -69,6 +79,10 @@ class DiffusionLossConfig(BaseConfig):
             raise ValueError(f"adaptive_weight_min must be positive, got {self.adaptive_weight_min}.")
         if self.kl_mask_threshold <= 0:
             raise ValueError(f"kl_mask_threshold must be positive, got {self.kl_mask_threshold}.")
+        if self.dgpo_beta <= 0:
+            raise ValueError(f"dgpo_beta must be positive, got {self.dgpo_beta}.")
+        if self.dgpo_clip_range < 0:
+            raise ValueError(f"dgpo_clip_range must be non-negative, got {self.dgpo_clip_range}.")
 
 
 @dataclass
@@ -186,6 +200,11 @@ class FSDPDiffusionActorConfig(DiffusionActorConfig):
     strategy: str = "fsdp"
     grad_clip: float = 1.0
     fsdp_config: FSDPEngineConfig = field(default_factory=FSDPEngineConfig)
+    # Stage training inputs from CPU one timestep at a time.
+    enable_timestep_staging: bool = False
+    # Defer FSDP reduce-scatter until the last (micro-batch, timestep) backward.
+    # Off by default: unsharded grads sit on GPU until that last backward.
+    use_no_sync_for_gradient_accumulation: bool = False
 
     def __post_init__(self):
         """Validate diffusion FSDP actor configuration parameters."""

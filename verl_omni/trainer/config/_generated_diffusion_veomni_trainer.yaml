@@ -61,7 +61,20 @@ actor_rollout_ref:
       all_ranks: false
       ranks: []
       save_path: ${oc.select:global_profiler.save_path,outputs/profile}
+      relocate_results: ${oc.select:global_profiler.relocate_results,false}
+      finish_hook_cmd: ${oc.select:global_profiler.finish_hook_cmd,null}
+      finish_hook_all_ranks: ${oc.select:global_profiler.finish_hook_all_ranks,false}
+      finish_hook_ranks: ${oc.select:global_profiler.finish_hook_ranks,[]}
       tool_config:
+        npu:
+          _target_: verl.utils.profiler.config.NPUToolConfig
+          contents: []
+          level: level0
+          analysis: true
+          discrete: false
+          profile_token_start: null
+          profile_token_end: null
+          name: npu
         nsys:
           _target_: verl.utils.profiler.config.NsightToolConfig
           discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete,false}
@@ -92,6 +105,12 @@ actor_rollout_ref:
       dpo_beta: 2000.0
       kl_mask_threshold: 1.0e-05
       add_kl_coefficient: true
+      dgpo_beta: 100.0
+      dgpo_clip_range: 0.01
+      video_weight: 1.0
+      audio_weight: 1.0
+      video_ref_kl_coef: 0.0
+      audio_ref_kl_coef: 0.0
     rollout_correction:
       _target_: verl.trainer.config.algorithm.RolloutCorrectionConfig
       bypass_mode: ${oc.select:algorithm.rollout_correction.bypass_mode,false}
@@ -116,6 +135,7 @@ actor_rollout_ref:
       - model
       - optimizer
       - extra
+      save_lora_only: false
       load_contents: ${.save_contents}
       async_save: false
   ref:
@@ -177,7 +197,20 @@ actor_rollout_ref:
       all_ranks: false
       ranks: []
       save_path: ${oc.select:global_profiler.save_path,outputs/profile}
+      relocate_results: ${oc.select:global_profiler.relocate_results,false}
+      finish_hook_cmd: ${oc.select:global_profiler.finish_hook_cmd,null}
+      finish_hook_all_ranks: ${oc.select:global_profiler.finish_hook_all_ranks,false}
+      finish_hook_ranks: ${oc.select:global_profiler.finish_hook_ranks,[]}
       tool_config:
+        npu:
+          _target_: verl.utils.profiler.config.NPUToolConfig
+          contents: []
+          level: level0
+          analysis: true
+          discrete: false
+          profile_token_start: null
+          profile_token_end: null
+          name: npu
         nsys:
           _target_: verl.utils.profiler.config.NsightToolConfig
           discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete,false}
@@ -201,7 +234,20 @@ actor_rollout_ref:
       all_ranks: false
       ranks: []
       save_path: ${oc.select:global_profiler.save_path,outputs/profile}
+      relocate_results: ${oc.select:global_profiler.relocate_results,false}
+      finish_hook_cmd: ${oc.select:global_profiler.finish_hook_cmd,null}
+      finish_hook_all_ranks: ${oc.select:global_profiler.finish_hook_all_ranks,false}
+      finish_hook_ranks: ${oc.select:global_profiler.finish_hook_ranks,[]}
       tool_config:
+        npu:
+          _target_: verl.utils.profiler.config.NPUToolConfig
+          contents: []
+          level: level0
+          analysis: true
+          discrete: false
+          profile_token_start: null
+          profile_token_end: null
+          name: npu
         nsys:
           _target_: verl.utils.profiler.config.NsightToolConfig
           discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete,false}
@@ -230,7 +276,12 @@ actor_rollout_ref:
     cudagraph_capture_sizes: null
     free_cache_engine: true
     tensor_model_parallel_size: 2
+    ulysses_degree: 1
+    ring_degree: 1
     text_encoder_tp_size: 1
+    vae_patch_parallel_size: 1
+    vae_parallel_mode: tile
+    vae_use_tiling: false
     data_parallel_size: 1
     expert_parallel_size: 1
     pipeline_model_parallel_size: 1
@@ -239,7 +290,7 @@ actor_rollout_ref:
     max_num_seqs: 1024
     step_execution: false
     enable_chunked_prefill: true
-    enable_prefix_caching: true
+    enable_prefix_caching: false
     logprobs_mode: processed_logprobs
     scheduling_policy: fcfs
     load_format: dummy
@@ -265,6 +316,7 @@ actor_rollout_ref:
         height: ${oc.select:actor_rollout_ref.rollout.pipeline.height,512}
         width: ${oc.select:actor_rollout_ref.rollout.pipeline.width,512}
         num_inference_steps: 50
+        requested_outputs: ${oc.select:actor_rollout_ref.rollout.pipeline.requested_outputs,null}
         true_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.true_cfg_scale,1.0}
         max_sequence_length: ${oc.select:actor_rollout_ref.rollout.pipeline.max_sequence_length,512}
         guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
@@ -297,6 +349,7 @@ actor_rollout_ref:
       height: 512
       width: 512
       num_inference_steps: 10
+      requested_outputs: null
       true_cfg_scale: 1.0
       max_sequence_length: 512
       guidance_scale: null
@@ -350,6 +403,12 @@ actor_rollout_ref:
     config_path: null
     transformer_subfolder: transformer
     attn_backend: _flash_3_varlen_hub
+    use_regional_compile: false
+    regional_compile_options:
+      backend: inductor
+      mode: default
+      fullgraph: false
+      dynamic: true
     lora_rank: 0
     lora_alpha: 64
     lora_init_weights: gaussian
@@ -372,6 +431,7 @@ actor_rollout_ref:
       height: ${oc.select:actor_rollout_ref.rollout.pipeline.height,512}
       width: ${oc.select:actor_rollout_ref.rollout.pipeline.width,512}
       num_inference_steps: ${oc.select:actor_rollout_ref.rollout.pipeline.num_inference_steps,10}
+      requested_outputs: ${oc.select:actor_rollout_ref.rollout.pipeline.requested_outputs,null}
       true_cfg_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.true_cfg_scale,1.0}
       max_sequence_length: ${oc.select:actor_rollout_ref.rollout.pipeline.max_sequence_length,512}
       guidance_scale: ${oc.select:actor_rollout_ref.rollout.pipeline.guidance_scale,null}
@@ -443,7 +503,20 @@ reward:
         all_ranks: false
         ranks: []
         save_path: ${oc.select:global_profiler.save_path,outputs/profile}/reward_model
+        relocate_results: ${oc.select:global_profiler.relocate_results,false}
+        finish_hook_cmd: ${oc.select:global_profiler.finish_hook_cmd,null}
+        finish_hook_all_ranks: ${oc.select:global_profiler.finish_hook_all_ranks,false}
+        finish_hook_ranks: ${oc.select:global_profiler.finish_hook_ranks,[]}
         tool_config:
+          npu:
+            _target_: verl.utils.profiler.config.NPUToolConfig
+            contents: []
+            level: level0
+            analysis: true
+            discrete: false
+            profile_token_start: null
+            profile_token_end: null
+            name: npu
           nsys:
             _target_: verl.utils.profiler.config.NsightToolConfig
             discrete: ${oc.select:global_profiler.global_tool_config.nsys.discrete,false}
@@ -513,7 +586,10 @@ reward:
     path: null
     name: compute_score
     use_accelerator: false
+  accelerator_workers:
+    enabled: false
   reward_functions: {}
+  models: {}
   aggregation: weighted_sum
   reward_manager:
     _target_: verl.workers.config.reward_model.RewardManagerConfig
@@ -537,8 +613,38 @@ distillation:
       key: null
       model_path: null
       world_size: 0
+      guidance_scale: null
   teacher_key: data_source
   scheduler: inline
+dmd:
+  _target_: verl_omni.workers.config.DiffusionDMDConfig
+  fake_update_ratio: 2
+  student_micro_batch_size_per_gpu: 1
+  fake_score_micro_batch_size_per_gpu: 1
+  fake_score_optim:
+    _target_: verl.workers.config.FSDPOptimizerConfig
+    lr: 2.0e-05
+    weight_decay: 0.001
+    betas:
+    - 0.9
+    - 0.999
+    clip_grad: 1.0
+    lr_scheduler_type: constant
+    lr_warmup_steps: -1
+    lr_warmup_steps_ratio: 0.0
+    total_training_steps: -1
+  teacher_guidance_scale: 4.0
+  cfg_norm: layer_norm
+  negative_prompt: ' '
+  normalization_epsilon: 1.0e-06
+  rollout_timestep_shift: 3.0
+  score_discrete_steps: 1000
+  score_sigma_min: 0.02
+  score_sigma_max: 0.98
+  score_timestep_shift: 3.0
+  ema_decay: 0.999
+  ema_start_step: 0
+  export_role: student
 algorithm:
   _target_: verl_omni.trainer.config.DiffusionAlgoConfig
   trainer_type: policy_gradient
@@ -550,6 +656,8 @@ algorithm:
   old_policy_decay: null
   old_policy_update_interval: 1
   timestep_fraction: 1.0
+  train_timestep_range: null
+  train_timestep_count: null
   adv_mode: continuous
   paired_preference: false
   rollout_correction:
@@ -592,7 +700,7 @@ trainer:
   ray_wait_register_center_timeout: 300
   ray_master_port_range: null
   device: cuda
-  use_v1: false
+  use_v1: true
   v1:
     trainer_mode: sync
     sync: {}
@@ -602,11 +710,21 @@ trainer:
       num_warmup_batches: 1
       parameter_sync_step: 4
       sync_compatible: false
+      hybrid_rollout:
+        _target_: verl.trainer.config.HybridRolloutSwitchConfig
+        enable_switch: false
+        switch_threshold_ratio: 0.4
+        adaptive_switch_threshold: true
+        switch_threshold_step_up: 0.05
+        switch_threshold_step_down: 0.03
+        switch_threshold_release_steps: 2
+        switch_cost_window_size: 3
     sampler:
       max_off_policy_threshold: 8
       max_off_policy_strategy: drop
       drop_incomplete_groups: false
       max_incomplete_group_refill_rounds: 3
+      poll_interval: null
       custom_sampler:
         path: null
         name: null
@@ -617,6 +735,10 @@ global_profiler:
   steps: null
   profile_continuous_steps: false
   save_path: outputs/profile
+  relocate_results: false
+  finish_hook_cmd: null
+  finish_hook_all_ranks: false
+  finish_hook_ranks: []
   global_tool_config:
     nsys:
       _target_: verl.utils.profiler.config.NsightToolConfig

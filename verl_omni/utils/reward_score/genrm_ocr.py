@@ -101,6 +101,7 @@ async def compute_score_ocr(
     reward_router_address: str,
     reward_model_tokenizer: PreTrainedTokenizer = None,
     model_name: Optional[str] = None,
+    sampling_params: dict = None,
 ):
     """Compute an image OCR score via a generative reward model (GRM).
 
@@ -120,48 +121,18 @@ async def compute_score_ocr(
             for interface consistency.
         model_name: Name or path of the GRM. Defaults to
             ``DEFAULT_GRM_MODEL_PATH``.
+        sampling_params: Override the defaults from :func:`_sampling_params`.
+            An explicit ``seed`` opts in to reproducible sampling; without one
+            any env-inherited seed is dropped.
 
     Returns:
         dict: ``{"score": float, "genrm_response": str}``.
     """
     from verl.utils.ray_utils import get_event_loop
 
-    from verl_omni.utils.reward_score.reward_utils import pil_image_to_base64
+    from verl_omni.utils.reward_score.reward_utils import pil_image_to_base64, visual_reward_frames
 
-    # Normalize any input format to [N, C, H, W] (frames × channels × height × width).
-    # Detected formats:
-    #   3D:        [C, H, W]             — single image (QwenImage FlowGRPO)
-    #   4D:        [C, F, H, W]          — channels-first video (raw VAE)
-    #              [F, H, W, C]          — channels-last video (engine postprocess)
-    #   5D:        [B, C, F, H, W]       — batched channels-first
-    #              [B, F, H, W, C]       — batched channels-last (Wan22 DanceGRPO)
-    is_channels_last = solution_image.shape[-1] in (1, 3)
-
-    if solution_image.ndim == 3:
-        frame_interval = extra_info.get("frame_interval", 1)
-        # [C, H, W] → [1, C, H, W]
-        solution_image = solution_image.unsqueeze(0)
-
-    elif solution_image.ndim == 4:
-        frame_interval = extra_info.get("frame_interval", 4)
-        if is_channels_last:
-            # [F, H, W, C] → [C, F, H, W]
-            solution_image = solution_image.permute(3, 0, 1, 2)
-        # Now [C, F, H, W]: subsample frames, then frame-dim first
-        solution_image = solution_image[:, ::frame_interval]  # [C, F', H, W]
-        solution_image = solution_image.permute(1, 0, 2, 3)  # [F', C, H, W]
-
-    elif solution_image.ndim == 5:
-        frame_interval = extra_info.get(
-            "frame_interval",
-        )
-        if is_channels_last:
-            # [B, F, H, W, C] → [B, C, F, H, W]
-            solution_image = solution_image.permute(0, 4, 1, 2, 3)
-        # Now [B, C, F, H, W]: subsample frames, flatten batch + frames
-        solution_image = solution_image[:, :, ::frame_interval]  # [B, C, F', H, W]
-        solution_image = solution_image.permute(0, 2, 1, 3, 4)  # [B, F', C, H, W]
-        solution_image = solution_image.reshape(-1, *solution_image.shape[2:])  # [B*F', C, H, W]
+    solution_image = visual_reward_frames(solution_image, extra_info, extra_info.get("frame_interval", 4))
 
     model_name = model_name or os.path.expanduser(DEFAULT_GRM_MODEL_PATH)
     loop = get_event_loop()
@@ -182,11 +153,15 @@ async def compute_score_ocr(
                 ],
             },
         ]
-        # TODO: make sampling params configurable
+        params = _sampling_params()
+        if sampling_params is not None:
+            params.update(sampling_params)
+            if "seed" not in sampling_params:
+                params.pop("seed", None)
         chat_complete_request = {
             "messages": messages,
             "model": model_name,
-            **_sampling_params(),
+            **params,
         }
         result = await _chat_complete(
             router_address=reward_router_address,
