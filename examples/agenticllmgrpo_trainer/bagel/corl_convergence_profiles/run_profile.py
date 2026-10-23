@@ -42,11 +42,13 @@ def build_profile(profile, seed, inherited):
     env = dict(inherited)
     env.update(
         BAGEL_MODEL_PATH=inherited["START_CHECKPOINT"],
+        UNICOT_TEST=inherited["UNICOT_VAL"],
         REBUILD_UNICOT="0",
         RESUME_MODE="disable",
         EXPERIMENT_NAME=name,
         RUN_NAME=name,
         RUN_DIR=str(run_dir / "train"),
+        BAGEL_CORL_PROVENANCE_DIR=str(run_dir / "provenance"),
         DEFAULT_LOCAL_DIR=str(output_root / "checkpoints" / name),
         PROJECT_NAME="bagel_corl_convergence",
         TOTAL_STEPS="50",
@@ -75,11 +77,20 @@ def build_profile(profile, seed, inherited):
         N="4",
         S="2",
         MAX_GENERATE_PASSES="1",
+        LOGPROBS_MODE="raw_logprobs",
     )
     freeze_und = freeze_gen = no_step = False
     und_weight = gen_weight = 1.0
     if profile == "reproduction":
-        env.update(ACTOR_LR="3e-5", GEN_LR="3e-5", N="8", S="1", MAX_GENERATE_PASSES="3", TOTAL_STEPS="200")
+        env.update(
+            ACTOR_LR="3e-5",
+            GEN_LR="3e-5",
+            N="8",
+            S="1",
+            MAX_GENERATE_PASSES="3",
+            TOTAL_STEPS="200",
+            LOGPROBS_MODE="processed_logprobs",
+        )
     elif profile == "B0":
         no_step = True
     elif profile == "B1":
@@ -90,6 +101,8 @@ def build_profile(profile, seed, inherited):
     elif profile == "B4":
         env["MAX_GENERATE_PASSES"] = "3"
     overrides = [
+        "++ray_kwargs.ray_init.runtime_env.env_vars.BAGEL_CORL_PROVENANCE_DIR="
+        + json.dumps(env["BAGEL_CORL_PROVENANCE_DIR"]),
         f"data.seed={seed}",
         f"actor_rollout_ref.actor.data_loader_seed={seed}",
         f"actor_rollout_ref.actor.fsdp_config.seed={seed}",
@@ -104,9 +117,25 @@ def build_profile(profile, seed, inherited):
         f"++actor_rollout_ref.actor.diffusion_loss.loss_weight_gen={gen_weight}",
         f"++agentic_image_gen.corl_reward_version={'v1' if profile == 'reproduction' else 'v2'}",
     ]
+    # The trainer runs inside Ray; inherited launcher environment alone is not
+    # sufficient to enable capture in an already running Ray cluster.
+    for key in (
+        "BAGEL_CORL_PARITY_CAPTURE_DIR",
+        "BAGEL_CORL_PARITY_MANIFEST",
+        "BAGEL_CORL_PARITY_REPLICA_LABEL",
+    ):
+        if env.get(key):
+            overrides.append(f"++ray_kwargs.ray_init.runtime_env.env_vars.{key}=" + json.dumps(env[key]))
     if profile == "B1":
         overrides.append("+actor_rollout_ref.rollout.agent.corl_fixed_gen_prompt=__user_request__")
     return env, overrides
+
+
+def validate_profile_logprobs(profile, config):
+    expected = "processed_logprobs" if profile == "reproduction" else "raw_logprobs"
+    actual = config.get("actor_rollout_ref", {}).get("rollout", {}).get("logprobs_mode")
+    if actual != expected:
+        raise ValueError(f"Profile {profile} requires resolved rollout.logprobs_mode={expected}; got {actual!r}")
 
 
 def main():
@@ -164,6 +193,7 @@ def main():
     config = yaml.safe_load(resolved.stdout[match.start() :])
     if not isinstance(config, dict) or "actor_rollout_ref" not in config:
         raise ValueError("Hydra composition did not yield the trainer config")
+    validate_profile_logprobs(args.profile, config)
     config["source_root"] = str(ROOT)
     spec = importlib.util.spec_from_file_location(
         "write_run_manifest", ROOT / "scripts/bagel_corl/write_run_manifest.py"
@@ -173,7 +203,8 @@ def main():
     artifact_dir = Path(env["RUN_DIR"]).parent / "provenance"
     manifest = manifest_tool.write_run_manifest(artifact_dir, config, env["START_CHECKPOINT"])
     # This intentionally contains only reviewed semantic fields, never credential
-    # subtrees. A runtime snapshot must later record effective optimizer group LRs.
+    # subtrees. The trainer later records initialized/restored optimizer group LRs
+    # through the profile's explicit Ray runtime environment opt-in.
     snapshot = json.loads(manifest.read_text(encoding="utf-8"))["resolved_config_allowlist"]
     (artifact_dir / "resolved-config.allowlisted.json").write_text(
         json.dumps(snapshot, indent=2, sort_keys=True) + "\n", encoding="utf-8"

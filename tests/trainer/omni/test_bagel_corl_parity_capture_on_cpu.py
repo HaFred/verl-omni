@@ -186,6 +186,7 @@ def test_real_runtime_method_replays_and_restores_first_old(tmp_path, monkeypatc
     gen = dict(
         episode_uid="ep",
         gen_sample_uid="sample",
+        rollout_policy_version=2,
         all_latents=torch.tensor([[1.0], [2.0], [3.0]]),
         timesteps=torch.tensor([1.0, 0.5]),
         rollout_log_probs=torch.tensor([-0.3, -0.4]),
@@ -279,6 +280,7 @@ def test_enabled_capture_requires_manifest_and_rejects_bypass(tmp_path, monkeypa
     with pytest.raises(ValueError, match="policy_version"):
         module.FrozenPolicyCapture.from_environment(trainer)
     trainer.global_steps = 2
+    trainer._bagel_corl_published_weight_version = 2
     trainer.config = SimpleNamespace(algorithm={"rollout_correction": {"bypass_mode": True}})
     with pytest.raises(ValueError, match="bypass_mode"):
         module.FrozenPolicyCapture.from_environment(trainer)
@@ -292,3 +294,154 @@ def test_recorded_replica_identity_takes_precedence(tmp_path):
     assert saved["replica_id"] == 7
     assert saved["replica_identity_source"] == "rollout_metadata"
     assert not saved["complete_replica_coverage_verified"]
+
+
+@pytest.mark.parametrize("gen_identity", [None, "top_level", "extra_fields"])
+def test_gen_replica_provenance_never_comes_from_parent_und(tmp_path, gen_identity):
+    cap = capture(tmp_path)
+    cap.manual_replica_label = None
+    parent = dict(und(), rollout_replica_id="physical-und-server")
+    raw = dict(
+        episode_uid="ep",
+        gen_sample_uid="sample",
+        rollout_policy_version=2,
+        all_latents=torch.tensor([[1.0], [2.0]]),
+        timesteps=torch.tensor([1.0]),
+        rollout_log_probs=torch.tensor([-0.3]),
+        rm_score=0.5,
+        gen_group_uid="group",
+    )
+    if gen_identity == "top_level":
+        raw["rollout_replica_id"] = "physical-gen-server"
+    elif gen_identity == "extra_fields":
+        raw["extra_fields"] = {"rollout_replica_id": "physical-gen-server"}
+
+    class Proto:
+        def __init__(self):
+            self.batch = dict(
+                all_latents=raw["all_latents"].unsqueeze(0),
+                all_timesteps=torch.tensor([[1.0]]),
+                gen_transition_valid=torch.ones(1, 1),
+                old_log_probs=torch.tensor([[-0.3]]),
+                gen_row_id=torch.tensor([0]),
+            )
+            self.non_tensor_batch = {"prompt_token_ids": [[1, 2]]}
+
+        def __len__(self):
+            return 1
+
+    proto = Proto()
+    missing_version = dict(raw)
+    missing_version.pop("rollout_policy_version")
+    with pytest.raises(ValueError, match="rollout_policy_version"):
+        cap.write_gen(proto, proto, proto, [missing_version], [parent])
+    if gen_identity is None:
+        with pytest.raises(ValueError, match="replica"):
+            cap.write_gen(proto, proto, proto, [raw], [parent])
+        assert not cap.path.exists()
+        cap.manual_replica_label = "manual-isolated-gen-server"
+    cap.write_gen(proto, proto, proto, [raw], [parent])
+    saved = json.loads(cap.path.read_text().splitlines()[0])
+    assert saved["replica_id"] == ("manual-isolated-gen-server" if gen_identity is None else "physical-gen-server")
+    assert saved["policy_version"] == 2
+    assert saved["episode_id"] == "ep"
+    assert saved["replica_identity_source"] == (
+        "manual_physical_replica_calibration_label" if gen_identity is None else "rollout_metadata"
+    )
+
+
+def test_first_training_step_uses_successfully_published_version(tmp_path, monkeypatch):
+    module = load()
+    path = tmp_path / "manifest.json"
+    manifest = dict(
+        policy_version=0,
+        calibration_id="fixture",
+        logprob_convention="raw_policy",
+        kernel_config={"und": {"dtype": "float32"}, "gen": {"dtype": "float32"}},
+    )
+    path.write_text(json.dumps(manifest))
+    monkeypatch.setenv("BAGEL_CORL_PARITY_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("BAGEL_CORL_PARITY_MANIFEST", str(path))
+    trainer = SimpleNamespace(
+        global_steps=1,
+        _bagel_corl_published_weight_version=0,
+        actor_rollout_wg=object(),
+        config=SimpleNamespace(algorithm={}),
+    )
+    cap = module.FrozenPolicyCapture.from_environment(trainer)
+    assert cap.provenance(dict(und(), policy_version=0, rollout_replica_id="und"))["actor_policy_version"] == 0
+    assert cap.trainer_step == 1
+    trainer._bagel_corl_published_weight_version = None
+    with pytest.raises(ValueError, match="published"):
+        module.FrozenPolicyCapture.from_environment(trainer)
+
+
+def test_publication_marker_is_set_only_after_both_lanes_and_wake_succeed():
+    import contextlib
+
+    tree = ast.parse((ROOT / "verl_omni/trainer/omni/bagel_corl_trainer.py").read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "OmniBagelCoRLTrainerSync")
+    methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in ("on_init_end", "on_step_end")]
+
+    class Base:
+        def on_init_end(self):
+            self.events.append("gen")
+
+        def on_step_end(self):
+            self.events.append("gen")
+
+    namespace = dict(Base=Base, marked_timer=lambda *a, **kw: contextlib.nullcontext())
+    test_cls = ast.ClassDef(
+        name="Trainer", bases=[ast.Name(id="Base", ctx=ast.Load())], keywords=[], body=methods, decorator_list=[]
+    )
+    exec(
+        compile(ast.fix_missing_locations(ast.Module(body=[test_cls], type_ignores=[])), "<publication-hooks>", "exec"),
+        namespace,
+    )
+    trainer = namespace["Trainer"]()
+    trainer.global_steps = 0
+    trainer.events = []
+    trainer.timing_raw = {}
+    trainer._record_runtime_optimizer_provenance = lambda: None
+    trainer._ensure_dual_role_rollout = lambda: None
+    trainer._bagel_rm_enabled = lambda: False
+    trainer._publish_und_ar_weights = lambda: trainer.events.append("und")
+
+    def wake():
+        assert trainer._bagel_corl_published_weight_version is None
+        trainer.events.append("wake")
+
+    trainer._wake_rollout_replicas = wake
+    trainer.on_init_end()
+    assert trainer._bagel_corl_published_weight_version == 0
+    assert trainer.events == ["und", "gen", "wake"]
+    trainer.global_steps = 1
+    trainer.on_step_end()
+    assert trainer._bagel_corl_published_weight_version == 1
+
+    def failed_wake():
+        raise RuntimeError("wake failed")
+
+    trainer._wake_rollout_replicas = failed_wake
+    trainer.global_steps = 2
+    with pytest.raises(RuntimeError, match="wake failed"):
+        trainer.on_step_end()
+    assert trainer._bagel_corl_published_weight_version is None
+
+
+def test_explicit_serving_version_wins_and_missing_gen_version_cannot_use_parent(tmp_path):
+    cap = capture(tmp_path)
+    assert cap.provenance(dict(und(), policy_version=99, rollout_policy_version=2))["policy_version"] == 2
+    with pytest.raises(ValueError, match="serving|rollout_policy_version"):
+        cap.provenance(dict(und(), rollout_policy_version=None, min_global_steps=2, max_global_steps=2))
+    with pytest.raises(ValueError, match="serving|version"):
+        cap.provenance(
+            dict(
+                und(),
+                rollout_policy_version=2,
+                und_serving_provenance=[
+                    {"rollout_policy_version": 2, "rollout_replica_id": "und"},
+                    {"rollout_policy_version": None, "rollout_replica_id": None},
+                ],
+            )
+        )

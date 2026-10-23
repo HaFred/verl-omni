@@ -193,6 +193,8 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
 
     max_steps = max(item[1].numel() for item in usable)
     latent_list, timestep_list, prompt_token_ids, old_list, masks, parents = [], [], [], [], [], []
+    has_reference = any(row.get("ref_prev_sample_mean") is not None for row, *_ in usable)
+    reference_means = []
     for row, logprob, _, _, latents, timesteps in usable:
         timesteps = timesteps.reshape(-1).float()
         count = logprob.numel()
@@ -211,6 +213,15 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
             raise ValueError("GEN trajectory requires parent episode_uid for unique ownership")
         parents.append(episode_numeric_id(str(episode_uid)))
         pad = max_steps - count
+        if has_reference:
+            reference = _as_tensor(row.get("ref_prev_sample_mean"))
+            if reference is None or reference.shape != (count, *latents.shape[1:]):
+                raise ValueError("GEN reference means must be supplied for every row with T latent-shaped transitions")
+            if not torch.isfinite(reference).all():
+                raise ValueError("GEN reference means contain nonfinite transitions")
+            reference_means.append(
+                torch.cat([reference.float(), reference[-1:].float().expand(pad, *reference.shape[1:])])
+            )
         # Repeat a finite transition timestep/latent instead of synthetic zero SDE inputs.
         latent_list.append(torch.cat([latents.float(), latents[-1:].float().expand(pad, *latents.shape[1:])]))
         timestep_list.append(torch.cat([timesteps, timesteps[:1].expand(pad)]))
@@ -230,6 +241,8 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
         "parent_episode_id": torch.tensor(parents, dtype=torch.long),
         "gen_row_id": torch.arange(len(usable), dtype=torch.long),
     }
+    if has_reference:
+        batch_tensors["ref_prev_sample_mean"] = torch.stack(reference_means)
 
     batch = TensorDict(batch_tensors, batch_size=[len(usable)])
     # Build the object array explicitly 1-D rather than ``np.array(prompt_token_ids,

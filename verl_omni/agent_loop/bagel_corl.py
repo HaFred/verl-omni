@@ -44,7 +44,9 @@ from verl_omni.agent_loop.bagel_corl_lib import (  # noqa: F401
     generate_retrying_engine_wake,
     resolve_task_type,
     run_serial_episode,
+    serving_rollout_provenance,
     strip_reflection_tail,
+    trusted_image_reward_fields,
     turn_histogram,
     und_turn_max_tokens,
 )
@@ -214,6 +216,13 @@ def episode_to_agent_output(
         "num_gen_calls": episode.num_gen_calls,
         "und_reward": episode.und_reward,
         "policy_version": episode.policy_version,
+        "rollout_policy_version": episode.policy_version,
+        "requested_policy_version": episode.requested_policy_version,
+        "rollout_replica_id": episode.rollout_replica_id,
+        "serving_provenance_verified": episode.serving_provenance_verified,
+        "und_serving_provenance": list(episode.und_serving_provenance),
+        "min_global_steps": episode.policy_version,
+        "max_global_steps": episode.policy_version,
         "bagel_role_timing": dict(timing or {}),
         "bagel_corl_r2": dict(episode.r2_metrics),
         "llm_all_log_probs": None,
@@ -277,6 +286,41 @@ def _materialized_turn_trace(turn_trace: list[dict[str, Any]], image_relpath: st
     return out
 
 
+def trace_ground_truth(kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Copy only reward ground truth from dataset metadata, never policy prose.
+
+    Do not export arbitrary rollout kwargs (which can include service secrets).
+    Preserve missing labels/references as missing so offline diagnosis can detect
+    them. ``resolve_task_type`` uses the same extra_info precedence as rollout.
+    """
+    extra = kwargs.get("extra_info")
+    extra = extra if isinstance(extra, dict) else {}
+    reward_model = kwargs.get("reward_model")
+    reward_model = reward_model if isinstance(reward_model, dict) else {}
+    raw = kwargs.get("ground_truth", reward_model.get("ground_truth", extra.get("ground_truth", {})))
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    keys = {
+        "task_type",
+        "reference_subtasks",
+        "reference_steps",
+        "expected_num_images",
+        "plan_expected",
+        "user_request",
+    }
+    keys.update("w_" + dim for dim in ("reflect", "plan", "format", "protocol", "tool", "result", "image", "done"))
+    ground_truth = {key: value for key, value in extra.items() if key in keys}
+    ground_truth.update({key: value for key, value in raw.items() if key in keys})
+    task_type = resolve_task_type(extra_info=extra, ground_truth=raw)
+    if task_type is not None:
+        ground_truth["task_type"] = task_type
+    return ground_truth
+
+
 def dump_episode_trace(
     *,
     episode: EpisodeRollout,
@@ -287,6 +331,7 @@ def dump_episode_trace(
     prompt_ids: list[int] | None = None,
     tokenizer: Any | None = None,
     image_relpath: str | None = None,
+    ground_truth: dict[str, Any] | None = None,
 ) -> str | None:
     """Write one finished Co-RL episode to ``rollout_trajectories/<relpath>``.
 
@@ -332,6 +377,21 @@ def dump_episode_trace(
             except Exception:  # noqa: BLE001 - decoding is best effort
                 prompt_text = ""
 
+        trusted_reward = dict(episode.bagel_corl_reward)
+        trusted_capture_error = None
+        if not trusted_reward:
+            # Diagnostic capture for V1 comparisons only. This does not change
+            # the episode's live reward or promote legacy unmarked RM scores.
+            try:
+                trusted_reward = trusted_image_reward_fields(
+                    episode.gen_samples,
+                    num_gen_calls=episode.num_gen_calls,
+                    autonomous_done=episode.autonomous_done,
+                    forced_reflection=episode.forced_reflection,
+                )
+            except ValueError as error:
+                trusted_capture_error = str(error)
+
         payload = {
             "trajectory_relpath": relpath,
             "step": step,
@@ -339,6 +399,17 @@ def dump_episode_trace(
             "episode_uid": episode.episode_uid,
             "und_group_uid": episode.und_group_uid,
             "policy_version": episode.policy_version,
+            "ground_truth": dict(ground_truth or {}),
+            "corl_reward_version": episode.corl_reward_version,
+            "bagel_corl_reward": trusted_reward,
+            "trusted_reward_capture_error": trusted_capture_error,
+            "autonomous_done": episode.autonomous_done,
+            "response_mask": list(episode.response_mask),
+            "trace_metadata_origin": {
+                "ground_truth": "dataset_rollout_kwargs",
+                "bagel_corl_reward": "episode_harness_envelope",
+                "response_mask": "episode_response_mask",
+            },
             "user_prompt": user_prompt,
             "prompt_text": prompt_text,
             "turns": episode.turns,
@@ -607,8 +678,9 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             or (kwargs.get("extra_info") or {}).get("dataset_task_uid")
             or "missing_task"
         )
-        # The TQ worker forwards ``global_steps`` as a per-prompt kwarg, not in sampling_params.
-        policy_version = int(
+        # This is the requested trainer step for episode IDs, not evidence of
+        # which weights served the tokens. The decode outputs supply that version.
+        requested_policy_version = int(
             sampling_params.get("global_steps", kwargs.get("global_steps", kwargs.get("policy_version", 0))) or 0
         )
         raw_prompt = kwargs.get("raw_prompt")
@@ -825,7 +897,15 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                         f"{len(token_ids)} tokens). The AR replica must be asked with "
                         "sampling_params['logprobs']=0 and its engine started with a logprobs_mode."
                     )
-                return {"token_ids": token_ids, "text": text, "log_probs": [float(v) for v in step_log_probs]}
+                provenance = serving_rollout_provenance(
+                    dict(getattr(output, "extra_fields", None) or {}), required=True
+                )
+                return {
+                    "token_ids": token_ids,
+                    "text": text,
+                    "log_probs": [float(v) for v in step_log_probs],
+                    **provenance,
+                }
             finally:
                 timing["und_decode_s"] += time.perf_counter() - t0
 
@@ -869,7 +949,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         try:
             episode = await run_serial_episode(
                 dataset_task_uid=dataset_task_uid,
-                policy_version=policy_version,
+                policy_version=requested_policy_version,
                 prompt_ids=list(prompt_ids),
                 und_decode=_und_decode,
                 generate_tool=tool,
@@ -904,6 +984,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             prompt_ids=list(prompt_ids),
             tokenizer=self.tokenizer,
             image_relpath=image_relpath,
+            ground_truth=trace_ground_truth(kwargs),
         )
         # Action-level index beside the trajectory (and the PNGs the image dumper copies
         # under the same ``relpath``). Written from the episode because the bagel TQ
@@ -1014,6 +1095,9 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                 # log-probs and must not be required to carry one. See
                 # ``stash_gen_row_from_diffusion_output`` for the split.
                 row = stash_gen_row_from_diffusion_output(output, seed=int(seed), require_traj=not is_validate)
+                # Live serving must identify its own GEN version/replica; a
+                # parent UND or requested trainer step cannot supply these.
+                row.update(serving_rollout_provenance(row, required=True))
                 row["cond_uid"] = cond_uid
                 row["cond_len"] = cond_len
                 rows.append(row)

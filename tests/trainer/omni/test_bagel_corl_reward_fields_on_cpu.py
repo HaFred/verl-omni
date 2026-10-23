@@ -90,7 +90,7 @@ def test_colocated_reward_hands_the_scorer_unwrapped_row_fields(monkeypatch):
 
 def test_override_is_bound_on_the_trainer_not_inherited():
     assert "_compute_reward_colocate" in vars(OmniBagelCoRLTrainerSync)
-    assert trainer_module.OmniBagelCoRLTrainerSync.REWARD_ROW_FIELDS == ("data_source", "reward_model")
+    assert trainer_module.OmniBagelCoRLTrainerSync.REWARD_ROW_FIELDS == ("data_source", "reward_model", "extra_info")
 
 
 if __name__ == "__main__":  # pragma: no cover

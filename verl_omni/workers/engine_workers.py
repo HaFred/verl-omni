@@ -64,6 +64,7 @@ from verl_omni.utils.mfu import (
     collect_diffusion_flops_meta,
 )
 from verl_omni.utils.rollout_wake import is_cuda_oom
+from verl_omni.workers.bagel_corl_provenance import optimizer_snapshot, policy_parameter_digest
 from verl_omni.workers.config import (
     DiffusionActorConfig,
     DiffusionModelConfig,
@@ -832,6 +833,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 self.loss_fn = partial(ppo_loss, config=actor_config)
             self.actor = TrainingWorker(config=actor_training_config)
             self.actor.reset()
+            self._capture_bagel_optimizer_snapshot(phase="initialized")
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
@@ -1103,10 +1105,64 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             timings["get_per_tensor_param"] = time.perf_counter() - gather_start
         return lora_weights, peft_config
 
+    def _capture_bagel_optimizer_snapshot(self, *, phase, checkpoint_path=None):
+        if not os.environ.get("BAGEL_CORL_PROVENANCE_DIR"):
+            return
+        if self.config.model.get("composite_mode") != "bagel_corl":
+            return
+        snapshot = optimizer_snapshot(self.actor.engine, phase=phase, checkpoint_path=checkpoint_path)
+        if not hasattr(self, "_bagel_optimizer_snapshots"):
+            self._bagel_optimizer_snapshots = []
+        self._bagel_optimizer_snapshots.append(snapshot)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_bagel_optimizer_snapshots(self):
+        return getattr(self, "_bagel_optimizer_snapshots", [])
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_bagel_gen_publication_receipts(self):
+        """Observe this actor rank's last opt-in GEN sender receipt, without publishing."""
+        import copy
+
+        return copy.deepcopy(getattr(getattr(self, "rollout", None), "_bagel_corl_gen_receipt", None))
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def prepare_bagel_gen_publication_receipts(self, capabilities_by_replica):
+        """Validate all native GEN preflights before enabling any sender rank.
+
+        The coordinator collects all native capability responses first and awaits
+        this blocking ALL-rank RPC before calling normal weight publication.
+        """
+        from verl_omni.workers.rollout.vllm_rollout.bagel_corl_gen_receipts import (
+            prepare_adapter_capabilities,
+            validate_native_capabilities,
+        )
+
+        self.rollout._bagel_corl_gen_receipt_capabilities = None
+        if not isinstance(capabilities_by_replica, dict) or not capabilities_by_replica:
+            raise ValueError("GEN receipts require every native replica capability response")
+        for results in capabilities_by_replica.values():
+            validate_native_capabilities(
+                results,
+                expected_tp_size=self.rollout.config.tensor_model_parallel_size,
+                dtype=self.rollout.config.dtype,
+            )
+        if self.rollout.replica_rank not in capabilities_by_replica:
+            raise ValueError("GEN receipt preflight omitted this sender's actual replica")
+        return prepare_adapter_capabilities(self.rollout, capabilities_by_replica[self.rollout.replica_rank])
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def get_bagel_policy_digest(self):
+        """Observe actual local actor weights for an externally coordinated frozen probe."""
+        if "actor" not in self.role or self.config.model.get("composite_mode") != "bagel_corl":
+            raise ValueError("Policy digest requires a bagel_corl actor worker")
+        return policy_parameter_digest(self.actor.engine.module)
+
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def load_checkpoint(self, local_path, hdfs_path=None, del_local_after_load=False):
         assert "actor" in self.role, "load_checkpoint only support actor role"
         self.actor.load_checkpoint(local_path, hdfs_path, del_local_after_load)
+        self._capture_bagel_optimizer_snapshot(phase="restored", checkpoint_path=local_path)
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None, global_step=0, max_ckpt_to_keep=None):

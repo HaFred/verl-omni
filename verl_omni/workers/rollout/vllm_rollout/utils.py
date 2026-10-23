@@ -86,6 +86,14 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
 
     _pending_lora_peft_config: dict | None = None
 
+    def clear_prompt_embed_cache(self) -> None:
+        """Expose the diffusion runner's cache invalidation through worker RPC."""
+        self.model_runner.clear_prompt_embed_cache()
+
+    def get_prompt_embed_cache_stats(self) -> dict | None:
+        """Return the owning runner's counters, or None when no cache is installed."""
+        return self.model_runner.get_prompt_embed_cache_stats()
+
     def __new__(cls, **kwargs):
         set_death_signal()
 
@@ -141,6 +149,30 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             return model, model_config
         return None
 
+    def score_bagel_corl_gen_fixed_inputs(self, request: dict) -> dict:
+        """Collective-only live GEN probe; never fall back to an actor/model alias."""
+        from vllm_omni.diffusion.forward_context import set_forward_context
+
+        from verl_omni.pipelines.bagel_flow_grpo.vllm_omni_rollout_adapter import BagelPipelineWithLogProb
+        from verl_omni.workers.rollout.vllm_rollout.bagel_corl_replay import score_gen_pipeline
+
+        runner = getattr(self, "model_runner", None)
+        pipeline = getattr(runner, "pipeline", None)
+        if not isinstance(pipeline, BagelPipelineWithLogProb):
+            raise RuntimeError("Fixed GEN scoring requires the live BAGEL FlowGRPO diffusion pipeline")
+        if getattr(runner.od_config, "cache_backend", None) not in (None, "none"):
+            raise RuntimeError("Fixed GEN scoring does not support cached diffusion execution")
+        if getattr(runner, "kv_cache_config", None) is not None:
+            raise RuntimeError("Fixed GEN scoring does not support paged KV replay")
+        if getattr(runner, "prompt_embed_cache", None) is not None:
+            raise RuntimeError("Fixed GEN scoring requires prompt embedding caching disabled")
+        if getattr(self, "lora_manager", None) is not None:
+            raise RuntimeError("Fixed GEN scoring requires merged weights, without active serving adapters")
+        with set_forward_context(vllm_config=runner.vllm_config, omni_diffusion_config=runner.od_config):
+            result = score_gen_pipeline(pipeline, request)
+        result["worker_distributed_rank"] = torch.distributed.get_rank() if torch.distributed.is_initialized() else None
+        return result
+
     def policy_param_checksum(self, name: str) -> float | None:
         """``weight_fingerprint`` of one loaded parameter, or ``None`` when this worker lacks it.
 
@@ -157,6 +189,28 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
             return None
         return weight_fingerprint(param)
 
+    def get_bagel_corl_gen_receipt(self):
+        """Read last successful GEN transport receipt and current native sentinels."""
+        from verl_omni.workers.rollout.vllm_rollout.bagel_corl_gen_receipts import get_receiver_receipt
+
+        return get_receiver_receipt(self)
+
+    def get_bagel_corl_gen_sentinels(self):
+        """Preflight native loader layout without reading potentially sleeping values.
+
+        Coordinators must collect every TP worker's capability response before
+        starting any publication. Native digests are read only after wake/load.
+        """
+        import hashlib
+
+        from verl_omni.workers.rollout.vllm_rollout.bagel_corl_gen_receipts import native_sentinels
+
+        if getattr(self, "lora_manager", None) is not None:
+            raise ValueError("GEN receipt preflight requires merged weights without serving adapters")
+        result = native_sentinels(self.model_runner.pipeline, include_digests=False)
+        result["base_channel_sha256"] = hashlib.sha256(self._get_zmq_handle().encode()).hexdigest()
+        return result
+
     def monkey_patch_model(self) -> None:
         # startup MoE weight-loader patch; re-attached per sync in update_weights_from_ipc
         standard = self._get_standard_weight_model_and_config()
@@ -170,6 +224,7 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         use_shm: bool = False,
         zmq_update_id: str | None = None,
         delta_flush: bool | None = None,
+        bagel_corl_gen_receipt: bool = False,
     ):
         """Update the weights of the rollout model.
 
@@ -185,6 +240,27 @@ class vLLMOmniColocateWorkerExtension(CustomPipelineWorkerExtension):
         """
 
         from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightReceiver
+
+        # An ordinary later update must never leave an earlier verified receipt
+        # attached to the new (possibly only partially loaded) serving weights.
+        if hasattr(self, "_bagel_corl_gen_receipt"):
+            self._bagel_corl_gen_receipt = None
+
+        if bagel_corl_gen_receipt:
+            from verl_omni.workers.rollout.vllm_rollout.bagel_corl_gen_receipts import receive_receipted_weights
+
+            self._bagel_corl_gen_receipt = None
+            if peft_config is not None or self._pending_lora_peft_config is not None or delta_flush:
+                raise ValueError("GEN receipts support merged full weights only")
+            if self.device is None:
+                raise RuntimeError("Worker device is not set.")
+            return receive_receipted_weights(
+                self,
+                update_id=zmq_update_id,
+                handle=make_update_zmq_handle(self._get_zmq_handle(), zmq_update_id) if zmq_update_id else None,
+                use_shm=use_shm,
+                receiver_cls=BucketedWeightReceiver,
+            )
 
         if peft_config is None and self._pending_lora_peft_config is not None:
             peft_config = self._pending_lora_peft_config

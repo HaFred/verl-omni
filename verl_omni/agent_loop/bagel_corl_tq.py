@@ -268,6 +268,9 @@ def pack_dual_lane_episode(
                     "all_latents": sample.all_latents,
                     "timesteps": sample.timesteps,
                     "rollout_log_probs": sample.rollout_log_probs,
+                    "rollout_policy_version": sample.rollout_policy_version,
+                    "rollout_replica_id": sample.rollout_replica_id,
+                    "serving_provenance_verified": sample.serving_provenance_verified,
                     "rm_score": sample.rm_score,
                     "rm_score_source": sample.rm_score_source,
                     "call_role": sample.call_role,
@@ -315,7 +318,12 @@ def pack_dual_lane_episode(
         "used_image_credit": bool(episode.used_image_credit),
         "token_level_scores": float(episode.und_reward),
         "num_gen_calls": k,
-        "policy_version": int(episode.policy_version),
+        "policy_version": episode.policy_version,
+        "rollout_policy_version": episode.policy_version,
+        "requested_policy_version": episode.requested_policy_version,
+        "rollout_replica_id": episode.rollout_replica_id,
+        "serving_provenance_verified": episode.serving_provenance_verified,
+        "und_serving_provenance": list(episode.und_serving_provenance),
         "gen_cond_uids": cond_uids,
         "gen_cond_len": int(max((s.cond_len for s in episode.gen_samples if s.valid), default=0)),
     }
@@ -432,7 +440,11 @@ def episode_from_agent_extra(
     return EpisodeRollout(
         und_group_uid=str(extra.get("und_group_uid") or und_group_uid),
         episode_uid=str(extra.get("episode_uid") or f"{und_group_uid}-ep"),
-        policy_version=int(extra.get("policy_version") or 0),
+        policy_version=extra.get("policy_version"),
+        requested_policy_version=extra.get("requested_policy_version"),
+        rollout_replica_id=extra.get("rollout_replica_id"),
+        serving_provenance_verified=bool(extra.get("serving_provenance_verified", False)),
+        und_serving_provenance=list(extra.get("und_serving_provenance") or []),
         prompt_ids=list(prompt_ids),
         response_ids=list(response_ids),
         response_mask=list(response_mask),
@@ -689,6 +701,15 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
         und_field["bagel_episode_id"] = torch.tensor(episode_numeric_id(episode.episode_uid), dtype=torch.long)
 
         und_field.update({k: v for k, v in kwargs.items() if k not in und_field})
+        for name in (
+            "policy_version",
+            "rollout_policy_version",
+            "requested_policy_version",
+            "rollout_replica_id",
+            "serving_provenance_verified",
+            "und_serving_provenance",
+        ):
+            und_field[name] = pack.und_record["fields"][name]
         und_field.pop("multi_modal_data", None)
         und_field["loss_mask"] = und_field["response_mask"]
         prompts = und_field["prompts"]
@@ -716,8 +737,14 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
                 "und_group_uid": pack.und_record["fields"]["und_group_uid"],
                 "episode_uid": pack.und_record["fields"]["episode_uid"],
                 "bagel_corl_metrics": dict(pack.metrics),
-                "min_global_steps": und_extra.get("min_global_steps", kwargs.get("global_steps")),
-                "max_global_steps": und_extra.get("max_global_steps", kwargs.get("global_steps")),
+                "min_global_steps": episode.policy_version,
+                "max_global_steps": episode.policy_version,
+                "policy_version": episode.policy_version,
+                "rollout_policy_version": episode.policy_version,
+                "requested_policy_version": episode.requested_policy_version,
+                "rollout_replica_id": episode.rollout_replica_id,
+                "serving_provenance_verified": episode.serving_provenance_verified,
+                "und_serving_provenance": list(episode.und_serving_provenance),
             }
         )
         und_field["extra_fields"] = und_extra
@@ -761,8 +788,8 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
             gen_fields["extra_fields"] = {
                 "bagel_role": "gen",
                 "parent_und_key": und_key,
-                "min_global_steps": kwargs.get("global_steps"),
-                "max_global_steps": kwargs.get("global_steps"),
+                "min_global_steps": gen_fields.get("rollout_policy_version"),
+                "max_global_steps": gen_fields.get("rollout_policy_version"),
             }
             # RM score as a 1-length tensor for TQ consumers that expect rm_scores.
             if gen_fields.get("rm_score") is not None:
@@ -778,8 +805,8 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
                     "is_auxiliary": True,
                     "parent_und_key": und_key,
                     "global_steps": kwargs["global_steps"],
-                    "min_global_steps": kwargs.get("global_steps"),
-                    "max_global_steps": kwargs.get("global_steps"),
+                    "min_global_steps": gen_fields.get("rollout_policy_version"),
+                    "max_global_steps": gen_fields.get("rollout_policy_version"),
                     "prompt_len": 0,
                     "response_len": 0,
                     "seq_len": 0,

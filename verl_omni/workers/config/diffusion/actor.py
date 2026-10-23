@@ -53,6 +53,9 @@ class DiffusionLossConfig(BaseConfig):
     # GEN regularizer: "latent_kl" is the stack default (provisional per UniGRPO);
     # "velocity_mse" (UniGRPO Eq. 8, the reward-hacking-safe choice) lands in Phase 2.
     gen_regularizer: str = "latent_kl"
+    # Co-RL GEN reference KL is independent of the UND actor's use_kl_loss.
+    # Requires explicit per-transition reference reverse-SDE means.
+    use_gen_kl_loss: bool = False
 
     def __post_init__(self):
         """Validate diffusion loss configuration."""

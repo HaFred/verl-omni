@@ -49,7 +49,11 @@ from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size, g
 from verl_omni.workers.rollout.replica import DiffusionOutput
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_ar_strategy import ARStrategy
 from verl_omni.workers.rollout.vllm_rollout.vllm_omni_diffusion_strategy import DiffusionStrategy
-from verl_omni.workers.rollout.vllm_rollout.zmq_utils import colocate_zmq_handle, namespace_colocate_zmq_handle
+from verl_omni.workers.rollout.vllm_rollout.zmq_utils import (
+    colocate_zmq_handle,
+    export_colocate_zmq_namespace,
+    namespace_colocate_zmq_handle,
+)
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
@@ -315,6 +319,7 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
     def _post_init(self, cuda_visible_devices: str) -> None:
         """Run strategy post-init and preserve the replica device list."""
+        export_colocate_zmq_namespace()
         if get_rollout_sequence_parallel_size(self.config) > 1:
             self.replica_world_size = get_rollout_world_size(self.config)
             profiler = self.profiler_controller
@@ -475,6 +480,93 @@ class vLLMOmniHttpServer(vLLMHttpServer):
             kwargs=kwargs,
             stage_ids=self._generate_strategy.collective_rpc_stage_ids(method),
         )
+
+    async def get_bagel_corl_gen_publication_receipts(self):
+        """Observe actual GEN worker receipts and logical server step independently.
+
+        This collection alone does not verify a publication: the coordinator must
+        join every sender/receiver channel and compare the native TP sentinels.
+        Direct HTTP traffic must also be isolated by the probe coordinator.
+        """
+        from verl_omni.workers.rollout.vllm_rollout.bagel_corl_gen_receipts import flatten_receiver_receipts
+
+        if self.node_rank != 0 or not isinstance(self._generate_strategy, DiffusionStrategy):
+            raise RuntimeError("GEN receipts require a head diffusion server")
+        if len(self.engine.default_sampling_params_list) != 1:
+            raise RuntimeError("GEN receipts require one BAGEL diffusion stage")
+        lock = getattr(self, "_bagel_corl_fixed_score_lock", None)
+        if lock is None:
+            lock = self._bagel_corl_fixed_score_lock = asyncio.Lock()
+        async with lock:
+            states = getattr(self.engine, "request_states", None)
+            if not isinstance(states, dict) or states or getattr(self, "_inflight_generations", 0):
+                raise RuntimeError("GEN receipt collection requires a quiescent engine")
+            self._bagel_corl_fixed_scoring = True
+            try:
+                results = await self.engine.collective_rpc(method="get_bagel_corl_gen_receipt", stage_ids=[0])
+                return dict(
+                    server_replica_id=self.replica_rank,
+                    stage_id=0,
+                    observed_global_steps=self.global_steps,
+                    worker_receipts=flatten_receiver_receipts(results, expected_workers=self.replica_world_size),
+                    publication_verified=False,
+                    full_model_verified=False,
+                )
+            finally:
+                self._bagel_corl_fixed_scoring = False
+
+    async def score_bagel_corl_fixed_inputs(self, request: dict) -> dict:
+        """Opt-in quiescent scoring probe on this actual serving replica.
+
+        No publication version is accepted from the caller. The GEN RPC is
+        collective over every TP worker so serving model collectives stay aligned.
+        Only server-actor generate admission is guarded; callers must separately
+        isolate direct native HTTP/engine traffic for the whole probe.
+        """
+        from verl_omni.workers.rollout.vllm_rollout.bagel_corl_replay import (
+            observation,
+            score_und,
+            validate_gen_worker_results,
+        )
+
+        if self.node_rank != 0:
+            raise RuntimeError("Fixed scoring must target a head serving replica")
+        lock = getattr(self, "_bagel_corl_fixed_score_lock", None)
+        if lock is None:
+            lock = self._bagel_corl_fixed_score_lock = asyncio.Lock()
+        async with lock:
+            states = getattr(self.engine, "request_states", None)
+            if not isinstance(states, dict):
+                raise RuntimeError("Fixed replay requires an observable native request-state registry")
+            if states or getattr(self, "_inflight_generations", 0):
+                raise RuntimeError("Fixed serving replay requires a quiescent engine")
+            # No await between the checks and this admission flag: generate() sees
+            # it before registering any new actor-routed request.
+            self._bagel_corl_fixed_scoring = True
+            try:
+                lane = request.get("lane")
+                if lane == "und" and isinstance(self._generate_strategy, ARStrategy):
+                    return await score_und(self, request)
+                if lane != "gen" or not isinstance(self._generate_strategy, DiffusionStrategy):
+                    raise RuntimeError("Fixed serving replay lane does not match the server strategy")
+                if len(self.engine.default_sampling_params_list) != 1:
+                    raise RuntimeError("Fixed GEN replay supports a single BAGEL diffusion stage only")
+                results = await self.engine.collective_rpc(
+                    method="score_bagel_corl_gen_fixed_inputs",
+                    kwargs={"request": request},
+                    stage_ids=[0],
+                )
+                workers = validate_gen_worker_results(results, expected_workers=self.replica_world_size)
+                return dict(
+                    supported=True,
+                    lane="gen",
+                    server_replica_id=self.replica_rank,
+                    stage_id=0,
+                    worker_results=workers,
+                    **observation(),
+                )
+            finally:
+                self._bagel_corl_fixed_scoring = False
 
     # -----------------------------------------------------------------------
     # wake_up hook: full wake must include kv_cache
@@ -673,6 +765,8 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         negative_extra_prompt_ids: Optional[dict[str, list[int]]] = None,
         priority: int = 0,
     ) -> DiffusionOutput | TokenOutput:
+        if getattr(self, "_bagel_corl_fixed_scoring", False):
+            raise RuntimeError("Normal generation is unavailable during fixed scoring")
         # Read-modify-write rather than ``+=`` so a server built without ``_init_config`` (the CPU
         # tests use ``object.__new__``) still counts correctly instead of raising AttributeError.
         self._inflight_generations = getattr(self, "_inflight_generations", 0) + 1
@@ -838,12 +932,10 @@ class vLLMOmniHttpServer(vLLMHttpServer):
         sleep issued while a decode is still running tears that request down *and* unmaps the
         memory the worker is reading it from.
 
-        Why it counts here rather than asking the engine: ``AsyncOmni.request_states`` is
-        append-only -- only its ``abort`` path ever pops, so it never empties and would always read
-        as "everything is in flight". ``vLLMOmniHttpServer`` is the single entry point for both
-        lanes' ``generate`` calls, so it is the one place that can count this exactly (a *number*,
-        not a set of ids, because the GEN S-group deliberately reuses one ``routing_key`` across
-        siblings).
+        The server admission counter covers registration and cleanup windows around
+        engine requests; the native registry's lifetime varies across serving versions.
+        Count calls rather than IDs because the GEN S-group deliberately reuses one
+        ``routing_key`` across siblings.
 
         On timeout it logs and returns the remainder instead of raising: the caller is a sleep
         and the engine's own abort semantics are the fallback.
@@ -981,6 +1073,29 @@ class vLLMOmniHttpServer(vLLMHttpServer):
 
 class vLLMOmniServerAdapter(ServerAdapter):
     """Reuse verl's transport with SP-aware replica and IPC rank mapping."""
+
+    async def update_weights(self, weights, global_steps=None, wire_format="named_tensors", **kwargs):
+        if hasattr(self, "_bagel_corl_gen_receipt"):
+            self._bagel_corl_gen_receipt = None
+        if os.environ.get("BAGEL_CORL_GEN_RECEIPTS") != "1":
+            return await super().update_weights(weights, global_steps=global_steps, wire_format=wire_format, **kwargs)
+        from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import BucketedWeightSender
+
+        from verl_omni.workers.rollout.vllm_rollout.bagel_corl_gen_receipts import send_receipted_weights
+        from verl_omni.workers.rollout.vllm_rollout.zmq_utils import make_update_zmq_handle, make_update_zmq_id
+
+        self._bagel_corl_gen_receipt = None
+        if wire_format != "named_tensors":
+            raise ValueError("GEN receipts support named_tensors transport only")
+        return await send_receipted_weights(
+            self,
+            weights,
+            global_steps=global_steps,
+            sender_cls=BucketedWeightSender,
+            make_id=make_update_zmq_id,
+            make_handle=make_update_zmq_handle,
+            **kwargs,
+        )
 
     def __init__(self, config, model_config, device_mesh, replica_rank: int = -1):
         super().__init__(config, model_config, device_mesh, replica_rank=replica_rank)

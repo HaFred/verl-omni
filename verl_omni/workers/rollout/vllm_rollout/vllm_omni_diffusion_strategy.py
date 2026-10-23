@@ -352,7 +352,7 @@ class DiffusionStrategy(OmniStrategyBase):
                 log_probs=None,
                 stop_reason=stop_reason,
                 num_preempted=None,
-                extra_fields={"global_steps": self.server.global_steps},
+                extra_fields={"global_steps": self.server.global_steps, **self.observed_rollout_provenance(final_res)},
             )
 
         diffusion_output = final_res.images[0]
@@ -399,7 +399,10 @@ class DiffusionStrategy(OmniStrategyBase):
         else:
             log_probs = None
 
-        extra_fields: dict[str, Any] = {"global_steps": self.server.global_steps}
+        extra_fields: dict[str, Any] = {
+            "global_steps": self.server.global_steps,
+            **self.observed_rollout_provenance(final_res),
+        }
         if final_res.trajectory_latents is not None:
             extra_fields["all_latents"] = _maybe_unbatch(final_res.trajectory_latents)
         if final_res.trajectory_timesteps is not None:

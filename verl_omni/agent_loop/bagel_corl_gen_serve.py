@@ -414,7 +414,10 @@ def stash_gen_row_from_diffusion_output(
             "refuse soft-fallback to stashed-only / skip GEN loss."
         )
 
+    from verl_omni.agent_loop.bagel_corl_lib import serving_rollout_provenance
+
     extra = dict(getattr(output, "extra_fields", None) or {})
+    provenance = serving_rollout_provenance(extra)
     image_path = extra.get("image_path") or extra.get("path")
     if not image_path:
         image_path = save_diffusion_image(output.diffusion_output, seed=seed, root=image_root)
@@ -425,4 +428,5 @@ def stash_gen_row_from_diffusion_output(
         "timesteps": timesteps,
         "rollout_log_probs": log_probs,
         "image_path": image_path,
+        **provenance,
     }

@@ -24,6 +24,27 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def test_explicit_validation_panel_reaches_recipe_environment(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "profiles_val_forward", ROOT / "examples/agenticllmgrpo_trainer/bagel/corl_convergence_profiles/run_profile.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    env, _ = module.build_profile(
+        "B0",
+        11,
+        {
+            "START_CHECKPOINT": "/model",
+            "UNICOT_TRAIN": "/fixed/train.parquet",
+            "UNICOT_VAL": "/fixed/panel.parquet",
+            "EXPERIMENT_PREFIX": "validation",
+            "EXPERIMENT_ROOT": str(tmp_path),
+        },
+    )
+    assert env["UNICOT_TEST"] == "/fixed/panel.parquet"
+    assert env["REBUILD_UNICOT"] == "0"
+
+
 def load():
     spec = importlib.util.spec_from_file_location(
         "profiles", ROOT / "examples/agenticllmgrpo_trainer/bagel/corl_convergence_profiles/run_profile.py"
@@ -96,3 +117,130 @@ def test_dry_run_cli_does_not_launch_or_write(tmp_path):
     value = json.loads(result.stdout)
     assert "corl_no_optimizer_step=True" in value["command"]
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("profile", ["reproduction", "B0", "B1", "B2-1e-6", "B2-1e-5", "B3", "B4"])
+def test_profiles_choose_explicit_logprob_convention(profile):
+    env, _ = load().build_profile(
+        profile,
+        11,
+        {
+            "START_CHECKPOINT": "/model",
+            "UNICOT_TRAIN": "/train",
+            "UNICOT_VAL": "/val",
+            "EXPERIMENT_PREFIX": "logp",
+            "LOGPROBS_MODE": "inherited_wrong_mode",
+        },
+    )
+    assert env["LOGPROBS_MODE"] == ("processed_logprobs" if profile == "reproduction" else "raw_logprobs")
+
+
+@pytest.mark.parametrize("mode", [None, "raw_logprobs", "processed_logprobs"])
+def test_recipe_emits_actual_logprob_and_unchanged_sampling_arguments(mode):
+    import shutil
+
+    bash = shutil.which("bash")
+    if not bash:
+        git = shutil.which("git")
+        candidate = Path(git).parent.parent / "bin/bash.exe" if git else Path("/nonexistent")
+        if candidate.exists():
+            bash = str(candidate)
+    if not bash:
+        pytest.skip("Bash is required to execute the recipe command fixture")
+    source = (ROOT / "examples/agenticllmgrpo_trainer/bagel/run_agentic_bagel_rpco_lora.sh").read_text(encoding="utf-8")
+    assignments = "\n".join(
+        line
+        for line in source.splitlines()
+        if line.startswith(
+            (
+                "LOGPROBS_MODE=",
+                "ROLLOUT_TEMPERATURE=",
+                "ROLLOUT_TOP_P=",
+                "ROLLOUT_TOP_K=",
+                "ROLLOUT_REPETITION_PENALTY=",
+            )
+        )
+    )
+    command = source[source.index('"${_PY}" -m verl_omni.trainer.main_omni') :]
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key
+        not in {"LOGPROBS_MODE", "ROLLOUT_TEMPERATURE", "ROLLOUT_TOP_P", "ROLLOUT_TOP_K", "ROLLOUT_REPETITION_PENALTY"}
+    }
+    if mode:
+        env["LOGPROBS_MODE"] = mode
+    script = 'capture() { printf "%s\\n" "$@"; }; _PY=capture\n' + assignments + "\n" + command
+    result = subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True, check=True)
+    argv = result.stdout.splitlines()
+    assert f"actor_rollout_ref.rollout.logprobs_mode={mode or 'raw_logprobs'}" in argv
+    assert "actor_rollout_ref.rollout.temperature=0.7" in argv
+    assert "actor_rollout_ref.rollout.top_p=0.9" in argv
+    assert "actor_rollout_ref.rollout.top_k=50" in argv
+    assert "+actor_rollout_ref.rollout.repetition_penalty=1.05" in argv
+
+
+@pytest.mark.parametrize("mode", ["raw_logprobs", "processed_logprobs"])
+def test_und_builder_inherits_requested_logprob_mode(mode):
+    import ast
+    from types import SimpleNamespace
+
+    from omegaconf import OmegaConf
+
+    path = ROOT / "verl_omni/trainer/omni/bagel_corl_trainer.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "OmniBagelCoRLTrainerSync")
+    node = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_build_und_ar_entrypoint_config")
+    node.decorator_list = []
+    namespace = {"_actor_merges_lora": lambda model: True}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
+    trainer = SimpleNamespace(
+        config=OmegaConf.create(
+            {
+                "data": {"max_prompt_length": 32, "max_response_length": 32},
+                "actor_rollout_ref": {
+                    "model": {"path": "/model"},
+                    "rollout": {"logprobs_mode": mode, "agent": {"und_n_gpus": 1}},
+                },
+            }
+        ),
+        _und_deploy_config_path=lambda: "/fixture/deploy.yaml",
+        _resolve_und_hf_config_path=lambda model, agent: None,
+        _und_stage_max_model_len=lambda deploy: 128,
+        _und_ar_stage_ids=lambda deploy: [0, 1],
+        UND_AR_LOAD_FORMAT="auto",
+        UND_AR_POLICY_STAGE_ID=0,
+    )
+    result = namespace["_build_und_ar_entrypoint_config"](trainer)
+    assert result.actor_rollout_ref.rollout.get("logprobs_mode") == mode
+
+
+@pytest.mark.parametrize("profile,mode", [("B0", None), ("B3", "processed_logprobs"), ("reproduction", "raw_logprobs")])
+def test_profile_manifest_rejects_missing_or_conflicting_resolved_mode(profile, mode):
+    config = {"actor_rollout_ref": {"rollout": {}}}
+    if mode:
+        config["actor_rollout_ref"]["rollout"]["logprobs_mode"] = mode
+    tool = load()
+    assert hasattr(tool, "validate_profile_logprobs"), "Missing resolved profile logprob convention validation"
+    with pytest.raises(ValueError, match="logprobs_mode"):
+        tool.validate_profile_logprobs(profile, config)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_capture_settings_are_explicitly_forwarded_to_ray_only_when_set(enabled):
+    inherited = dict(START_CHECKPOINT="/model", UNICOT_TRAIN="/train", UNICOT_VAL="/val", EXPERIMENT_PREFIX="capture")
+    capture_env = dict(
+        BAGEL_CORL_PARITY_CAPTURE_DIR="/runs/capture rows",
+        BAGEL_CORL_PARITY_MANIFEST="/runs/verified manifest.json",
+        BAGEL_CORL_PARITY_REPLICA_LABEL="isolated-server-pair",
+    )
+    if enabled:
+        inherited.update(capture_env)
+    env, overrides = load().build_profile("B0", 11, inherited)
+    prefix = "++ray_kwargs.ray_init.runtime_env.env_vars."
+    for key, value in capture_env.items():
+        matches = [item for item in overrides if item.startswith(prefix + key + "=")]
+        assert len(matches) == int(enabled)
+        if enabled:
+            assert env[key] == value
+            assert json.loads(matches[0].split("=", 1)[1]) == value

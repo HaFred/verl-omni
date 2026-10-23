@@ -710,6 +710,18 @@ def _extract_plan_lines(text: str) -> list[str]:
     ]
 
 
+def _extract_initial_plan_lines(text: str) -> list[str]:
+    """V2 plans precede the first tool call, including within one sampled turn.
+
+    Normalize every supported call dialect before finding the boundary. Removing
+    tool JSON first would erase that boundary and let post-call feedback bullets
+    masquerade as an initial subtask plan. Legacy extraction remains unchanged.
+    """
+    normalized = _normalize_trajectory_dialect(text)
+    first_call = re.search(r"<tool_call\b", normalized, re.IGNORECASE)
+    return _extract_plan_lines(normalized[: first_call.start()] if first_call else normalized)
+
+
 def _reflection_text(text: str) -> str:
     prose = _assistant_prose(text)
     match = re.search(r"\bReflection\s*:(.*?)(?:\bDone\.\s*$|$)", prose, re.IGNORECASE | re.DOTALL)
@@ -739,11 +751,11 @@ def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
     return 0.5 * quality + 0.5 * _coverage(_reflection_text(text), reference)
 
 
-def _plan_reward(text: str, ground_truth: dict[str, Any]) -> float:
+def _plan_reward(text: str, ground_truth: dict[str, Any], *, initial_only: bool = False) -> float:
     references = [
         str(item).strip() for item in _as_sequence(ground_truth.get("reference_subtasks")) if str(item).strip()
     ]
-    candidates = _extract_plan_lines(text)
+    candidates = _extract_initial_plan_lines(text) if initial_only else _extract_plan_lines(text)
     if not references or not candidates:
         return 0.0
     return sum(max(_coverage(candidate, reference) for candidate in candidates) for reference in references) / len(
@@ -757,6 +769,7 @@ def _format_reward(
     task_type: str,
     successful_generates: int,
     forced_context: bool = False,
+    initial_plan_only: bool = False,
 ) -> float:
     raw_blocks = len(_TOOL_CALL_RE.findall(text))
     calls = _extract_tool_calls(text)
@@ -779,7 +792,8 @@ def _format_reward(
         terminal_done,
     ]
     if task_type == "plan":
-        checks.extend((bool(_extract_plan_lines(text)), policy_reflection or forced_context))
+        plan_lines = _extract_initial_plan_lines(text) if initial_plan_only else _extract_plan_lines(text)
+        checks.extend((bool(plan_lines), policy_reflection or forced_context))
     else:
         # #409 force-injects Reflection (stripped from prose) then policy Done.
         # Count forced_context so the default curriculum can still saturate format.
@@ -1091,12 +1105,13 @@ def compute_score(
     )
     rewards = {
         "reflect": _reflection_reward(text, gt),
-        "plan": _plan_reward(text, gt),
+        "plan": _plan_reward(text, gt, initial_only=version == "v2"),
         "format": _format_reward(
             text,
             task_type=task_type,
             successful_generates=successful_generates,
             forced_context=forced_context,
+            initial_plan_only=version == "v2",
         ),
         "protocol": protocol_reward,
         "tool": tool_reward,

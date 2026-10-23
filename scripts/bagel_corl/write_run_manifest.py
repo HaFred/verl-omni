@@ -76,10 +76,12 @@ CONFIG_ALLOWLIST = (
     "actor_rollout_ref.rollout.algo.sde_window_size",
     "actor_rollout_ref.rollout.algo.sde_window_range",
     "actor_rollout_ref.rollout.temperature",
+    "actor_rollout_ref.rollout.logprobs_mode",
     "actor_rollout_ref.rollout.top_p",
     "actor_rollout_ref.rollout.top_k",
     "actor_rollout_ref.rollout.repetition_penalty",
     "actor_rollout_ref.actor.fsdp_config.model_dtype",
+    "actor_rollout_ref.actor.diffusion_loss.use_gen_kl_loss",
     "data.train_files",
     "data.val_files",
     "data.holdout_files",
@@ -214,6 +216,11 @@ def write_run_manifest(output_dir: Path, resolved_config: dict, checkpoint_path:
     versions = {
         dist.metadata["Name"]: dist.version for dist in importlib.metadata.distributions() if dist.metadata["Name"]
     }
+    logprobs_mode = get(resolved_config, "actor_rollout_ref.rollout.logprobs_mode")
+    convention = {
+        "raw_logprobs": "raw_policy",
+        "processed_logprobs": "processed_behavior_vs_raw_actor",
+    }.get(logprobs_mode, get(resolved_config, "logprob_convention", "unverified"))
     manifest = {
         "schema_version": 1,
         "source": {
@@ -244,7 +251,10 @@ def write_run_manifest(output_dir: Path, resolved_config: dict, checkpoint_path:
             "training": get(resolved_config, "scorer_version"),
             "evaluation": get(resolved_config, "evaluation_scorer_version"),
         },
-        "logprob_convention": get(resolved_config, "logprob_convention", "unverified"),
+        "logprob_convention": convention,
+        "logprob_parity_verified": False,
+        "behavior_sampling_convention": "transformed",
+        "behavior_importance_correction": "unverified",
     }
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

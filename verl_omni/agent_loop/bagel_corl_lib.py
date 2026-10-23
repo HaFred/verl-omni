@@ -967,6 +967,20 @@ def cond_reuse_metrics(
     return metrics
 
 
+def serving_rollout_provenance(extra: dict[str, Any], *, required: bool = False) -> dict[str, Any]:
+    """Read serving-observed provenance only; request/trainer steps are not evidence."""
+    version = extra.get("rollout_policy_version")
+    replica = extra.get("rollout_replica_id")
+    if version is not None and (type(version) is not int or version < 0):
+        raise ValueError("Invalid observed serving policy version")
+    if replica is not None and (type(replica) not in (str, int) or replica == ""):
+        raise ValueError("Invalid observed serving replica identity")
+    verified = version is not None and replica is not None and extra.get("serving_provenance_verified") is True
+    if required and not verified:
+        raise ValueError("Live BAGEL output requires observed serving version and replica identity")
+    return {"rollout_policy_version": version, "rollout_replica_id": replica, "serving_provenance_verified": verified}
+
+
 @dataclass
 class GenSample:
     """One of S FlowGRPO seeds for a single ``generate_image`` turn."""
@@ -998,6 +1012,9 @@ class GenSample:
     # coincides. ``None`` when the serving path did not report it.
     cond_uid: str | None = None
     cond_len: int = 0
+    rollout_policy_version: int | None = None
+    rollout_replica_id: str | int | None = None
+    serving_provenance_verified: bool = False
 
 
 @dataclass
@@ -1010,7 +1027,7 @@ class EpisodeRollout:
 
     und_group_uid: str
     episode_uid: str
-    policy_version: int
+    policy_version: int | None
     prompt_ids: list[int]
     response_ids: list[int]
     response_mask: list[int]
@@ -1019,6 +1036,10 @@ class EpisodeRollout:
     # TransferQueue as ``rollout_log_probs`` so the trainer's π_rollout/π_θ correction has a
     # rollout distribution; empty on a replay that never sampled (tests, pattern-3 stubs).
     rollout_log_probs: list[float] = field(default_factory=list)
+    requested_policy_version: int | None = None
+    rollout_replica_id: str | int | None = None
+    serving_provenance_verified: bool = False
+    und_serving_provenance: list[dict[str, Any]] = field(default_factory=list)
     gen_samples: list[GenSample] = field(default_factory=list)
     used_image_credit: bool = False
     forced_reflection: bool = False
@@ -1157,6 +1178,7 @@ class BagelGenerateImageTool:
                     call_role="initial",
                     cond_uid=str(cond_uid) if cond_uid else None,
                     cond_len=int(row.get("cond_len") or 0),
+                    **serving_rollout_provenance(row),
                 )
             )
             _ = seed
@@ -1387,6 +1409,37 @@ async def run_serial_episode(
         # failure that made a healthy rollout look wedged (see ``_force_info_logging``).
         _force_info_logging()
 
+    observed_und_version: int | None = None
+    observed_und_replicas: set[str | int] = set()
+    und_provenance: list[dict[str, Any]] = []
+    all_und_provenance_verified = True
+
+    def _observe_serving(step: dict[str, Any]) -> None:
+        nonlocal observed_und_version, all_und_provenance_verified
+        provenance = serving_rollout_provenance(step)
+        version = provenance["rollout_policy_version"]
+        if version is not None:
+            if observed_und_version is not None and version != observed_und_version:
+                raise ValueError("Synchronous episode mixed observed UND serving policy versions")
+            observed_und_version = version
+        replica = provenance["rollout_replica_id"]
+        if replica is not None:
+            observed_und_replicas.add(replica)
+        all_und_provenance_verified &= provenance["serving_provenance_verified"]
+        und_provenance.append(
+            {
+                **provenance,
+                "response_start": len(response_ids),
+                "response_end": len(response_ids) + len(step.get("token_ids") or []),
+            }
+        )
+
+    def _check_gen_serving(samples: list[GenSample]) -> None:
+        for sample in samples:
+            version = sample.rollout_policy_version
+            if version is not None and observed_und_version is not None and version != observed_und_version:
+                raise ValueError("Synchronous episode mixed GEN and UND serving policy versions")
+
     def _context_budget_spent() -> bool:
         """True once ``prompt_ids + response_ids`` has used up ``max_context_tokens``.
 
@@ -1484,6 +1537,7 @@ async def run_serial_episode(
         else:
             done_decode = und_decode(prompt_ids=prompt_ids, response_ids=response_ids)
             done_step = await done_decode if asyncio.iscoroutine(done_decode) else done_decode
+            _observe_serving(done_step)
         done_ids = list(done_step.get("token_ids") or [])
         done_text = str(done_step.get("text") or "")
         try:
@@ -1547,6 +1601,7 @@ async def run_serial_episode(
         _req_ctx = len(prompt_ids) + len(response_ids)
         decode = und_decode(prompt_ids=prompt_ids, response_ids=response_ids)
         step = await decode if asyncio.iscoroutine(decode) else decode
+        _observe_serving(step)
         token_ids: list[int] = list(step["token_ids"])
         text: str = str(step["text"])
         kind = und_turn_kind(text)
@@ -1642,6 +1697,7 @@ async def run_serial_episode(
             gen_call_id=gen_call_id,
         )
         call_samples = sorted(call_samples, key=lambda sample: sample.seed_index)
+        _check_gen_serving(call_samples)
         call_role = str(meta.get("call_role") or "initial")
         for sample in call_samples:
             sample.call_role = call_role
@@ -1668,6 +1724,7 @@ async def run_serial_episode(
             if asyncio.iscoroutine(scored):
                 scored = await scored
             call_samples = scored
+            _check_gen_serving(call_samples)
 
         # Accumulate — every generate_image call contributes its S seeds to the
         # episode (RFC: all K calls survive to gen_batch). Replacing the list here
@@ -1766,7 +1823,13 @@ async def run_serial_episode(
     return EpisodeRollout(
         und_group_uid=str(ids["und_group_uid"]),
         episode_uid=str(ids["episode_uid"]),
-        policy_version=int(ids["policy_version"]),
+        policy_version=observed_und_version,
+        requested_policy_version=int(ids["policy_version"]),
+        rollout_replica_id=next(iter(observed_und_replicas)) if len(observed_und_replicas) == 1 else None,
+        serving_provenance_verified=bool(und_provenance)
+        and all_und_provenance_verified
+        and len(observed_und_replicas) == 1,
+        und_serving_provenance=und_provenance,
         prompt_ids=list(prompt_ids),
         response_ids=response_ids,
         response_mask=response_mask,
@@ -1992,6 +2055,11 @@ def flatten_multiturn_rollouts(
                 "und_group_uid": episode.und_group_uid,
                 "episode_uid": episode.episode_uid,
                 "policy_version": episode.policy_version,
+                "rollout_policy_version": episode.policy_version,
+                "requested_policy_version": episode.requested_policy_version,
+                "rollout_replica_id": episode.rollout_replica_id,
+                "serving_provenance_verified": episode.serving_provenance_verified,
+                "und_serving_provenance": list(episode.und_serving_provenance),
                 "prompt_ids": list(episode.prompt_ids),
                 "response_ids": list(episode.response_ids),
                 "response_mask": list(episode.response_mask),
@@ -2019,6 +2087,7 @@ def flatten_multiturn_rollouts(
             for sample in sorted(rows, key=lambda s: int(s.seed_index)):
                 gen_batch.append(
                     {
+                        "episode_uid": episode.episode_uid,
                         "gen_group_uid": sample.gen_group_uid,
                         "gen_sample_uid": sample.gen_sample_uid,
                         "seed_index": sample.seed_index,
@@ -2026,6 +2095,9 @@ def flatten_multiturn_rollouts(
                         "all_latents": sample.all_latents,
                         "timesteps": sample.timesteps,
                         "rollout_log_probs": sample.rollout_log_probs,
+                        "rollout_policy_version": sample.rollout_policy_version,
+                        "rollout_replica_id": sample.rollout_replica_id,
+                        "serving_provenance_verified": sample.serving_provenance_verified,
                         "rm_score": sample.rm_score,
                         "call_role": sample.call_role,
                         "cond_uid": sample.cond_uid,
@@ -2350,6 +2422,7 @@ def _as_gen_sample(item: Any) -> GenSample | None:
         good_enough=item.get("good_enough"),
         cond_uid=str(item["cond_uid"]) if item.get("cond_uid") else None,
         cond_len=int(item.get("cond_len") or 0),
+        **serving_rollout_provenance(item),
     )
 
 
@@ -2364,6 +2437,11 @@ def _ntb_from_extra_fields(extras: Any) -> dict[str, list[Any]]:
         "response_mask": [],
         "turns": [],
         "used_image_credit": [],
+        "policy_version": [],
+        "requested_policy_version": [],
+        "rollout_replica_id": [],
+        "serving_provenance_verified": [],
+        "und_serving_provenance": [],
     }
     for extra in rows:
         mapping = extra if isinstance(extra, dict) else {}
@@ -2375,6 +2453,14 @@ def _ntb_from_extra_fields(extras: Any) -> dict[str, list[Any]]:
         ntb["response_mask"].append(mapping.get("response_mask") or [])
         ntb["turns"].append(mapping.get("turns", 1))
         ntb["used_image_credit"].append(mapping.get("used_image_credit", False))
+        for name in (
+            "policy_version",
+            "requested_policy_version",
+            "rollout_replica_id",
+            "serving_provenance_verified",
+            "und_serving_provenance",
+        ):
+            ntb[name].append(mapping.get(name))
     return ntb
 
 
@@ -2418,7 +2504,11 @@ def flatten_from_agent_output(output: Any, *, expected_s: int) -> FlattenResult:
             EpisodeRollout(
                 und_group_uid=str(und_groups[index]),
                 episode_uid=str(episode_uids[index] or f"ep{index}"),
-                policy_version=0,
+                policy_version=_col("policy_version", None)[index],
+                requested_policy_version=_col("requested_policy_version", None)[index],
+                rollout_replica_id=_col("rollout_replica_id", None)[index],
+                serving_provenance_verified=bool(_col("serving_provenance_verified", False)[index]),
+                und_serving_provenance=list(_col("und_serving_provenance", [])[index] or []),
                 prompt_ids=list(prompt_ids[index] or []),
                 response_ids=list(response_ids[index] or []),
                 response_mask=list(response_mask[index] or []),

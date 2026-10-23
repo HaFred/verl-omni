@@ -42,6 +42,7 @@ from verl_omni.trainer.omni.bagel_corl_gen_adv import (
 )
 from verl_omni.trainer.omni.bagel_corl_replay_buffer import install_auxiliary_row_filter
 from verl_omni.trainer.omni.ray_omni_trainer import OmniPPOTrainerSync
+from verl_omni.workers.bagel_corl_provenance import write_runtime_provenance
 from verl_omni.workers.config import DiffusionModelConfig
 from verl_omni.workers.config.diffusion import DiffusionRolloutConfig, DiffusionSamplingConfig
 
@@ -1234,28 +1235,20 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     DIVERGENCE_GRAD_NORM_LIMIT = 100.0
 
     def _divergence_tripwire(self, metrics: dict) -> None:
-        """Warn -- or abort -- the step the actor leaves its trust region.
+        """Warn or optionally abort on provisional rollout/actor mismatch diagnostics.
 
-        ``bagel_corl_rm1_0123_20261012_084724`` (devices 0-3) spent its last ~150 steps
-        producing an unusable policy and said nothing: ``actor/grad_norm`` 0.32 -> 310 and
-        ``rollout_corr/kl`` 0.03 -> 175 while ``actor/entropy`` fell to 0.02 and
-        ``rollout_corr/training_ppl`` overflowed to ``inf`` (the training forward assigning
-        ~``e^-65`` to tokens the rollout engine sampled at p~0.92). Neither number is
-        trended anywhere, so the only way to notice was to read the run afterwards.
+        ``rollout_corr/kl`` compares sampled rollout and actor-replayed log probabilities.
+        It is distinct from old/new actor update KL and actor/fixed-reference KL. Serving
+        kernel or sampling-transform differences and stale publication can affect this
+        gap; exceeding the threshold alone does not establish policy divergence or a
+        breached fixed trust region. Interpret it together with parity checks, explicit
+        lane KL metrics, and held-out behavior.
 
-        This recipe has no KL anchor (``use_kl_loss=false``) and no entropy bonus
-        (``entropy_coeff=0``), so a step that has already left the region cannot come back
-        on its own -- the point of the tripwire is to make that visible on the step it
-        happens rather than after the budget is spent. Default is a loud WARNING plus
-        ``bagel_corl/divergence_warning`` in the metrics; set
-        ``BAGEL_CORL_DIVERGENCE_ABORT=1`` to fail the run instead (a checkpoint this far out
-        of the region is not a usable starting point for a restart).
-
-        Called after ``super()._update_actor``, so both keys are already on ``metrics``:
-        ``actor/grad_norm`` is the *pre-clip* norm the engine reports, and
-        ``rollout_corr/kl`` is the rollout-vs-training log-prob gap computed once per step
-        from the same batch. Both are per-step diagnostics, so the thresholds are exact
-        rather than a heuristic on a trend.
+        ``actor/grad_norm`` is the engine's pre-clip norm. Both thresholds are provisional
+        diagnostics motivated by historical runs, not validated convergence guarantees.
+        Default behavior logs a warning and ``bagel_corl/divergence_warning``;
+        ``BAGEL_CORL_DIVERGENCE_ABORT=1`` opts into aborting for investigation. Neither a
+        warning nor an abort establishes that recovery from the checkpoint is impossible.
         """
         kl = _metric_scalar(metrics, "rollout_corr/kl")
         grad_norm = _metric_scalar(metrics, "actor/grad_norm")
@@ -1265,7 +1258,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 return False
             # ``nan`` comparisons are always False, but a non-finite grad norm or KL is the
             # loudest possible divergence signal -- do not let it slip through the ``>``.
-            return math.isnan(value) or value > limit
+            return not math.isfinite(value) or value > limit
 
         triggers = []
         if _runaway(kl, self.DIVERGENCE_KL_LIMIT):
@@ -1580,6 +1573,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     # ``"dummy"`` and silently costs the run its UND lane. See
                     # ``UND_AR_LOAD_FORMAT`` for the measurement and the ``verl`` history.
                     "load_format": self.UND_AR_LOAD_FORMAT,
+                    "logprobs_mode": rollout.get("logprobs_mode", "processed_logprobs"),
                     # ``tensor_model_parallel_size`` here is the replica's *width
                     # declaration*, not a stage-level parallelism knob. It is what makes
                     # the colocated server see more than one card:
@@ -2228,12 +2222,15 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         return batch
 
     def on_init_end(self):
+        self._record_runtime_optimizer_provenance()
         # Build UND AR before the first weight publish so both pools see step-0 weights.
         self._ensure_dual_role_rollout()
         if self._bagel_rm_enabled():
             self._ensure_reward_loop_manager()
         # A resumed checkpoint is already loaded into the actor (``_setup``), so this is the
         # resumed policy, not the launch checkpoint the Thinker loaded.
+        # A partial dual-lane publication cannot attest a loaded policy version.
+        self._bagel_corl_published_weight_version = None
         self._publish_und_ar_weights()
         super().on_init_end()
         # ``_setup`` slept the GEN replica(s) to load the checkpoint and the parent hook
@@ -2241,10 +2238,20 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         # is a no-op today and a guard if the creation order ever moves. Both pools are
         # woken, since the parent's tagless wake leaves each one's ``kv_cache`` set.
         self._wake_rollout_replicas()
+        self._bagel_corl_published_weight_version = self.global_steps
+
+    def _record_runtime_optimizer_provenance(self):
+        output_dir = os.environ.get("BAGEL_CORL_PROVENANCE_DIR")
+        if not output_dir:
+            return
+        snapshots = self.actor_rollout_wg.get_bagel_optimizer_snapshots()
+        write_runtime_provenance(output_dir, snapshots, trainer_step=self.global_steps)
 
     def on_step_end(self):
         # ``on_sample_end`` slept every replica, so the UND push runs first, before the
         # parent's naive publish wakes the GEN servers onto the same GPUs.
+        # A partial dual-lane publication cannot attest a loaded policy version.
+        self._bagel_corl_published_weight_version = None
         with marked_timer("update_und_weights", self.timing_raw, color="red"):
             self._publish_und_ar_weights()
         super().on_step_end()
@@ -2254,6 +2261,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         # engine is awake on weights but still holds ``kv_cache``. See
         # ``_wake_und_rollout_replicas`` / ``_wake_rollout_replicas``.
         self._wake_rollout_replicas()
+        self._bagel_corl_published_weight_version = self.global_steps
 
     def on_validate_end(self):
         """Re-wake the AR replica after ``_validate``'s colocated-reward sleep.

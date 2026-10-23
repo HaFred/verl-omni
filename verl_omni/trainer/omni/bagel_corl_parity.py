@@ -79,8 +79,9 @@ def scalar(value):
 
 
 class FrozenPolicyCapture:
-    def __init__(self, directory, manifest, manual_replica_label=None):
+    def __init__(self, directory, manifest, manual_replica_label=None, trainer_step=None):
         self.manifest = manifest
+        self.trainer_step = trainer_step
         for key in ("policy_version", "calibration_id", "logprob_convention", "kernel_config"):
             required(manifest, key)
         if not manifest["calibration_id"] or manifest["logprob_convention"] not in {
@@ -109,26 +110,43 @@ class FrozenPolicyCapture:
         if not manifest_path:
             raise ValueError("BAGEL_CORL_PARITY_CAPTURE_DIR requires BAGEL_CORL_PARITY_MANIFEST")
         manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
-        if manifest.get("policy_version") != getattr(trainer, "global_steps", None):
-            raise ValueError("Parity manifest policy_version differs from actor trainer global_steps")
+        published_version = getattr(trainer, "_bagel_corl_published_weight_version", None)
+        if published_version is None or manifest.get("policy_version") != published_version:
+            raise ValueError(
+                "Parity manifest policy_version requires the last successfully published dual-lane version"
+            )
         correction = trainer.config.algorithm.get("rollout_correction") or {}
         if correction.get("bypass_mode", False):
             raise ValueError("Parity capture requires actor recomputation; bypass_mode is enabled")
         if getattr(trainer, "actor_rollout_wg", None) is None:
             raise ValueError("Parity capture requires a live actor worker group")
-        return cls(directory, manifest, os.environ.get("BAGEL_CORL_PARITY_REPLICA_LABEL"))
+        return cls(
+            directory,
+            manifest,
+            os.environ.get("BAGEL_CORL_PARITY_REPLICA_LABEL"),
+            trainer_step=getattr(trainer, "global_steps", None),
+        )
 
     def provenance(self, source):
         source = metadata(source)
-        version = source.get("policy_version")
-        if version is None:
+        explicit_observation = "rollout_policy_version" in source
+        version = source.get("rollout_policy_version") if explicit_observation else source.get("policy_version")
+        if version is None and not explicit_observation:
             low, high = source.get("min_global_steps"), source.get("max_global_steps")
             if low is not None and scalar(low) == scalar(high):
                 version = scalar(low)
         if version is None:
-            raise ValueError("Parity capture requires rollout policy_version (or equal min/max_global_steps)")
+            raise ValueError(
+                "Parity capture requires observed serving policy_version (or legacy equal min/max_global_steps)"
+            )
         if scalar(version) != self.manifest["policy_version"]:
             raise ValueError("Stale rollout policy version in parity capture")
+        turns = source.get("und_serving_provenance") or []
+        if any(turn.get("rollout_policy_version") != scalar(version) for turn in turns):
+            raise ValueError("UND parity capture requires a consistent observed serving version on every decode")
+        turn_replicas = {turn.get("rollout_replica_id") for turn in turns if turn.get("rollout_replica_id") is not None}
+        if len(turn_replicas) > 1:
+            raise ValueError("UND parity capture cannot assign a single replica identity to a mixed-replica episode")
         replica = source.get("rollout_replica_id")
         identity_source = "rollout_metadata"
         if replica is None:
@@ -142,6 +160,7 @@ class FrozenPolicyCapture:
             policy_version=scalar(version),
             rollout_policy_version=scalar(version),
             actor_policy_version=self.manifest["policy_version"],
+            trainer_step=self.trainer_step,
             replica_id=scalar(replica),
             replica_identity_source=identity_source,
             complete_replica_coverage_verified=False,
@@ -258,7 +277,10 @@ class FrozenPolicyCapture:
             parent = parents.get(required(raw, "episode_uid"))
             if parent is None:
                 raise ValueError("GEN capture lacks parent rollout provenance")
-            source = {**metadata(parent), **raw}
+            # GEN must identify its own loaded weights and serving replica.
+            # A parent episode links ownership, never GEN serving provenance.
+            source = {"episode_uid": metadata(parent)["episode_uid"], **metadata(raw)}
+            required(source, "rollout_policy_version")
             context = {key: proto.batch[key][index] for key in ("all_latents", "all_timesteps", "gen_transition_valid")}
             context["prompt_token_ids"] = proto.non_tensor_batch["prompt_token_ids"][index]
             required(context, "prompt_token_ids")

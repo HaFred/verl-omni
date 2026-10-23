@@ -54,6 +54,10 @@ ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.7}"
 ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.9}"
 ROLLOUT_TOP_K="${ROLLOUT_TOP_K:-50}"
 ROLLOUT_REPETITION_PENALTY="${ROLLOUT_REPETITION_PENALTY:-1.05}"
+# Actor UND replay computes raw-policy log-softmax. Sample with the transforms
+# above while requesting raw log-probabilities for future Co-RL comparisons.
+# This does not establish cross-engine parity or behavior importance correction.
+LOGPROBS_MODE="${LOGPROBS_MODE:-raw_logprobs}"
 
 export BAGEL_MODEL_PATH="${BAGEL_MODEL_PATH:-$HOME/models/ByteDance-Seed/BAGEL-7B-MoT}"
 WORKSPACE=${WORKSPACE:-$HOME}
@@ -663,6 +667,7 @@ export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
     +actor_rollout_ref.rollout.pipeline.cfg_img_scale=$CFG_IMG_SCALE \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.temperature=$ROLLOUT_TEMPERATURE \
+    actor_rollout_ref.rollout.logprobs_mode=$LOGPROBS_MODE \
     actor_rollout_ref.rollout.top_p=$ROLLOUT_TOP_P \
     actor_rollout_ref.rollout.top_k=$ROLLOUT_TOP_K \
     +actor_rollout_ref.rollout.repetition_penalty=$ROLLOUT_REPETITION_PENALTY \
