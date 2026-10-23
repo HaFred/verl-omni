@@ -19,6 +19,16 @@ trajectory text emitted by those PRs once they are present, but does not import
 their agent-loop or dataset modules.
 
 Wire with ``reward.reward_manager.name=naive`` so verl passes ``solution_str``.
+The runtime must also pass ``trajectory_messages`` as a keyword argument or in
+``extra_info``. This is a list of runtime-owned chat messages: assistant entries
+contain ``content`` and OpenAI-style ``tool_calls`` (``id`` and ``function`` with
+``name`` / ``arguments``); tool entries contain ``role="tool"``, ``tool_call_id``
+and text ``content``. Optional tool ``name`` must match the call. These messages
+must come from the runtime, never from parsing policy-authored text or JSON.
+Structured messages are authoritative when present. Tool results are matched
+once per call ID, and judge image paths must match the latest successful image
+execution at the time of both the call and response. Plain ``solution_str`` or
+decoded tokens alone cannot authenticate tool outcomes and receive zero reward.
 ``VisualRewardManager``'s ``solution_image`` is the wrong modality and raises.
 
 The active reward set is ``{reflect, plan, format, tool, result}``. ``plan`` is
@@ -27,8 +37,8 @@ closed-loop indicators for metrics, but are not additional score dimensions.
 Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
 receive score zero and ``rollout_valid=0``. ``task_type`` is required.
 
-Judge C/A is trusted only after a parsed ``judge_image`` ``<tool_call>`` and the
-tool observation header. Coverage is token F1 (not recall-only), so dumping
+Judge C/A is trusted only in a matched runtime ``judge_image`` observation
+with the tool observation header and finite scores in [0, 1]. Coverage is token F1 (not recall-only), so dumping
 reference words into a long blob does not max ``R_reflect`` / ``R_plan``.
 Rewrite-after-YES zeros ``R_result`` as well as the Done indicator. Reflect
 ``R_result`` requires a terminal trusted YES. ``R_tool`` needs a successful
@@ -38,7 +48,9 @@ PNG generate plus a trusted judge (not merely a parsed tool call).
 from __future__ import annotations
 
 import json
+import math
 import re
+from dataclasses import dataclass
 from typing import Any
 
 DIMS = ("reflect", "plan", "format", "tool", "result")
@@ -58,7 +70,84 @@ _TOOL_OBS_LINE_RE = re.compile(
 _REFLECTION_RE = re.compile(r"\bReflection\s*:", re.IGNORECASE)
 
 
+@dataclass(frozen=True)
+class _ToolObservation:
+    """A runtime tool response bound to one call and its trajectory position."""
+
+    name: str
+    content: str
+    end: int
+
+
+def _resolve_trajectory(text: str, messages: Any) -> tuple[str, list[_ToolObservation]]:
+    """Separate policy text from runtime observations, binding call and image IDs."""
+    if not isinstance(messages, list):
+        return text, []
+    parts: list[str] = []
+    observations: list[_ToolObservation] = []
+    pending: dict[str, tuple[str, tuple[str, str] | None]] = {}
+    seen_ids: set[str] = set()
+    latest_image: tuple[str, str] | None = None
+    position = 0
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            continue
+        role = message.get("role")
+        if role == "assistant":
+            tool_calls = message.get("tool_calls") or []
+            if not isinstance(tool_calls, list):
+                continue
+            if tool_calls:
+                content = _TOOL_CALL_RE.sub("", content)
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                call_id = call.get("id")
+                function = call.get("function")
+                if not isinstance(call_id, str) or not call_id or not isinstance(function, dict):
+                    continue
+                name = _tool_name(function)
+                content += f"\n<tool_call>{json.dumps(function)}</tool_call>"
+                if call_id in seen_ids:
+                    pending.pop(call_id, None)
+                    continue
+                seen_ids.add(call_id)
+                pending[call_id] = (name, latest_image)
+            parts.append(content + "\n")
+            position += len(content) + 1
+        elif role == "tool":
+            call_id = message.get("tool_call_id")
+            call = pending.pop(call_id, None) if isinstance(call_id, str) else None
+            if call is None:
+                continue
+            name, image_at_call = call
+            if message.get("name", name) != name:
+                continue
+            paths = re.findall(r"\bpath=([^\s'\"]+)", content, re.IGNORECASE)
+            if name == "generate_image":
+                if not re.search(r"\bagentic_tool\s+ok=1\b", content, re.IGNORECASE):
+                    continue
+                if len(paths) != 1 or not paths[0].lower().endswith(".png"):
+                    continue
+                latest_image = (call_id, paths[0])
+            elif name == "judge_image":
+                if latest_image is None or image_at_call != latest_image or paths != [latest_image[1]]:
+                    continue
+            else:
+                continue
+            observations.append(_ToolObservation(name, content, position + len(content)))
+            parts.append(" " * len(content) + "\n")
+            position += len(content) + 1
+    return "".join(parts), observations
+
+
 def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
+    """Return the complete metric schema with all rewards disabled."""
     return {
         "score": 0.0,
         **{f"reward_{dim}": 0.0 for dim in DIMS},
@@ -84,6 +173,7 @@ def _zero_result(*, method: str) -> dict[str, float | str | int | None]:
 
 
 def _as_dict(value: Any) -> dict[str, Any]:
+    """Normalize mapping or JSON ground truth without mutating caller data."""
     if isinstance(value, dict):
         return dict(value)
     if isinstance(value, str):
@@ -100,6 +190,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _parse_tool_call_body(body: str) -> dict[str, Any] | None:
+    """Parse JSON or Qwen XML tool-call syntax without executing it."""
     if not body:
         return None
     if body.lstrip().startswith("{"):
@@ -128,6 +219,7 @@ def _parse_tool_call_body(body: str) -> dict[str, Any] | None:
 
 
 def _extract_tool_calls(text: str) -> list[tuple[int, int, dict[str, Any]]]:
+    """Collect recognized tool calls and their offsets in policy text."""
     calls = []
     for match in _TOOL_CALL_RE.finditer(text or ""):
         call = _parse_tool_call_body((match.group(1) or "").strip())
@@ -137,6 +229,7 @@ def _extract_tool_calls(text: str) -> list[tuple[int, int, dict[str, Any]]]:
 
 
 def _call_arguments(call: dict[str, Any]) -> dict[str, Any]:
+    """Decode mapping or JSON-string tool arguments."""
     arguments = call.get("arguments") or {}
     if isinstance(arguments, str):
         try:
@@ -147,15 +240,12 @@ def _call_arguments(call: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tool_name(call: dict[str, Any]) -> str:
+    """Normalize the name of a parsed tool call."""
     return str(call.get("name") or "").strip().lower()
 
 
-def _follows_judge_image_call(pos: int, calls: list[tuple[int, int, dict[str, Any]]]) -> bool:
-    """True when ``pos`` is after at least one parsed ``judge_image`` ``<tool_call>``."""
-    return any(end <= pos for _, end, call in calls if _tool_name(call) == "judge_image")
-
-
 def _generate_prompts(calls: list[tuple[int, int, dict[str, Any]]]) -> list[str]:
+    """Collect nonempty prompts from parsed generate-image calls."""
     prompts = []
     for _, _, call in calls:
         if _tool_name(call) != "generate_image":
@@ -167,6 +257,7 @@ def _generate_prompts(calls: list[tuple[int, int, dict[str, Any]]]) -> list[str]
 
 
 def _assistant_prose(text: str) -> str:
+    """Remove tool syntax and injected reflection from policy prose."""
     prose = _TOOL_CALL_RE.sub(" ", text or "")
     prose = _TOOL_OBS_LINE_RE.sub(" ", prose)
     prose = re.sub(r"</?think>", " ", prose, flags=re.IGNORECASE)
@@ -188,6 +279,7 @@ def _assistant_prose_lines(text: str) -> str:
 
 
 def _tokens(text: str) -> set[str]:
+    """Extract normalized unique word tokens for coverage scoring."""
     return set(re.findall(r"[a-z0-9_']+", (text or "").lower()))
 
 
@@ -209,35 +301,8 @@ def _coverage(candidate: str, reference: str) -> float:
     return 2.0 * precision * recall / (precision + recall)
 
 
-def _count_successful_generates(text: str) -> int:
-    return sum(
-        1
-        for line in (text or "").splitlines()
-        if re.search(r"\bagentic_tool\s+ok=1\b", line, re.IGNORECASE)
-        and any(path.lower().endswith(".png") for path in re.findall(r"\bpath=([^\s'\"]+)", line, re.IGNORECASE))
-    )
-
-
-def _judge_parse_stats(text: str, calls: list[tuple[int, int, dict[str, Any]]] | None = None) -> tuple[int, int, float]:
-    blob = text or ""
-    parsed_calls = calls if calls is not None else _extract_tool_calls(blob)
-    ok = 0
-    for marker in _JUDGE_OK_RE.finditer(blob):
-        if _follows_judge_image_call(marker.start(), parsed_calls):
-            ok += 1
-    failed = 0
-    for marker in re.finditer(r"\bagentic_judge\s+ok=0\b", blob, flags=re.IGNORECASE):
-        if _follows_judge_image_call(marker.start(), parsed_calls):
-            failed += 1
-    if failed == 0:
-        for marker in re.finditer(r"\bagentic_judge\s+ok=0\b|\bparse_ok\s*=\s*0\b", blob, re.IGNORECASE):
-            if _follows_judge_image_call(marker.start(), parsed_calls):
-                failed += 1
-    total = ok + failed
-    return ok, failed, (ok / total) if total else 0.0
-
-
 def _good_enough(window: str) -> bool | None:
+    """Read an explicit judge acceptance decision from one observation."""
     matches = list(re.finditer(r"\bgood_enough\s*=\s*(YES|NO|1|0|true|false)\b", window or "", re.IGNORECASE))
     if not matches:
         return None
@@ -245,38 +310,38 @@ def _good_enough(window: str) -> bool | None:
     return value in {"yes", "1", "true"}
 
 
-def _successful_judges(text: str) -> list[tuple[float, float, bool | None, int]]:
-    """Return trusted ``(correctness, aesthetics, good_enough, end)`` values.
-
-    Hits must follow a parsed ``judge_image`` ``<tool_call>`` and the tool's
-    ``VL judge on the last generated image`` header.
-    """
-    blob = text or ""
-    calls = _extract_tool_calls(blob)
+def _successful_judges(observations: list[_ToolObservation]) -> list[tuple[float, float, bool | None, int]]:
+    """Parse judge values only inside validated runtime judge observations."""
     hits = []
-    for marker in _JUDGE_OK_RE.finditer(blob):
-        if not _follows_judge_image_call(marker.start(), calls):
+    for observation in observations:
+        if observation.name != "judge_image":
             continue
-        window = blob[max(0, marker.start() - 1400) : marker.end()]
+        window = observation.content
+        if len(_JUDGE_OK_RE.findall(window)) != 1:
+            continue
         if "VL judge on the last generated image" not in window:
             continue
-        if re.search(r"\bparse_ok\s*=\s*0\b", window, re.IGNORECASE):
+        if re.search(r"\b(?:parse_ok|ok)\s*=\s*0\b|\bstub\s*=\s*1\b", window, re.IGNORECASE):
             continue
-        correctness = list(re.finditer(r"\bcorrectness\s*=\s*([0-9]*\.?[0-9]+)", window, re.IGNORECASE))
-        aesthetics = list(re.finditer(r"\baesthetics\s*=\s*([0-9]*\.?[0-9]+)", window, re.IGNORECASE))
-        if not correctness or not aesthetics:
-            continue
-        try:
-            c = min(1.0, max(0.0, float(correctness[-1].group(1))))
-            a = min(1.0, max(0.0, float(aesthetics[-1].group(1))))
-        except ValueError:
-            continue
-        hits.append((c, a, _good_enough(window), marker.end()))
+        values = []
+        for field in ("correctness", "aesthetics"):
+            matches = re.findall(r"(?im)^\s*" + field + r"\s*=\s*(\S+)\s*$", window)
+            if len(matches) != 1:
+                break
+            try:
+                value = float(matches[0])
+            except ValueError:
+                break
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                break
+            values.append(value)
+        if len(values) == 2 and _good_enough(window) is not None:
+            hits.append((values[0], values[1], _good_enough(window), observation.end))
     return hits
 
 
-def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
-    judges = _successful_judges(text)
+def _terminal_decision(text: str, judges: list[tuple[float, float, bool | None, int]]) -> tuple[bool, bool, bool]:
+    """Recognize policy completion following the final trusted judge."""
     if not judges:
         return False, False, False
 
@@ -302,14 +367,18 @@ def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
     return terminal_done, policy_reflection, forced_context
 
 
-def _generates_after_first_yes(text: str, calls: list[tuple[int, int, dict[str, Any]]]) -> int:
-    yes_position = next((end for _, _, accepted, end in _successful_judges(text) if accepted is True), None)
+def _generates_after_first_yes(
+    calls: list[tuple[int, int, dict[str, Any]]], judges: list[tuple[float, float, bool | None, int]]
+) -> int:
+    """Count generation calls made after the first trusted acceptance."""
+    yes_position = next((end for _, _, accepted, end in judges if accepted is True), None)
     if yes_position is None:
         return 0
     return sum(1 for start, _, call in calls if start > yes_position and _tool_name(call) == "generate_image")
 
 
 def _extract_plan_lines(text: str) -> list[str]:
+    """Extract substantive numbered or bulleted policy plan items."""
     prose = _assistant_prose_lines(text)
     header = re.search(r"\bPlan\s*:", prose, re.IGNORECASE)
     body = prose[header.end() :] if header else prose
@@ -321,13 +390,21 @@ def _extract_plan_lines(text: str) -> list[str]:
 
 
 def _reflection_text(text: str) -> str:
+    """Extract policy reflection prose without its terminal Done marker."""
     prose = _assistant_prose(text)
     match = re.search(r"\bReflection\s*:(.*?)(?:\bDone\.\s*$|$)", prose, re.IGNORECASE | re.DOTALL)
     return match.group(1).strip() if match else ""
 
 
-def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
-    judges = _successful_judges(text)
+def _reflection_reward(
+    text: str,
+    ground_truth: dict[str, Any],
+    judges: list[tuple[float, float, bool | None, int]],
+    observations: list[_ToolObservation],
+) -> float:
+    """Blend trusted judge quality with reference or trusted-feedback coverage."""
+    if not judges:
+        return 0.0
     quality = 0.0
     if judges:
         preferred = next((hit for hit in judges if hit[2] is True), judges[-1])
@@ -337,8 +414,11 @@ def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
     reference = " ".join(str(step.get("reflection") or "") for step in steps if isinstance(step, dict)).strip()
     if not reference and judges:
         feedback = []
-        for _, _, _, end in judges:
-            window = text[max(0, end - 1400) : end]
+        trusted_ends = {end for _, _, _, end in judges}
+        for observation in observations:
+            if observation.end not in trusted_ends:
+                continue
+            window = observation.content
             feedback.extend(
                 match.group(1).strip()
                 for match in re.finditer(r"(?im)^\s*(?:findings|suggested_fixes)\s*:\s*(.*)$", window)
@@ -350,6 +430,7 @@ def _reflection_reward(text: str, ground_truth: dict[str, Any]) -> float:
 
 
 def _plan_reward(text: str, ground_truth: dict[str, Any]) -> float:
+    """Average the best policy-plan coverage of each reference subtask."""
     references = [str(item).strip() for item in ground_truth.get("reference_subtasks") or [] if str(item).strip()]
     candidates = _extract_plan_lines(text)
     if not references or not candidates:
@@ -365,17 +446,19 @@ def _format_reward(
     task_type: str,
     successful_generates: int,
     forced_context: bool = False,
+    judges: list[tuple[float, float, bool | None, int]],
 ) -> float:
+    """Score structural protocol checks using trusted execution evidence."""
     raw_blocks = len(_TOOL_CALL_RE.findall(text))
     calls = _extract_tool_calls(text)
     names = [_tool_name(call) for _, _, call in calls]
     generates = [index for index, name in enumerate(names) if name == "generate_image"]
-    judges = [index for index, name in enumerate(names) if name == "judge_image"]
-    terminal_done, policy_reflection, _ = _terminal_decision(text)
+    judge_calls = [index for index, name in enumerate(names) if name == "judge_image"]
+    terminal_done, policy_reflection, _ = _terminal_decision(text, judges)
     checks = [
         raw_blocks > 0 and len(calls) == raw_blocks,
         successful_generates >= 1,
-        bool(judges) and (not generates or max(judges) > max(generates)),
+        bool(judge_calls) and (not generates or max(judge_calls) > max(generates)),
         terminal_done,
     ]
     if task_type == "plan":
@@ -388,7 +471,6 @@ def _format_reward(
 
 
 def _result_reward(
-    text: str,
     *,
     task_type: str,
     expected: int,
@@ -396,12 +478,13 @@ def _result_reward(
     terminal_done: bool,
     blocked: bool,
     rewrite_after_yes: int,
+    judges: list[tuple[float, float, bool | None, int]],
 ) -> float:
+    """Require terminal trusted judging and task-specific generation counts."""
     if blocked or not terminal_done or successful_generates < 1 or rewrite_after_yes > 0:
         return 0.0
     if task_type == "plan":
         return 1.0 if successful_generates == expected else 0.0
-    judges = _successful_judges(text)
     final_yes = bool(judges) and judges[-1][2] is True
     # Fail closed on a terminal NO: early-stop alone is not a free result point.
     return 1.0 if final_yes and successful_generates <= expected else 0.0
@@ -454,6 +537,7 @@ def _resolve_solution_text(
 
 
 def _require_task_type(ground_truth: dict[str, Any], extra_info: dict[str, Any]) -> str | None:
+    """Require an explicit supported task type from ground truth or metadata."""
     raw = ground_truth.get("task_type")
     if raw is None:
         raw = extra_info.get("task_type")
@@ -481,9 +565,9 @@ def _active_weights(
         else:
             try:
                 value = float(raw)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 return None
-            if value < 0:
+            if not math.isfinite(value) or value < 0:
                 return None
         if value > 0:
             weights[dim] = value
@@ -504,9 +588,10 @@ def compute_score(
         solution_str: Decoded trajectory text (NaiveRewardManager).
         ground_truth: Must include ``task_type`` (``reflect`` / ``plan``) plus
             optional references and ``w_*`` weights.
-        extra_info: Fallback for ``task_type`` / weights; optional tokenizer.
-        **kwargs: May include ``responses`` + tokenizer, or ``solution_image``
-            (rejected).
+        extra_info: Fallback for task type / weights, tokenizer, and runtime
+            ``trajectory_messages`` with role and tool-call identity preserved.
+        **kwargs: May include runtime ``trajectory_messages``, decoded
+            ``responses`` + tokenizer, or ``solution_image`` (rejected).
 
     Returns:
         Dict with ``score``, per-dim ``reward_*``, and metric schema fields.
@@ -528,17 +613,25 @@ def compute_score(
 
     text = _resolve_solution_text(solution_str, kwargs=kwargs, extra_info=metadata)
     kwargs.pop("solution_image", None)
-    if not text.strip():
+    if not text.strip() and "trajectory_messages" not in kwargs and "trajectory_messages" not in metadata:
         result = _zero_result(method="agentic_multidim_empty")
         result.update(task_type=task_type, expected_num_images=expected)
         return result
 
+    messages = kwargs.get("trajectory_messages", metadata.get("trajectory_messages"))
+    text, observations = _resolve_trajectory(text, messages)
     calls = _extract_tool_calls(text)
     prompts = _generate_prompts(calls)
     names = [_tool_name(call) for _, _, call in calls]
-    judge_ok, judge_failed, judge_rate = _judge_parse_stats(text, calls)
-    successful_generates = _count_successful_generates(text)
-    terminal_done, policy_reflection, forced_context = _terminal_decision(text)
+    judges = _successful_judges(observations)
+    judge_ok = len(judges)
+    judge_failed = sum(observation.name == "judge_image" for observation in observations) - judge_ok
+    judge_rate = judge_ok / (judge_ok + judge_failed) if judge_ok + judge_failed else 0.0
+    successful_generates = sum(observation.name == "generate_image" for observation in observations)
+    last_generate_end = max((obs.end for obs in observations if obs.name == "generate_image"), default=0)
+    last_judge_end = max((obs.end for obs in observations if obs.name == "judge_image"), default=0)
+    terminal_judges = judges if judges and judges[-1][3] == last_judge_end > last_generate_end else []
+    terminal_done, policy_reflection, forced_context = _terminal_decision(text, terminal_judges)
     blocked = bool(
         re.search(
             r"\b(?:blocked_after_yes|blocked_after_max_passes)=1\b|generate_image blocked:",
@@ -546,8 +639,8 @@ def compute_score(
             re.IGNORECASE,
         )
     )
-    rewrites_after_yes = _generates_after_first_yes(text, calls)
-    tool_reward = float(successful_generates >= 1 and judge_ok >= 1)
+    rewrites_after_yes = _generates_after_first_yes(calls, judges)
+    tool_reward = float(successful_generates >= 1 and bool(judges))
 
     result = _zero_result(method="agentic_multidim")
     result.update(
@@ -573,27 +666,30 @@ def compute_score(
     valid_terminal_context = judge_ok > 0 and not blocked and rewrites_after_yes == 0
     closed = valid_terminal_context and terminal_done and (policy_reflection or forced_context)
     rewards = {
-        "reflect": _reflection_reward(text, gt),
+        "reflect": _reflection_reward(text, gt, judges, observations),
         "plan": _plan_reward(text, gt),
         "format": _format_reward(
             text,
             task_type=task_type,
             successful_generates=successful_generates,
             forced_context=forced_context,
+            judges=terminal_judges,
         ),
         "tool": tool_reward,
         "result": _result_reward(
-            text,
             task_type=task_type,
             expected=expected,
             successful_generates=successful_generates,
             terminal_done=terminal_done,
             blocked=blocked,
             rewrite_after_yes=rewrites_after_yes,
+            judges=judges,
         ),
     }
-    weight_sum = sum(weights.values())
-    score = sum(weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
+    scale = max(weights.values(), default=1.0)
+    normalized_weights = {dim: weight / scale for dim, weight in weights.items()}
+    weight_sum = sum(normalized_weights.values())
+    score = sum(normalized_weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
     result.update(
         score=float(min(1.0, score)),
         **{f"reward_{dim}": float(rewards[dim]) for dim in DIMS},
