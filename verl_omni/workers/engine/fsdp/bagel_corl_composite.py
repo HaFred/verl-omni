@@ -35,6 +35,7 @@ from verl.workers.engine.utils import prepare_micro_batches
 logger = logging.getLogger(__name__)
 
 _UND_SELECT = (
+    "bagel_episode_id",
     "input_ids",
     "attention_mask",
     "response_mask",
@@ -160,8 +161,10 @@ def materialize_gen_train_batch(gen_view: TensorDict, flags: dict[str, Any]) -> 
     for key, val in flags.items():
         if val is not None:
             tu.assign_non_tensor(gen_data, **{key: val})
-    # GEN phase: loss must use FlowGRPO view, not UND token advantages on this TensorDict.
-    tu.assign_non_tensor(gen_data, bagel_corl_gen=gen_view if isinstance(gen_view, TensorDict) else gen_data)
+    # After ingress all GEN fields are row-aligned tensors, sliced by normal microbatching.
+    # Reattaching the full view here silently broadcasts one row's forward over all rewards.
+    gen_data.pop("bagel_corl_gen", None)
+    tu.assign_non_tensor(gen_data, bagel_corl_lane="gen")
     tu.assign_non_tensor(gen_data, skip_gen=False)
     tu.assign_non_tensor(gen_data, has_complete_gen_groups=True)
     return gen_data
@@ -327,6 +330,23 @@ def run_und_token_forward_backward(
         )
     tu.assign_non_tensor(und, micro_batch_size_per_gpu=int(micro_batch_size_per_gpu))
 
+    und_episode_normalizer = None
+    if not forward_only:
+        masks = list(und["response_mask"].unbind())
+        ids = und.get("bagel_episode_id", None)
+        if ids is not None:
+            masks = [mask * (int(ids[i]) >= 0) for i, mask in enumerate(masks)]
+            und["response_mask"] = (
+                torch.nested.as_nested_tensor(masks, layout=torch.jagged)
+                if und["response_mask"].is_nested
+                else torch.stack(masks)
+            )
+        count = torch.tensor(float(sum(bool(mask.any()) for mask in masks)), device=get_device_id())
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        dp_size = torch.distributed.get_world_size(engine.get_data_parallel_group()) if distributed else 1
+        if distributed:
+            torch.distributed.all_reduce(count, group=engine.get_data_parallel_group())
+        und_episode_normalizer = max(float(count.item()), 1.0) / dp_size
     micro_batches, indices = prepare_micro_batches(
         data=und, dp_group=engine.get_data_parallel_group(), same_micro_num_in_dp=True
     )
@@ -355,7 +375,15 @@ def run_und_token_forward_backward(
         padded = micro_batch
         pad_keys = [
             k
-            for k in ("input_ids", "attention_mask", "response_mask", "old_log_probs", "advantages")
+            for k in (
+                "input_ids",
+                "attention_mask",
+                "response_mask",
+                "old_log_probs",
+                "advantages",
+                "ref_log_prob",
+                "rollout_is_weights",
+            )
             if k in micro_batch.keys()
         ]
         if hasattr(micro_batch, "to_padded_tensor"):
@@ -381,7 +409,8 @@ def run_und_token_forward_backward(
             # TransferQueue alongside ``log_probs`` (``trainer_base.py:1506,1513``). The train pass
             # deliberately leaves it out so ``ppo_loss`` keeps skipping the entropy term, and so
             # the log-prob grid is not duplicated on the hot path.
-            if forward_only:
+            want_entropy = forward_only or bool(tu.get_non_tensor_data(data, "calculate_entropy", default=False))
+            if want_entropy:
                 token_logp, token_entropy = module.compute_und_log_prob(
                     input_ids, attention_mask, full_response_mask, with_entropy=True
                 )
@@ -405,6 +434,11 @@ def run_und_token_forward_backward(
             # slice instead breaks it: ``no_padding_2_padding`` then still needs ``data["prompts"]``.
             und_grid = torch.nested.as_nested_tensor(und_rows, layout=torch.jagged)
             model_output = {"und": {"log_probs": und_grid}, "modality": "und", "log_probs": und_grid}
+            if want_entropy and not forward_only:
+                model_output["und"]["entropy"] = torch.nested.as_nested_tensor(
+                    und_jagged_rows(token_entropy, attention_mask), layout=torch.jagged
+                )
+                und_nested = None
 
             # Infer (old log-prob): no token-GRPO fields yet — return log_probs only.
             infer_only = forward_only and ("old_log_probs" not in padded.keys() or "advantages" not in padded.keys())
@@ -490,6 +524,7 @@ def run_und_token_forward_backward(
                 tu.assign_non_tensor(loss_data, batch_num_tokens=None)
                 tu.assign_non_tensor(loss_data, global_batch_size=None)
 
+                tu.assign_non_tensor(loss_data, und_episode_normalizer=und_episode_normalizer, corl_dp_size=dp_size)
                 tu.assign_non_tensor(loss_data, bagel_corl_und=loss_data)
                 tu.assign_non_tensor(loss_data, skip_gen=True)
                 tu.assign_non_tensor(loss_data, has_complete_gen_groups=False)
@@ -507,7 +542,7 @@ def run_und_token_forward_backward(
                     dp_group=engine.get_data_parallel_group(),
                 )
 
-            if not forward_only:
+            if not forward_only and not engine.model_config.get("corl_freeze_und", False):
                 loss.backward()
 
         # ``model_output`` only survives on the lanes that need it: the transformer engine drops it

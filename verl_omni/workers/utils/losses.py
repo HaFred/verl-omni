@@ -68,7 +68,7 @@ def _apply_bypass_rc(
         metrics[k] = Metric(value=float(v), aggregation=AggregationType.MEAN)
 
 
-def diffusion_loss(config: DiffusionActorConfig, model_output, data: TensorDict, dp_group=None):
+def diffusion_loss(config: DiffusionActorConfig, model_output, data: TensorDict, dp_group=None, use_kl_loss=None):
     """Compute loss for diffusion model"""
     config.global_batch_info["loss_scale_factor"] = config.loss_scale_factor
 
@@ -103,7 +103,7 @@ def diffusion_loss(config: DiffusionActorConfig, model_output, data: TensorDict,
     if loss_result.add_loss_metric:
         metrics["actor/loss"] = Metric(value=loss_value, aggregation=AggregationType.MEAN)
 
-    if config.use_kl_loss:
+    if config.use_kl_loss if use_kl_loss is None else use_kl_loss:
         loss_func = get_diffusion_loss_fn("kl")
         loss_func.validate_inputs(loss_name="kl", model_output=model_output, data=data)
         kl_result = loss_func(config=config, model_output=model_output, data=data)
@@ -134,7 +134,8 @@ def diffusion_loss(config: DiffusionActorConfig, model_output, data: TensorDict,
         metrics["distill_coef"] = distill_coef
 
     gradient_accumulation_steps = tu.get_non_tensor_data(data, "gradient_accumulation_steps", default=None)
-    loss_value = loss_value / gradient_accumulation_steps
+    if not tu.get_non_tensor_data(data, "corl_loss_normalized", default=False):
+        loss_value = loss_value / gradient_accumulation_steps
 
     sp_size = tu.get_non_tensor_data(data, "sp_size", default=None)
     if sp_size > 1:
@@ -244,6 +245,66 @@ def _bagel_lane_weight(config, key: str, *, default: float | str = 1.0, cast=flo
     return cast(raw)
 
 
+def _singleton_loss_tensor(value, index):
+    """Keep a batch dimension without unsupported jagged batch slicing or detaching gradients."""
+    if value.is_nested:
+        return torch.nested.as_nested_tensor([value.unbind(0)[index]], layout=value.layout)
+    return value[index : index + 1]
+
+
+def bagel_und_episode_loss(config, model_output, data, dp_group=None):
+    """Average each episode's token objective before global episode normalization."""
+    from verl.utils.py_functional import append_to_dict
+    from verl.workers.utils.losses import ppo_loss
+
+    normalizer = float(tu.get_non_tensor_data(data, "und_episode_normalizer", default=1.0))
+    if normalizer <= 0:
+        raise ValueError("UND episode normalizer must be positive")
+    terms, metrics = [], {}
+    for i in range(len(data)):
+        # The ingress UND view can reference its parent as non-tensor metadata.
+        # Do not recursively deepcopy that cycle; fields below are replaced, not mutated.
+        tensor_keys = [key for key, value in data.items() if isinstance(value, torch.Tensor)]
+        row = data.exclude(*tensor_keys)[i : i + 1].clone(recurse=False)
+        for key in tensor_keys:
+            row[key] = _singleton_loss_tensor(data[key], i)
+        output = {
+            key: _singleton_loss_tensor(value, i)
+            for key, value in model_output.items()
+            if isinstance(value, torch.Tensor)
+        }
+        valid = bool(row["response_mask"].any())
+        if not valid:
+            # Publish the same finite metric keys on all ranks without a 0/0 token mean.
+            row["response_mask"] = torch.ones_like(row["response_mask"])
+            for key in ("old_log_probs", "advantages", "ref_log_prob", "rollout_is_weights"):
+                if key in row.keys():
+                    row[key] = torch.zeros_like(row[key])
+            metric_output = {key: torch.zeros_like(value) for key, value in output.items()}
+        else:
+            metric_output = output
+        term, row_metrics = ppo_loss(config, metric_output, row, dp_group=dp_group)
+        if not valid:
+            raw = output["log_probs"]
+            raw = raw.values() if raw.is_nested else raw
+            term = torch.nan_to_num(raw).sum() * 0.0
+        terms.append(term)
+        append_to_dict(metrics, row_metrics)
+        dp_size = float(tu.get_non_tensor_data(data, "corl_dp_size", default=1))
+        for key, value in row_metrics.items():
+            leaf = {
+                "actor/pg_loss": "pg_loss",
+                "actor/ppo_kl": "update_kl",
+                "kl_loss": "ref_kl",
+                "actor/entropy_loss": "entropy",
+            }.get(key)
+            if leaf:
+                raw_value = float(value.aggregate()) if isinstance(value, Metric) else float(value)
+                metric = Metric(value=raw_value * int(valid) / (normalizer * dp_size), aggregation=AggregationType.SUM)
+                append_to_dict(metrics, {f"actor/und/{leaf}": metric})
+    return torch.stack(terms).sum() / normalizer, metrics
+
+
 def bagel_composite_loss(config, model_output, data, dp_group=None):
     """Composite Co-RL (Joint-Training) loss: UND token PPO + GEN FlowGRPO on *separate* advantage views.
 
@@ -293,13 +354,29 @@ def bagel_composite_loss(config, model_output, data, dp_group=None):
         und_data = data
 
     if und_output is not None and und_data is not None and "log_probs" in und_output:
-        und_loss, und_metrics = ppo_loss(config, und_output, und_data, dp_group=dp_group)
-        if gradient_accumulation_steps:
-            und_loss = und_loss / gradient_accumulation_steps
+        if tu.get_non_tensor_data(und_data, "und_episode_normalizer", default=None) is not None:
+            und_loss, und_metrics = bagel_und_episode_loss(config, und_output, und_data, dp_group=dp_group)
+        else:
+            und_loss, und_metrics = ppo_loss(config, und_output, und_data, dp_group=dp_group)
+            if gradient_accumulation_steps:
+                und_loss = und_loss / gradient_accumulation_steps
         loss_value = und_loss * _bagel_lane_weight(config, "loss_weight_und")
         metrics.update(und_metrics)
+        for key, value in und_metrics.items():
+            leaf = {
+                "actor/pg_loss": "pg_loss",
+                "actor/ppo_kl": "update_kl",
+                "kl_loss": "ref_kl",
+                "actor/entropy_loss": "entropy",
+            }.get(key)
+            if leaf:
+                metrics.setdefault(f"actor/und/{leaf}", value)
 
     gen_data = _bagel_corl_view(data, "bagel_corl_gen")
+    if tu.get_non_tensor_data(data, "bagel_corl_lane", default=None) == "gen":
+        gen_data = data
+    elif gen_data is not None and model_output.get("gen") is None and und_output is None:
+        raise ValueError("GEN timestep loss requires row-aligned tagged data, not the full bagel_corl_gen view")
     _align_view_to_device(gen_data, lane_device)
     _inherit_micro_batch_scalars(data, gen_data)
     if skip_gen or not has_complete or int(num_gen_rows) <= 0 or gen_data is None:
@@ -332,8 +409,41 @@ def bagel_composite_loss(config, model_output, data, dp_group=None):
             "gen_regularizer='velocity_mse' (UniGRPO Eq. 8) lands in Phase 2; use 'latent_kl' for now"
         )
 
-    gen_loss, gen_metrics = diffusion_loss(config, gen_output, gen_data, dp_group=dp_group)
+    if "ref_log_prob" in gen_data.keys() or "ref_prev_sample_mean" in gen_data.keys():
+        raise NotImplementedError(
+            "Co-RL GEN reference regularization requires valid-transition normalization and is unsupported; "
+            "omit GEN reference tensors. UND reference KL remains supported."
+        )
+
+    gen_loss, gen_metrics = diffusion_loss(
+        config,
+        gen_output,
+        gen_data,
+        dp_group=dp_group,
+        use_kl_loss=False,
+    )
     metrics.update(gen_metrics)
+    normalized = bool(tu.get_non_tensor_data(data, "corl_loss_normalized", default=False))
+    dp_size = float(tu.get_non_tensor_data(data, "corl_dp_size", default=1))
+    metric_weight = 1.0
+    if normalized:
+        normalizer = float(tu.get_non_tensor_data(data, "loss_normalizer", default=None))
+        metric_weight = float(data["loss_unit_weight"].sum().item()) / (normalizer * dp_size)
+    for key, value in gen_metrics.items():
+        leaf = {
+            "actor/loss": "pg_loss",
+            "actor/pg_clipfrac": "clipfrac",
+            "actor/ratio_std": "ratio_std",
+            "actor/ratio_mean": "ratio_mean",
+            "actor/ratio_square_mean": "ratio_square_mean",
+            "actor/ppo_kl": "update_kl",
+        }.get(key)
+        if leaf:
+            raw_value = float(value.aggregate()) if isinstance(value, Metric) else float(value)
+            metrics[f"actor/gen/{leaf}"] = (
+                Metric(value=raw_value * metric_weight, aggregation=AggregationType.SUM) if normalized else value
+            )
+    metrics["actor/gen/pg_loss"] = Metric(value=gen_loss.detach().item() / dp_size, aggregation=AggregationType.SUM)
     metrics["gen/skipped_no_groups"] = Metric(value=0.0, aggregation=AggregationType.MEAN)
     if loss_value is None:
         loss_value = gen_loss * _bagel_lane_weight(config, "loss_weight_gen")

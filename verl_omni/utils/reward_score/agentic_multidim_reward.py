@@ -63,6 +63,7 @@ transcript.
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -952,6 +953,39 @@ def _active_weights(
     return weights
 
 
+def _trusted_v2_reward(metadata):
+    """Validate structured harness metadata; policy-written numbers are never parsed."""
+    row = metadata.get("bagel_corl_reward")
+    if not isinstance(row, dict) or row.get("origin") != "bagel_corl_tool_rm" or row.get("version") != "v2":
+        raise ValueError("V2 requires trusted bagel_corl_reward envelope")
+    calls = row.get("call_seed_scores")
+    count = row.get("num_gen_calls")
+    if not isinstance(calls, list) or not isinstance(count, int) or count < 0 or len(calls) != count:
+        raise ValueError("invalid trusted V2 call count")
+    means = []
+    for scores in calls:
+        if not scores or not all(isinstance(v, int | float) and math.isfinite(v) for v in scores):
+            raise ValueError("invalid trusted V2 seed scores")
+        means.append(sum(scores) / len(scores))
+    for key in ("autonomous_done", "forced_reflection"):
+        if not isinstance(row.get(key), bool):
+            raise ValueError("missing trusted V2 closure flags")
+    if row["autonomous_done"] and row["forced_reflection"]:
+        raise ValueError("forced closure cannot be autonomous")
+    if means:
+        expected = {
+            "image_reward_first": means[0],
+            "image_reward_final": means[-1],
+            "image_reward_best": max(means),
+            "image_reward_gain": means[-1] - means[0],
+            "image_reward_objective": means[-1] - 0.01 * max(0, count - 1),
+        }
+        for key, value in expected.items():
+            if not isinstance(row.get(key), int | float) or not math.isclose(row[key], value, abs_tol=1e-9):
+                raise ValueError("inconsistent trusted V2 " + key)
+    return row
+
+
 def compute_score(
     data_source: str = "",
     solution_str: str = "",
@@ -976,6 +1010,10 @@ def compute_score(
     del data_source
     gt = _as_dict(ground_truth)
     metadata = dict(extra_info or {})
+    version = str(metadata.get("corl_reward_version", "v1"))
+    if version not in ("v1", "v2"):
+        raise ValueError("corl_reward_version must be v1 or v2")
+    trusted = _trusted_v2_reward(metadata) if version == "v2" else None
     task_type = _require_task_type(gt, metadata)
     if task_type is None:
         return _zero_result(method="agentic_multidim_missing_task_type")
@@ -1038,6 +1076,8 @@ def compute_score(
         reward_tool=tool_reward,
     )
     if not prompts or successful_generates == 0:
+        if trusted is not None:
+            result.update(trusted)
         return result
 
     valid_terminal_context = judge_ok > 0 and not blocked and rewrites_after_yes == 0
@@ -1077,6 +1117,12 @@ def compute_score(
         ),
         "done": float(closed),
     }
+    if trusted is not None:
+        # Keep protocol/planning dimensions and weights explicit and unchanged.
+        rewards["image"] = float(trusted["image_reward_objective"])
+        rewards["done"] = float(trusted["autonomous_done"])
+        result.update(trusted)
+        result["method"] = "agentic_multidim_corl_v2"
     weight_sum = sum(weights.values())
     score = sum(weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
     result.update(

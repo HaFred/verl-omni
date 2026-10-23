@@ -256,6 +256,30 @@ def test_ar_strategy_preserves_hyphenated_timeout_kwargs(monkeypatch, timeout_kw
     assert engine_kwargs == expected
 
 
+def test_ar_strategy_takes_weight_sync_stages_from_engine_kwargs_without_an_adapter(monkeypatch):
+    monkeypatch.setattr(ar_strategy_module.OmniRolloutPipelineBase, "get_class", lambda pipeline_name: None)
+    strategy = ARStrategy(SimpleNamespace())
+    engine_kwargs = {"output_mode": "ar", "weight_sync_stage_ids": ["0"]}
+
+    strategy.preprocess_engine_kwargs(engine_kwargs)
+
+    assert strategy._weight_sync_stage_ids == [0]
+    assert "weight_sync_stage_ids" not in engine_kwargs, "not a vLLM engine arg"
+    for method in ("update_weights_from_ipc", "policy_param_checksum"):
+        assert strategy.collective_rpc_stage_ids(method) == [0]
+    assert strategy.collective_rpc_stage_ids("sleep") is None
+
+
+def test_ar_strategy_rejects_weight_sync_stages_that_an_adapter_already_declares(monkeypatch):
+    class Adapter:
+        pass
+
+    monkeypatch.setattr(ar_strategy_module.OmniRolloutPipelineBase, "get_class", lambda pipeline_name: Adapter)
+    strategy = ARStrategy(SimpleNamespace(_rollout_flags={}))
+    with pytest.raises(ValueError, match="declared by Adapter"):
+        strategy.preprocess_engine_kwargs({"pipeline_name": "adapter", "weight_sync_stage_ids": [0]})
+
+
 def test_ar_strategy_honors_adapter_chunking_and_weight_sync_contracts(monkeypatch):
     class Adapter:
         supports_async_chunk = False
@@ -579,7 +603,7 @@ async def test_ar_strategy_retains_requested_stage_outputs_and_targets_weight_sy
     assert strategy._rollout_fields_by_request_id == {"request-0": {"audio_sample_rate": 24_000}}
     assert server.engine.generate_kwargs["output_modalities"] == ["latent", "audio"]
     assert server.engine.rpc_kwargs["stage_ids"] == [0]
-    assert rpc_result is None
+    assert rpc_result == "rpc-result"
 
     output = strategy.process_output(result, ar_strategy_module.SamplingParams(), {})
     assert output.extra_fields == {"global_steps": 3, "audio_sample_rate": 24_000}

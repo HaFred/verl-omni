@@ -32,6 +32,8 @@ class BagelCorlAgentLoopConfig(AgentLoopConfig):
 
     # S = FlowGRPO seeds per generate_image turn (not episode GEN-turn count K).
     gen_samples_per_call: Optional[int] = None
+    # Empty preserves policy conditioning; sentinel uses the original task request.
+    corl_fixed_gen_prompt: str = ""
     # PR1 fail-closed: must be 1 (bounds in-episode K = number of GEN turns).
     max_generate_passes: Optional[int] = None
     # UND turn budget before force-stop (bounds in-episode J).

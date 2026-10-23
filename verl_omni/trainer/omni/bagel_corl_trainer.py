@@ -21,11 +21,13 @@ import os
 from dataclasses import fields
 from typing import Any
 
+import torch
 from omegaconf import OmegaConf, open_dict
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.utils import Role
 from verl.trainer.ppo.v1.trainer_base import register_trainer
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.debug import marked_timer
 
 from verl_omni.agent_loop.bagel_corl_lib import (
     aggregate_episode_metrics,
@@ -80,6 +82,9 @@ _DIFFUSION_MODEL_KEYS = {
     "lora_alpha",
     "lora_init_weights",
     "lr_gen",
+    "corl_freeze_und",
+    "corl_freeze_gen",
+    "corl_no_optimizer_step",
     "target_modules",
     "target_parameters",
     "exclude_modules",
@@ -330,11 +335,20 @@ def _bagel_corl_step_metric_keys(extra: dict) -> list[str]:
     return keys
 
 
+def _flatten_rpc_results(value: Any) -> list[Any]:
+    """Flatten ``AsyncOmni.collective_rpc``'s per-stage, per-worker nesting into one list."""
+    if isinstance(value, list | tuple):
+        return [leaf for item in value for leaf in _flatten_rpc_results(item)]
+    return [value]
+
+
 @register_trainer("bagel_corl_sync")
 class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     """Synchronous Bagel Co-RL (Joint-Training): serial J-episode gather, then one UND+GEN optimizer step.
 
-    Weight sync runs once in ``on_step_end`` (inherited) to every replica. No mid-episode sync.
+    Weight sync runs once per step in ``on_step_end``: ``_publish_und_ar_weights`` pushes the
+    merged policy to the UND AR (Thinker) replica, then the inherited naive publish reaches the
+    GEN hybrids. No mid-episode sync.
     Replay uses the sync ``ReplayBuffer`` even though ``trainer_mode`` is not the string ``sync``.
 
     ``main_omni`` defaults to omni ``OmniModelConfig`` / ``RolloutConfig``. Bagel Co-RL (Joint-Training) needs
@@ -687,6 +701,21 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
 
     def _compute_old_log_prob(self, batch, metrics: dict):
         """UND: PPO V1 token old-logprob. GEN: diffusion V1 ``infer_actor_batch`` (required when K>0)."""
+        from verl_omni.trainer.omni.bagel_corl_parity import FrozenPolicyCapture
+
+        capture = FrozenPolicyCapture.from_environment(self)
+        rollout_rows = None
+        if capture is not None:
+            rollout_rows, _ = capture.fetch_und(batch, _normalize_tq_kv_get_result)
+            for row in rollout_rows:
+                capture.provenance(row)
+
+        def compute_und():
+            base_recompute = super(OmniBagelCoRLTrainerSync, self)._compute_old_log_prob
+            if capture is None:
+                return base_recompute(batch, metrics)
+            return capture.recompute_und(batch, metrics, base_recompute, _normalize_tq_kv_get_result, rollout_rows)
+
         extra = self._extra_info(batch)
         gen_rows = self._gen_batch_from_step(batch)
         logger.info(
@@ -697,7 +726,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         )
         proto = build_gen_flowgrpo_proto(gen_rows)
         if proto is None:
-            return super()._compute_old_log_prob(batch, metrics)
+            return compute_und()
         if "all_latents" not in proto.batch.keys():
             raise RuntimeError(
                 "bagel_corl GEN old_log_prob requires all_latents; refuse rollout_log_probs-only recompute skip."
@@ -705,7 +734,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         if getattr(self, "actor_rollout_wg", None) is None:
             # CPU unit tests: no worker group. Packed traj logprobs stay on proto for GEN advantage.
             metrics["gen/old_log_prob_recomputed"] = 0.0
-            return super()._compute_old_log_prob(batch, metrics)
+            return compute_und()
         # The GEN proto's row count is data-dependent: one row per *trainable* GEN call, and K
         # varies per episode, so ``len(proto)`` is not necessarily a multiple of the actor DP
         # size. ``actor_rollout_wg.infer_actor_batch`` dispatches through
@@ -726,12 +755,25 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 len(proto),
                 divisor,
             )
+        if capture is not None:
+            import copy
+
+            replay_proto = copy.deepcopy(proto)
+            proto = copy.deepcopy(replay_proto)
         old = self._diffusion_v1_gen_lane()._compute_old_log_prob(proto)
+        if capture is not None:
+            # Both actor calls receive the exact same frozen input, before any update.
+            proto = copy.deepcopy(replay_proto)
+            repeat = self._diffusion_v1_gen_lane()._compute_old_log_prob(proto)
+            capture_proto = unpad_dataproto(replay_proto, pad_size) if pad_size else replay_proto
+            capture_old = unpad_dataproto(old, pad_size) if pad_size else old
+            capture_repeat = unpad_dataproto(repeat, pad_size) if pad_size else repeat
+            capture.write_gen(capture_proto, capture_old, capture_repeat, gen_rows, rollout_rows)
         if pad_size:
             old = unpad_dataproto(old, pad_size)
         extra["bagel_corl_gen_old"] = old.batch
         metrics["gen/old_log_prob_recomputed"] = 1.0
-        return super()._compute_old_log_prob(batch, metrics)
+        return compute_und()
 
     def _gen_dispatch_divisor(self) -> int:
         """Row-count divisor the GEN lane's worker-group dispatch requires.
@@ -1044,6 +1086,19 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                     global_std=bool(algo.get("global_std", True)),
                     algo_config=algo,
                 )
+        if gen_proto is not None:
+            adv = gen_proto.batch["advantages"]
+            valid = gen_proto.batch["gen_transition_valid"].bool()
+            metrics["gen/adv_std"] = float(adv[valid].float().std(unbiased=False).item())
+            metrics["gen/effective_transitions"] = float(valid.sum().item())
+            metrics["gen/valid_rows"] = float(gen_proto.batch["gen_valid"].sum().item())
+            scores = gen_proto.batch["sample_level_scores"].reshape(-1)
+            uids = gen_proto.non_tensor_batch["uid"]
+            group_stds = [
+                float(scores[torch.tensor(uids == uid, device=scores.device)].std(unbiased=False))
+                for uid in set(uids.tolist())
+            ]
+            metrics["gen/zero_std_group_fraction"] = sum(v == 0.0 for v in group_stds) / len(group_stds)
         metrics.update(gen_metrics)
         # Now that the gather has run, the dual-lane bookkeeping is on ``extra`` (see the note at the
         # top of this method); publish it so a skipped GEN lane is attributable from the step log.
@@ -1093,6 +1148,30 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         from verl.utils import tensordict_utils as tu
 
         extra = self._extra_info(batch)
+        # Ownership lives in tensor columns so DP and optimizer minibatching slice it.
+        import transfer_queue as tq
+        from tensordict import TensorDict
+
+        from verl_omni.trainer.omni.bagel_corl_batch import validate_episode_ownership
+
+        gen_view = extra.get("bagel_corl_gen")
+        parents = gen_view["parent_episode_id"] if gen_view is not None else torch.empty(0, dtype=torch.long)
+        if isinstance(batch, TensorDict):
+            ids = batch["bagel_episode_id"]
+            batch["bagel_episode_id"] = validate_episode_ownership(ids, parents).to(ids.device)
+        elif hasattr(batch, "partition_id"):
+            ids = tq.kv_batch_get(keys=batch.keys, partition_id=batch.partition_id, select_fields=["bagel_episode_id"])[
+                "bagel_episode_id"
+            ]
+            tags = list(getattr(batch, "tags", None) or [])
+            padding = [bool(tag.get("is_padding", False)) for tag in tags] if len(tags) == len(batch.keys) else None
+            checked = validate_episode_ownership(ids, parents, padding)
+            tq.kv_batch_put(
+                keys=batch.keys,
+                partition_id=batch.partition_id,
+                fields=TensorDict({"bagel_episode_id": checked}, batch_size=[len(checked)]),
+            )
+
         has_complete = bool(extra.get("has_complete_gen_groups"))
         extra["skip_gen"] = not has_complete
         extra["has_complete_gen_groups"] = has_complete
@@ -1128,6 +1207,17 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         updated = super()._update_actor(batch, metrics)
         # ``metrics`` now carries ``actor/*`` (renamed by ``trainer_base._update_actor``)
         # alongside this step's ``rollout_corr/*``. See ``_divergence_tripwire``.
+        for key, value in list(metrics.items()):
+            if key.startswith(("actor/und/", "actor/gen/")):
+                metrics[key.removeprefix("actor/")] = value
+        if "rollout_corr/kl" in metrics:
+            metrics["und/rollout_actor_logp_gap"] = metrics["rollout_corr/kl"]
+        if "actor/entropy" in metrics:
+            metrics["und/entropy"] = metrics["actor/entropy"]
+        if "gen/ratio_square_mean" in metrics and "gen/ratio_mean" in metrics:
+            metrics["gen/ratio_std"] = math.sqrt(
+                max(0.0, metrics["gen/ratio_square_mean"] - metrics["gen/ratio_mean"] ** 2)
+            )
         self._divergence_tripwire(metrics)
         return updated
 
@@ -1195,12 +1285,12 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         step = getattr(self, "global_steps", None)
         entropy = _metric_scalar(metrics, "actor/entropy")
         message = (
-            f"bagel_corl_sync step={step}: actor has left its trust region "
+            f"bagel_corl_sync step={step}: actor/rollout mismatch or gradient health threshold exceeded "
             f"({'; '.join(triggers)}"
             + (f"; actor/entropy={entropy:.4g}" if entropy is not None else "")
-            + "). This recipe has no KL anchor and no entropy bonus, so the policy cannot "
-            "recover by itself -- check NORM_ADV_BY_STD / loss_weight_* / optim.lr, and treat "
-            "any checkpoint past this step as unusable."
+            + "). Check serving synchronization, probability conventions, and update scale; "
+            "check NORM_ADV_BY_STD / loss_weight_* / optim.lr, and inspect "
+            "checkpoint health before resuming."
         )
         if os.environ.get("BAGEL_CORL_DIVERGENCE_ABORT", "0") == "1":
             raise RuntimeError(message)
@@ -1251,8 +1341,16 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         convention), so the pool width has to cover the widest one or the stage's
         engine core dies during init with an unrelated-looking error.
         """
+        return {
+            stage_id: max(indices)
+            for stage_id, indices in OmniBagelCoRLTrainerSync._und_stage_devices(deploy_config).items()
+        }
+
+    @staticmethod
+    def _und_stage_devices(deploy_config: str) -> dict[int, list[int]]:
+        """Logical device indices each stage of the UND AR deploy config declares, in order."""
         stages = OmegaConf.load(deploy_config).get("stages") or []
-        widest: dict[int, int] = {}
+        devices: dict[int, list[int]] = {}
         for stage in stages:
             if "stage_id" not in stage:
                 continue
@@ -1262,8 +1360,8 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 continue
             indices = [int(token) for token in str(raw).replace(",", " ").split() if token.strip()]
             if indices:
-                widest[int(stage["stage_id"])] = max(indices)
-        return widest
+                devices[int(stage["stage_id"])] = indices
+        return devices
 
     @staticmethod
     def _und_stage_max_model_len(deploy_config: str) -> int | None:
@@ -1303,12 +1401,12 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     # weights for the whole run.
     #
     # The AR replica is a *separate* Ray actor over a slice of the actor pool
-    # (``init_colocated`` -> ``RolloutMode.COLOCATED``), so nothing in the training
-    # loop ever hands it weights: the V1 trainer forces
-    # ``checkpoint_engine.backend="naive"`` and ``CheckpointEngineManager.update_weights``
-    # early-returns for that backend after publishing through the *actor* to its own
-    # in-process GEN server (``verl/checkpoint_engine/base.py``). The only weights this
-    # engine ever has are the ones it loads at launch.
+    # (``init_colocated`` -> ``RolloutMode.COLOCATED``), so the inherited publish never
+    # hands it weights: the V1 trainer forces ``checkpoint_engine.backend="naive"`` and
+    # ``CheckpointEngineManager.update_weights`` early-returns for that backend after
+    # publishing through the *actor* to its own in-process GEN server
+    # (``verl/checkpoint_engine/base.py``). ``_publish_und_ar_weights`` pushes the policy
+    # to the Thinker stage only; the DiT stage keeps the checkpoint it loads at launch.
     #
     # Which is why the value has to be pinned *here*. ``verl`` 0.9.0.dev (the sibling
     # checkout the 2026-10-13/14 runs resolved through ``PYTHONPATH``) promoted exactly
@@ -1342,6 +1440,14 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     # proven configuration. The GEN hybrid must keep ``dummy``: its weights are pushed by
     # the actor, and loading the checkpoint there would only waste a copy.
     UND_AR_LOAD_FORMAT = "auto"
+
+    #: Stage of the ``bagel_think`` deploy that holds the policy LLM (the Thinker). Only this
+    #: stage receives per-step weights; stage 1 is the DiT, which UND never trains.
+    UND_AR_POLICY_STAGE_ID = 0
+
+    #: Check both a merged LoRA target and the untied output head after publication.
+    UND_AR_SYNC_CHECK_PARAM = "language_model.model.layers.0.self_attn.o_proj.weight"
+    UND_AR_SYNC_CHECK_PARAMS = (UND_AR_SYNC_CHECK_PARAM, "language_model.lm_head.weight")
 
     def _resolve_und_hf_config_path(self, model, agent) -> str | None:
         """HF config path for the UND AR replica (RFC §4.7).
@@ -1567,6 +1673,9 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                                 str(stage_id): {"tensor_parallel_size": 1}
                                 for stage_id in self._und_ar_stage_ids(und_deploy)
                             },
+                            # The policy push carries Thinker names only; the DiT stage
+                            # would reject them.
+                            "weight_sync_stage_ids": [self.UND_AR_POLICY_STAGE_ID],
                         }
                     },
                     "agent": OmegaConf.to_container(agent, resolve=True) or {},
@@ -1751,17 +1860,15 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
 
         und_replicas = [und_replica]
         self.und_rollout_replicas = und_replicas
-        # RFC §4.11: ONE publication path. The UND AR replica joins the shared
-        # ``checkpoint_manager`` so ``on_step_end`` publishes to it alongside the GEN
-        # hybrids — a second ``CheckpointEngineManager`` here was dead code (never
-        # invoked) and would have been a no-op anyway: the V1 trainer forces
-        # ``checkpoint_engine.backend="naive"`` (verl/trainer/ppo/v1/trainer_base.py),
-        # and ``CheckpointEngineManager.update_weights`` early-returns for that
-        # backend without touching ``self.replicas``.
+        # Registration makes ``checkpoint_manager.sleep_replicas()`` sleep the UND AR replica
+        # with the GEN hybrids. It does NOT publish weights to it: the V1 trainer forces
+        # ``checkpoint_engine.backend="naive"`` (verl/trainer/ppo/v1/trainer_base.py), and
+        # ``CheckpointEngineManager.update_weights`` early-returns for that backend without
+        # touching ``self.replicas``. ``_publish_und_ar_weights`` does the UND publish.
         self.checkpoint_manager.add_replicas(und_replicas)
         logger.info(
-            "bagel_corl_sync UND AR replica registered for weight publication "
-            "replica=%s und_n_gpus=%s (shared checkpoint_manager, RFC §4.11)",
+            "bagel_corl_sync UND AR replica registered for sleep/wake "
+            "replica=%s und_n_gpus=%s (weights published by _publish_und_ar_weights)",
             getattr(und_replica, "replica_rank", None),
             und_n_gpus,
         )
@@ -1889,6 +1996,106 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             label,
         )
 
+    def _publish_und_ar_weights(self) -> None:
+        """Push the merged actor policy into the UND AR Thinker and verify it landed.
+
+        The inherited naive publish only reaches the actor's own GEN servers, so without this
+        the Thinker would decode from the launch checkpoint for the whole run while the UND
+        lane trains on its samples.
+
+        Must run while the GEN replicas are asleep. Each UND server is woken with both tags
+        first: vLLM only offloads on ``sleep`` from a fully awake engine, so a weights-only
+        wake would leave the Thinker resident through the GEN publish. After the push, two
+        Thinker parameters are fingerprinted on the engine and compared with what the actor
+        sent, and the server goes back to sleep; ``_wake_rollout_replicas`` restores it
+        (level-1 sleep keeps the pushed weights in host memory).
+        """
+        import time
+
+        import ray
+
+        from verl_omni.workers.rollout.vllm_rollout.weight_fingerprint import fingerprints_match
+
+        replicas = getattr(self, "und_rollout_replicas", None) or []
+        if not replicas:
+            return
+        receiver_ranks = self._und_stage_devices(self._und_deploy_config_path()).get(self.UND_AR_POLICY_STAGE_ID)
+        if not receiver_ranks:
+            raise RuntimeError(
+                f"bagel_corl_sync: UND AR deploy config declares no devices for stage "
+                f"{self.UND_AR_POLICY_STAGE_ID}; cannot route the policy push"
+            )
+        check_names = self.UND_AR_SYNC_CHECK_PARAMS
+        check_name = check_names[0]
+        started = time.perf_counter()
+        num_tensors = 0
+        fingerprint = None
+        for replica in replicas:
+            if len(replica.servers) != 1:
+                raise RuntimeError(
+                    f"bagel_corl_sync: UND AR replica {replica.replica_rank} has {len(replica.servers)} "
+                    "servers; the policy push assumes a single-node replica"
+                )
+            server = replica.servers[0]
+            ray.get(server.wake_up.remote(tags=["weights", "kv_cache"]))
+            try:
+                results = ray.get(
+                    self.actor_rollout_wg.update_bagel_und_ar_weights(
+                        server_handle=server,
+                        und_replica_rank=replica.replica_rank,
+                        receiver_ranks=receiver_ranks,
+                        checksum_name=check_name,
+                        checksum_names=list(check_names),
+                        global_steps=self.global_steps,
+                    )
+                )
+                stats = next((r for r in _flatten_rpc_results(results) if r is not None), None)
+                checksums = {} if stats is None else stats.get("checksums", {})
+                for name in check_names:
+                    if checksums.get(name) is None:
+                        raise RuntimeError(
+                            f"bagel_corl_sync: actor export carried no {name!r}; UND AR name routing "
+                            "no longer matches the Thinker"
+                        )
+                    engine_values = [
+                        v
+                        for v in _flatten_rpc_results(
+                            ray.get(server.collective_rpc.remote("policy_param_checksum", kwargs={"name": name}))
+                        )
+                        if v is not None
+                    ]
+                    if not engine_values or not all(fingerprints_match(checksums[name], v) for v in engine_values):
+                        raise RuntimeError(
+                            f"bagel_corl_sync step={self.global_steps}: UND AR replica {replica.replica_rank} "
+                            f"did not take the pushed weights; {name} fingerprint sent={checksums[name]!r} "
+                            f"engine={engine_values!r}"
+                        )
+            finally:
+                ray.get(server.sleep.remote())
+            num_tensors += int(stats["num_tensors"])
+            fingerprint = stats["checksum"]
+
+        previous = getattr(self, "_und_ar_last_fingerprint", None)
+        self._und_ar_last_fingerprint = fingerprint
+        sync_metrics = {
+            "bagel_corl/und_sync/num_tensors": float(num_tensors),
+            "bagel_corl/und_sync/seconds": time.perf_counter() - started,
+            "bagel_corl/und_sync/fingerprint_delta": 0.0 if previous is None else abs(fingerprint - previous),
+        }
+        pending = getattr(self, "_pending_sync_metrics", None) or {}
+        pending.update(sync_metrics)
+        self._pending_sync_metrics = pending
+        logger.info(
+            "bagel_corl_sync step=%s published policy to %d UND AR replica(s): %d tensors, %.1fs, "
+            "%s fingerprint verified (delta since last publish %s)",
+            self.global_steps,
+            len(replicas),
+            num_tensors,
+            sync_metrics["bagel_corl/und_sync/seconds"],
+            check_name,
+            sync_metrics["bagel_corl/und_sync/fingerprint_delta"],
+        )
+
     def _bagel_rm_enabled(self) -> bool:
         reward_cfg = getattr(self.config, "reward", None)
         if reward_cfg is None:
@@ -1948,7 +2155,7 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
     # Row-scoped dataset fields ``VisualRewardManager`` dispatches on: ``data_source`` picks
     # the scorer (``unicot_reflection`` / ``unicot_breakdown``), ``reward_model`` carries its
     # ``ground_truth``.
-    REWARD_ROW_FIELDS = ("data_source", "reward_model")
+    REWARD_ROW_FIELDS = ("data_source", "reward_model", "extra_info")
 
     def _compute_reward_colocate(self, batch, metrics: dict | None = None):
         """Score a batch with the colocated RM, handing it the row fields the scorer needs.
@@ -2025,6 +2232,9 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         self._ensure_dual_role_rollout()
         if self._bagel_rm_enabled():
             self._ensure_reward_loop_manager()
+        # A resumed checkpoint is already loaded into the actor (``_setup``), so this is the
+        # resumed policy, not the launch checkpoint the Thinker loaded.
+        self._publish_und_ar_weights()
         super().on_init_end()
         # ``_setup`` slept the GEN replica(s) to load the checkpoint and the parent hook
         # woke them through the actor; the AR replica is created after that sleep, so this
@@ -2033,25 +2243,11 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
         self._wake_rollout_replicas()
 
     def on_step_end(self):
-        # Parent updates weights for every replica registered on checkpoint_manager
-        # (GEN hybrid + UND standalone via add_replicas, RFC §4.11). The UND AR
-        # replica must NOT stay on step-0 weights, so record which replicas were
-        # published rather than trusting the registration implicitly.
+        # ``on_sample_end`` slept every replica, so the UND push runs first, before the
+        # parent's naive publish wakes the GEN servers onto the same GPUs.
+        with marked_timer("update_und_weights", self.timing_raw, color="red"):
+            self._publish_und_ar_weights()
         super().on_step_end()
-        if getattr(self, "und_rollout_replicas", None):
-            registered = getattr(getattr(self, "checkpoint_manager", None), "replicas", None) or []
-            missing = [r for r in self.und_rollout_replicas if r not in registered]
-            if missing:
-                raise RuntimeError(
-                    f"bagel_corl_sync: {len(missing)} UND AR replica(s) are not registered on "
-                    "checkpoint_manager; they would keep step-0 weights (RFC §4.11)"
-                )
-            logger.info(
-                "bagel_corl_sync step=%s: %s rollout replica(s) registered incl. UND AR "
-                "(naive backend publishes through the actor to its own GEN server only)",
-                getattr(self, "global_steps", None),
-                len(registered),
-            )
         # The parent hook's naive publish only resumed the actor's own GEN server, and it
         # requests no tags, so neither pool is fully awake here: the AR engine is still
         # asleep and every rollout since would fail on its first UND decode, while the GEN

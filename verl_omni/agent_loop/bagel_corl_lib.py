@@ -980,8 +980,10 @@ class GenSample:
     timesteps: Any | None = None
     rollout_log_probs: Any | None = None
     rm_score: float | None = None
+    rm_score_source: str | None = None
     image_path: str | None = None
     call_role: str = "initial"
+    gen_call_index: int | None = None
     good_enough: bool | None = None
     # Per-axis RM breakdown when the backend reports one (UnifiedReward 2.0:
     # ``alignment`` / ``coherence`` / ``style`` on 1-5). Feeds the judge observation only;
@@ -1020,7 +1022,11 @@ class EpisodeRollout:
     gen_samples: list[GenSample] = field(default_factory=list)
     used_image_credit: bool = False
     forced_reflection: bool = False
+    autonomous_done: bool = False
+    corl_reward_version: str = "v1"
+    bagel_corl_reward: dict[str, Any] = field(default_factory=dict)
     und_reward: float = 0.0
+    terminal_reward: float | None = None
     judge_text: str | None = None
     stop_required: bool = False
     num_gen_calls: int = 0
@@ -1315,6 +1321,8 @@ async def run_serial_episode(
     non_image_reward: float | None = None,
     good_enough_threshold: float | None = None,
     good_enough_reduction: str = "any",
+    corl_reward_version: str = "v1",
+    fixed_gen_prompt: str = "",
 ) -> EpisodeRollout:
     """Serial UND turn(s) → optional one GEN turn (S FlowGRPO seeds) → RM → reflection / Done.
 
@@ -1358,6 +1366,9 @@ async def run_serial_episode(
     gen_samples: list[GenSample] = []
     used_image_credit = False
     forced = False
+    autonomous_done = False
+    if corl_reward_version not in ("v1", "v2"):
+        raise ValueError("corl_reward_version must be v1 or v2")
     turns = 0
     num_gen_calls = 0
     judge_text: str | None = None
@@ -1455,7 +1466,13 @@ async def run_serial_episode(
             forced = True
             _append_response(forced_ids, 0)
         trace.append({"record": "reflection", "turn": turns, "text": reflection_text})
-        if any(s.good_enough for s in judged_samples if s.good_enough is not None) or "good_enough=YES" in verdict:
+        if (
+            ("good_enough=YES" in verdict)
+            if corl_reward_version == "v2"
+            else (
+                any(s.good_enough for s in judged_samples if s.good_enough is not None) or "good_enough=YES" in verdict
+            )
+        ):
             set_good_enough_yes_reached(True)
         if not stop_required:
             return False
@@ -1498,7 +1515,7 @@ async def run_serial_episode(
                 fallback_ids=list(done_step.get("done_token_ids") or judged_step.get("done_token_ids") or []),
             )
             if fallback:
-                _append_response(fallback, 1)
+                _append_response(fallback, 0 if corl_reward_version == "v2" else 1)
         return True
 
     # Defined before the loop so the budget guard below can break on its very first
@@ -1560,6 +1577,7 @@ async def run_serial_episode(
             )
         _append_response(token_ids, 1, step.get("log_probs"))
         if kind == "done":
+            autonomous_done = not forced
             break
         if kind == "judge_image":
             if pending_judge is None:
@@ -1604,6 +1622,10 @@ async def run_serial_episode(
         # recorded trajectory ``prompt``, ``build_generate_call_meta`` and the GEN request
         # all see the same sanitized text.
         prompt = strip_reflection_tail(str(arguments.get("prompt", "")))
+        if fixed_gen_prompt:
+            prompt = active_user_prompt if fixed_gen_prompt == "__user_request__" else fixed_gen_prompt
+            if not prompt:
+                raise ValueError("fixed generator prompt requires a nonempty original request")
         meta = build_generate_call_meta(prompt=prompt, user_prompt=active_user_prompt)
         # RFC component-1 IDs: GEN TQ keys must be deterministic per (episode, call)
         # so a replay reproduces the same keys. Call 0 keeps the episode's base
@@ -1619,9 +1641,11 @@ async def run_serial_episode(
             prompt_token_ids=list(prompt_ids) + list(response_ids),
             gen_call_id=gen_call_id,
         )
+        call_samples = sorted(call_samples, key=lambda sample: sample.seed_index)
         call_role = str(meta.get("call_role") or "initial")
         for sample in call_samples:
             sample.call_role = call_role
+            sample.gen_call_index = num_gen_calls - 1
 
         valid_paths = [s.image_path for s in call_samples if s.valid and s.image_path]
         if valid_paths:
@@ -1671,7 +1695,7 @@ async def run_serial_episode(
         if not call_judge_text:
             call_judge_text = judge_text_from_gen_samples(
                 call_samples,
-                reduction=good_enough_reduction,
+                reduction="all" if corl_reward_version == "v2" else good_enough_reduction,
                 threshold=good_enough_threshold,
             )
 
@@ -1697,7 +1721,14 @@ async def run_serial_episode(
         forced = True
         _ = forced_reflection_text
 
-    image_credit = image_credit_reward(gen_samples)
+    trusted_fields = (
+        trusted_image_reward_fields(
+            gen_samples, num_gen_calls=num_gen_calls, autonomous_done=autonomous_done, forced_reflection=forced
+        )
+        if corl_reward_version == "v2"
+        else {}
+    )
+    image_credit = trusted_fields.get("image_reward_objective") if trusted_fields else image_credit_reward(gen_samples)
     if image_credit is not None:
         und_reward = image_credit
     elif non_image_reward is not None:
@@ -1744,6 +1775,9 @@ async def run_serial_episode(
         gen_samples=gen_samples,
         used_image_credit=used_image_credit,
         forced_reflection=forced,
+        autonomous_done=autonomous_done,
+        corl_reward_version=corl_reward_version,
+        bagel_corl_reward=trusted_fields,
         und_reward=und_reward,
         judge_text=judge_text,
         stop_required=stop_required,
@@ -1758,6 +1792,57 @@ class FlattenResult:
     gen_batch: list[dict[str, Any]]
     gen_episode_map: list[dict[str, Any]]
     metrics: dict[str, float]
+
+
+def trusted_image_reward_fields(samples, *, num_gen_calls, autonomous_done=False, forced_reflection=False):
+    """Build the harness-only V2 envelope from RM-marked samples, never transcript text.
+
+    Group first appearance is call chronology; seed order is explicit and stable.
+    A failed/missing image score rejects the episode instead of fabricating signal.
+    """
+    calls = {}
+    call_indices = {}
+    for sample in samples:
+        if (
+            not sample.valid
+            or sample.rm_score_source != "bagel_corl_tool_rm"
+            or sample.rm_score is None
+            or not math.isfinite(float(sample.rm_score))
+        ):
+            raise ValueError("V2 requires finite trusted tool RM scores for every seed")
+        uid = str(sample.gen_group_uid)
+        call_index = getattr(sample, "gen_call_index", None)
+        if uid in call_indices and call_indices[uid] != call_index:
+            raise ValueError("inconsistent call index in V2 group")
+        call_indices[uid] = call_index
+        group = calls.setdefault(uid, {})
+        if sample.seed_index in group:
+            raise ValueError("duplicate seed index in V2 call")
+        group[sample.seed_index] = float(sample.rm_score)
+    if len(calls) != num_gen_calls:
+        raise ValueError("V2 trusted call count does not match generated calls")
+    if calls and all(index is not None for index in call_indices.values()):
+        if sorted(call_indices.values()) != list(range(num_gen_calls)):
+            raise ValueError("V2 call indices must be unique and contiguous")
+        calls = dict(sorted(calls.items(), key=lambda pair: call_indices[pair[0]]))
+    seed_scores = [[row[i] for i in sorted(row)] for row in calls.values()]
+    means = [sum(row) / len(row) for row in seed_scores]
+    first, final, best = (means[0], means[-1], max(means)) if means else (None, None, None)
+    return {
+        "origin": "bagel_corl_tool_rm",
+        "version": "v2",
+        "call_means": means,
+        "call_seed_scores": seed_scores,
+        "image_reward_first": first,
+        "image_reward_final": final,
+        "image_reward_best": best,
+        "image_reward_gain": final - first if means else None,
+        "image_reward_source": "bagel_corl_tool_rm",
+        "num_gen_calls": num_gen_calls,
+        "autonomous_done": bool(autonomous_done),
+        "forced_reflection": bool(forced_reflection),
+        "image_reward_objective": final - 0.01 * max(0, num_gen_calls - 1) if means else None,
+    }
 
 
 def image_credit_reward(samples: list[GenSample]) -> float | None:
@@ -1817,6 +1902,11 @@ def episode_und_reward(episode: EpisodeRollout) -> tuple[float, bool]:
     (``flatten_multiturn_rollouts``' ``token_level_scores``). Keeping them on one derivation is
     what stops UND and GEN from training against different numbers for the same episode.
     """
+    if episode.corl_reward_version == "v2" and episode.terminal_reward is not None:
+        return float(episode.terminal_reward), not episode.used_image_credit
+    if episode.corl_reward_version == "v2":
+        value = episode.bagel_corl_reward.get("image_reward_objective")
+        return (float(value), False) if value is not None else (float(episode.und_reward), True)
     image_credit = image_credit_reward(episode.gen_samples)
     if image_credit is not None:
         return image_credit, False
@@ -2132,9 +2222,9 @@ def _episode_score(value: Any) -> float | None:
     """
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, int | float):
         return _as_float(value)
-    if isinstance(value, (str, bytes)) or value is None:
+    if isinstance(value, str | bytes) or value is None:
         return None
     try:
         import numpy as np
@@ -2253,8 +2343,10 @@ def _as_gen_sample(item: Any) -> GenSample | None:
         timesteps=item.get("timesteps"),
         rollout_log_probs=item.get("rollout_log_probs"),
         rm_score=item.get("rm_score"),
+        rm_score_source=item.get("rm_score_source"),
         image_path=item.get("image_path"),
         call_role=str(item.get("call_role", "initial")),
+        gen_call_index=item.get("gen_call_index"),
         good_enough=item.get("good_enough"),
         cond_uid=str(item["cond_uid"]) if item.get("cond_uid") else None,
         cond_len=int(item.get("cond_len") or 0),

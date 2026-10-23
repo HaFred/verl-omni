@@ -57,6 +57,7 @@ from verl_omni.agent_loop.rpco_turn_protocol import derive_good_enough_from_scor
 from verl_omni.agent_loop.utils import derive_rollout_seed
 from verl_omni.tools.trajectory.artifacts import get_latest_generate_prompt_for_active_rollout
 from verl_omni.tools.trajectory.context import (
+    get_active_user_prompt,
     reset_active_trajectory_relpath,
     reset_active_user_prompt,
     set_active_trajectory_relpath,
@@ -204,6 +205,11 @@ def episode_to_agent_output(
         "und_group_uid": episode.und_group_uid,
         "episode_uid": episode.episode_uid,
         "used_image_credit": episode.used_image_credit,
+        "bagel_corl_reward": dict(episode.bagel_corl_reward),
+        "corl_reward_version": episode.corl_reward_version,
+        "autonomous_done": episode.autonomous_done,
+        "forced_reflection": episode.forced_reflection,
+        **{k: v for k, v in episode.bagel_corl_reward.items() if k.startswith("image_reward_")},
         "turns": episode.turns,
         "num_gen_calls": episode.num_gen_calls,
         "und_reward": episode.und_reward,
@@ -601,7 +607,10 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             or (kwargs.get("extra_info") or {}).get("dataset_task_uid")
             or "missing_task"
         )
-        policy_version = int(sampling_params.get("global_steps", kwargs.get("policy_version", 0)) or 0)
+        # The TQ worker forwards ``global_steps`` as a per-prompt kwarg, not in sampling_params.
+        policy_version = int(
+            sampling_params.get("global_steps", kwargs.get("global_steps", kwargs.get("policy_version", 0))) or 0
+        )
         raw_prompt = kwargs.get("raw_prompt")
         if raw_prompt is None:
             raise ValueError("bagel_multiturn_agent requires raw_prompt")
@@ -715,7 +724,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             self._rm_score_fn = make_rm_score_fn(
                 rm_handle,
                 get_reference_paths=lambda: list(self._rm_reference_paths),
-                get_extra_info=lambda: dict(self._rm_extra_info),
+                get_extra_info=lambda: {**self._rm_extra_info, "user_prompt": get_active_user_prompt() or ""},
                 get_scorer_knobs=lambda: dict(agentic_scorer_knobs_from_config(self.config)),
                 get_image_prompt=lambda: get_latest_generate_prompt_for_active_rollout() or "",
                 # The RM worker's reward manager validates the row's ``responses``
@@ -872,6 +881,8 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                 non_image_reward=float(non_image_reward) if non_image_reward is not None else None,
                 good_enough_threshold=good_enough_threshold,
                 good_enough_reduction=good_enough_reduction,
+                corl_reward_version=str(agentic_scorer_knobs_from_config(self.config).get("corl_reward_version", "v1")),
+                fixed_gen_prompt=str(self.config.actor_rollout_ref.rollout.agent.get("corl_fixed_gen_prompt", "")),
             )
         finally:
             reset_active_trajectory_relpath(path_tokens)

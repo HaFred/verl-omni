@@ -15,11 +15,12 @@
 """CPU regression: the UND AR replica must load real weights, not decode from ``dummy``.
 
 The UND AR (Thinker) replica is its own Ray actor over a slice of the actor pool
-(``init_colocated`` -> ``RolloutMode.COLOCATED``), and no code path ever hands it weights:
-the V1 trainer forces ``checkpoint_engine.backend="naive"`` and
+(``init_colocated`` -> ``RolloutMode.COLOCATED``), and the inherited publish never hands it
+weights: the V1 trainer forces ``checkpoint_engine.backend="naive"`` and
 ``CheckpointEngineManager.update_weights`` early-returns for that backend after publishing
 through the *actor* to its own in-process GEN server (``verl/checkpoint_engine/base.py``).
-Whatever the Thinker loads at launch is what it decodes with for the rest of the run.
+``_publish_und_ar_weights`` pushes the policy into the Thinker stage only, so the DiT stage
+decodes with whatever it loads at launch for the rest of the run.
 
 ``verl`` 0.9.0.dev -- the sibling checkout the 2026-10-13/14 runs reached through
 ``PYTHONPATH`` -- promoted precisely this case in ``vllm_async_server.__init__``::
@@ -91,7 +92,7 @@ def _entry_config():
                     # ``dummy`` is correct there and must survive this builder untouched.
                     "load_format": "dummy",
                     "tensor_model_parallel_size": 2,
-                    # The V1 trainer forces this backend; the AR replica is never published to.
+                    # The V1 trainer forces this backend, so its publish skips the AR replica.
                     "checkpoint_engine": {"backend": "naive"},
                     "agent": {
                         "und_ar_serving_ready": 1,
@@ -156,15 +157,14 @@ def test_the_rest_of_the_ar_config_is_unchanged(tmp_path):
         "0": {"tensor_parallel_size": 1},
         "1": {"tensor_parallel_size": 1},
     }
+    assert rollout.engine_kwargs.vllm_omni.weight_sync_stage_ids == [0], "the Thinker only, never the DiT"
 
 
 class _FakeUndEntrypointConfig:
     """A replica config that would be born weightless -- the failure, not the fix."""
 
     def __init__(self, load_format):
-        self.actor_rollout_ref = OmegaConf.create(
-            {"model": {"lora_rank": 0}, "rollout": {"load_format": load_format}}
-        )
+        self.actor_rollout_ref = OmegaConf.create({"model": {"lora_rank": 0}, "rollout": {"load_format": load_format}})
 
 
 @pytest.mark.parametrize("load_format", ["dummy", "", None], ids=["dummy", "empty", "unset"])

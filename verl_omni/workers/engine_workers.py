@@ -71,7 +71,11 @@ from verl_omni.workers.config import (
 )
 from verl_omni.workers.config.diffusion import DiffusionDistillationTeacherModelConfig
 from verl_omni.workers.rollout.base import get_rollout_sequence_parallel_size
-from verl_omni.workers.rollout.vllm_rollout.zmq_utils import make_update_zmq_handle, make_update_zmq_id
+from verl_omni.workers.rollout.vllm_rollout.zmq_utils import (
+    colocate_zmq_handle,
+    make_update_zmq_handle,
+    make_update_zmq_id,
+)
 from verl_omni.workers.utils.losses import bagel_composite_loss, diffusion_loss, omni_loss
 
 logger = logging.getLogger(__file__)
@@ -1340,6 +1344,104 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             "update_weights timing (ms): %s",
             {k: round(v * 1000, 2) for k, v in timings.items()},
         )
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
+    async def update_bagel_und_ar_weights(
+        self,
+        server_handle,
+        und_replica_rank: int,
+        receiver_ranks: list[int],
+        checksum_name: str | None = None,
+        checksum_names: list[str] | None = None,
+        global_steps: int | None = None,
+    ) -> dict | None:
+        """Push merged actor weights to the Bagel Co-RL UND AR (Thinker) replica.
+
+        The naive ``update_weights`` only reaches this rank's own colocated GEN server; the
+        UND AR replica is a separate colocated server that nothing else publishes to. Every
+        rank must call this, because the export gathers each FSDP shard collectively: ranks
+        in ``receiver_ranks`` stream the weights over CUDA IPC to the replica's worker at the
+        same replica-local device index, the rest drain the export.
+
+        The replica must hold its weights awake, and the trainer must carve it out of the
+        first ``len(UND pool)`` bundles of the actor pool, so actor rank ``i`` shares a GPU
+        with replica device ``i``.
+
+        Returns:
+            On the first receiver rank, tensor count and fingerprints keyed by parameter
+            name in ``checksums``; ``checksum`` retains the single-name compatibility
+            value. Every other rank returns ``None``.
+        """
+        from verl.utils.device import is_support_ipc
+
+        from verl_omni.pipelines.bagel_flow_grpo.bagel_corl import route_actor_weight_for_und_ar
+        from verl_omni.workers.rollout.vllm_rollout.weight_fingerprint import weight_fingerprint
+
+        set_expandable_segments(False)
+        try:
+            per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
+                layered_summon=self.layered_summon,
+                base_sync_done=True,
+                adapter_name=self.rollout_adapter,
+            )
+            if peft_config is not None:
+                raise ValueError(
+                    "Bagel Co-RL UND AR weight sync needs merged full weights (model.lora.merge=True); "
+                    "the AR replica is launched without LoRA support."
+                )
+
+            rank = torch.distributed.get_rank()
+            stats = {"num_tensors": 0, "checksum": None, "checksums": {}}
+            check_names = set(checksum_names or [])
+            if checksum_name is not None:
+                check_names.add(checksum_name)
+
+            def _routed():
+                for name, tensor in per_tensor_param:
+                    routed = route_actor_weight_for_und_ar(name)
+                    if routed in check_names:
+                        stats["checksums"][routed] = weight_fingerprint(tensor)
+                    if routed == checksum_name:
+                        stats["checksum"] = stats["checksums"][routed]
+                    stats["num_tensors"] += 1
+                    yield routed, tensor
+
+            if rank not in receiver_ranks:
+                for _ in _routed():
+                    pass
+                return None
+
+            import ray
+
+            use_shm = not is_support_ipc()
+            is_lead = rank == receiver_ranks[0]
+            # Every receiver rank advances this counter once per call, so the ids agree.
+            self._und_ar_update_seq = getattr(self, "_und_ar_update_seq", 0) + 1
+            zmq_update_id = "und-ar-" + make_update_zmq_id(global_steps, self._und_ar_update_seq)
+            future = None
+            if is_lead:
+                future = server_handle.collective_rpc.remote(
+                    "update_weights_from_ipc", kwargs={"use_shm": use_shm, "zmq_update_id": zmq_update_id}
+                )
+            job_id = ray.get_runtime_context().get_job_id()
+            sender = BucketedWeightSender(
+                zmq_handle=make_update_zmq_handle(colocate_zmq_handle(job_id, und_replica_rank, rank), zmq_update_id),
+                bucket_size_mb=self.config.rollout.checkpoint_engine.update_weights_bucket_megabytes,
+                use_shm=use_shm,
+            )
+            with RLInsightLogger.trace_state("update_und_ar_weights", state_lane_id=f"rank_{self.rank}"):
+                await sender.async_send_weights(_routed())
+                if future is not None:
+                    await future
+            if is_lead:
+                await server_handle.clear_kv_cache.remote()
+                if global_steps is not None:
+                    await server_handle.set_global_steps.remote(global_steps)
+            return stats if is_lead else None
+
+        finally:
+            self._offload_actor_and_empty_cache()
+            set_expandable_segments(True)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

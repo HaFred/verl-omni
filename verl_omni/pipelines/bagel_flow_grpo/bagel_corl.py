@@ -197,6 +197,31 @@ def route_actor_weight_for_und_replica(name: str) -> str | None:
     return None
 
 
+# Top-level ``ema.safetensors`` modules that ``_map_checkpoint_to_training`` keeps unprefixed.
+_UND_AR_TOP_LEVEL_PREFIXES = ("time_embedder.", "vae2llm.", "llm2vae.", "latent_pos_embed.")
+
+
+def route_actor_weight_for_und_ar(name: str) -> str:
+    """Map an exported actor parameter name onto the UND AR Thinker's checkpoint layout.
+
+    The Thinker stage (vLLM-Omni ``OmniBagelForConditionalGeneration``) loads the published
+    ``ema.safetensors`` names at boot, so the sync sends exactly those names back: this is the
+    inverse of ``map_checkpoint_to_corl`` (``language_model.model.*`` -> bare, and
+    ``language_model.lm_head`` -> ``lm_head``) behind the ``transformer.`` export prefix.
+
+    Raises:
+        ValueError: ``name`` does not carry the actor's ``transformer.`` export prefix.
+    """
+    if not name.startswith("transformer."):
+        raise ValueError(f"UND AR weight sync expects actor names under 'transformer.', got {name!r}")
+    inner = name[len("transformer.") :]
+    if inner.startswith("lm_head."):
+        return "language_model." + inner
+    if inner.startswith(_UND_AR_TOP_LEVEL_PREFIXES):
+        return inner
+    return "language_model.model." + inner
+
+
 class BagelForCoRL(BagelForTraining):
     """``BagelForTraining`` plus an untied ``lm_head`` for UND causal log-probs."""
 

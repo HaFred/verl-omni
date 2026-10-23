@@ -123,3 +123,6 @@ e2e_root: null
 # experiment_name are namespaced apart). Set → used verbatim, with no experiment_name
 # appended, so a launcher can place the three trees directly in its own run dir.
 run_dir: null
+
+# Co-RL objective contract: v1 baseline or opt-in v2 final quality/call cost.
+corl_reward_version: v1

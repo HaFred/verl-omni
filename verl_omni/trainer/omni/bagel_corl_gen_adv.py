@@ -44,11 +44,9 @@ def select_gen_advantages_for_step(micro_batch, step: int, *, require_bagel_corl
     """
     from verl.utils import tensordict_utils as tu
 
-    gen_view = tu.get_non_tensor_data(micro_batch, "bagel_corl_gen", default=None)
-    if gen_view is not None and hasattr(gen_view, "keys") and "advantages" in gen_view.keys():
-        return gen_view["advantages"][:, step]
-    if require_bagel_corl_gen:
-        raise ValueError("bagel_corl GEN step requires bagel_corl_gen['advantages']; refusing UND token advantages")
+    lane = tu.get_non_tensor_data(micro_batch, "bagel_corl_lane", default=None)
+    if require_bagel_corl_gen and lane != "gen":
+        raise ValueError("bagel_corl GEN step requires an explicitly tagged GEN microbatch")
     return micro_batch["advantages"][:, step]
 
 
@@ -191,35 +189,47 @@ def build_gen_flowgrpo_proto(gen_batch: list[Mapping[str, Any]]) -> DataProto | 
             )
         return None
 
+    from verl_omni.trainer.omni.bagel_corl_batch import episode_numeric_id
+
     max_steps = max(item[1].numel() for item in usable)
-    old_log_probs = torch.zeros(len(usable), max_steps, dtype=torch.float32)
-    for index, (_, logprob, _, _, _, _) in enumerate(usable):
-        old_log_probs[index, : logprob.numel()] = logprob
+    latent_list, timestep_list, prompt_token_ids, old_list, masks, parents = [], [], [], [], [], []
+    for row, logprob, _, _, latents, timesteps in usable:
+        timesteps = timesteps.reshape(-1).float()
+        count = logprob.numel()
+        if count != timesteps.numel() or latents.shape[0] != count + 1:
+            raise ValueError("GEN transition lengths require T logprobs, T timesteps, and T+1 latents")
+        if (
+            not torch.isfinite(timesteps).all()
+            or not torch.isfinite(logprob).all()
+            or not torch.isfinite(latents).all()
+        ):
+            raise ValueError("GEN trajectory contains nonfinite transition inputs")
+        if (timesteps <= 0).any():
+            raise ValueError("GEN recorded stochastic transition timestep must be positive")
+        episode_uid = row.get("episode_uid")
+        if episode_uid is None:
+            raise ValueError("GEN trajectory requires parent episode_uid for unique ownership")
+        parents.append(episode_numeric_id(str(episode_uid)))
+        pad = max_steps - count
+        # Repeat a finite transition timestep/latent instead of synthetic zero SDE inputs.
+        latent_list.append(torch.cat([latents.float(), latents[-1:].float().expand(pad, *latents.shape[1:])]))
+        timestep_list.append(torch.cat([timesteps, timesteps[:1].expand(pad)]))
+        old_list.append(torch.cat([logprob, logprob.new_zeros(pad)]))
+        masks.append(torch.cat([torch.ones(count), torch.zeros(pad)]))
+        prompt_token_ids.append(row.get("prompt_token_ids"))
     scores = torch.tensor([[item[2]] for item in usable], dtype=torch.float32)
     uids = np.array(_flowgrpo_group_index(usable), dtype=object)
-    batch_tensors: dict[str, torch.Tensor] = {
-        "old_log_probs": old_log_probs,
+    batch_tensors = {
+        "old_log_probs": torch.stack(old_list),
         "rm_scores": scores,
         "sample_level_scores": scores,
+        "all_latents": torch.stack(latent_list),
+        "all_timesteps": torch.stack(timestep_list),
+        "gen_transition_valid": torch.stack(masks),
+        "gen_valid": torch.ones(len(usable)),
+        "parent_episode_id": torch.tensor(parents, dtype=torch.long),
+        "gen_row_id": torch.arange(len(usable), dtype=torch.long),
     }
-
-    latent_list: list[torch.Tensor] = []
-    timestep_list: list[torch.Tensor] = []
-    prompt_token_ids: list[Any] = []
-    for row, _, _, _, latents, timesteps in usable:
-        # Engine indexes latents[:, step]; accept (T, ...) or (T+1, ...).
-        latent_list.append(latents.float())
-        timestep_list.append(timesteps.reshape(-1).float())
-        prompt_token_ids.append(row.get("prompt_token_ids"))
-
-    batch_tensors["all_latents"] = _stack_padded(latent_list)
-    batch_tensors["all_timesteps"] = _stack_padded(timestep_list)
-    num_t = int(batch_tensors["all_timesteps"].shape[1])
-    if old_log_probs.shape[1] != num_t:
-        resized = torch.zeros(len(usable), num_t, dtype=torch.float32)
-        copy_t = min(old_log_probs.shape[1], num_t)
-        resized[:, :copy_t] = old_log_probs[:, :copy_t]
-        batch_tensors["old_log_probs"] = resized
 
     batch = TensorDict(batch_tensors, batch_size=[len(usable)])
     # Build the object array explicitly 1-D rather than ``np.array(prompt_token_ids,

@@ -362,7 +362,10 @@ class BagelDiffusion(DiffusionModelBase):
         # sigma at this denoising step (same for the entire batch in BAGEL)
         sigma_now = float(timesteps[0, step].item())
         in_cfg_interval = sigma_now > cfg["cfg_interval_low"] and sigma_now <= cfg["cfg_interval_high"]
-        apply_cfg = in_cfg_interval and cfg["cfg_text_scale"] > 1.0
+        corl = model_config.get("composite_mode") == "bagel_corl"
+        # Co-RL can pad variable-length trajectories. Keep the FSDP forward count
+        # equal across ranks, then select guidance per row's actual timestep.
+        apply_cfg = (corl or in_cfg_interval) and cfg["cfg_text_scale"] > 1.0
 
         if apply_cfg:
             assert negative_model_inputs is not None, (
@@ -375,7 +378,7 @@ class BagelDiffusion(DiffusionModelBase):
             # reuse ``noise_pred`` instead of running a third forward.
             cfg_img_pred = noise_pred if cfg["cfg_img_scale"] > 1.0 else None
 
-            noise_pred = cls._combine_cfg(
+            guided_pred = cls._combine_cfg(
                 v_t=noise_pred,
                 cfg_text_v_t=cfg_text_pred,
                 cfg_img_v_t=cfg_img_pred,
@@ -384,6 +387,13 @@ class BagelDiffusion(DiffusionModelBase):
                 cfg_renorm_type=cfg["cfg_renorm_type"],
                 cfg_renorm_min=cfg["cfg_renorm_min"],
             )
+            if corl:
+                active = (timesteps[:, step] > cfg["cfg_interval_low"]) & (
+                    timesteps[:, step] <= cfg["cfg_interval_high"]
+                )
+                noise_pred = torch.where(active.reshape(-1, *([1] * (noise_pred.ndim - 1))), guided_pred, noise_pred)
+            else:
+                noise_pred = guided_pred
 
         _, log_prob, prev_sample_mean, std_dev_t, sqrt_dt = scheduler.sample_previous_step(
             sample=latents[:, step].float(),

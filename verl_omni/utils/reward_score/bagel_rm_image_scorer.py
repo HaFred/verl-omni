@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -357,6 +358,13 @@ def compute_score(
     # ``unified_reward_rubric``: the reward stays UnifiedReward's point score, and the same
     # reward-pool model is asked the Mode-2a C/A rubric a second time, for the
     # ``judge_image`` response and the stop verdict only.
+    version = str(knobs.get("corl_reward_version", "v1"))
+    if version not in ("v1", "v2"):
+        raise ValueError("corl_reward_version must be v1 or v2")
+    if version == "v2" and not user_request:
+        raise ValueError("V2 image scorer requires original user request")
+    if version == "v2":
+        image_prompt = user_request
     with_rubric = backend == "unified_reward_rubric"
     # The user's request is the fixed target across rewrite passes; the policy's own
     # diffusion prompt would move it every pass.
@@ -385,7 +393,9 @@ def compute_score(
             match = judged.get("match")
             facets = [correctness, aesthetics] + ([float(match)] if match is not None else [])
             score = sum(facets) / len(facets)
-            good_enough = bool(judged.get("good_enough", False))
+            good_enough = (
+                score >= knobs["good_enough_threshold"] if version == "v2" else bool(judged.get("good_enough", False))
+            )
             sample_judge.append(_rubric_row(judged))
         elif backend == "pickscore":
             picked = _score_image_pickscore(path=path, caption=caption, knobs=knobs)
@@ -410,12 +420,15 @@ def compute_score(
                 )
                 if judged is not None and judged.get("ok"):
                     sample_judge.append(_rubric_row(judged))
-                    good_enough = bool(judged.get("good_enough", False))
+                    if version == "v1":
+                        good_enough = bool(judged.get("good_enough", False))
                 else:
                     # The reward is already scored; an unparsed rubric only costs this
                     # image its written verdict, so fall back to the axes text.
                     logger.warning("unified_reward_rubric: rubric judge failed for %s; using axes", path)
                     sample_judge.append(None)
+        if not math.isfinite(float(score)):
+            raise ValueError("bagel_rm_image_scorer: nonfinite quality; refusing zero-fill")
         scores.append(score)
         flags.append(good_enough)
         per_image.append({"image_path": path, "score": score, "good_enough": good_enough})

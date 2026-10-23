@@ -110,6 +110,11 @@ class DiffusionModelConfig(BaseConfig):
     # Bagel Co-RL (Joint-Training) per-group LR (RFC §4.4 / UniGRPO per-expert LRs): GEN (*_moe_gen)
     # optimizer group LR override; None keeps the base actor.optim.lr for both groups.
     lr_gen: Optional[float] = None
+    # Co-RL ablations freeze actual parameter groups before FSDP construction.
+    corl_freeze_und: bool = False
+    corl_freeze_gen: bool = False
+    # Frozen-policy control: skip optimizer and LR scheduler state changes.
+    corl_no_optimizer_step: bool = False
 
     exclude_modules: Optional[str] = None
 

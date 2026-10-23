@@ -43,6 +43,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import math
 from typing import Any, Callable
 
 import numpy as np
@@ -146,6 +147,8 @@ def parse_rm_result(
             raise RMScoringError(f"bagel RM sample_scores length {len(scores)} != image count {len(image_paths)}")
     else:
         scores = [float(result["reward_score"])] * len(image_paths)
+    if not all(math.isfinite(score) for score in scores):
+        raise RMScoringError("bagel RM returned nonfinite image score")
     sample_flags = extra.get("sample_good_enough")
     if sample_flags is not None:
         if len(sample_flags) != len(image_paths):
@@ -308,6 +311,7 @@ def make_rm_score_fn(
             if not getattr(sample, "valid", False) or not getattr(sample, "image_path", None):
                 continue
             sample.rm_score = by_path[str(sample.image_path)]
+            sample.rm_score_source = "bagel_corl_tool_rm"
             flag = flag_by_path.get(str(sample.image_path))
             if flag is not None:
                 sample.good_enough = flag

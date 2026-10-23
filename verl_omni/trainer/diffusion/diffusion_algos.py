@@ -13,6 +13,7 @@
 # limitations under the License.
 """Diffusion-specific loss functions and KL penalties."""
 
+import math
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass
@@ -315,6 +316,8 @@ class FlowGRPOLoss(DiffusionLossFn):
         advantages: torch.Tensor,
         config: DiffusionActorConfig,
         rollout_is_weights: Optional[torch.Tensor] = None,
+        unit_weights: Optional[torch.Tensor] = None,
+        loss_normalizer: Optional[float] = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Compute the clipped policy objective and related metrics for FlowGRPO.
 
@@ -337,6 +340,30 @@ class FlowGRPOLoss(DiffusionLossFn):
                 the mean reduction.
         """
         assert config is not None, "config is required for FlowGRPOLoss!"
+        if log_prob.shape != old_log_prob.shape or log_prob.shape != advantages.shape:
+            raise ValueError(
+                f"FlowGRPO shape mismatch: new={tuple(log_prob.shape)}, old={tuple(old_log_prob.shape)}, "
+                f"advantages={tuple(advantages.shape)}; broadcasting across rows/timesteps is forbidden"
+            )
+        if rollout_is_weights is not None and rollout_is_weights.shape != log_prob.shape:
+            raise ValueError("FlowGRPO rollout IS weights shape must match log probabilities")
+        if unit_weights is not None:
+            if (
+                unit_weights.shape != log_prob.shape
+                or not torch.isfinite(unit_weights).all()
+                or (unit_weights < 0).any()
+            ):
+                raise ValueError("FlowGRPO unit weights shape/values invalid")
+            valid = unit_weights > 0
+            log_prob = log_prob.masked_fill(~valid, 0.0)
+            old_log_prob = old_log_prob.masked_fill(~valid, 0.0)
+            advantages = advantages.masked_fill(~valid, 0.0)
+            if rollout_is_weights is not None:
+                rollout_is_weights = rollout_is_weights.masked_fill(~valid, 0.0)
+        else:
+            valid = torch.ones_like(log_prob, dtype=torch.bool)
+        if loss_normalizer is not None and (not math.isfinite(loss_normalizer) or loss_normalizer <= 0):
+            raise ValueError("FlowGRPO loss_normalizer must be finite and positive")
         loss_cfg = _loss_cfg_of(config)
         advantages = torch.clamp(
             advantages,
@@ -354,15 +381,19 @@ class FlowGRPOLoss(DiffusionLossFn):
         per_elem_loss = torch.maximum(unclipped_loss, clipped_loss)
         if rollout_is_weights is not None:
             per_elem_loss = per_elem_loss * rollout_is_weights.detach()
-        pg_loss = torch.mean(per_elem_loss)
+        if unit_weights is not None:
+            per_elem_loss = per_elem_loss * unit_weights
+        pg_loss = per_elem_loss.sum() / loss_normalizer if loss_normalizer is not None else per_elem_loss.mean()
 
         with torch.no_grad():
+            ratio = ratio[valid] if valid.any() else ratio.new_ones(1)
+            log_ratio = log_ratio[valid] if valid.any() else log_ratio.new_zeros(1)
             ppo_kl = torch.mean(-log_ratio)
             pg_clipfrac = torch.mean((torch.abs(ratio - 1.0) > loss_cfg.clip_ratio).float())
             pg_clipfrac_higher = torch.mean((ratio - 1.0 > loss_cfg.clip_ratio).float())
             pg_clipfrac_lower = torch.mean((1.0 - ratio > loss_cfg.clip_ratio).float())
             ratio_mean = ratio.mean()
-            ratio_std = ratio.std()
+            ratio_std = ratio.std(unbiased=False)
 
         pg_metrics = {
             "actor/ppo_kl": ppo_kl.detach().item(),
@@ -370,6 +401,7 @@ class FlowGRPOLoss(DiffusionLossFn):
             "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
             "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
             "actor/ratio_mean": ratio_mean.detach().item(),
+            "actor/ratio_square_mean": ratio.square().mean().detach().item(),
             "actor/ratio_std": ratio_std.detach().item(),
         }
         return pg_loss, pg_metrics
@@ -387,6 +419,8 @@ class FlowGRPOLoss(DiffusionLossFn):
             advantages=data["advantages"],
             config=config,
             rollout_is_weights=data.get("rollout_is_weights", None),
+            unit_weights=data.get("loss_unit_weight", None),
+            loss_normalizer=tu.get_non_tensor_data(data, "loss_normalizer", default=None),
         )
         return DiffusionLossResult(loss=loss, metrics=metrics)
 

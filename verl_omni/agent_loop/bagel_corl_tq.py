@@ -269,7 +269,9 @@ def pack_dual_lane_episode(
                     "timesteps": sample.timesteps,
                     "rollout_log_probs": sample.rollout_log_probs,
                     "rm_score": sample.rm_score,
+                    "rm_score_source": sample.rm_score_source,
                     "call_role": sample.call_role,
+                    "gen_call_index": sample.gen_call_index,
                     "good_enough": sample.good_enough,
                     "image_path": sample.image_path,
                     # RFC §4.4.2a: the reuse identity, per GEN row.
@@ -440,6 +442,11 @@ def episode_from_agent_extra(
         turns=turns,
         gen_samples=samples,
         used_image_credit=bool(extra.get("used_image_credit", False)),
+        autonomous_done=bool(extra.get("autonomous_done", False)),
+        forced_reflection=bool(extra.get("forced_reflection", False)),
+        corl_reward_version=str(extra.get("corl_reward_version", "v1")),
+        bagel_corl_reward=dict(extra.get("bagel_corl_reward") or {}),
+        terminal_reward=float(reward_score) if reward_score is not None else None,
         und_reward=float(reward_score if reward_score is not None else extra.get("und_reward") or 0.0),
         num_gen_calls=int(num_gen),
         r2_metrics=dict(extra.get("bagel_corl_r2") or {}),
@@ -608,6 +615,25 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
         if not outputs:
             raise RuntimeError(f"Empty bagel Co-RL (Joint-Training) agent output for prompt {uid}_{session_id}")
 
+        # The RM manager forwards extra_info only. Overwrite any dataset-supplied
+        # lookalike with the actual tool envelope before the live colocated call.
+        kwargs = dict(kwargs)
+        reward_metadata = dict(kwargs.get("extra_info") or {})
+        for key in ("bagel_corl_reward", "corl_reward_version", "autonomous_done", "forced_reflection"):
+            reward_metadata.pop(key, None)
+        episode_extra = outputs[-1].extra_fields or {}
+        reward_metadata["corl_reward_version"] = episode_extra.get("corl_reward_version", "v1")
+        if episode_extra.get("corl_reward_version") == "v2":
+            envelope = dict(episode_extra["bagel_corl_reward"])
+            reward_metadata["bagel_corl_reward"] = envelope
+            reward_metadata.update(
+                {
+                    k: v
+                    for k, v in envelope.items()
+                    if k.startswith("image_reward_") or k in ("num_gen_calls", "autonomous_done", "forced_reflection")
+                }
+            )
+        kwargs["extra_info"] = reward_metadata
         await self._compute_score(outputs, kwargs=kwargs)
 
         final_output = outputs[-1]
@@ -658,6 +684,10 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
 
         # UND token row: reuse AgentLoopOutput.as_dict for TQ training tensors.
         und_field = episode_output.as_dict()
+        from verl_omni.trainer.omni.bagel_corl_batch import episode_numeric_id
+
+        und_field["bagel_episode_id"] = torch.tensor(episode_numeric_id(episode.episode_uid), dtype=torch.long)
+
         und_field.update({k: v for k, v in kwargs.items() if k not in und_field})
         und_field.pop("multi_modal_data", None)
         und_field["loss_mask"] = und_field["response_mask"]
@@ -691,6 +721,16 @@ class BagelCorlAgentLoopWorkerTQ(_AgentLoopWorkerTQBase):
             }
         )
         und_field["extra_fields"] = und_extra
+        und_field["extra_info"] = dict(reward_metadata)
+        if episode.corl_reward_version == "v2":
+            und_field["bagel_corl_reward"] = dict(episode.bagel_corl_reward)
+            und_field.update(
+                {
+                    k: v
+                    for k, v in episode.bagel_corl_reward.items()
+                    if k.startswith("image_reward_") or k in ("num_gen_calls", "autonomous_done", "forced_reflection")
+                }
+            )
         und_field["child_gen_keys"] = list(pack.child_gen_keys)
         und_field["bagel_role"] = "und"
         # The v1 UND advantage reads ``rm_scores`` off the TQ (``trainer_base.py:1595`` copies it

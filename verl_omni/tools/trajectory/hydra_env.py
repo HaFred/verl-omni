@@ -54,6 +54,7 @@ SCORER_KNOB_KEYS: tuple[str, ...] = (
     "judge_enable_thinking",
     "good_enough_threshold",
     "score_backend",
+    "corl_reward_version",
     "unified_good_enough_threshold",
     "pickscore_good_enough_threshold",
 )

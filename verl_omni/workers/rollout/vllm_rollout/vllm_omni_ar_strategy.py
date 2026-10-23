@@ -108,8 +108,18 @@ class ARStrategy(OmniStrategyBase):
         # TODO (mike): drop this later. It should be inferred from the model config.
         pipeline_name = engine_kwargs.pop("pipeline_name", None)
         pipeline_mode = engine_kwargs.pop("pipeline_mode", "thinker_only")
+        # Explicit weight-sync stages for a deploy config with no rollout adapter, whose
+        # stage topology the adapter would otherwise declare.
+        weight_sync_stage_ids = engine_kwargs.pop("weight_sync_stage_ids", None)
 
         adapter_cls = OmniRolloutPipelineBase.get_class(pipeline_name)
+        if weight_sync_stage_ids is not None:
+            if adapter_cls is not None:
+                raise ValueError(
+                    f"weight_sync_stage_ids is declared by {adapter_cls.__name__}.weight_sync_stage_ids(); "
+                    "do not also pass it as an engine kwarg."
+                )
+            self._weight_sync_stage_ids = [int(stage_id) for stage_id in weight_sync_stage_ids]
         if adapter_cls is not None:
             async_chunk = engine_kwargs.get("async_chunk", engine_kwargs.get("async-chunk", True))
             if not isinstance(async_chunk, bool):
@@ -261,7 +271,12 @@ class ARStrategy(OmniStrategyBase):
             engine_args["compilation_config"] = _drop_none_mapping_values(engine_args["compilation_config"])
 
     def collective_rpc_stage_ids(self, method: Any) -> list[int] | None:
-        if method in {"set_pending_lora_peft_config", "update_weights_from_ipc", "monkey_patch_model"}:
+        if method in {
+            "set_pending_lora_peft_config",
+            "update_weights_from_ipc",
+            "monkey_patch_model",
+            "policy_param_checksum",
+        }:
             return self._weight_sync_stage_ids
         return None
 
