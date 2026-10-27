@@ -230,7 +230,10 @@ _TAGGED_CALL_RE = re.compile(r"<tools>\s*(.*?)\s*</tools>", re.DOTALL)
 # The terminal ``Done.`` decode comes back from the engine with ``skip_special_tokens=False``, so
 # the raw text is ``Done.<|im_end|>``. The trailing special tokens are therefore tolerated;
 # without that the loop reads its own stop word as ``continue`` and appends a second ``Done.``.
-_DONE_RE = re.compile(r"\bDone\.\s*(?:<\|[^|]*?\|>\s*)*$", re.IGNORECASE)
+# The period is optional: the checkpoint writes ``Done`` as often as ``Done.`` (16 of 96
+# episodes in steps 78-82 of ``bagel_corl_plateaufix_2356``), and a missing period used to make
+# the loop re-sample its own stop word until ``max_und_turns``.
+_DONE_RE = re.compile(r"\bDone\.?\s*(?:<\|[^|]*?\|>\s*)*$", re.IGNORECASE)
 
 # Control markers, which the engine returns inside ``text`` because it decodes with
 # ``skip_special_tokens=False`` (``<|im_end|>``, ``<|end of conversation|>``, ...). A turn made
@@ -1681,9 +1684,12 @@ async def run_serial_episode(
         _append_response(token_ids, 1, step.get("log_probs"))
         if kind == "done":
             remaining = generate_tool.remaining_passes()
-            if remaining > 0 and not get_good_enough_yes_reached():
+            if remaining > 0 and not get_good_enough_yes_reached() and not _is_terminal_only(text):
                 # The episode ends at min(max_generate_passes, first good_enough=YES); an
                 # earlier Done. is declined so the policy rewrites instead of quitting on NO.
+                # A silent turn (bare ``<|im_end|>``) is not a Done the policy chose to write:
+                # re-sampling it produced prompt fragments repeated to ``max_und_turns``
+                # (``sample_9003.01``, step 82), so it ends the episode as before.
                 next_step = (
                     "call judge_image on the new image"
                     if pending_judge is not None

@@ -675,9 +675,9 @@ def _terminal_decision(text: str) -> tuple[bool, bool, bool]:
     suffix = re.sub(r"\s+", " ", suffix).strip()
     policy_reflection = bool(_REFLECTION_RE.search(suffix))
     if policy_reflection:
-        terminal_done = bool(re.search(r"\bDone\.\s*$", suffix, re.IGNORECASE))
+        terminal_done = bool(re.search(r"\bDone\.?\s*$", suffix, re.IGNORECASE))
     else:
-        terminal_done = bool(re.fullmatch(r"Done\.", suffix, re.IGNORECASE))
+        terminal_done = bool(re.fullmatch(r"Done\.?", suffix, re.IGNORECASE))
     # Accept the checkpoint's own terminal form as well: ``{"name": "Done"}`` is the same
     # statement as prose ``Done.`` in the grammar this checkpoint actually speaks, and the
     # object's ``{`` is the last character before the anchor, so the suffix holds its tail

@@ -119,6 +119,21 @@ def test_a_quoted_example_or_schema_echo_after_a_plan_is_not_a_call(text):
 NO_VERDICT = VERDICT.replace("good_enough=YES", "good_enough=NO").replace("0.8000", "0.4000")
 
 
+@pytest.mark.parametrize("terminal", ["Done", "Done.", "Done<|im_end|>", "Done.<|im_end|>"])
+def test_a_done_without_the_period_still_ends_the_episode(terminal):
+    """The checkpoint writes ``Done`` as often as ``Done.``; a missing period is not a continuation."""
+    from verl_omni.agent_loop.bagel_corl_lib import und_turn_kind
+
+    assert und_turn_kind(terminal) == "done"
+
+
+def test_a_silent_turn_after_a_no_verdict_is_not_declined():
+    """A bare ``<|im_end|>`` is not a Done the policy wrote; re-sampling it repeated prompt fragments."""
+    episode = _episode([GENERATE, JUDGE, "<|im_end|>"], verdict=NO_VERDICT, task_type="reflect", expected_num_images=1)
+    assert not any(text.startswith("agentic_stop ok=0") for text in _observations(episode))
+    assert episode.turn_trace[-1]["text"] == "<|im_end|>"
+
+
 @pytest.mark.parametrize("task_type", ["reflect", "plan"])
 def test_done_after_a_no_verdict_is_declined_until_the_last_generate(task_type):
     script = [GENERATE, JUDGE, "Done.", GENERATE, JUDGE, "Done.", GENERATE, JUDGE]

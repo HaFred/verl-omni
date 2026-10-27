@@ -122,6 +122,16 @@ def test_v2_plan_result_is_not_zeroed_by_a_rewrite_after_a_no_verdict():
     assert over_planned["reward_result"] == 0.0
 
 
+def test_v2_accepts_a_terminal_done_without_the_period():
+    gt = {"task_type": "reflect"}
+    spaced = v2(forced_transcript(), gt)
+    unpunctuated = v2(forced_transcript().removesuffix("Done.") + "Done", gt)
+    assert spaced["terminal_done"] == 1
+    assert unpunctuated["terminal_done"] == 1
+    assert unpunctuated["reward_result"] == pytest.approx(spaced["reward_result"])
+    assert unpunctuated["reward_done"] == pytest.approx(spaced["reward_done"])
+
+
 def test_v2_plan_image_charges_only_calls_past_the_plan():
     gt = {"task_type": "plan", "expected_num_images": 3, "reference_subtasks": ["a", "b", "c"]}
     assert v2(forced_transcript(3), gt, num_gen_calls=3)["reward_image"] == pytest.approx(0.7)
