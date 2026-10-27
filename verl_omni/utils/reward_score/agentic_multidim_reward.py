@@ -810,10 +810,27 @@ def _result_reward(
     terminal_done: bool,
     blocked: bool,
     rewrite_after_yes: int,
+    graded_plan: bool = False,
 ) -> float:
     if blocked or not terminal_done or successful_generates < 1 or rewrite_after_yes > 0:
         return 0.0
     if task_type == "plan":
+        if graded_plan:
+            # Exact-count-or-zero is unreachable from a one-image policy: every sibling scores
+            # 0 and the group carries no signal toward the second image. Only the subtask
+            # images rendered before the first verdict are the plan; a rewrite after a NO
+            # verdict is the reflection the harness asks for, not an extra subtask.
+            judges = _successful_judges(text)
+            first_verdict_end = judges[0][3] if judges else len(text)
+            subtask_images = min(
+                successful_generates,
+                sum(
+                    1
+                    for _, end, call in _extract_tool_calls(text)
+                    if _tool_name(call) == "generate_image" and end <= first_verdict_end
+                ),
+            )
+            return subtask_images / expected if subtask_images <= expected else 0.0
         return 1.0 if successful_generates == expected else 0.0
     judges = _successful_judges(text)
     final_yes = bool(judges) and judges[-1][2] is True
@@ -1000,6 +1017,18 @@ def _trusted_v2_reward(metadata):
     return row
 
 
+def _scalar_reward_fields(trusted):
+    """The reward loop stacks every extra field with ``np.array`` across the batch, so the
+    per-call score lists, whose length is the episode's K, would make it ragged and raise.
+    Validation then averages every numeric field, so a K=0 episode's ``None`` image
+    scores are reported as 0.0, the image reward that episode is scored with."""
+    return {
+        key: (0.0 if value is None and key.startswith("image_reward_") else value)
+        for key, value in trusted.items()
+        if not isinstance(value, list | tuple | dict)
+    }
+
+
 def compute_score(
     data_source: str = "",
     solution_str: str = "",
@@ -1091,7 +1120,7 @@ def compute_score(
     )
     if not prompts or successful_generates == 0:
         if trusted is not None:
-            result.update(trusted)
+            result.update(_scalar_reward_fields(trusted))
         return result
 
     valid_terminal_context = judge_ok > 0 and not blocked and rewrites_after_yes == 0
@@ -1123,6 +1152,7 @@ def compute_score(
             terminal_done=terminal_done,
             blocked=blocked,
             rewrite_after_yes=rewrites_after_yes,
+            graded_plan=version == "v2",
         ),
         "image": _image_reward(
             text,
@@ -1135,9 +1165,19 @@ def compute_score(
     if trusted is not None:
         # Keep protocol/planning dimensions and weights explicit and unchanged.
         rewards["image"] = float(trusted["image_reward_objective"])
+        if task_type == "plan":
+            # The harness charges every call after the first as a rewrite; the planned
+            # subtask images are the task, so only calls past ``expected`` are charged.
+            count = trusted["num_gen_calls"]
+            rewards["image"] = float(trusted["image_reward_final"]) - 0.01 * max(0, count - expected)
         rewards["done"] = float(trusted["autonomous_done"])
-        result.update(trusted)
+        result.update(_scalar_reward_fields(trusted))
         result["method"] = "agentic_multidim_corl_v2"
+        if forced_context and not policy_reflection:
+            # The harness wrote the reflection, so ``reflect`` is half the rubric verdict and
+            # half the coverage of empty policy prose: a coarse copy of ``image``, not a
+            # policy-controllable dimension.
+            weights.pop("reflect", None)
     weight_sum = sum(weights.values())
     score = sum(weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
     result.update(

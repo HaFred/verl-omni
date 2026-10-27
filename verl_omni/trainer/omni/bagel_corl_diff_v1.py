@@ -25,7 +25,7 @@ from __future__ import annotations
 import copy
 from typing import Any
 
-__all__ = ["DiffusionV1GenLane", "diffusion_v1_gen_hooks"]
+__all__ = ["DiffusionV1GenLane", "diffusion_v1_gen_hooks", "gen_norm_adv_by_std"]
 
 
 def _lane_config_with_gen_estimator(config: Any, gen_adv_estimator: str) -> Any:
@@ -38,6 +38,9 @@ def _lane_config_with_gen_estimator(config: Any, gen_adv_estimator: str) -> Any:
     the token estimator into the GEN lane. RFC §4.4 requires GEN to carry its own
     estimator; the lane therefore gets its own config view rather than mutating
     the owner's shared config.
+
+    ``algorithm.gen_norm_adv_by_std_in_grpo``, when set, replaces ``norm_adv_by_std_in_grpo``
+    on this view only, so UND token GRPO and GEN FlowGRPO can normalize differently.
     """
     view = copy.deepcopy(config)
     try:
@@ -48,6 +51,9 @@ def _lane_config_with_gen_estimator(config: Any, gen_adv_estimator: str) -> Any:
                 if view.get("algorithm") is None:
                     view.algorithm = OmegaConf.create({})
                 view.algorithm.adv_estimator = gen_adv_estimator
+                gen_norm = gen_norm_adv_by_std(view.algorithm)
+                if gen_norm is not None:
+                    view.algorithm.norm_adv_by_std_in_grpo = gen_norm
             return view
     except ImportError:  # pragma: no cover - omegaconf is a hard dep in practice
         pass
@@ -57,8 +63,20 @@ def _lane_config_with_gen_estimator(config: Any, gen_adv_estimator: str) -> Any:
     if algorithm is None:
         algorithm = copy.copy(view)
     algorithm.adv_estimator = gen_adv_estimator
+    gen_norm = gen_norm_adv_by_std(algorithm)
+    if gen_norm is not None:
+        algorithm.norm_adv_by_std_in_grpo = gen_norm
     view.algorithm = algorithm
     return view
+
+
+def gen_norm_adv_by_std(algorithm: Any) -> bool | None:
+    """The GEN-lane ``gen_norm_adv_by_std_in_grpo`` override, or ``None`` to inherit."""
+    getter = getattr(algorithm, "get", None)
+    value = getter("gen_norm_adv_by_std_in_grpo", None) if callable(getter) else None
+    if value is None:
+        value = getattr(algorithm, "gen_norm_adv_by_std_in_grpo", None)
+    return None if value is None else bool(value)
 
 
 def diffusion_v1_gen_hooks():

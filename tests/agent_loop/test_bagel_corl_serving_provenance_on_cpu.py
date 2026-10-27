@@ -151,7 +151,8 @@ def test_sync_episode_rejects_changed_ordinary_forced_or_gen_versions(steps, gen
 
 def test_legacy_stub_provenance_is_explicitly_unknown():
     module = load_lib()
-    result = episode(module, [dict(text="Done.", token_ids=[4], log_probs=[-0.2])])
+    # A Done. before any image is declined, so the stub repeats it until max_und_turns.
+    result = episode(module, [dict(text="Done.", token_ids=[4], log_probs=[-0.2])] * 4)
     assert result.policy_version is None
     assert result.requested_policy_version == 1
     assert result.rollout_replica_id is None

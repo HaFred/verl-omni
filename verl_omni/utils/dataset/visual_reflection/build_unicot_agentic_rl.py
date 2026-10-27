@@ -87,9 +87,19 @@ Protocol:
 1. Write a short numbered plan of at most three complete subtask image prompts.
 2. Call generate_image once per planned subtask, in order.
 3. After the final image, call judge_image on that image.
-4. Reflect briefly on the feedback and finish with Done.
+4. Reflect briefly on the feedback. If it says good_enough=NO and a generate_image call remains, \
+rewrite the final image prompt from its findings, call generate_image, and judge again.
+5. Finish with Done once good_enough=YES or no generate_image call remains.
 
-Do not judge between subtasks or generate more images than the plan lists."""
+Do not judge between subtasks or plan more subtask images than the request needs.
+
+Start your reply like this, with your own prompts in place of the angle brackets:
+Plan:
+1. <complete image prompt for subtask 1>
+2. <complete image prompt for subtask 2>
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "<complete image prompt for subtask 1>"}}
+</tool_call>"""
 
 _BREVITY_SUFFIX = (
     " Keep any private thinking to one short paragraph; do not repeat the request, "

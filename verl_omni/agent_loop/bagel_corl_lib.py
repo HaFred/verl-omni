@@ -110,7 +110,8 @@ JUDGE_IMAGE_TOOL_SCHEMA: dict[str, Any] = {
         "name": "judge_image",
         "description": (
             "Judge the last generated image. Returns correctness/aesthetics scores, "
-            "findings, suggested prompt fixes, and a good_enough verdict. Call after every generate_image."
+            "findings, suggested prompt fixes, and a good_enough verdict. Call it after generate_image; "
+            "on a planned task, call it once, after the final planned image."
         ),
         "parameters": {
             "type": "object",
@@ -513,6 +514,40 @@ def _native_tagged_call(text: str) -> dict[str, Any] | None:
     return None
 
 
+_NAMED_OBJECT_START_RE = re.compile(r'\{\s*"(?:name|function)"\s*:')
+_TRAILING_JUNK_RE = re.compile(r"(?:<\|[^|]*?\|>|[^\w])*")
+
+
+def _trailing_call(text: str) -> dict[str, Any] | None:
+    """Parse a named call that *ends* the turn, after a prose plan.
+
+    The plan prompt makes the checkpoint write ``Plan: 1. ... 2. ...`` and then its call with
+    no tag, or in a wrapper it invents (``《《{...}》》``). A JSON example quoted inside the plan
+    is followed by more prose; a call is followed by nothing but punctuation and special
+    tokens, which is what this requires. ``arguments`` separates a call from a schema echo.
+    A turn that ends in several calls (generate, then judge) runs the first of them.
+    """
+    decoder = json.JSONDecoder()
+    run: list[dict[str, Any]] = []
+    tail_start = len(text)
+    for match in reversed(list(_NAMED_OBJECT_START_RE.finditer(text))):
+        try:
+            payload, end = decoder.raw_decode(text, match.start())
+        except json.JSONDecodeError:
+            continue
+        if end > tail_start or not isinstance(payload, dict):
+            continue
+        if _TRAILING_JUNK_RE.fullmatch(text[end:tail_start]) is None:
+            break
+        run.insert(0, payload)
+        tail_start = match.start()
+    for payload in run:
+        payload = _named_payload(payload)
+        if payload is not None and "arguments" in payload:
+            return payload
+    return None
+
+
 def parse_und_tool_call(text: str) -> dict[str, Any] | None:
     """Parse a tool call emitted by the UND lane -- tagged, native, ``<tools>``, bare, or fenced.
 
@@ -550,9 +585,11 @@ def parse_und_tool_call(text: str) -> dict[str, Any] | None:
     tools_tagged = _tools_tagged_call(text)
     if tools_tagged is not None:
         return tools_tagged
-    if "```" not in text:
-        return None
-    return _labelled_fenced_call(text)
+    if "```" in text:
+        fenced = _labelled_fenced_call(text)
+        if fenced is not None:
+            return fenced
+    return _trailing_call(text)
 
 
 #: Stop strings for the UND lane. The checkpoint role-plays the transcript: once it has made a
@@ -1345,6 +1382,8 @@ async def run_serial_episode(
     good_enough_reduction: str = "any",
     corl_reward_version: str = "v1",
     fixed_gen_prompt: str = "",
+    task_type: str | None = None,
+    expected_num_images: int = 1,
 ) -> EpisodeRollout:
     """Serial UND turn(s) → optional one GEN turn (S FlowGRPO seeds) → RM → reflection / Done.
 
@@ -1374,6 +1413,12 @@ async def run_serial_episode(
 
     The turns that fit are kept and the post-loop forced reflection still closes the
     episode. ``None`` disables the guard.
+
+    ``task_type="plan"`` with ``expected_num_images > 1`` makes the environment follow the
+    plan protocol: each image before the last is answered with the next subtask number,
+    and the first ``judge_image`` before the last image is declined (``agentic_judge
+    ok=0``) instead of judged. Otherwise the forced reflection after that judge ends the
+    episode on its first image, and the graded plan result can never pass 1/E.
     """
     ids = bind_episode_ids(
         dataset_task_uid=dataset_task_uid,
@@ -1395,6 +1440,9 @@ async def run_serial_episode(
     num_gen_calls = 0
     judge_text: str | None = None
     stop_required = False
+    planned_images = max(1, int(expected_num_images)) if str(task_type or "").strip().lower() == "plan" else 1
+    images_rendered = 0
+    early_judge_declined = False
     # Per-turn trajectory trace (see ``EpisodeRollout.turn_trace``). Collected even when
     # ``BAGEL_CORL_DEBUG`` is off: the live per-turn ``logger.info`` below is the only
     # other place the raw UND text surfaces, and it is exactly the text that explains a
@@ -1632,6 +1680,24 @@ async def run_serial_episode(
             )
         _append_response(token_ids, 1, step.get("log_probs"))
         if kind == "done":
+            remaining = generate_tool.remaining_passes()
+            if remaining > 0 and not get_good_enough_yes_reached():
+                # The episode ends at min(max_generate_passes, first good_enough=YES); an
+                # earlier Done. is declined so the policy rewrites instead of quitting on NO.
+                next_step = (
+                    "call judge_image on the new image"
+                    if pending_judge is not None
+                    else "rewrite the diffusion prompt from the judge's findings and call generate_image"
+                )
+                _append_env_turn(
+                    "agentic_stop ok=0\n"
+                    f"good_enough=YES has not been reached and {remaining} of "
+                    f"{generate_tool.max_generate_passes} generate_image calls remain: {next_step}. "
+                    "Done. is accepted after good_enough=YES or the final generate_image call.",
+                    text,
+                    list(step.get("obs_token_ids") or []),
+                )
+                continue
             autonomous_done = not forced
             break
         if kind == "judge_image":
@@ -1639,6 +1705,18 @@ async def run_serial_episode(
                 _append_env_turn(
                     "agentic_judge ok=0 parse_ok=0 stub=0 backend=reward_loop\n"
                     "No new image to judge: call generate_image first.",
+                    text,
+                    list(step.get("obs_token_ids") or []),
+                )
+                continue
+            if not early_judge_declined and images_rendered < planned_images and generate_tool.remaining_passes() > 0:
+                # Declined once only, so a policy that keeps judging still gets a verdict
+                # within ``max_und_turns``.
+                early_judge_declined = True
+                _append_env_turn(
+                    "agentic_judge ok=0 parse_ok=1 stub=0 backend=reward_loop\n"
+                    f"Plan step {images_rendered}/{planned_images}: call generate_image for subtask "
+                    f"{images_rendered + 1} first. judge_image runs once, after the final subtask image.",
                     text,
                     list(step.get("obs_token_ids") or []),
                 )
@@ -1733,10 +1811,16 @@ async def run_serial_episode(
 
         if valid_paths:
             used_image_credit = True
+            images_rendered += 1
             observation = (
                 f"vLLM-Omni generated the requested image. {compact_image_observation(valid_paths[0])} "
                 f"agentic_tool ok=1 images={len(valid_paths)} backend=vllm_omni"
             )
+            if images_rendered < planned_images and generate_tool.remaining_passes() > 0:
+                observation += (
+                    f"\nPlan step {images_rendered}/{planned_images} rendered. Next: call generate_image "
+                    f"with the complete prompt for subtask {images_rendered + 1} of your plan."
+                )
         else:
             observation = (
                 "agentic_tool ok=0 images=0 backend=vllm_omni\n"

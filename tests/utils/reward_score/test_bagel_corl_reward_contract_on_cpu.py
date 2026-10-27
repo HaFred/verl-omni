@@ -125,6 +125,11 @@ def test_v2_rubric_disagreement_keeps_score_stop(monkeypatch):
     assert seen == ["original", "original"]
     assert result["sample_judge"][0]["correctness"] == 1.0
 
+    seen.clear()
+    payload["extra_info"] = {"user_prompt": "original Keep any private thinking short.", "raw_prompt": "original"}
+    scorer.compute_score(extra_info={"bagel_corl": payload})
+    assert seen == ["original", "original"]
+
 
 def test_posthoc_v2_uses_same_stored_image_scores_and_keeps_structure(monkeypatch):
     scorer = load_module("verl_omni/utils/reward_score/agentic_multidim_reward.py")
@@ -277,7 +282,8 @@ def test_forced_done_cannot_be_autonomous():
         orelse=[],
     )
     for forced in (True, False):
-        ns = {"kind": "done", "forced": forced, "autonomous_done": False}
+        spent = type("SpentTool", (), {"remaining_passes": staticmethod(lambda: 0)})()
+        ns = {"kind": "done", "forced": forced, "autonomous_done": False, "generate_tool": spent}
         exec(
             compile(ast.fix_missing_locations(ast.Module(body=[loop], type_ignores=[])), "done_attribution", "exec"), ns
         )

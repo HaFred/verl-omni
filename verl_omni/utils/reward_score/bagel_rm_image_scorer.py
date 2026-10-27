@@ -330,7 +330,14 @@ def compute_score(
     # Route the judge at the reward pool when one is deployed (see
     # ``_resolve_judge_endpoint``); falls back to the configured judge otherwise.
     knobs = _resolve_judge_endpoint(knobs, kwargs)
-    user_request = str(extra_info.get("user_prompt") or extra_info.get("raw_prompt") or "")
+    # ``user_prompt`` is the rendered user turn, which carries the dataset's brevity
+    # instructions; the judge caption must be the request alone.
+    raw_request = extra_info.get("raw_prompt")
+    user_request = (
+        raw_request.strip()
+        if isinstance(raw_request, str) and raw_request.strip()
+        else str(extra_info.get("user_prompt") or "")
+    )
     image_prompt = str(payload.get("image_prompt") or "")
     reference_paths = [str(p) for p in payload.get("reference_paths") or []]
     if reference_paths:

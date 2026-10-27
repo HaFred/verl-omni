@@ -34,7 +34,7 @@ from verl_omni.agent_loop.bagel_corl_lib import (
     aggregate_reward_breakdown_metrics,
     und_record_field_keys,
 )
-from verl_omni.trainer.omni.bagel_corl_diff_v1 import DiffusionV1GenLane
+from verl_omni.trainer.omni.bagel_corl_diff_v1 import DiffusionV1GenLane, gen_norm_adv_by_std
 from verl_omni.trainer.omni.bagel_corl_gen_adv import (
     apply_gen_flowgrpo_advantage,
     build_gen_flowgrpo_proto,
@@ -1083,7 +1083,11 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
                 gen_proto, gen_metrics = apply_gen_flowgrpo_advantage(
                     self._gen_batch_from_step(batch),
                     adv_estimator=gen_estimator,
-                    norm_adv_by_std_in_grpo=bool(algo.get("norm_adv_by_std_in_grpo", True)),
+                    norm_adv_by_std_in_grpo=(
+                        gen_norm
+                        if (gen_norm := gen_norm_adv_by_std(algo)) is not None
+                        else bool(algo.get("norm_adv_by_std_in_grpo", True))
+                    ),
                     global_std=bool(algo.get("global_std", True)),
                     algo_config=algo,
                 )
@@ -1221,6 +1225,31 @@ class OmniBagelCoRLTrainerSync(OmniPPOTrainerSync):
             )
         self._divergence_tripwire(metrics)
         return updated
+
+    #: Trend view of the per-step scalars. ``critic/score/mean`` averages 16-32 episodes and
+    #: is white noise step to step (lag-1 autocorrelation 0.06, std 0.067 on ``v0s9x7t2``)
+    #: against a trend of a few hundredths per 100 steps. A bias-corrected EMA with ~20-step
+    #: memory is the curve to read for "is training reward rising".
+    METRIC_EMA_BETA = 0.95
+    METRIC_EMA_KEYS = (
+        "critic/score/mean",
+        "bagel_corl/reward_dim/image/mean",
+        "episode/J",
+        "episode/K_zero",
+    )
+
+    def _compute_metrics(self, batch, metrics, timing_raw, global_steps, epoch):
+        super()._compute_metrics(batch, metrics, timing_raw, global_steps=global_steps, epoch=epoch)
+        state = self.__dict__.setdefault("_metric_ema", {})
+        for key in self.METRIC_EMA_KEYS:
+            value = _metric_scalar(metrics, key)
+            if value is None or not math.isfinite(value):
+                continue
+            ema, n = state.get(key, (0.0, 0))
+            ema = self.METRIC_EMA_BETA * ema + (1.0 - self.METRIC_EMA_BETA) * value
+            n += 1
+            state[key] = (ema, n)
+            metrics[f"bagel_corl/ema/{key}"] = ema / (1.0 - self.METRIC_EMA_BETA**n)
 
     #: Runaway-policy tripwire thresholds (see ``_divergence_tripwire``).
     #:

@@ -142,10 +142,15 @@ reward_model_name=${REWARD_MODEL:-${_HF_HUB}/models--CodeGoat24--UnifiedReward-2
 # --mix_ratio/--reflect_ratio/--seed from a clean shell.
 UNICOT_REFLECTION_DIR=${UNICOT_REFLECTION_DIR:-${_HF_HUB}/datasets--Fr0zencr4nE--UniCoT-Self-Reflection-6K}
 UNICOT_BREAKDOWN_DIR=${UNICOT_BREAKDOWN_DIR:-${_HF_HUB}/datasets--Fr0zencr4nE--UniCoT-Breakdown-3K}
-UNICOT_MIX_RATIO=${UNICOT_MIX_RATIO:-0.5}
+# The mix ratio only applies to a capped split. The full train split is 13% plan rows
+# (1107 of 8679), so a 4-prompt step sees a plan group about every other step. 3000 rows
+# at 0.65 reflect keep 1050 plan rows (35%) and still outlast 200 steps x 4 prompts.
+# UNICOT_TRAIN_SIZE=full restores the uncapped split.
+UNICOT_MIX_RATIO=${UNICOT_MIX_RATIO:-0.65}
 UNICOT_VAL_RATIO=${UNICOT_VAL_RATIO:-0.05}
 UNICOT_SPLIT_SEED=${UNICOT_SPLIT_SEED:-42}
-UNICOT_TRAIN_SIZE=${UNICOT_TRAIN_SIZE:-}
+UNICOT_TRAIN_SIZE=${UNICOT_TRAIN_SIZE:-3000}
+if [[ "$UNICOT_TRAIN_SIZE" == "full" ]]; then UNICOT_TRAIN_SIZE=; fi
 UNICOT_VAL_SIZE=${UNICOT_VAL_SIZE:-}
 
 TRAIN_FILE=${UNICOT_TRAIN:-"${_REPO_ROOT}/outputs/data/agentic_unicot/train.parquet"}
@@ -312,8 +317,10 @@ else
   REWARD_GPU_MEM_UTIL=${REWARD_GPU_MEM_UTIL:-0.15}
   # This bounds only the GEN lane's KV/workspace, not its checkpoint footprint; keep 0.25.
   ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.25}
-  # 4 prompt groups x N=4 sibling episodes = 16 episodes per optimizer step, and PPO_MINI=4
-  # keeps them in ONE mini-batch (4 episodes per rank at PPO_MICRO=1). The reference run at
+  # 4 prompt groups x N=8 sibling episodes = 32 episodes per optimizer step, and PPO_MINI=4
+  # keeps them in ONE mini-batch (8 episodes per rank at PPO_MICRO=1). N=8 matches UniGRPO
+  # (pr634); at N=4 the median within-group reward std was 0.041
+  # (``bagel_corl_prfix_t07_20261020_092656_a1``). The reference run at
   # 2 x N=4 (8 episodes/step) measured a training reward with no trend under this recipe's
   # noise; every extra sibling episode is another sample of the same task distribution,
   # whereas a smaller batch only re-rolls the same dice. Memory is not the constraint at
@@ -321,7 +328,7 @@ else
   # the activations are per-episode, so doubling TRAIN_BSZ doubles the *step time*, not the
   # peak (modulo the bounds the rollout/RM engines already carry via their mem-util knobs).
   TRAIN_BSZ=${TRAIN_BSZ:-4}
-  GEN_N_DEFAULT=4
+  GEN_N_DEFAULT=8
   MAX_PROMPT_LEN=${MAX_PROMPT_LEN:-2048}
   # pr634 UniGRPO SDE kernel: noise 0.8, SDE on the first ~20% of the schedule (window fixed at 0).
   GEN_STEPS=${GEN_STEPS:-10}
@@ -340,6 +347,18 @@ else
 fi
 if [[ "$ENABLE_RM" != "1" ]]; then
   ENABLE_RM=0
+fi
+
+# Co-RL reward contract (``agentic_image_gen.corl_reward_version``). v1 reads the UND ``image``
+# dim off the rubric verdict in the transcript, which is nearly binary: on ``v0s9x7t2`` 40% of
+# verdicts were exactly C/A 0.8/0.8 and 19% 0.0/0.0. v2 scores it from the trusted, continuous
+# UnifiedReward call scores the GEN lane already trains on, grades the plan-task ``result``
+# by images generated, and drops ``reflect`` when the harness wrote the reflection. v2 needs
+# the RM-scored samples, so it is the default only with the RM lane on.
+if [[ "$ENABLE_RM" == "1" ]]; then
+  CORL_REWARD_VERSION=${CORL_REWARD_VERSION:-v2}
+else
+  CORL_REWARD_VERSION=${CORL_REWARD_VERSION:-v1}
 fi
 
 # Reward-pool boot knobs, kept off the colocated actor: pin max_model_len to the episode
@@ -425,6 +444,30 @@ fi
 # is 50-step ODE (deterministic), so the extra prompts cost wall time, not signal.
 VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES:-32}
 
+# Balanced validation panel. The first 32 val rows are 22 reflect + 10 plan, so
+# ``val-core/unicot_breakdown`` moved 0.52 <-> 0.69 when one or two of ten prompts flipped.
+# ``VAL_PANEL_PER_TASK`` > 0 validates on a fixed, seeded panel of that many prompts per task
+# instead (``scripts/bagel_corl/build_eval_panel.py``, rebuilt whenever the val split is
+# newer), and every panel row is scored. 0 keeps the first-``VAL_MAX_SAMPLES`` subset.
+VAL_PANEL_PER_TASK=${VAL_PANEL_PER_TASK:-24}
+if [[ "$VAL_PANEL_PER_TASK" -gt 0 ]]; then
+  VAL_PANEL_FILE="$(dirname "$VAL_FILE")/val_panel_${VAL_PANEL_PER_TASK}.parquet"
+  if [[ ! -f "$VAL_PANEL_FILE" || "$VAL_FILE" -nt "$VAL_PANEL_FILE" ]]; then
+    "${_PY}" "${_REPO_ROOT}/scripts/bagel_corl/build_eval_panel.py" \
+        --dataset "$VAL_FILE" \
+        --training-dataset "$TRAIN_FILE" \
+        --output "$VAL_PANEL_FILE" \
+        --per-task "$VAL_PANEL_PER_TASK" \
+        --seed "${VAL_PANEL_SEED:-42}" \
+        --drop-duplicate-prompts || {
+      echo "[ERROR] validation panel build failed (traceback above); set VAL_PANEL_PER_TASK=0 to skip it." >&2
+      exit 1
+    }
+  fi
+  VAL_FILE="$VAL_PANEL_FILE"
+  VAL_MAX_SAMPLES=-1
+fi
+
 # Fixed validation holdout: samples 9001/9002 (cafe poster, reflect + plan) and 9003/9004
 # (CN poster, reflect + plan) -- the same four the Mode (2a) RPCO recipe dumps. One
 # deterministic ODE render per validation step under ``rollout_images/val/step_XXXXXX/
@@ -437,10 +480,21 @@ export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 # Advantage normalization. ``False`` is Dr.GRPO (arXiv:2503.20783): the advantage is the raw
 # centred reward, so the update scales with the actual signal and a near-tie is nearly a
 # no-op. Stock GRPO divides by the group std, which is *gap-independent* — at N=2 every gap
-# becomes +/-1/sqrt(2), i.e. a full-amplitude push on a coin flip. Read on both lanes: UND
-# token GRPO (``compute_advantage_for_multi_trajectories``) and GEN FlowGRPO
-# (``apply_gen_flowgrpo_advantage``).
+# becomes +/-1/sqrt(2), i.e. a full-amplitude push on a coin flip.
+#
+# ``NORM_ADV_BY_STD`` is the UND token GRPO switch (``compute_advantage_for_multi_trajectories``),
+# which normalizes per ``und_group_uid``. On ``v0s9x7t2`` the median within-group reward std
+# was 0.03, 30% of groups sat below 0.02, and siblings with identical UND transcripts still
+# differed by 0.012 (image seed + judge noise), so per-group std turns those near-ties into
+# full +/-1 pushes. A small but uniform raw advantage scale is not the problem it looks
+# like: one on-policy update per step under Adam absorbs it.
+#
+# ``GEN_NORM_ADV_BY_STD`` is the GEN FlowGRPO switch (``algorithm.gen_norm_adv_by_std_in_grpo``).
+# GEN divides by one batch-wide std (``global_std``), which rescales every group equally and
+# so cannot amplify a near-tie. It applies to any 2-member group, which is why S stays 1
+# below: an S=2 call is its own FlowGRPO group.
 NORM_ADV_BY_STD=${NORM_ADV_BY_STD:-False}
+GEN_NORM_ADV_BY_STD=${GEN_NORM_ADV_BY_STD:-True}
 
 # Actor (UND) LR. The schedule below (5% warmup, cosine to 10% of peak) was already the
 # mitigation for the old constant-1e-4 run, but the *peak* stayed 1e-4 -- and every run that
@@ -450,15 +504,39 @@ NORM_ADV_BY_STD=${NORM_ADV_BY_STD:-False}
 #   at steps 84/70/77, with actor/entropy collapsing 0.17 -> 0.085. The recipe has no KL
 #   anchor and no entropy bonus, so nothing pulls the actor back.
 #
-# A LoRA rank-8 actor on a 7B model does not need 1e-4; the comment that introduced the
-# cosine schedule already said the late steps should "move ~10x less". Make that the peak:
-# 1e-5 for UND, 1e-5 for the GEN lane (was 3e-5). ``ACTOR_LR``/``GEN_LR`` are knobs so a
-# sweep can move one lane without editing the file.
-ACTOR_LR=${ACTOR_LR:-1e-5}
-GEN_LR=${GEN_LR:-1e-5}
+# 1e-5 on both lanes then over-corrected. ``bagel_corl_prfix_t07_20261019_042153_a1`` (200
+# steps at 1e-5 peak) never tripped the wire, but it also never moved: ``rollout_corr/kl``
+# 0.016-0.099 with no trend, ``actor/entropy`` flat, ``val-core/unicot_reflection`` 0.799 ->
+# 0.856 by step 30 and flat after, training ``critic/score/mean`` flat-to-down. The LR was
+# doing the trust region's job by keeping the policy stationary.
+#
+# So the peak goes back up to 3e-5 on both lanes and the trust region moves into the
+# objective: UND gets a ``low_var_kl`` anchor to the LoRA-off base (``ref_in_actor``, no
+# extra weights), and GEN keeps its ``diffusion_loss.clip_ratio`` band (the actor config is
+# shared, but ``bagel_composite_loss`` only applies the KL term to a lane that carries a
+# ``ref_log_prob``, and only UND does). ``kl_loss_coef`` is verl's 0.001: UND advantages are
+# raw (|A| ~0.03, see ``NORM_ADV_BY_STD``), and 0.01 against them is a 10x stronger anchor
+# than it was against std-normalized ones.
+ACTOR_LR=${ACTOR_LR:-3e-5}
+GEN_LR=${GEN_LR:-3e-5}
 LR_WARMUP_RATIO=${LR_WARMUP_RATIO:-0.05}
 LR_SCHEDULER=${LR_SCHEDULER:-cosine}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
+USE_KL_LOSS=${USE_KL_LOSS:-True}
+KL_LOSS_COEF=${KL_LOSS_COEF:-0.001}
+KL_LOSS_TYPE=${KL_LOSS_TYPE:-low_var_kl}
+
+# UND rollout rejection sampling. ``algorithm.rollout_correction`` was computing the
+# rollout-vs-trainer diagnostics with both ``rollout_is`` and ``rollout_rs`` off, so a
+# sequence the trainer forward scores at ~0 probability still entered the gradient. On the
+# 20261019 run 8/200 steps had ``rollout_corr/ppl_ratio`` 22 -> 1.5e9, each with
+# ``actor/grad_norm`` 2.7-8.8 (healthy ~0.2) and -0.06 reward, 5 of them inside the steps
+# 101-180 dip. ``seq_mean_k1`` is the per-sequence ``training_log_ppl - rollout_log_ppl``,
+# i.e. ``rollout_corr/log_ppl_diff_max`` per row: healthy steps peak at 2.67, the corrupt
+# steps sit at a median 12.5. A bound of 20 (|log| <= 3.0) drops only the corrupt rows.
+# Verify on the next run: ``rollout_corr/rollout_rs_seq_masked_fraction`` ~0 on most steps.
+ROLLOUT_RS=${ROLLOUT_RS:-seq_mean_k1}
+ROLLOUT_RS_THRESHOLD=${ROLLOUT_RS_THRESHOLD:-20}
 
 # GEN (FlowGRPO) importance-ratio trust band. ``DiffusionLossConfig.clip_ratio`` defaults to
 # 1e-4, and this recipe used to inherit it. Measured on
@@ -587,9 +665,9 @@ export BAGEL_CORL_GEN_DECODE=${GEN_DECODE:-sde}
 # Fail the run the step the actor leaves its trust region, instead of only warning
 # (``OmniBagelCoRLTrainerSync._divergence_tripwire``, which reads these two env vars).
 #
-# Default is 1 here, not the class default of 0. This recipe sets no KL anchor
-# (``use_kl_loss`` stays false) and no entropy bonus (``entropy_coeff`` stays 0), so a step
-# that has already left the region cannot come back on its own: every remaining step spends
+# Default is 1 here, not the class default of 0. The UND KL anchor (``USE_KL_LOSS``) pulls
+# toward the base, but it is a soft term and GEN has none, so a step
+# that has already left the region is not expected to come back on its own: every remaining step spends
 # rollout + reward budget on a policy that will not be used. That is not a hypothetical --
 # ``bagel_corl_prfix_t07_20261016_023749_a1`` crossed ``rollout_corr/kl`` 41.8 against the
 # limit of 20 at step 84, kept going for another 115 steps, and produced nothing.
@@ -607,10 +685,14 @@ export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
     agentic_image_gen.vllm_url=$JUDGE_VLLM_URL \
     agentic_image_gen.good_enough_threshold=$JUDGE_GOOD_ENOUGH_THRESHOLD \
     agentic_image_gen.score_backend=${SCORE_BACKEND:-unified_reward_rubric} \
+    agentic_image_gen.corl_reward_version=$CORL_REWARD_VERSION \
     agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.62} \
     agentic_image_gen.pickscore_good_enough_threshold=$PICKSCORE_GOOD_ENOUGH_THRESHOLD \
     trainer.v1.trainer_mode=bagel_corl_sync \
     algorithm.norm_adv_by_std_in_grpo=$NORM_ADV_BY_STD \
+    algorithm.gen_norm_adv_by_std_in_grpo=$GEN_NORM_ADV_BY_STD \
+    algorithm.rollout_correction.rollout_rs=$ROLLOUT_RS \
+    algorithm.rollout_correction.rollout_rs_threshold=$ROLLOUT_RS_THRESHOLD \
     trainer.v1.sampler.sync_refill_failed_groups=${SYNC_REFILL_FAILED_GROUPS:-True} \
     data.train_files=$TRAIN_FILE \
     data.val_files=$VAL_FILE \
@@ -636,6 +718,9 @@ export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=$LR_WARMUP_RATIO \
     actor_rollout_ref.actor.optim.lr_scheduler_type=$LR_SCHEDULER \
     actor_rollout_ref.actor.optim.min_lr_ratio=$MIN_LR_RATIO \
+    actor_rollout_ref.actor.use_kl_loss=$USE_KL_LOSS \
+    actor_rollout_ref.actor.kl_loss_coef=$KL_LOSS_COEF \
+    actor_rollout_ref.actor.kl_loss_type=$KL_LOSS_TYPE \
     actor_rollout_ref.actor.ppo_mini_batch_size=$PPO_MINI \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=$PPO_MICRO \
     actor_rollout_ref.actor.strategy=fsdp2 \

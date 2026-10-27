@@ -946,6 +946,11 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
         path_tokens = set_active_trajectory_relpath(relpath)
         user_prompt_text = last_user_prompt(raw_prompt)
         prompt_token = set_active_user_prompt(user_prompt_text)
+        episode_ground_truth = trace_ground_truth(kwargs)
+        try:
+            expected_num_images = max(1, int(episode_ground_truth.get("expected_num_images") or 1))
+        except (TypeError, ValueError):
+            expected_num_images = 1
         try:
             episode = await run_serial_episode(
                 dataset_task_uid=dataset_task_uid,
@@ -963,6 +968,8 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
                 good_enough_reduction=good_enough_reduction,
                 corl_reward_version=str(agentic_scorer_knobs_from_config(self.config).get("corl_reward_version", "v1")),
                 fixed_gen_prompt=str(self.config.actor_rollout_ref.rollout.agent.get("corl_fixed_gen_prompt", "")),
+                task_type=episode_ground_truth.get("task_type"),
+                expected_num_images=expected_num_images,
             )
         finally:
             reset_active_trajectory_relpath(path_tokens)
@@ -984,7 +991,7 @@ class BagelMultiturnAgentLoop(AgentLoopBase):
             prompt_ids=list(prompt_ids),
             tokenizer=self.tokenizer,
             image_relpath=image_relpath,
-            ground_truth=trace_ground_truth(kwargs),
+            ground_truth=episode_ground_truth,
         )
         # Action-level index beside the trajectory (and the PNGs the image dumper copies
         # under the same ``relpath``). Written from the episode because the bagel TQ
