@@ -28,12 +28,6 @@ The builder combines:
 Source annotations are reward ground truth only and never appear in the model
 prompt. Validation is metadata-only; the builder does not require
 ``images.zip`` or read image pixels.
-
-Reward weights are set at build time with ``RPCO_W_REFLECT``, ``RPCO_W_PLAN``,
-``RPCO_W_FORMAT``, ``RPCO_W_TOOL``, and ``RPCO_W_RESULT``. Each defaults to 1.0
-and accepts a non-negative float. Resolved values are stored as ``w_<dimension>``
-in every row's ``ground_truth`` and in ``build_report.json`` under
-``reward_weights``; reuse these values when reproducing a build.
 """
 
 from __future__ import annotations
@@ -70,6 +64,8 @@ BREAKDOWN_DATA_SOURCE = "unicot_breakdown"
 # Parquet data_source follows task_type. Hub corpus stays on extra_info.unicot_source.
 PLAN_DATA_SOURCE = BREAKDOWN_DATA_SOURCE
 REWARD_DIMS = ("reflect", "plan", "format", "tool", "result")
+# Public alias retained for reward/dataset consumers.
+DIMS = REWARD_DIMS
 MANIFEST_ID = "agentic_rl_unicot_v1"
 
 REFLECT_SYSTEM_PROMPT = """You are a visual creation agent with two tools:
@@ -92,9 +88,19 @@ Protocol:
 1. Write a short numbered plan of at most three complete subtask image prompts.
 2. Call generate_image once per planned subtask, in order.
 3. After the final image, call judge_image on that image.
-4. Reflect briefly on the feedback and finish with Done.
+4. Reflect briefly on the feedback. If it says good_enough=NO and a generate_image call remains, \
+rewrite the final image prompt from its findings, call generate_image, and judge again.
+5. Finish with Done once good_enough=YES or no generate_image call remains.
 
-Do not judge between subtasks or generate more images than the plan lists."""
+Do not judge between subtasks or plan more subtask images than the request needs.
+
+Start your reply like this, with your own prompts in place of the angle brackets:
+Plan:
+1. <complete image prompt for subtask 1>
+2. <complete image prompt for subtask 2>
+<tool_call>
+{"name": "generate_image", "arguments": {"prompt": "<complete image prompt for subtask 1>"}}
+</tool_call>"""
 
 _BREVITY_SUFFIX = (
     " Keep any private thinking to one short paragraph; do not repeat the request, "
@@ -113,7 +119,6 @@ class _TextOnlyImageResolver:
         index: int = 0,
         source_record_id: str | None = None,
     ) -> dict[str, str]:
-        """Return a URI fingerprint for metadata-only transition validation."""
         uri = str(value).strip() if value is not None else ""
         if not uri:
             raise VisualReflectionDataError(
@@ -128,12 +133,10 @@ class _TextOnlyImageResolver:
 
 
 def _with_brevity(prompt: str) -> str:
-    """Append the agent's response-length guidance to a source prompt."""
     return f"{prompt.rstrip()}{_BREVITY_SUFFIX}"
 
 
 def _env_weight(dim: str) -> float:
-    """Resolve a non-negative reward weight from its RPCO environment variable."""
     env_name = f"RPCO_W_{dim.upper()}"
     raw = os.environ.get(env_name, "1.0").strip()
     try:
@@ -145,9 +148,24 @@ def _env_weight(dim: str) -> float:
     return value
 
 
+# CLI overrides (--w_reflect / --w_plan / ...) win over the RPCO_W_* env fallback
+# so one knob source (the build invocation) is enough — env stays as the documented
+# override for wrapper scripts. Audit knob-SoT module C.
+_CLI_WEIGHTS: dict[str, float] | None = None
+
+
 def _weights() -> dict[str, float]:
-    """Resolve all build-time reward weights using ground-truth field names."""
-    return {f"w_{dim}": _env_weight(dim) for dim in REWARD_DIMS}
+    weights: dict[str, float] = {}
+    for dim in REWARD_DIMS:
+        key = f"w_{dim}"
+        if _CLI_WEIGHTS and key in _CLI_WEIGHTS:
+            value = float(_CLI_WEIGHTS[key])
+            if value < 0:
+                raise ValueError(f"--{key} must be non-negative, got {value}")
+        else:
+            value = _env_weight(dim)
+        weights[key] = value
+    return weights
 
 
 def _hub_ref_files(refs_dir: Path) -> list[Path]:
@@ -182,7 +200,6 @@ def _resolve_hub_snapshot(root: Path) -> Path:
 
 
 def _load_metadata(dataset_dir: str, dataset_id: str) -> list[Any]:
-    """Load a snapshot's JSON list, leaving row validation to the source parser."""
     root = Path(dataset_dir).expanduser()
     snapshot = _resolve_hub_snapshot(root)
     metadata_path = snapshot / "metadata.json"
@@ -202,7 +219,6 @@ def _rejection(record: Any, error: VisualReflectionDataError) -> dict[str, Any]:
 
 
 def _split_record(*, dataset_id: str, data_id: str, prompt: str) -> dict[str, str]:
-    """Construct source identity and prompt deduplication inputs for splitting."""
     return {
         "source_dataset": dataset_id,
         "source_record_id": data_id,
@@ -212,13 +228,11 @@ def _split_record(*, dataset_id: str, data_id: str, prompt: str) -> dict[str, st
     }
 
 
-def _parse_reflection_rows(
-    metadata: list[Any], *, weights: Mapping[str, float]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Convert valid reflection trajectories and collect rejected source entries."""
+def _parse_reflection_rows(metadata: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     rejections: list[dict[str, Any]] = []
     resolver = _TextOnlyImageResolver()
+    weights = _weights()
     for source in metadata:
         try:
             trajectory = parse_unicot_record(
@@ -256,12 +270,10 @@ def _parse_reflection_rows(
     return rows, rejections
 
 
-def _parse_breakdown_rows(
-    metadata: list[Any], *, weights: Mapping[str, float]
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Convert plans and no-breakdown rows while collecting invalid entries."""
+def _parse_breakdown_rows(metadata: list[Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     rejections: list[dict[str, Any]] = []
+    weights = _weights()
     for source in metadata:
         try:
             parsed = parse_unicot_breakdown_record(source, manifest_id=MANIFEST_ID)
@@ -301,7 +313,6 @@ def _assign_splits(
     seed: int,
     val_ratio: float,
 ) -> tuple[dict[tuple[str, str], str], str | None]:
-    """Assign deduplicated prompts to reproducible train and validation splits."""
     assignments = assign_source_splits(
         [row["split_record"] for row in rows],
         ratios={"train": 1.0 - val_ratio, "validation": val_ratio, "test": 0.0},
@@ -325,13 +336,13 @@ def _select_rows(
     mix_ratio: float,
     seed: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Select a full split or sample an exact capped task mix, failing on shortages."""
     split_rows = [row for row in rows if split_by_identity[(row["source_dataset"], row["data_id"])] == split]
     split_rows.sort(key=lambda row: (row["source_dataset"], row["data_id"]))
     if size is None:
         return split_rows, {
             "requested_size": None,
             "actual_size": len(split_rows),
+            "shortfall": None,
         }
 
     reflect = [row for row in split_rows if row["task_type"] == "reflect"]
@@ -353,13 +364,13 @@ def _select_rows(
     return selected, {
         "requested_size": size,
         "actual_size": len(selected),
+        "shortfall": None,
         "requested_reflect": requested_reflect,
         "requested_plan": requested_plan,
     }
 
 
 def _build_parquet_row(row: dict[str, Any], *, split: str, index: int) -> dict[str, Any]:
-    """Format a training row with references confined to reward ground truth."""
     prompt = row["prompt_text"]
     is_plan = row["task_type"] == "plan"
     return {
@@ -392,7 +403,6 @@ def build_rows(
     mix_ratio: float,
     seed: int,
 ) -> tuple[list[dict[str, Any]], dict[str, int], dict[str, Any]]:
-    """Build one split's parquet records, task counts, and selection summary."""
     selected, selection = _select_rows(
         rows,
         split_by_identity,
@@ -430,17 +440,14 @@ def main_cli(
     if any(size is not None and size < 0 for size in (train_size, val_size)):
         raise SystemExit("train_size and val_size must be non-negative")
 
-    weights = _weights()
     rows: list[dict[str, Any]] = []
     rejections: list[dict[str, Any]] = []
     if reflection_dir:
-        parsed, rejected = _parse_reflection_rows(_load_metadata(reflection_dir, UNICOT_DATASET_ID), weights=weights)
+        parsed, rejected = _parse_reflection_rows(_load_metadata(reflection_dir, UNICOT_DATASET_ID))
         rows.extend(parsed)
         rejections.extend(rejected)
     if breakdown_dir:
-        parsed, rejected = _parse_breakdown_rows(
-            _load_metadata(breakdown_dir, UNICOT_BREAKDOWN_DATASET_ID), weights=weights
-        )
+        parsed, rejected = _parse_breakdown_rows(_load_metadata(breakdown_dir, UNICOT_BREAKDOWN_DATASET_ID))
         rows.extend(parsed)
         rejections.extend(rejected)
 
@@ -452,7 +459,7 @@ def main_cli(
         "partition_id": partition_id,
         "seed": seed,
         "val_ratio": val_ratio,
-        "reward_weights": weights,
+        "reward_weights": _weights(),
         "source_configs": {
             "reflection": unicot_converter_config(),
             "breakdown": breakdown_converter_config(),
@@ -482,16 +489,7 @@ def main_cli(
 
 
 def main() -> None:
-    """Parse command-line build settings and write the dataset outputs."""
-    parser = argparse.ArgumentParser(
-        description="Build UniCoT agentic RL parquet files",
-        epilog=(
-            "Build-time reward weights: RPCO_W_REFLECT, RPCO_W_PLAN, RPCO_W_FORMAT, "
-            "RPCO_W_TOOL, RPCO_W_RESULT. Each accepts a non-negative float (default: 1.0). "
-            "Resolved w_<dimension> values are saved in ground_truth and in "
-            "build_report.json under reward_weights."
-        ),
-    )
+    parser = argparse.ArgumentParser(description="Build UniCoT agentic RL parquet files")
     parser.add_argument("--breakdown_dir", default=os.environ.get("UNICOT_BREAKDOWN_DIR", ""))
     parser.add_argument("--reflection_dir", default=os.environ.get("UNICOT_REFLECTION_DIR", ""))
     parser.add_argument("--local_save_dir", default=os.path.expanduser("~/data/agentic_unicot"))
@@ -511,7 +509,18 @@ def main() -> None:
         default=float(os.environ.get("UNICOT_VAL_RATIO", "0.05")),
     )
     parser.add_argument("--seed", type=int, default=int(os.environ.get("UNICOT_SPLIT_SEED", "42")))
+    for dim in REWARD_DIMS:
+        parser.add_argument(
+            f"--w_{dim}",
+            type=float,
+            default=None,
+            help=f"RPCO weight for the {dim} dimension (overrides RPCO_W_{dim.upper()})",
+        )
     args = parser.parse_args()
+    global _CLI_WEIGHTS
+    _CLI_WEIGHTS = {
+        f"w_{dim}": getattr(args, f"w_{dim}") for dim in REWARD_DIMS if getattr(args, f"w_{dim}") is not None
+    }
     main_cli(
         reflection_dir=args.reflection_dir,
         breakdown_dir=args.breakdown_dir,
