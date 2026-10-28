@@ -260,3 +260,176 @@ def test_fits_response_budget_rejects_overflow():
     assert u.fits_response_budget(mask_len=10, n_new_ids=6, response_length=16) is False
     assert u.fits_response_budget(mask_len=10, n_new_ids=0, response_length=16) is False
     assert u.fits_response_budget(mask_len=0, n_new_ids=1, response_length=1) is False
+
+
+def _hermes_rollout_messages(*, with_ids: bool = False) -> list[dict]:
+    """Messages as ``ToolAgentLoop`` records a reflect rollout under the Hermes parser."""
+    from verl_omni.utils.agentic_image_judge_parse import format_judge_observation
+
+    judge_text, _ = format_judge_observation(
+        image_path="/tmp/x.png",
+        parsed={"correctness": 0.8, "aesthetics": 0.7, "good_enough": True, "findings": "text is legible"},
+        backend="vllm",
+    )
+
+    def call(name: str, call_id: str, **arguments: str) -> dict:
+        entry = {"type": "function", "function": {"name": name, "arguments": json.dumps(arguments)}}
+        if with_ids:
+            entry["id"] = call_id
+        return entry
+
+    def response(content: str, call_id: str) -> dict:
+        message = {"role": "tool", "content": content}
+        if with_ids:
+            message["tool_call_id"] = call_id
+        return message
+
+    return [
+        {"role": "system", "content": "tools"},
+        {"role": "user", "content": "a poster"},
+        {"role": "assistant", "content": "", "tool_calls": [call("generate_image", "g", prompt="a poster")]},
+        response(_gen_obs(), "g"),
+        {"role": "assistant", "content": "", "tool_calls": [call("judge_image", "j", user_request="a poster")]},
+        response(judge_text, "j"),
+        {"role": "assistant", "content": "Reflection: the poster text is legible. Done."},
+    ]
+
+
+def test_runtime_trajectory_messages_bind_responses_by_position():
+    exported = utils.runtime_trajectory_messages(_hermes_rollout_messages())
+    assert [message["role"] for message in exported] == ["assistant", "tool", "assistant", "tool", "assistant"]
+    generate_id = exported[0]["tool_calls"][0]["id"]
+    judge_id = exported[2]["tool_calls"][0]["id"]
+    assert generate_id != judge_id
+    assert exported[1]["tool_call_id"] == generate_id
+    assert exported[3]["tool_call_id"] == judge_id
+    assert "tool_calls" not in exported[4]
+
+
+def test_runtime_trajectory_messages_keep_parser_ids_and_text_content():
+    messages = _hermes_rollout_messages(with_ids=True)
+    messages[3]["content"] = [{"type": "image", "image": "x"}, {"type": "text", "text": _gen_obs()}]
+    exported = utils.runtime_trajectory_messages(messages)
+    assert exported[0]["tool_calls"][0]["id"] == "g"
+    assert exported[1] == {"role": "tool", "content": _gen_obs(), "tool_call_id": "g"}
+
+
+def test_exported_messages_authenticate_a_hermes_rollout_for_the_rpco_reward():
+    """The Hermes parser sets no call IDs: the export is what makes outcomes trusted."""
+    from verl_omni.agent_loop.utils import messages_to_text
+    from verl_omni.utils.reward_score.agentic_multidim_reward import compute_score
+
+    messages = _hermes_rollout_messages()
+    kwargs = {
+        "solution_str": messages_to_text(messages[2:]),
+        "ground_truth": {"task_type": "reflect", "expected_num_images": 1},
+    }
+    raw = compute_score(**kwargs, extra_info={"trajectory_messages": messages})
+    assert raw["n_successful_generates"] == 0
+    assert raw["score"] == 0.0
+
+    exported = compute_score(**kwargs, extra_info={"trajectory_messages": utils.runtime_trajectory_messages(messages)})
+    assert exported["rollout_valid"] == 1
+    assert exported["judge_parse_ok"] == 1
+    assert exported["reward_tool"] == exported["reward_result"] == exported["reward_done"] == 1.0
+
+
+class _Tokenizer:
+    eos_token = "<|im_end|>"
+
+    def encode(self, text, add_special_tokens=False):
+        return list(range(len(text.split())))
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "Reflection: the poster is fine. Done."
+
+
+def _bare_loop():
+    import asyncio
+
+    from verl_omni.agent_loop.tool_agent_loop import ImageGenToolAgentLoop
+
+    loop = object.__new__(ImageGenToolAgentLoop)
+    loop.tokenizer = _Tokenizer()
+    loop.loop = asyncio.get_running_loop()
+    loop.response_length = 1024
+    loop.tools = {}
+    return loop
+
+
+def _agent_data(messages):
+    from verl.experimental.agent_loop.tool_agent_loop import AgentData
+
+    return AgentData(
+        messages=list(messages),
+        image_data=None,
+        video_data=None,
+        audio_data=None,
+        mm_processor_kwargs=None,
+        metrics={},
+        request_id="r",
+        tools_kwargs={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_teacher_forced_call_is_recorded_as_a_structured_call():
+    from verl.experimental.agent_loop.tool_parser import FunctionCall
+
+    loop = _bare_loop()
+    agent_data = _agent_data([{"role": "user", "content": "a poster"}])
+    tool_call = FunctionCall(name="generate_image", arguments=json.dumps({"prompt": "a poster"}))
+    hermes = utils.hermes_tool_call("generate_image", prompt="a poster")
+    await loop._replace_last_assistant_with_tool_call(agent_data, hermes, tool_call)
+
+    message = agent_data.messages[-1]
+    assert tool_call.tool_call_id
+    assert message["tool_calls"] == [
+        {
+            "type": "function",
+            "id": tool_call.tool_call_id,
+            "function": {"name": "generate_image", "arguments": tool_call.arguments},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_budget_terminated_turn_is_recorded_in_messages(monkeypatch):
+    from verl.experimental.agent_loop.tool_agent_loop import AgentState, ToolAgentLoop
+
+    async def stop_on_budget(self, agent_data, sampling_params, ignore_termination=False):
+        agent_data.response_ids = [1, 2, 3]
+        agent_data.assistant_turns += 1
+        return AgentState.TERMINATED
+
+    monkeypatch.setattr(ToolAgentLoop, "_handle_generating_state", stop_on_budget)
+    clear_agentic_image_gen()
+    bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))
+    loop = _bare_loop()
+    agent_data = _agent_data([{"role": "user", "content": "a poster"}])
+    state = await loop._handle_generating_state(agent_data, {})
+    clear_agentic_image_gen()
+
+    assert state == AgentState.TERMINATED
+    assert agent_data.messages[-1] == {"role": "assistant", "content": "Reflection: the poster is fine. Done."}
+
+
+@pytest.mark.asyncio
+async def test_run_publishes_runtime_trajectory_messages(monkeypatch):
+    from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+
+    messages = _hermes_rollout_messages()
+
+    async def fake_pending(self, agent_data, sampling_params):
+        return None
+
+    async def fake_run(self, sampling_params, **kwargs):
+        agent_data = _agent_data(messages)
+        await self._handle_pending_state(agent_data, sampling_params)
+        return SimpleNamespace(extra_fields=agent_data.extra_fields)
+
+    monkeypatch.setattr(ToolAgentLoop, "_handle_pending_state", fake_pending)
+    monkeypatch.setattr(ToolAgentLoop, "run", fake_run)
+    output = await _bare_loop().run({})
+
+    assert output.extra_fields["trajectory_messages"] == utils.runtime_trajectory_messages(messages)

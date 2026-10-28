@@ -682,3 +682,31 @@ def test_failed_final_judge_cannot_reuse_an_earlier_acceptance():
     output = compute_score(ground_truth=_ground_truth(), trajectory_messages=messages)
     assert output["judge_parse_fail"] == 1
     assert output["reward_done"] == output["reward_result"] == 0.0
+
+
+def test_blocked_generation_after_success_voids_completion_credit():
+    """A runtime block response must zero completion even though it is not an observation."""
+    plan = _plan_trajectory(["A bold headline on a vertical cafe poster"]).replace("good_enough=YES", "good_enough=NO")
+    messages = _fixture_messages(plan)
+    blocked_call = _fixture_messages(_call("generate_image", prompt="One more poster."))
+    blocked_call[0]["tool_calls"][0]["id"] = "blocked-generation"
+    blocked_response = {
+        "role": "tool",
+        "tool_call_id": "blocked-generation",
+        "content": "generate_image blocked: blocked_after_max_passes=1 agentic_tool ok=0",
+    }
+    messages[-1:-1] = [*blocked_call, blocked_response]
+    output = compute_score(ground_truth=_ground_truth(task_type="plan", expected=1), trajectory_messages=messages)
+    assert output["n_successful_generates"] == 1
+    assert output["terminal_done"] == 1
+    assert output["reward_done"] == output["reward_result"] == 0.0
+
+
+def test_unstructured_tool_call_markup_is_not_a_call():
+    """Only structured ``tool_calls`` count; markup left in assistant prose is dropped."""
+    messages = _fixture_messages(_reflect_trajectory())
+    messages.insert(-1, {"role": "assistant", "content": _call("generate_image", prompt="An unexecuted poster.")})
+    output = compute_score(ground_truth=_ground_truth(), trajectory_messages=messages)
+    assert output["num_hermes_tool_calls"] == 2
+    assert output["rewrite_after_yes"] == 0
+    assert output["reward_result"] == 1.0

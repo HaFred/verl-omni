@@ -40,6 +40,7 @@ from verl_omni.tools.agent_helper.image_gen_utils import (
     hermes_tool_call,
     last_user_text,
     max_generate_passes,
+    runtime_trajectory_messages,
     tool_calls_are_premature_judge,
     tool_message_text,
 )
@@ -76,9 +77,14 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             path_tokens = set_active_trajectory_relpath(self._agentic_trajectory_relpath)
         clear_good_enough_yes_reached()
         clear_latest_tool_image_for_active_rollout()
+        self._agent_data: AgentData | None = None
         try:
             # Dense extra_fields so DataProto.concat across workers keeps a shared key set.
             output = await super().run(sampling_params, **kwargs)
+            # The RPCO reward trusts tool outcomes only from these runtime-owned messages.
+            output.extra_fields["trajectory_messages"] = (
+                runtime_trajectory_messages(self._agent_data.messages) if self._agent_data is not None else []
+            )
             output.extra_fields.pop("_forced_generate_prompt", None)
             output.extra_fields.setdefault("forced_reflection", False)
             output.extra_fields.setdefault("force_stop_max_passes", False)
@@ -98,6 +104,10 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             clear_latest_tool_image_for_active_rollout()
             if path_tokens is not None:
                 reset_active_trajectory_relpath(path_tokens)
+
+    async def _handle_pending_state(self, agent_data: AgentData, sampling_params: dict[str, Any]) -> AgentState:
+        self._agent_data = agent_data
+        return await super()._handle_pending_state(agent_data, sampling_params)
 
     async def _rewrite_premature_judge_to_generate(self, agent_data: AgentData) -> AgentState | None:
         """Replace a first-turn ``judge_image`` call with ``generate_image`` (mask=1)."""
@@ -161,7 +171,19 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             if agent_data.response_logprobs:
                 agent_data.response_logprobs = agent_data.response_logprobs[:-n_last]
 
-        assistant_msg = {"role": "assistant", "content": hermes_text}
+        # A structured call, like a parsed one, so its tool response is a runtime observation.
+        tool_call.tool_call_id = tool_call.tool_call_id or f"forced_call_{agent_data.assistant_turns}"
+        assistant_msg = {
+            "role": "assistant",
+            "content": hermes_text,
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "id": tool_call.tool_call_id,
+                    "function": {"name": tool_call.name, "arguments": tool_call.arguments},
+                }
+            ],
+        }
         # Stock ToolAgentLoop does not append assistant turns; keep messages coherent for dumps.
         if agent_data.messages and agent_data.messages[-1].get("role") == "assistant":
             agent_data.messages[-1] = assistant_msg
@@ -192,7 +214,16 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
         ignore_termination: bool = False,
     ) -> AgentState:
         """Write missing generate/judge tool calls for the model during early training."""
+        n_messages = len(agent_data.messages)
         state = await super()._handle_generating_state(agent_data, sampling_params, ignore_termination)
+        if state == AgentState.TERMINATED and len(agent_data.messages) == n_messages and agent_data.response_ids:
+            # The parent stops on a length / turn budget before recording the turn; the
+            # reward reads the trajectory from ``messages``, so the final turn must be there.
+            response_ids = list(agent_data.response_ids)
+            text = await self.loop.run_in_executor(
+                None, lambda: self.tokenizer.decode(response_ids, skip_special_tokens=True)
+            )
+            agent_data.messages.append({"role": "assistant", "content": text})
         probability = force_first_generate_probability(
             getattr(self, "_agentic_step", 0),
             validate=getattr(self, "_agentic_validate", False),
