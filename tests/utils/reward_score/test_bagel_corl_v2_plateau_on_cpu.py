@@ -122,6 +122,39 @@ def test_v2_plan_result_is_not_zeroed_by_a_rewrite_after_a_no_verdict():
     assert over_planned["reward_result"] == 0.0
 
 
+def test_v2_reflect_result_survives_the_harness_requested_rewrite():
+    """A NO verdict is the env's cue to rewrite, so the rewrite cannot be what zeroes result."""
+    gt = {"task_type": "reflect"}
+    call = '{"name":"generate_image","arguments":{"prompt":"plate of jollof"}}'
+    text = "\n".join(
+        [
+            f"{call}\nagentic_tool ok=1 path=first.png",
+            "Reflection: VL judge reports correctness=0.3, aesthetics=0.4, good_enough=NO. "
+            "rubber_stamp=False. The plate is empty. Rewriting the diffusion prompt next.",
+            f"{call}\nagentic_tool ok=1 path=rewrite.png",
+            "Reflection: VL judge reports correctness=0.85, aesthetics=0.8, good_enough=YES. "
+            "Stop now; do not call another tool. Your next and only action must be exactly Done. "
+            "agentic_stop_decision_required=1",
+            "Done.",
+        ]
+    )
+    rewritten = v2(text, gt, num_gen_calls=2)
+    legacy = scorer().compute_score(solution_str=text, ground_truth=gt)
+    assert rewritten["n_successful_generates"] == 2
+    assert rewritten["reward_result"] == pytest.approx(1.0)
+    assert legacy["reward_result"] == 0.0
+
+
+def test_v2_score_drops_the_dead_done_dim():
+    """``autonomous_done`` is False on every harness-forced episode; it must not rescale the rest."""
+    gt = {"task_type": "reflect"}
+    light = v2(forced_transcript(), {**gt, "w_done": 0.0})
+    heavy = v2(forced_transcript(), {**gt, "w_done": 5.0})
+    assert light["reward_done"] == 0.0
+    assert heavy["reward_done"] == 0.0
+    assert heavy["score"] == pytest.approx(light["score"])
+
+
 def test_v2_accepts_a_terminal_done_without_the_period():
     gt = {"task_type": "reflect"}
     spaced = v2(forced_transcript(), gt)

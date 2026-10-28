@@ -810,30 +810,35 @@ def _result_reward(
     terminal_done: bool,
     blocked: bool,
     rewrite_after_yes: int,
-    graded_plan: bool = False,
+    graded: bool = False,
 ) -> float:
     if blocked or not terminal_done or successful_generates < 1 or rewrite_after_yes > 0:
         return 0.0
+    judges = _successful_judges(text)
+    # Only images rendered before the first verdict are the *submission*: a rewrite after a NO
+    # verdict is the reflection the harness demands, not an extra attempt. Charging it against
+    # the budget is what zeroed every reflect ``result`` (val 0.04-0.08) while the policy was
+    # doing exactly what the env asked.
+    first_verdict_end = judges[0][3] if judges else len(text)
+    submission_images = min(
+        successful_generates,
+        sum(
+            1
+            for _, end, call in _extract_tool_calls(text)
+            if _tool_name(call) == "generate_image" and end <= first_verdict_end
+        ),
+    )
     if task_type == "plan":
-        if graded_plan:
+        if graded:
             # Exact-count-or-zero is unreachable from a one-image policy: every sibling scores
             # 0 and the group carries no signal toward the second image. Only the subtask
             # images rendered before the first verdict are the plan; a rewrite after a NO
             # verdict is the reflection the harness asks for, not an extra subtask.
-            judges = _successful_judges(text)
-            first_verdict_end = judges[0][3] if judges else len(text)
-            subtask_images = min(
-                successful_generates,
-                sum(
-                    1
-                    for _, end, call in _extract_tool_calls(text)
-                    if _tool_name(call) == "generate_image" and end <= first_verdict_end
-                ),
-            )
-            return subtask_images / expected if subtask_images <= expected else 0.0
+            return submission_images / expected if submission_images <= expected else 0.0
         return 1.0 if successful_generates == expected else 0.0
-    judges = _successful_judges(text)
     final_yes = bool(judges) and judges[-1][2] is True
+    if graded:
+        return 1.0 if final_yes and submission_images <= expected else 0.0
     # Fail closed on a terminal NO: early-stop alone is not a free result point.
     return 1.0 if final_yes and successful_generates <= expected else 0.0
 
@@ -1152,7 +1157,7 @@ def compute_score(
             terminal_done=terminal_done,
             blocked=blocked,
             rewrite_after_yes=rewrites_after_yes,
-            graded_plan=version == "v2",
+            graded=version == "v2",
         ),
         "image": _image_reward(
             text,
@@ -1178,6 +1183,12 @@ def compute_score(
             # half the coverage of empty policy prose: a coarse copy of ``image``, not a
             # policy-controllable dimension.
             weights.pop("reflect", None)
+        # ``done`` is ``autonomous_done``, and the harness sets that to False on every episode
+        # it forced a reflection into -- which is nearly all of them (val step 90: 0.04 plan,
+        # 0.00 reflect). A dim that is 0 on almost every row cannot teach termination; it only
+        # rescales the rest of the composite down by its weight share. Keep reporting
+        # ``reward_done`` as a diagnostic, but leave it out of the score.
+        weights.pop("done", None)
     weight_sum = sum(weights.values())
     score = sum(weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
     result.update(
