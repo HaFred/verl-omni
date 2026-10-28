@@ -50,7 +50,7 @@ from verl_omni.tools.trajectory import (
     reset_active_trajectory_relpath,
     set_active_trajectory_relpath,
 )
-from verl_omni.tools.trajectory.hydra_env import agentic_get_bool
+from verl_omni.utils.agentic.config import agentic_get_bool
 
 logger = logging.getLogger(__name__)
 

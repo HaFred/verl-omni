@@ -23,7 +23,7 @@ from omegaconf import OmegaConf
 
 import verl_omni  # noqa: F401
 from verl_omni.tools.agent_helper import image_gen_utils as utils
-from verl_omni.tools.trajectory.hydra_env import bind_agentic_image_gen, clear_agentic_image_gen
+from verl_omni.utils.agentic.config import bind_agentic_image_gen, clear_agentic_image_gen
 
 
 def _judge_obs(*, correctness=0.80, aesthetics=0.76, good_enough="YES", findings="text is legible", fixes="none"):
@@ -44,7 +44,7 @@ def _gen_obs(prompt="a poster", backend="qwen_image"):
 
 @pytest.mark.parametrize("value", [False, "0", "false", "off", "no"])
 def test_force_reflection_after_judge_hydra_gate(value):
-    from verl_omni.tools.trajectory.hydra_env import agentic_get_bool
+    from verl_omni.utils.agentic.config import agentic_get_bool
 
     clear_agentic_image_gen()
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {"force_reflection_after_judge": value}}))
@@ -112,7 +112,7 @@ def test_force_first_generate_probability_schedule():
 
 
 def test_rewrite_judge_before_generate_hydra():
-    from verl_omni.tools.trajectory.hydra_env import agentic_get_bool
+    from verl_omni.utils.agentic.config import agentic_get_bool
 
     clear_agentic_image_gen()
     bind_agentic_image_gen(OmegaConf.create({"agentic_image_gen": {}}))

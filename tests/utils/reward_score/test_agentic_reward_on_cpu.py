@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 
 import verl_omni.utils.reward_score.agentic_reward as agentic_reward
-from verl_omni.tools.trajectory.hydra_env import SCORER_KNOB_KEYS, yaml_agentic_image_gen_defaults
+from verl_omni.utils.agentic.config import SCORER_KNOB_KEYS, yaml_agentic_image_gen_defaults
 from verl_omni.utils.reward_score.agentic_reward import compute_score as _compute_score
 
 
@@ -453,7 +453,7 @@ def test_compute_score_merges_scorer_knobs_into_extra_info(monkeypatch):
         return merged
 
     monkeypatch.setattr(
-        "verl_omni.tools.trajectory.hydra_env.merge_agentic_scorer_knobs",
+        "verl_omni.utils.agentic.config.merge_agentic_scorer_knobs",
         _fake_merge,
     )
     # Minimal valid generate trajectory (no VL fallback needed).

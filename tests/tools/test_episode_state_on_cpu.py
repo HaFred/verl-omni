@@ -154,17 +154,6 @@ def test_frozen_judge_feedback_is_associated_with_its_generated_image(tmp_path, 
         assert state.good_enough
 
 
-def test_worker_config_and_artifact_bindings_share_compatibility_imports():
-    from verl_omni.tools.trajectory import hydra_env, paths
-    from verl_omni.utils.agentic import artifacts, config
-
-    assert hydra_env is config
-    assert paths is artifacts
-    config.clear_agentic_image_gen()
-    with pytest.raises(RuntimeError, match="unbound"):
-        hydra_env.agentic_get("max_generate_image_passes")
-
-
 def test_legacy_prompt_binding_stays_local_to_a_copied_thread_context():
     with trajectory.episode_scope(episode("outer")) as state:
         asyncio.run(asyncio.to_thread(trajectory.active_user_prompt.set, "thread prompt"))

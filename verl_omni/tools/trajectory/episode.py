@@ -17,11 +17,6 @@
 The loop owns ``episode_scope``; nested tools reuse its owner across awaits and
 ``asyncio.to_thread`` callbacks. Each concurrent episode needs a fresh state.
 Scope exit releases references, leaves saved files alone, and rejects late writes.
-
-Mode (2b) and Mode (3) adapters retain their own trainability, tensor and reward
-contracts. This binding is process-local: pass immutable records or the existing
-rollout payload across Ray boundaries, never the state and its lock.
-Worker configuration and optional output paths live in ``utils.agentic``.
 """
 
 from __future__ import annotations

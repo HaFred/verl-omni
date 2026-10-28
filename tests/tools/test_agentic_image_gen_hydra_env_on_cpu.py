@@ -23,7 +23,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 import verl_omni
-from verl_omni.tools.trajectory.hydra_env import (
+from verl_omni.utils.agentic.config import (
     agentic_get,
     agentic_get_bool,
     agentic_get_str,
@@ -163,14 +163,14 @@ def test_agentic_get_unbound_fails_loud():
 
 
 def test_agentic_scorer_knobs_from_config_rejects_none():
-    from verl_omni.tools.trajectory.hydra_env import agentic_scorer_knobs_from_config
+    from verl_omni.utils.agentic.config import agentic_scorer_knobs_from_config
 
     with pytest.raises(ValueError, match="composed Hydra config"):
         agentic_scorer_knobs_from_config(None)
 
 
 def test_yaml_defaults_are_single_source_of_truth():
-    from verl_omni.tools.trajectory.hydra_env import yaml_agentic_image_gen_defaults
+    from verl_omni.utils.agentic.config import yaml_agentic_image_gen_defaults
 
     defaults = yaml_agentic_image_gen_defaults()
     assert defaults["max_generate_image_passes"] == 3
@@ -181,7 +181,7 @@ def test_yaml_defaults_are_single_source_of_truth():
 def test_merge_agentic_scorer_knobs_requires_stamp_or_config():
     from omegaconf import OmegaConf
 
-    from verl_omni.tools.trajectory.hydra_env import SCORER_KNOB_KEYS, merge_agentic_scorer_knobs
+    from verl_omni.utils.agentic.config import SCORER_KNOB_KEYS, merge_agentic_scorer_knobs
 
     with pytest.raises(ValueError, match="missing from extra_info"):
         merge_agentic_scorer_knobs({"w_tool_call": 0.1}, None)
