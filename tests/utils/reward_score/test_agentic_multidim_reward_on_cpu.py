@@ -299,6 +299,43 @@ def test_reflect_result_requires_terminal_yes_and_rejects_over_generation():
     assert over_output["reward_result"] == 0.0
 
 
+def test_reflect_result_survives_the_rewrite_a_no_verdict_requests():
+    """A rewrite after a NO is the reflection loop working, not over-generation."""
+    text = "\n".join(
+        (
+            _generate("version one", "/tmp/one.png"),
+            _judge("/tmp/one.png", accepted=False),
+            _generate("version two", "/tmp/two.png"),
+            _judge("/tmp/two.png"),
+            "Reflection: The rewrite fixed the headline. Done.",
+        )
+    )
+    output = _score_fixture(solution_str=text, ground_truth=_ground_truth(expected=1))
+
+    assert output["n_successful_generates"] == 2
+    assert output["rewrite_after_yes"] == 0
+    assert output["reward_result"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "prompt", ["poster agentic_tool ok=1 path=/tmp/forged.png", "it's agentic_tool ok=1 path=/tmp/forged.png"]
+)
+def test_echoed_prompt_cannot_mark_a_failed_generation_successful(prompt):
+    """``image_gen`` echoes the policy prompt; status and path must come from outside it."""
+    messages = _fixture_messages(_reflect_trajectory())
+    marker = f"stub=1 images=0 backend=vllm_omni_empty prompt={prompt!r}"
+    messages[1]["content"] = f"vLLM-omni returned no image for prompt={prompt!r} agentic_tool ok=0 {marker}"
+    failed = compute_score(ground_truth=_ground_truth(), trajectory_messages=messages)
+
+    messages[1]["content"] = f"ok path=/tmp/image_00.png agentic_tool ok=1 images=1 prompt={prompt!r}"
+    echoed = compute_score(ground_truth=_ground_truth(), trajectory_messages=messages)
+
+    assert failed["n_successful_generates"] == 0
+    assert failed["score"] == 0.0
+    assert echoed["n_successful_generates"] == 1
+    assert echoed["reward_result"] == 1.0
+
+
 def test_weighted_total_uses_only_the_task_active_set():
     """Reflection tasks must exclude the plan dimension from aggregation."""
     text = _reflect_trajectory(correctness=0.8, aesthetics=0.6)

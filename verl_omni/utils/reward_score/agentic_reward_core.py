@@ -65,6 +65,8 @@ BLOCKED_RE = re.compile(
 )
 _GENERATE_OK_RE = re.compile(r"\bagentic_tool\s+ok=1\b", re.IGNORECASE)
 _PATH_RE = re.compile(r"\bpath=([^\s'\"]+)", re.IGNORECASE)
+# ``image_gen`` echoes the policy's prompt as a Python repr; its contents are policy-authored.
+_PROMPT_ECHO_RE = re.compile(r"\bprompt=(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")")
 
 
 @dataclass(frozen=True)
@@ -179,9 +181,10 @@ def resolve_trajectory(text: str, messages: Any) -> Trajectory:
             name, image_at_call = call
             if message.get("name", name) != name:
                 continue
-            paths = _PATH_RE.findall(content)
+            status = _PROMPT_ECHO_RE.sub("", content)
+            paths = _PATH_RE.findall(status)
             if name == "generate_image":
-                if not _GENERATE_OK_RE.search(content):
+                if not _GENERATE_OK_RE.search(status):
                     continue
                 if len(paths) != 1 or not paths[0].lower().endswith(".png"):
                     continue

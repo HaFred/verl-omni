@@ -137,6 +137,12 @@ def compute_score(
     blocked = trajectory.blocked or bool(BLOCKED_RE.search(text))
     rewrites_after_yes = generates_after_first_yes(calls, judges)
     tool_reward = float(successful_generates >= 1 and bool(judges))
+    # Plan rows keep exact-count-or-zero; only reflect discounts the rewrite a NO verdict requests.
+    submission_images = (
+        sum(obs.name == "generate_image" and obs.end < judges[0].end for obs in observations)
+        if task_type == "reflect" and judges
+        else None
+    )
 
     result = zero_result(method="agentic_multidim", components=REWARD_COMPONENTS)
     result.update(
@@ -192,6 +198,7 @@ def compute_score(
             blocked=blocked,
             rewrite_after_yes=rewrites_after_yes,
             judges=judges,
+            submission_images=submission_images,
         ),
     }
     result.update(
