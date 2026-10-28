@@ -552,8 +552,8 @@ def test_stamped_rollout_images_root_enables_vl_fallback(tmp_path, monkeypatch):
     import numpy as np
     from omegaconf import OmegaConf
 
-    import verl_omni.tools.trajectory as trajectory_pkg
     from verl_omni.agent_loop.omni_agent_loop import _stamp_reward_context
+    from verl_omni.utils.agentic import artifacts as trajectory_pkg
 
     Image = pytest.importorskip("PIL.Image")
     root = tmp_path / "rollout_images"
