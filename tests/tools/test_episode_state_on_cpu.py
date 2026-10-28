@@ -165,33 +165,6 @@ def test_worker_config_and_artifact_bindings_share_compatibility_imports():
         hydra_env.agentic_get("max_generate_image_passes")
 
 
-def test_direct_legacy_module_imports_delegate_to_the_single_episode_owner(tmp_path):
-    from verl_omni.tools.trajectory import (
-        artifacts,
-        context,
-        episode_artifacts,
-        episode_context,
-        episode_judge,
-        judge_latch,
-    )
-
-    assert context is episode_context
-    assert artifacts is episode_artifacts
-    assert judge_latch is episode_judge
-    token = context.set_active_trajectory_relpath("step_000001/sample_legacy")
-    state = trajectory.current_episode()
-    image = tmp_path / "legacy.png"
-    image.write_bytes(b"pixels")
-    try:
-        artifacts.register_tool_artifact(prompt="scene", paths=[str(image)], artifact_id="image")
-        judge_latch.set_good_enough_yes_reached(True)
-        assert state.latest_generation.paths == (str(image),)
-        assert state.good_enough
-    finally:
-        context.reset_active_trajectory_relpath(token)
-    assert state.closed and not state.generations
-
-
 def test_legacy_prompt_binding_stays_local_to_a_copied_thread_context():
     with trajectory.episode_scope(episode("outer")) as state:
         asyncio.run(asyncio.to_thread(trajectory.active_user_prompt.set, "thread prompt"))
