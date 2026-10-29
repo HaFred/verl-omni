@@ -22,8 +22,6 @@ import re
 from pathlib import Path
 from typing import Any
 
-from verl_omni.utils.agentic.config import agentic_get
-
 __all__ = [
     "bind_run_artifacts",
     "build_artifact_id",
@@ -192,7 +190,6 @@ def bind_run_artifacts(config: Any) -> None:
     if experiment_name:
         run_name = str(experiment_name)
 
-    e2e_root = None
     try:
         node = config.get("agentic_image_gen")
     except Exception:  # noqa: BLE001
@@ -205,25 +202,10 @@ def bind_run_artifacts(config: Any) -> None:
     # reusing ``e2e_root``) leaves ``e2e_root``'s namespacing semantics intact for
     # every caller that relies on ``<e2e_root>/<experiment_name>/``.
     run_dir = _node_get(node, "run_dir")
-    if run_dir is None:
-        try:
-            run_dir = agentic_get("run_dir", None)
-        except RuntimeError:
-            # Mirror the e2e_root fallback: bind_agentic_image_gen may not have run yet.
-            run_dir = None
     if run_dir:
         _run_dir_override = Path(str(run_dir)).expanduser().resolve()
 
-    if node is not None:
-        e2e_root = _node_get(node, "e2e_root")
-    if e2e_root is None:
-        try:
-            e2e_root = agentic_get("e2e_root")
-        except RuntimeError:
-            # bind_agentic_image_gen has not run in this process yet (a caller bound
-            # run artifacts first). Fall back to the documented default root instead
-            # of crashing worker/manager init (audit blocker: bind-order crash).
-            e2e_root = None
+    e2e_root = _node_get(node, "e2e_root")
     if e2e_root:
         _e2e_root = Path(str(e2e_root)).expanduser().resolve()
     else:

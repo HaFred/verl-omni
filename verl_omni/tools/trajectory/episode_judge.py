@@ -19,9 +19,6 @@ from .episode import current_episode
 
 def set_good_enough_yes_reached(reached: bool) -> None:
     state = current_episode(create=True)
-    latest = state.latest_generation
-    if latest is not None:
-        state.record_judgment(latest.call_id, good_enough=reached)
     state.set_good_enough(reached)
 
 

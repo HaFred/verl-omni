@@ -154,6 +154,19 @@ def test_frozen_judge_feedback_is_associated_with_its_generated_image(tmp_path, 
         assert state.good_enough
 
 
+@pytest.mark.parametrize("reached", [False, True])
+def test_compatibility_latch_setter_preserves_real_judgment_history(reached):
+    with trajectory.episode_scope(episode("latch")) as state:
+        state.record_generation(call_id="generated", prompt="p", paths=[])
+        state.record_judgment("generated", good_enough=True)
+        history = tuple(state.judgments)
+
+        trajectory.set_good_enough_yes_reached(reached)
+
+        assert state.good_enough is reached
+        assert tuple(state.judgments) == history
+
+
 def test_legacy_prompt_binding_stays_local_to_a_copied_thread_context():
     with trajectory.episode_scope(episode("outer")) as state:
         asyncio.run(asyncio.to_thread(trajectory.active_user_prompt.set, "thread prompt"))
