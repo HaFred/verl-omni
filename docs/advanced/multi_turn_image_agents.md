@@ -127,7 +127,7 @@ By default, artifacts live under
 replaces `outputs/e2e`, retaining the experiment-name subdirectory. An explicit
 `agentic_image_gen.run_dir` selects the run directory verbatim; when adding this
 field through Hydra on the shared config, use
-`+agentic_image_gen.run_dir=/shared/my_run`.
+`agentic_image_gen.run_dir=/shared/my_run`.
 
 The run directory contains `rollout_images/`, `rollout_trajectories/`, and
 `hermes_actions/`. Closing an episode releases runtime references without deleting
@@ -135,7 +135,10 @@ those files. See {doc}`diffusion_media_artifacts` for the separate contract for
 model-native rollout media and training tensors.
 
 The old module aliases have been removed. Update direct imports and test
-monkeypatch targets as follows; existing package-level helper exports remain:
+monkeypatch targets as follows. Package-level ContextVar facades are replaced by
+explicit `get_active_*`, `set_active_*`, and `reset_active_*` functions; the cleanup
+helper is `clear_tool_artifacts_for_active_rollout`. Artifact experiment metadata
+uses `utils.agentic.artifacts.get_run_name()` instead of a cached `run_name`:
 
 | Removed module | Replacement |
 | --- | --- |

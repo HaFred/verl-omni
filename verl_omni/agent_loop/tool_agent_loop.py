@@ -44,12 +44,12 @@ from verl_omni.tools.agent_helper.image_gen_utils import (
     tool_message_text,
 )
 from verl_omni.tools.trajectory import (
-    active_trajectory_relpath,
-    clear_good_enough_yes_reached,
-    clear_latest_tool_image_for_active_rollout,
-    reset_active_trajectory_relpath,
-    set_active_trajectory_relpath,
+    EpisodeState,
+    current_episode,
+    episode_scope,
+    get_active_trajectory_relpath,
 )
+from verl_omni.utils.agentic.artifacts import rollout_id_from_relpath
 from verl_omni.utils.agentic.config import agentic_get_bool
 
 logger = logging.getLogger(__name__)
@@ -65,18 +65,19 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
     """
 
     async def run(self, sampling_params: dict[str, Any], **kwargs) -> AgentLoopOutput:
-        # Per-rollout latch reset: YES from sample N must not block sample N+1.
         self._agentic_step = kwargs.pop("_agentic_step", 0)
         self._agentic_validate = bool(kwargs.pop("_agentic_validate", False))
         self._agentic_trajectory_relpath = (
-            kwargs.pop("_agentic_trajectory_relpath", None) or active_trajectory_relpath.get()
+            kwargs.pop("_agentic_trajectory_relpath", None) or get_active_trajectory_relpath()
         )
-        path_tokens = None
-        if self._agentic_trajectory_relpath:
-            path_tokens = set_active_trajectory_relpath(self._agentic_trajectory_relpath)
-        clear_good_enough_yes_reached()
-        clear_latest_tool_image_for_active_rollout()
-        try:
+        state = current_episode()
+        if state is None or state.artifact_relpath != self._agentic_trajectory_relpath:
+            state = EpisodeState(
+                episode_id=rollout_id_from_relpath(self._agentic_trajectory_relpath),
+                artifact_relpath=self._agentic_trajectory_relpath,
+                user_prompt=state.user_prompt if state else None,
+            )
+        with episode_scope(state):
             # Dense extra_fields so DataProto.concat across workers keeps a shared key set.
             output = await super().run(sampling_params, **kwargs)
             output.extra_fields.pop("_forced_generate_prompt", None)
@@ -93,11 +94,6 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             output.extra_fields.setdefault("rollout_valid", 0)
             output.extra_fields["trajectory_relpath"] = self._agentic_trajectory_relpath or ""
             return output
-        finally:
-            clear_good_enough_yes_reached()
-            clear_latest_tool_image_for_active_rollout()
-            if path_tokens is not None:
-                reset_active_trajectory_relpath(path_tokens)
 
     async def _rewrite_premature_judge_to_generate(self, agent_data: AgentData) -> AgentState | None:
         """Replace a first-turn ``judge_image`` call with ``generate_image`` (mask=1)."""

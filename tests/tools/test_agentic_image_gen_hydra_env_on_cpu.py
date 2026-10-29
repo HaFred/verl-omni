@@ -45,6 +45,7 @@ def test_omni_trainer_composes_agentic_image_gen():
     assert cfg.agentic_image_gen.force_reflection_after_judge is True
     assert cfg.agentic_image_gen.rewrite_judge_before_generate is True
     assert cfg.agentic_image_gen.e2e_root is None
+    assert cfg.agentic_image_gen.run_dir is None
     assert cfg.agentic_image_gen.good_enough_threshold == 0.80
     assert cfg.agentic_image_gen.qwen_image_height == 512
     assert cfg.agentic_image_gen.qwen_image_width == 512
@@ -197,3 +198,9 @@ def test_merge_agentic_scorer_knobs_requires_stamp_or_config():
     assert merged2["good_enough_threshold"] == 0.6
     assert merged2["vllm_url"] == "http://x"
     assert merged2["w_tool_call"] == 0.1
+
+
+def test_omni_trainer_accepts_run_dir_override_without_hydra_add():
+    with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+        cfg = compose(config_name="omni_trainer", overrides=["agentic_image_gen.run_dir=/shared/run"])
+    assert cfg.agentic_image_gen.run_dir == "/shared/run"

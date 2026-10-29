@@ -29,16 +29,10 @@ def register_tool_artifact(
     backend: str = "",
     tool_stubbed: bool = False,
     artifact_id: str | None = None,
-    trajectory_relpath: str | None = None,
-    rollout_id: str | None = None,
     call_id: str | None = None,
-) -> GenerationRecord | None:
-    """Adapt a completed image call; explicit scope overrides cannot cross episode owners."""
+) -> GenerationRecord:
+    """Record a completed image call on the current episode owner."""
     state = current_episode(create=True)
-    if rollout_id is not None and rollout_id != state.episode_id:
-        return None
-    if trajectory_relpath is not None and trajectory_relpath != state.artifact_relpath:
-        return None
     identifiers = []
     for index, path in enumerate(paths):
         match = re.search(r"image_\d+_([0-9a-f]{12})\.png$", Path(path).name, re.IGNORECASE)
@@ -84,9 +78,6 @@ def set_latest_tool_image_path(path: str | None) -> None:
 def get_latest_tool_image_path() -> str | None:
     state = current_episode()
     return state.resolve_image() if state else None
-
-
-clear_latest_tool_image_for_active_rollout = clear_tool_artifacts_for_active_rollout
 
 
 def resolve_tool_image_path(*, image_prompt: str | None = None, artifact_id: str | None = None) -> str | None:

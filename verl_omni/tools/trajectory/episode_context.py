@@ -16,27 +16,32 @@
 
 from __future__ import annotations
 
+from contextvars import Token
+
 from verl_omni.utils.agentic.artifacts import rollout_id_from_relpath
 
 from .episode import EpisodeState, _current_episode, _EpisodeBinding, current_episode
 
 
 def get_active_rollout_id() -> str | None:
+    """Return the current episode identity, or None when unbound."""
     state = current_episode()
     return state.episode_id if state else None
 
 
 def get_active_trajectory_relpath() -> str | None:
+    """Return the current episode artifact path, or None when unbound."""
     state = current_episode()
     return state.artifact_relpath if state else None
 
 
 def get_active_user_prompt() -> str | None:
+    """Return the callback-local prompt, including any scoped override."""
     binding = _current_episode.get()
     return binding.user_prompt if binding else None
 
 
-def set_active_trajectory_relpath(relpath: str | None):
+def set_active_trajectory_relpath(relpath: str | None) -> Token[_EpisodeBinding | None]:
     """Adapt legacy path scopes without retaining a process-wide rollout registry."""
     state = EpisodeState(
         episode_id=rollout_id_from_relpath(relpath), artifact_relpath=relpath, user_prompt=get_active_user_prompt()
@@ -44,36 +49,19 @@ def set_active_trajectory_relpath(relpath: str | None):
     return _current_episode.set(_EpisodeBinding(state, state.user_prompt))
 
 
-def reset_active_trajectory_relpath(token) -> None:
+def reset_active_trajectory_relpath(token: Token[_EpisodeBinding | None]) -> None:
     state = current_episode()
     _current_episode.reset(token)
     if state is not None and state is not current_episode():
         state.close()
 
 
-class _FieldView:
-    """Keep legacy get/set/reset callers on the same owner rather than a second ContextVar."""
-
-    def __init__(self, name):
-        self.name = name
-
-    def get(self):
-        return get_active_user_prompt() if self.name == "user_prompt" else get_active_trajectory_relpath()
-
-    def set(self, value):
-        if self.name == "artifact_relpath":
-            return set_active_trajectory_relpath(value)
-        state = current_episode(create=True)
-        return _current_episode.set(_EpisodeBinding(state, value))
-
-    def reset(self, token):
-        if self.name == "artifact_relpath":
-            reset_active_trajectory_relpath(token)
-        else:
-            _current_episode.reset(token)
+def set_active_user_prompt(prompt: str | None) -> Token[_EpisodeBinding | None]:
+    """Bind a callback-local prompt override without changing the shared owner."""
+    state = current_episode(create=True)
+    return _current_episode.set(_EpisodeBinding(state, prompt))
 
 
-active_trajectory_relpath = _FieldView("artifact_relpath")
-active_user_prompt = _FieldView("user_prompt")
-set_active_user_prompt = active_user_prompt.set
-reset_active_user_prompt = active_user_prompt.reset
+def reset_active_user_prompt(token: Token[_EpisodeBinding | None]) -> None:
+    """Restore the caller's prompt binding."""
+    _current_episode.reset(token)

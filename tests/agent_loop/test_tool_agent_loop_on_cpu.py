@@ -260,3 +260,66 @@ def test_fits_response_budget_rejects_overflow():
     assert u.fits_response_budget(mask_len=10, n_new_ids=6, response_length=16) is False
     assert u.fits_response_budget(mask_len=10, n_new_ids=0, response_length=16) is False
     assert u.fits_response_budget(mask_len=0, n_new_ids=1, response_length=1) is False
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_run_reuses_worker_episode_until_worker_scope_exits(monkeypatch, tmp_path, fail):
+    import asyncio
+    from types import SimpleNamespace
+
+    from verl.experimental.agent_loop.agent_loop import AgentLoopWorker
+    from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+
+    from verl_omni.agent_loop.omni_agent_loop import OmniAgentLoopWorker
+    from verl_omni.agent_loop.tool_agent_loop import ImageGenToolAgentLoop
+    from verl_omni.tools.trajectory import current_episode
+
+    owners = []
+    image = tmp_path / "image.png"
+    image.write_bytes(b"pixels")
+
+    async def parent_run(self, sampling_params, **kwargs):
+        state = current_episode()
+        assert state is owners[-1]
+        state.record_generation(call_id="call", prompt="scene", paths=[str(image)])
+        await asyncio.to_thread(state.record_judgment, "call", good_enough=True)
+        if fail:
+            raise RuntimeError("tool failed")
+        return SimpleNamespace(extra_fields={})
+
+    monkeypatch.setattr(ToolAgentLoop, "run", parent_run)
+    loop = ImageGenToolAgentLoop.__new__(ImageGenToolAgentLoop)
+
+    async def worker_parent(self, sampling_params, trajectory, *, agent_name, trace=True, **kwargs):
+        state = current_episode()
+        owners.append(state)
+        assert state.user_prompt == "request"
+        try:
+            return await loop.run(sampling_params, **kwargs)
+        finally:
+            assert current_episode() is state
+            assert not state.closed
+            assert len(state.generations) == len(state.judgments) == 1
+            assert state.good_enough
+
+    monkeypatch.setattr(AgentLoopWorker, "_run_agent_loop", worker_parent)
+    worker = OmniAgentLoopWorker.__new__(OmniAgentLoopWorker)
+
+    async def run():
+        invocation = worker._run_agent_loop(
+            {},
+            {"step": 1, "sample_index": 0, "rollout_n": 0, "validate": False},
+            agent_name="image_gen_tool_agent",
+            raw_prompt=[{"role": "user", "content": "request"}],
+        )
+        if fail:
+            with pytest.raises(RuntimeError, match="tool failed"):
+                await invocation
+        else:
+            output = await invocation
+            assert output.extra_fields["trajectory_relpath"] == "step_000001/sample_0.00"
+        state = owners[-1]
+        assert state.closed and not state.generations and not state.judgments
+        assert current_episode() is None
+
+    asyncio.run(run())

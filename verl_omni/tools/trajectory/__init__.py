@@ -30,7 +30,7 @@ from verl_omni.utils.agentic.config import (
 
 from .episode import EpisodeState, GenerationRecord, JudgmentRecord, current_episode, episode_scope
 from .episode_artifacts import (
-    clear_latest_tool_image_for_active_rollout,
+    clear_tool_artifacts_for_active_rollout,
     count_live_generate_artifacts_for_active_rollout,
     get_latest_generate_prompt_for_active_rollout,
     register_tool_artifact,
@@ -38,11 +38,13 @@ from .episode_artifacts import (
     set_latest_tool_image_path,
 )
 from .episode_context import (
-    active_trajectory_relpath,
-    active_user_prompt,
     get_active_rollout_id,
+    get_active_trajectory_relpath,
+    get_active_user_prompt,
     reset_active_trajectory_relpath,
+    reset_active_user_prompt,
     set_active_trajectory_relpath,
+    set_active_user_prompt,
 )
 from .episode_judge import (
     clear_good_enough_yes_reached,
@@ -63,11 +65,13 @@ __all__ = [
     "build_trajectory_relpath",
     "clear_agentic_image_gen",
     "clear_good_enough_yes_reached",
-    "clear_latest_tool_image_for_active_rollout",
+    "clear_tool_artifacts_for_active_rollout",
     "clear_run_artifacts",
     "count_live_generate_artifacts_for_active_rollout",
-    "active_trajectory_relpath",
-    "active_user_prompt",
+    "get_active_trajectory_relpath",
+    "get_active_user_prompt",
+    "set_active_user_prompt",
+    "reset_active_user_prompt",
     "get_active_rollout_id",
     "get_good_enough_yes_reached",
     "get_latest_generate_prompt_for_active_rollout",

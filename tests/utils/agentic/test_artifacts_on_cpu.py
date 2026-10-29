@@ -53,3 +53,31 @@ def test_rebinding_artifacts_uses_only_the_incoming_config(tmp_path, monkeypatch
     finally:
         artifacts.clear_run_artifacts()
         config.clear_agentic_image_gen()
+
+
+@pytest.mark.parametrize("incoming", [None, {}, {"trainer": {}}])
+def test_rebinding_without_experiment_name_drops_previous_name(tmp_path, monkeypatch, incoming):
+    monkeypatch.setenv("VERLOMNI_ROOT", str(tmp_path))
+    try:
+        artifacts.bind_run_artifacts(OmegaConf.create({"trainer": {"experiment_name": "old"}}))
+        artifacts.bind_run_artifacts(OmegaConf.create(incoming) if incoming is not None else None)
+        assert artifacts.resolve_run_dir() == tmp_path / "outputs/e2e/agentic_run"
+    finally:
+        artifacts.clear_run_artifacts()
+
+
+def test_artifact_binding_snapshots_config_and_resolves_only_artifact_fields(tmp_path):
+    cfg = OmegaConf.create(
+        {
+            "trainer": {"experiment_name": "run"},
+            "agentic_image_gen": {"run_dir": str(tmp_path / "${trainer.experiment_name}")},
+            "unrelated": "${missing_model_path}",
+        }
+    )
+    try:
+        artifacts.bind_run_artifacts(cfg)
+        cfg.trainer.experiment_name = "changed"
+        assert artifacts.resolve_run_dir() == tmp_path / "run"
+        assert artifacts.get_run_name() == "run"
+    finally:
+        artifacts.clear_run_artifacts()
