@@ -31,7 +31,7 @@ prompt. Validation is metadata-only; the builder does not require
 
 Reward weights are set at build time with ``RPCO_W_REFLECT``, ``RPCO_W_PLAN``,
 ``RPCO_W_FORMAT``, ``RPCO_W_TOOL``, and ``RPCO_W_RESULT``. Each defaults to 1.0
-and accepts a non-negative float. Resolved values are stored as ``w_<dimension>``
+and accepts a finite, non-negative float. Resolved values are stored as ``w_<dimension>``
 in every row's ``ground_truth`` and in ``build_report.json`` under
 ``reward_weights``; reuse these values when reproducing a build.
 """
@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 from collections.abc import Mapping
@@ -133,15 +134,15 @@ def _with_brevity(prompt: str) -> str:
 
 
 def _env_weight(dim: str) -> float:
-    """Resolve a non-negative reward weight from its RPCO environment variable."""
+    """Resolve a finite, non-negative weight from its RPCO environment variable."""
     env_name = f"RPCO_W_{dim.upper()}"
     raw = os.environ.get(env_name, "1.0").strip()
     try:
         value = float(raw)
     except ValueError:
         raise ValueError(f"{env_name} must be a float, got {raw!r}") from None
-    if value < 0:
-        raise ValueError(f"{env_name} must be non-negative")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{env_name} must be finite and non-negative")
     return value
 
 

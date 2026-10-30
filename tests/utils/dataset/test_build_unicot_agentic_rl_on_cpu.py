@@ -414,3 +414,13 @@ def test_report_weights_match_all_emitted_ground_truth(tmp_path, monkeypatch, ov
     assert len(rows) == 3
     for reward in rows["reward_model"]:
         assert {key: reward["ground_truth"][key] for key in expected} == expected
+
+
+@pytest.mark.parametrize("dim", builder.REWARD_DIMS)
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "1e309"])
+def test_build_rejects_nonfinite_reward_weights(tmp_path, monkeypatch, dim, value):
+    """Reject non-finite overrides before emitting ground-truth weights."""
+    env_name = f"RPCO_W_{dim.upper()}"
+    monkeypatch.setenv(env_name, value)
+    with pytest.raises(ValueError, match=env_name):
+        _build(tmp_path, reflection_rows=[_reflection_row("r")], breakdown_rows=[_breakdown_row("b")])
