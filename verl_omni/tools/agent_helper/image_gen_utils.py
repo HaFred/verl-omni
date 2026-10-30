@@ -20,7 +20,7 @@ import json
 import re
 from typing import Any
 
-from verl_omni.tools.trajectory.hydra_env import agentic_get, agentic_get_bool
+from verl_omni.utils.agentic.config import agentic_get, agentic_get_bool
 from verl_omni.utils.agentic.max_passes import max_generate_passes
 
 __all__ = [
