@@ -50,6 +50,14 @@ def set_active_trajectory_relpath(relpath: str | None) -> Token[_EpisodeBinding 
 
 
 def reset_active_trajectory_relpath(token: Token[_EpisodeBinding | None]) -> None:
+    """Restore the previous binding and close the owner created for the path scope.
+
+    Args:
+        token: Token returned by ``set_active_trajectory_relpath`` in this context.
+
+    Returns:
+        None.
+    """
     state = current_episode()
     _current_episode.reset(token)
     if state is not None and state is not current_episode():
