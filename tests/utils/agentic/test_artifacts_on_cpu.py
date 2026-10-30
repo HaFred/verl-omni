@@ -30,6 +30,7 @@ from verl_omni.utils.agentic import artifacts, config
     ],
 )
 def test_rebinding_artifacts_uses_only_the_incoming_config(tmp_path, monkeypatch, incoming, expected):
+    tmp_path = tmp_path.resolve()
     monkeypatch.setenv("VERLOMNI_ROOT", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     previous = OmegaConf.create(
@@ -57,6 +58,7 @@ def test_rebinding_artifacts_uses_only_the_incoming_config(tmp_path, monkeypatch
 
 @pytest.mark.parametrize("incoming", [None, {}, {"trainer": {}}])
 def test_rebinding_without_experiment_name_drops_previous_name(tmp_path, monkeypatch, incoming):
+    tmp_path = tmp_path.resolve()
     monkeypatch.setenv("VERLOMNI_ROOT", str(tmp_path))
     try:
         artifacts.bind_run_artifacts(OmegaConf.create({"trainer": {"experiment_name": "old"}}))
@@ -67,10 +69,11 @@ def test_rebinding_without_experiment_name_drops_previous_name(tmp_path, monkeyp
 
 
 def test_artifact_binding_snapshots_config_and_resolves_only_artifact_fields(tmp_path):
+    tmp_path = tmp_path.resolve()
     cfg = OmegaConf.create(
         {
             "trainer": {"experiment_name": "run"},
-            "agentic_image_gen": {"run_dir": str(tmp_path / "${trainer.experiment_name}")},
+            "agentic_image_gen": {"run_dir": (tmp_path / "${trainer.experiment_name}").as_posix()},
             "unrelated": "${missing_model_path}",
         }
     )

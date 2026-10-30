@@ -31,7 +31,19 @@ def register_tool_artifact(
     artifact_id: str | None = None,
     call_id: str | None = None,
 ) -> GenerationRecord:
-    """Record a completed image call on the current episode owner."""
+    """Record a completed image call on the current episode owner.
+
+    Args:
+        prompt: Generation prompt.
+        paths: Saved sample paths in backend order.
+        backend: Service name; ``fewshot`` is excluded from live-call counts.
+        tool_stubbed: Whether this call used a stub.
+        artifact_id: Explicit ID for the first sample; other IDs come from filenames.
+        call_id: Episode-local call ID, generated when omitted.
+
+    Returns:
+        The generation record registered on the current owner.
+    """
     state = current_episode(create=True)
     identifiers = []
     for index, path in enumerate(paths):
@@ -48,12 +60,23 @@ def register_tool_artifact(
 
 
 def clear_tool_artifacts_for_active_rollout() -> None:
+    """Clear generation records and image lookup for the current owner.
+
+    Returns:
+        None. Does nothing when no episode is bound.
+    """
     state = current_episode()
     if state:
         state.clear_artifacts()
 
 
 def count_live_generate_artifacts_for_active_rollout() -> int:
+    """Count live generation calls with at least one existing PNG.
+
+    Returns:
+        Call count, excluding stubs and fewshot records; zero for an unbound
+        episode or one without an episode ID.
+    """
     state = current_episode()
     if state is None or state.episode_id is None:
         return 0
@@ -66,42 +89,48 @@ def count_live_generate_artifacts_for_active_rollout() -> int:
 
 
 def get_latest_generate_prompt_for_active_rollout() -> str | None:
+    """Read the most recently registered generation prompt.
+
+    Returns:
+        Prompt text, or None when the owner has no generation records.
+    """
     state = current_episode()
     record = state.latest_generation if state else None
     return record.prompt if record else None
 
 
 def set_latest_tool_image_path(path: str | None) -> None:
+    """Set the current owner's latest image path, creating a local owner if needed.
+
+    Args:
+        path: Image path, or None to clear the direct image reference.
+
+    Returns:
+        None.
+    """
     current_episode(create=True).set_latest_image(path)
 
 
 def get_latest_tool_image_path() -> str | None:
+    """Resolve the current owner's latest available image.
+
+    Returns:
+        Existing PNG path, or None when no image is available.
+    """
     state = current_episode()
     return state.resolve_image() if state else None
 
 
 def resolve_tool_image_path(*, image_prompt: str | None = None, artifact_id: str | None = None) -> str | None:
+    """Resolve an existing PNG within the current episode.
+
+    Args:
+        image_prompt: Prompt used to match generation records.
+        artifact_id: Explicit sample ID; an unknown ID never falls back.
+
+    Returns:
+        Matching PNG path, a latest-image fallback when no ID was supplied,
+        or None when no image matches or no owner is bound.
+    """
     state = current_episode()
     return state.resolve_image(image_prompt=image_prompt, artifact_id=artifact_id) if state else None
-
-
-def build_generate_call_meta(*, prompt: str, user_prompt: str) -> dict:
-    """Preserve the existing metadata format while deriving call history from its owner."""
-    previous = get_latest_generate_prompt_for_active_rollout() or ""
-    rewrite = bool(previous)
-    return {
-        "call_role": "rewrite" if rewrite else "initial",
-        "controlled_by_reflection": rewrite,
-        "reflection": "",
-        "prev_tool_prompt": previous,
-        "source_image_for_reflection": (get_latest_tool_image_path() or "") if rewrite else "",
-        "rewritten_prompt": prompt if rewrite else "",
-        "image_generated_from_reflected_prompt": rewrite,
-        "tool_prompt_equals_rewritten_prompt": rewrite,
-        "content_source": "reflection" if rewrite else "initial",
-        "llm_reflection": "",
-        "llm_prompt": prompt,
-        "model_decode": "",
-        "user_prompt": user_prompt or "",
-        "tool_prompt": prompt,
-    }

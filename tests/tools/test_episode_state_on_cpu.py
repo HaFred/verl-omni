@@ -214,3 +214,28 @@ def test_legacy_direct_path_binding_updates_identity_and_restores_owner(tmp_path
             trajectory.reset_active_trajectory_relpath(token)
         assert child.closed
         assert trajectory.current_episode() is parent
+
+
+def test_prompt_binding_from_unbound_context_releases_its_scratch_owner():
+    """Prompt reset restores no owner and cannot leak artifacts or a YES latch."""
+    from contextvars import Context
+
+    def run():
+        assert trajectory.current_episode() is None
+        outer = trajectory.set_active_user_prompt("outer")
+        state = trajectory.current_episode()
+        try:
+            state.record_generation(call_id="generated", prompt="p", paths=[])
+            trajectory.set_good_enough_yes_reached(True)
+            inner = trajectory.set_active_user_prompt("inner")
+            trajectory.reset_active_user_prompt(inner)
+            assert trajectory.current_episode() is state and not state.closed
+            assert trajectory.get_active_user_prompt() == "outer"
+        finally:
+            trajectory.reset_active_user_prompt(outer)
+        assert trajectory.current_episode() is None
+        assert trajectory.get_active_user_prompt() is None
+        assert not trajectory.get_good_enough_yes_reached()
+        assert state.closed and not state.generations
+
+    Context().run(run)

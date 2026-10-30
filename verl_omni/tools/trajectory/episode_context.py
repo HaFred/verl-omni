@@ -58,10 +58,14 @@ def reset_active_trajectory_relpath(token: Token[_EpisodeBinding | None]) -> Non
 
 def set_active_user_prompt(prompt: str | None) -> Token[_EpisodeBinding | None]:
     """Bind a callback-local prompt override without changing the shared owner."""
-    state = current_episode(create=True)
+    binding = _current_episode.get()
+    state = binding.state if binding else EpisodeState()
     return _current_episode.set(_EpisodeBinding(state, prompt))
 
 
 def reset_active_user_prompt(token: Token[_EpisodeBinding | None]) -> None:
-    """Restore the caller's prompt binding."""
+    """Restore the caller's binding and close a prompt-only scratch owner."""
+    state = current_episode()
     _current_episode.reset(token)
+    if state is not None and state is not current_episode():
+        state.close()
