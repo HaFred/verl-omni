@@ -436,6 +436,30 @@ async def test_run_publishes_runtime_trajectory_messages(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("parent_fails", [False, True])
+async def test_run_fails_explicitly_and_cleans_up_rollout_context(monkeypatch, parent_fails):
+    from verl.experimental.agent_loop.tool_agent_loop import ToolAgentLoop
+
+    from verl_omni.tools.trajectory import active_trajectory_relpath
+    from verl_omni.tools.trajectory.judge_latch import get_good_enough_yes_reached, set_good_enough_yes_reached
+
+    async def fake_run(self, sampling_params, **kwargs):
+        set_good_enough_yes_reached(True)
+        if parent_fails:
+            raise ValueError("parent rollout failed")
+        return SimpleNamespace(extra_fields={})
+
+    monkeypatch.setattr(ToolAgentLoop, "run", fake_run)
+    original_path = active_trajectory_relpath.get()
+    expected_error = ValueError if parent_fails else RuntimeError
+    expected_message = "parent rollout failed" if parent_fails else "runtime trajectory messages"
+    with pytest.raises(expected_error, match=expected_message):
+        await _bare_loop().run({}, _agentic_trajectory_relpath="test/rollout")
+    assert active_trajectory_relpath.get() == original_path
+    assert not get_good_enough_yes_reached()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("include_runtime_messages", [False, True])
 async def test_pinned_naive_reward_manager_forwards_runtime_tool_fields(include_runtime_messages):
     import numpy as np

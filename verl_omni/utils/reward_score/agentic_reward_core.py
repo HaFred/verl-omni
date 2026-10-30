@@ -73,7 +73,13 @@ _PROMPT_ECHO_RE = re.compile(r"\bprompt=(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\
 
 @dataclass(frozen=True)
 class ToolObservation:
-    """A runtime tool response bound to one call and its position in the resolved text."""
+    """A runtime tool response accepted by the trajectory resolver.
+
+    Attributes:
+        name: Matched tool name, either ``generate_image`` or ``judge_image``.
+        content: Original response text, retained for judge parsing.
+        end: Exclusive end offset of the blanked response in ``Trajectory.text``.
+    """
 
     name: str
     content: str
@@ -91,11 +97,16 @@ class JudgeHit(NamedTuple):
 
 @dataclass(frozen=True)
 class Trajectory:
-    """Policy text with runtime observations separated out.
+    """Policy text and accepted tool observations in a shared offset space.
 
-    ``text`` carries policy prose and tool calls; observation bodies are blanked so
-    offsets stay aligned. ``authenticated`` is false when no runtime messages were
-    supplied, in which case ``observations`` is empty and nothing can be trusted.
+    Attributes:
+        text: Policy prose and structured calls; accepted tool response bodies are
+            replaced by spaces to preserve their offsets.
+        observations: Matched runtime tool responses that passed provenance checks.
+        blocked: Whether a block marker appeared in a runtime tool response, or in
+            the input text when runtime messages were not supplied.
+        authenticated: Whether a runtime message list was supplied. Individual
+            observations still require call and image matching before being trusted.
     """
 
     text: str
@@ -115,7 +126,13 @@ class TerminalDecision(NamedTuple):
 
 @dataclass(frozen=True)
 class TrajectoryAssessment:
-    """Analyze runtime-owned Hermes messages and expose the five RPCO dimensions."""
+    """Cache a resolved Hermes trajectory for diagnostics and five RPCO dimensions.
+
+    Create instances with ``from_messages``. The private fields hold the resolved
+    trajectory, parsed calls, trusted judge verdicts, terminal decision, and counts
+    used by ``metrics`` and ``dimension_scores``. Scorers choose active dimensions
+    and weights separately.
+    """
 
     _trajectory: Trajectory
     _calls: tuple[tuple[int, int, dict[str, Any]], ...]

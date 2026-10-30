@@ -82,9 +82,9 @@ class ImageGenToolAgentLoop(ToolAgentLoop):
             # Dense extra_fields so DataProto.concat across workers keeps a shared key set.
             output = await super().run(sampling_params, **kwargs)
             # The RPCO reward trusts tool outcomes only from these runtime-owned messages.
-            output.extra_fields["trajectory_messages"] = (
-                runtime_trajectory_messages(self._agent_data.messages) if self._agent_data is not None else []
-            )
+            if self._agent_data is None:
+                raise RuntimeError("Cannot export runtime trajectory messages: agent data was not initialized")
+            output.extra_fields["trajectory_messages"] = runtime_trajectory_messages(self._agent_data.messages)
             output.extra_fields.pop("_forced_generate_prompt", None)
             output.extra_fields.setdefault("forced_reflection", False)
             output.extra_fields.setdefault("force_stop_max_passes", False)
