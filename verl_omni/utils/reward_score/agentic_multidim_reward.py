@@ -11,36 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""RPCO multi-dimensional reward for Hermes agentic image-generation trajectories.
+"""RPCO reward for Hermes image-generation trajectories.
 
-The Hermes scorer of RFC #302 stage 3, composed from the shared
-``agentic_reward_core`` trajectory assessment. Other RPCO scorers reuse the same core with
-their own dimension set and dialect.
+Use the naive reward manager: the image-gen loop supplies runtime-owned
+``trajectory_messages`` via ``extra_info`` (or a keyword argument). Tool results
+are matched to calls and judge results to the latest generated image. Decoded
+text alone cannot authenticate tool outcomes; ``solution_image`` is unsupported.
 
-Wire with ``reward.reward_manager.name=naive`` so verl passes ``solution_str``.
-``image_gen_tool_agent`` publishes the runtime-owned ``trajectory_messages`` in
-its ``extra_fields``, and ``NaiveRewardManager`` merges those into ``extra_info``
-(a ``trajectory_messages`` keyword argument is accepted as well). Assistant
-entries carry ``content`` and OpenAI-style ``tool_calls`` (``id`` and
-``function`` with ``name`` / ``arguments``); tool entries carry
-``role="tool"``, ``tool_call_id`` and text ``content``. Structured messages are
-authoritative: tool results are matched once per call ID, and judge image paths
-must match the latest successful image at both call and response time. Plain
-``solution_str`` or decoded tokens alone cannot authenticate tool outcomes and
-receive zero reward. ``VisualRewardManager``'s ``solution_image`` raises.
-
-The active reward set is ``{reflect, plan, format, tool, result}``. ``plan`` is
-active only for plan rows. ``done`` and ``tool_call`` reproduce the PR1
-closed-loop indicators for metrics, but are not additional score dimensions.
-Invalid rollouts (no parsed ``generate_image`` call or no successful PNG)
-receive score zero and ``rollout_valid=0``. ``task_type`` is required.
-
-Judge C/A is trusted only in a matched runtime ``judge_image`` observation with
-the tool observation header and finite scores in [0, 1]. Coverage is token F1,
-so dumping reference words into a long blob does not max ``R_reflect`` /
-``R_plan``. A runtime block (``blocked_after_*=1``) or a rewrite after YES zeros
-``R_result`` and the Done indicator. Reflect ``R_result`` requires a terminal
-trusted YES. ``R_tool`` needs a successful PNG plus a trusted judge.
+The weighted dimensions are reflect, format, tool, result, and plan (plan rows
+only). Done and tool-call indicators are metrics. Task type is required; a
+rollout without a parsed generation call or successful PNG scores zero.
+Trusted judge scores must be finite and in [0, 1]. Reflection and plan coverage
+use token F1; a block or rewrite after YES disables result and Done credit.
 """
 
 from __future__ import annotations

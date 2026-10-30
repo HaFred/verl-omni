@@ -11,27 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared core of the RPCO multi-dimensional rewards for agentic image generation.
+"""Shared RPCO trajectory parsing and reward primitives.
 
-Every RPCO scorer is a thin layer over this module: the Hermes scorer
-(``agentic_multidim_reward``) and any model-specific scorer that speaks a
-different observation dialect. The core owns what must mean the same thing in
-every scorer:
-
-* trajectory provenance (:func:`resolve_trajectory`): tool outcomes are trusted
-  only from runtime-owned ``trajectory_messages``, never from policy text;
-* tool-call parsing, policy prose extraction and token-F1 coverage;
-* trusted judge parsing (:func:`trusted_judges`) and the terminal ``Done.``
-  decision after the final verdict (:func:`terminal_decision`);
-* the per-dimension primitives (reflection, plan, format, result) and the
-  weighted composition of an active dimension set (:func:`active_weights`,
-  :func:`weighted_score`).
-
-A scorer owns its active dimension subset, default weights, metric schema and
-dialect normalization. ``TrajectoryAssessment`` encapsulates trajectory analysis
-and the standard five RPCO dimensions for Hermes trajectories; individual
-primitives remain available for custom dialects.
-The module imports no agent-loop or dataset code.
+Tool outcomes require runtime-owned messages. ``TrajectoryAssessment`` evaluates
+five Hermes reward dimensions; other scorers can compose the primitives with
+their own dialect, active dimensions, weights, and metric schema.
 """
 
 from __future__ import annotations
