@@ -27,8 +27,10 @@ every scorer:
   weighted composition of an active dimension set (:func:`active_weights`,
   :func:`weighted_score`).
 
-A scorer owns its dimension set, default weights, metric schema and any dialect
-normalization; it composes these primitives rather than re-implementing them.
+A scorer owns its active dimension subset, default weights, metric schema and
+dialect normalization. ``TrajectoryAssessment`` encapsulates trajectory analysis
+and the standard five RPCO dimensions for Hermes trajectories; individual
+primitives remain available for custom dialects.
 The module imports no agent-loop or dataset code.
 """
 
@@ -109,6 +111,125 @@ class TerminalDecision(NamedTuple):
     policy_reflection: bool
     forced_context: bool
     anchor: int
+
+
+@dataclass(frozen=True)
+class TrajectoryAssessment:
+    """Analyze runtime-owned Hermes messages and expose the five RPCO dimensions."""
+
+    _trajectory: Trajectory
+    _calls: tuple[tuple[int, int, dict[str, Any]], ...]
+    _judges: tuple[JudgeHit, ...]
+    _decision: TerminalDecision
+    _successful_generates: int
+    _judge_failed: int
+    _blocked: bool
+    _rewrites_after_yes: int
+
+    @classmethod
+    def from_messages(cls, text: str, messages: Any) -> TrajectoryAssessment:
+        """Resolve provenance, calls, verdicts, and the final policy decision."""
+        trajectory = resolve_trajectory(text, messages)
+        calls = extract_tool_calls(trajectory.text)
+        judges = trusted_judges(trajectory.observations)
+        last_generate = max((obs.end for obs in trajectory.observations if obs.name == "generate_image"), default=0)
+        last_judge = max((obs.end for obs in trajectory.observations if obs.name == "judge_image"), default=0)
+        terminal_judges = judges if judges and judges[-1].end == last_judge > last_generate else []
+        return cls(
+            _trajectory=trajectory,
+            _calls=tuple(calls),
+            _judges=tuple(judges),
+            _decision=terminal_decision(trajectory.text, terminal_judges),
+            _successful_generates=sum(obs.name == "generate_image" for obs in trajectory.observations),
+            _judge_failed=sum(obs.name == "judge_image" for obs in trajectory.observations) - len(judges),
+            _blocked=trajectory.blocked or bool(BLOCKED_RE.search(trajectory.text)),
+            _rewrites_after_yes=generates_after_first_yes(calls, judges),
+        )
+
+    @property
+    def valid(self) -> bool:
+        """Whether a parsed generation call has a successful runtime image result."""
+        return bool(generate_prompts(self._calls)) and self._successful_generates > 0
+
+    @property
+    def closed(self) -> bool:
+        """Whether the final policy decision closes a valid, unblocked judge context."""
+        return bool(
+            self._judges
+            and not self._blocked
+            and self._rewrites_after_yes == 0
+            and self._decision.terminal_done
+            and (self._decision.policy_reflection or self._decision.forced_context)
+        )
+
+    @property
+    def _tool_reward(self) -> float:
+        return float(self._successful_generates >= 1 and bool(self._judges))
+
+    def metrics(self) -> dict[str, float | int]:
+        """Return trajectory diagnostics without choosing the scorer's output schema."""
+        judge_ok = len(self._judges)
+        judge_total = judge_ok + self._judge_failed
+        return {
+            "num_hermes_tool_calls": len(self._calls),
+            "num_generate_image_prompts": len(generate_prompts(self._calls)),
+            "num_judge_image_calls": sum(tool_name(call) == "judge_image" for _, _, call in self._calls),
+            "judge_parse_ok": judge_ok,
+            "judge_parse_fail": self._judge_failed,
+            "judge_parse_ok_rate": judge_ok / judge_total if judge_total else 0.0,
+            "terminal_done": int(self._decision.terminal_done),
+            "terminal_policy_reflection": int(self._decision.policy_reflection),
+            "forced_reflection_context": int(self._decision.forced_context),
+            "n_successful_generates": self._successful_generates,
+            "rewrite_after_yes": self._rewrites_after_yes,
+            "reward_tool_call": float(bool(self._calls)),
+            "reward_tool": self._tool_reward,
+        }
+
+    def dimension_scores(self, *, task_type: str, expected: int, ground_truth: Mapping[str, Any]) -> dict[str, float]:
+        """Evaluate the five RPCO dimensions, preserving task-specific result counts."""
+        text = self._trajectory.text
+        trusted_ends = {hit.end for hit in self._judges}
+        reference = reference_reflection(ground_truth) or judge_feedback(
+            obs.content for obs in self._trajectory.observations if obs.end in trusted_ends
+        )
+        names = [tool_name(call) for _, _, call in self._calls]
+        generate_indices = [index for index, name in enumerate(names) if name == "generate_image"]
+        judge_indices = [index for index, name in enumerate(names) if name == "judge_image"]
+        plan_lines = extract_plan_lines(text)
+        submission_images = (
+            sum(obs.name == "generate_image" and obs.end < self._judges[0].end for obs in self._trajectory.observations)
+            if task_type == "reflect" and self._judges
+            else None
+        )
+        return {
+            "reflect": reflection_score(judge_quality(self._judges), reflection_text(text), reference)
+            if self._judges
+            else 0.0,
+            "plan": plan_coverage(plan_lines, reference_subtasks(ground_truth)),
+            "format": format_score(
+                text,
+                task_type=task_type,
+                successful_generates=self._successful_generates,
+                judged_after_last_generate=bool(judge_indices)
+                and (not generate_indices or max(judge_indices) > max(generate_indices)),
+                terminal_done=self._decision.terminal_done,
+                policy_reflection=self._decision.policy_reflection,
+                forced_context=self._decision.forced_context,
+                plan_lines=plan_lines,
+            ),
+            "tool": self._tool_reward,
+            "result": result_score(
+                task_type=task_type,
+                expected=expected,
+                successful_generates=self._successful_generates,
+                terminal_done=self._decision.terminal_done,
+                blocked=self._blocked,
+                rewrite_after_yes=self._rewrites_after_yes,
+                judges=self._judges,
+                submission_images=submission_images,
+            ),
+        }
 
 
 def message_text(content: Any) -> str | None:
@@ -310,7 +431,7 @@ def tool_name(call: dict[str, Any]) -> str:
     return str(call.get("name") or "").strip().lower()
 
 
-def generate_prompts(calls: list[tuple[int, int, dict[str, Any]]]) -> list[str]:
+def generate_prompts(calls: Sequence[tuple[int, int, dict[str, Any]]]) -> list[str]:
     """Collect nonempty prompts from parsed ``generate_image`` calls."""
     prompts = []
     for _, _, call in calls:
@@ -561,9 +682,9 @@ def result_score(
     ``submission_images`` counts only the images rendered before the first
     verdict -- the actual submission. A rewrite after a ``NO`` verdict is the
     reflection the harness demands, so charging it against ``expected`` is what
-    zeroed every reflect result while the policy obeyed the loop. For ``plan``
-    it also grades the result (``submission_images / expected``) instead of
-    exact-count-or-zero, which a one-image policy can never reach.
+    zeroed reflect results while the policy obeyed the loop. The Hermes assessment
+    passes this override only for reflect rows, preserving exact counts for plan
+    rows. Other consumers that supply it for plan rows get graded count coverage.
     """
     if blocked or not terminal_done or successful_generates < 1 or rewrite_after_yes > 0:
         return 0.0

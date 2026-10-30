@@ -433,3 +433,42 @@ async def test_run_publishes_runtime_trajectory_messages(monkeypatch):
     output = await _bare_loop().run({})
 
     assert output.extra_fields["trajectory_messages"] == utils.runtime_trajectory_messages(messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_runtime_messages", [False, True])
+async def test_pinned_naive_reward_manager_forwards_runtime_tool_fields(include_runtime_messages):
+    import numpy as np
+    import torch
+    from verl import DataProto
+    from verl.experimental.reward_loop.reward_manager.naive import NaiveRewardManager
+
+    from verl_omni.agent_loop.utils import messages_to_text
+    from verl_omni.utils.reward_score.agentic_multidim_reward import compute_score
+
+    messages = _hermes_rollout_messages()
+    decoded = messages_to_text(messages[2:])
+    tool_fields = (
+        {"trajectory_messages": utils.runtime_trajectory_messages(messages)} if include_runtime_messages else {}
+    )
+    data = DataProto.from_dict(
+        tensors={"responses": torch.tensor([[1, 2, 3]]), "attention_mask": torch.ones((1, 3), dtype=torch.long)},
+        non_tensors={
+            "data_source": np.array(["agentic"], dtype=object),
+            "reward_model": np.array(
+                [{"ground_truth": {"task_type": "reflect", "expected_num_images": 1}}], dtype=object
+            ),
+            "extra_info": np.array([{}], dtype=object),
+            "tool_extra_fields": np.array([tool_fields], dtype=object),
+        },
+    )
+    manager = NaiveRewardManager(
+        OmegaConf.create({}), SimpleNamespace(decode=lambda *args, **kwargs: decoded), compute_score
+    )
+    output = await manager.run_single(data)
+    metrics = output["reward_extra_info"]
+
+    assert metrics["rollout_valid"] == int(include_runtime_messages)
+    assert metrics["n_successful_generates"] == int(include_runtime_messages)
+    assert metrics["reward_result"] == float(include_runtime_messages)
+    assert (output["reward_score"] > 0) is include_runtime_messages

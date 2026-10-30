@@ -317,6 +317,27 @@ def test_reflect_result_survives_the_rewrite_a_no_verdict_requests():
     assert output["reward_result"] == 1.0
 
 
+@pytest.mark.parametrize("task_type,expected,result", [("reflect", 1, 1.0), ("plan", 1, 0.0), ("plan", 2, 1.0)])
+def test_assessment_keeps_reflect_rewrites_and_plan_exact_count_distinct(task_type, expected, result):
+    from verl_omni.utils.reward_score.agentic_reward_core import TrajectoryAssessment
+
+    text = "\n".join(
+        (
+            _generate("version one", "/tmp/one.png"),
+            _judge("/tmp/one.png", accepted=False),
+            _generate("version two", "/tmp/two.png"),
+            _judge("/tmp/two.png"),
+            "Reflection: The rewrite fixed the headline. Done.",
+        )
+    )
+    assessment = TrajectoryAssessment.from_messages(text, _fixture_messages(text))
+    scores = assessment.dimension_scores(task_type=task_type, expected=expected, ground_truth={})
+
+    assert assessment.valid
+    assert assessment.metrics()["n_successful_generates"] == 2
+    assert scores["result"] == result
+
+
 @pytest.mark.parametrize(
     "prompt", ["poster agentic_tool ok=1 path=/tmp/forged.png", "it's agentic_tool ok=1 path=/tmp/forged.png"]
 )
