@@ -158,6 +158,9 @@ def test_recipe_emits_actual_logprob_and_unchanged_sampling_arguments(mode):
                 "ROLLOUT_TOP_P=",
                 "ROLLOUT_TOP_K=",
                 "ROLLOUT_REPETITION_PENALTY=",
+                "ADV_ESTIMATOR=",
+                "ADV_STD_FLOOR=",
+                "UNIFIED_GOOD_ENOUGH_THRESHOLD=",
             )
         )
     )
@@ -166,7 +169,16 @@ def test_recipe_emits_actual_logprob_and_unchanged_sampling_arguments(mode):
         key: value
         for key, value in os.environ.items()
         if key
-        not in {"LOGPROBS_MODE", "ROLLOUT_TEMPERATURE", "ROLLOUT_TOP_P", "ROLLOUT_TOP_K", "ROLLOUT_REPETITION_PENALTY"}
+        not in {
+            "LOGPROBS_MODE",
+            "ROLLOUT_TEMPERATURE",
+            "ROLLOUT_TOP_P",
+            "ROLLOUT_TOP_K",
+            "ROLLOUT_REPETITION_PENALTY",
+            "ADV_ESTIMATOR",
+            "ADV_STD_FLOOR",
+            "UNIFIED_GOOD_ENOUGH_THRESHOLD",
+        }
     }
     if mode:
         env["LOGPROBS_MODE"] = mode
@@ -174,10 +186,14 @@ def test_recipe_emits_actual_logprob_and_unchanged_sampling_arguments(mode):
     result = subprocess.run([bash, "-c", script], env=env, capture_output=True, text=True, check=True)
     argv = result.stdout.splitlines()
     assert f"actor_rollout_ref.rollout.logprobs_mode={mode or 'raw_logprobs'}" in argv
-    assert "actor_rollout_ref.rollout.temperature=0.7" in argv
-    assert "actor_rollout_ref.rollout.top_p=0.9" in argv
+    # Plateau fix defaults (bagel_corl_dualrm_3567): wider UND sampling, std-floor GRPO, reachable stop.
+    assert "actor_rollout_ref.rollout.temperature=0.9" in argv
+    assert "actor_rollout_ref.rollout.top_p=0.95" in argv
     assert "actor_rollout_ref.rollout.top_k=50" in argv
     assert "+actor_rollout_ref.rollout.repetition_penalty=1.05" in argv
+    assert "algorithm.adv_estimator=grpo_std_floor" in argv
+    assert "algorithm.adv_std_floor=0.05" in argv
+    assert "agentic_image_gen.unified_good_enough_threshold=0.56" in argv
 
 
 @pytest.mark.parametrize("mode", ["raw_logprobs", "processed_logprobs"])

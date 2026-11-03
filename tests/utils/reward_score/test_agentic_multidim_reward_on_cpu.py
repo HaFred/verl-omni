@@ -300,15 +300,33 @@ def test_image_dim_is_zero_on_a_hard_block_or_a_rewrite_after_yes():
 
 def test_image_is_the_heavy_dim_and_done_is_scored():
     """``image`` is the only dim with a continuous magnitude, so it carries the weight."""
-    assert _MODULE.DIMS == ("reflect", "plan", "format", "protocol", "tool", "result", "image", "done")
+    assert _MODULE.DIMS == ("reflect", "plan", "format", "protocol", "tool", "result", "image", "ca", "done")
     assert _MODULE.DEFAULT_DIM_WEIGHTS["image"] > _MODULE.DEFAULT_DIM_WEIGHTS["format"]
     for dim in _MODULE.DIMS:
         assert f"reward_{dim}" in _score(_bagel_transcript())
 
 
+def test_ca_dim_is_the_final_rubric_verdict_mean():
+    """``ca`` is the judge's own C/A on the final image: no rewrite bonus, no block gate."""
+    transcript = _normalize_trajectory_dialect(_bagel_transcript())
+    judges = _MODULE._successful_judges(transcript)
+    assert judges, "fixture must carry a trusted verdict"
+    correctness, aesthetics, _, _ = judges[-1]
+    assert _MODULE._ca_reward(transcript) == pytest.approx(0.5 * (correctness + aesthetics))
+    assert _MODULE._ca_reward("no verdict here") == 0.0
+    assert _MODULE.DEFAULT_DIM_WEIGHTS["ca"] == 1.0
+    # v1: reported, not weighted (``image`` is already the verdict).
+    result = _score(_bagel_transcript())
+    assert result["reward_ca"] == pytest.approx(0.5 * (correctness + aesthetics))
+    active = [dim for dim in _MODULE.DIMS if dim not in ("plan", "ca")]
+    weights = _MODULE.DEFAULT_DIM_WEIGHTS
+    expected = sum(weights[dim] * result[f"reward_{dim}"] for dim in active) / sum(weights[dim] for dim in active)
+    assert result["score"] == pytest.approx(expected)
+
+
 def test_the_weighted_total_uses_the_default_weights_for_the_new_dims():
     result = _score(_bagel_transcript())
     weights = _MODULE.DEFAULT_DIM_WEIGHTS
-    active = [dim for dim in _MODULE.DIMS if dim != "plan"]
+    active = [dim for dim in _MODULE.DIMS if dim not in ("plan", "ca")]
     expected = sum(weights[dim] * result[f"reward_{dim}"] for dim in active) / sum(weights[dim] for dim in active)
     assert result["score"] == pytest.approx(expected)

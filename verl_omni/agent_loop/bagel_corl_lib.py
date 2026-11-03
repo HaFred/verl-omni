@@ -2313,6 +2313,7 @@ TRAIN_REWARD_DIM_KEYS: tuple[str, ...] = (
     "reward_tool",
     "reward_result",
     "reward_image",
+    "reward_ca",
     "reward_done",
     "reward_tool_call",
 )

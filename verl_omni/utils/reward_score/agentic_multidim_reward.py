@@ -67,13 +67,18 @@ import math
 import re
 from typing import Any
 
-DIMS = ("reflect", "plan", "format", "protocol", "tool", "result", "image", "done")
+DIMS = ("reflect", "plan", "format", "protocol", "tool", "result", "image", "ca", "done")
 #: Default weight per dim when the row carries no ``w_<dim>``. The five original
 #: dims keep 1.0 so existing recipes are not rescaled relative to each other;
 #: ``image`` is deliberately heavier because it is the only dim with a continuous,
 #: task-specific magnitude -- the rest are mostly protocol gates that saturate.
 #: ``done``/``protocol`` are 1.0 so termination and parse validity are trained at
 #: the same order of magnitude as the behaviour dims they replace.
+#: ``ca`` is the VL judge's own correctness/aesthetics verdict on the final image:
+#: the rubric half of image quality, kept as its own dim so a continuous scorer
+#: (UnifiedReward in v2) cannot silently drop it and reward a plausible-looking
+#: image that the rubric judge says is wrong. Scored in v2 only; v1's ``image`` is
+#: already that verdict, so there ``ca`` is reported but not weighted.
 DEFAULT_DIM_WEIGHTS: dict[str, float] = {
     "reflect": 1.0,
     "plan": 1.0,
@@ -82,6 +87,7 @@ DEFAULT_DIM_WEIGHTS: dict[str, float] = {
     "tool": 1.0,
     "result": 1.0,
     "image": 3.0,
+    "ca": 1.0,
     "done": 1.0,
 }
 # Names consumed by AgenticMetricsAgentLoopManager when PR1 and PR3 are
@@ -956,6 +962,27 @@ def _image_reward(
     return min(1.0, final + improvement)
 
 
+def _ca_reward(text: str) -> float:
+    """The VL judge's own ``(correctness + aesthetics) / 2`` verdict on the final image.
+
+    Deliberately narrower than ``_image_reward``: no rewrite bonus, no blocking or
+    rewrite-after-YES gate, and no dependence on which scorer produced ``image``.
+    The two dims therefore answer different questions -- ``image`` is "how good is
+    the artifact on the scorer's continuous scale", ``ca`` is "does the rubric
+    judge think it is right and does it look right" -- and a v2 row whose
+    ``image`` comes from a trusted continuous envelope still carries the rubric
+    verdict instead of losing it.
+
+    Zero when the transcript carries no trusted verdict, so an episode that never
+    parsed a judge cannot bank rubric credit for free.
+    """
+    judges = _successful_judges(text)
+    if not judges:
+        return 0.0
+    correctness, aesthetics, _, _ = judges[-1]
+    return 0.5 * (correctness + aesthetics)
+
+
 def _active_weights(
     ground_truth: dict[str, Any], extra_info: dict[str, Any], *, task_type: str
 ) -> dict[str, float] | None:
@@ -1165,6 +1192,7 @@ def compute_score(
             blocked=blocked,
             rewrite_after_yes=rewrites_after_yes,
         ),
+        "ca": _ca_reward(text),
         "done": float(closed),
     }
     if trusted is not None:
@@ -1189,6 +1217,15 @@ def compute_score(
         # rescales the rest of the composite down by its weight share. Keep reporting
         # ``reward_done`` as a diagnostic, but leave it out of the score.
         weights.pop("done", None)
+        # ``ca`` stays in on purpose. ``image`` is now the trusted harness envelope (a
+        # continuous UnifiedReward mean), so the rubric verdict is *not* a copy of it --
+        # dropping it again would leave the score blind to an image the judge calls wrong.
+        # Nothing here pops it; this comment is the guard against re-adding the pop.
+    else:
+        # v1's ``image`` already *is* the rubric verdict (final C/A mean plus rewrite gain),
+        # so a separate ``ca`` term would count the same numbers twice. Report it, score
+        # without it.
+        weights.pop("ca", None)
     weight_sum = sum(weights.values())
     score = sum(weights[dim] * rewards[dim] for dim in weights) / weight_sum if weight_sum else 0.0
     result.update(

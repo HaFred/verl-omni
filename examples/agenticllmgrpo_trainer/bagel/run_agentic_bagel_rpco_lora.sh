@@ -50,8 +50,12 @@ echo "[INFO] bagel_corl run dir: ${RUN_DIR} (RUN_TS=${RUN_TS})"
 
 # UND AR sampling: the published Bagel checkpoint degenerates under vLLM defaults
 # (temp 1.0, top_p 1, top_k -1, no repetition penalty), so pin anti-repetition sampling.
-ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.7}"
-ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.9}"
+# 0.7/0.9 was the anti-degeneration pin, but on ``bagel_corl_dualrm_3567`` it also collapsed
+# exploration: ``actor/entropy`` 0.11, 7 of 8 siblings opening with the same sentence, so the
+# group reward spread (0.06-0.08) was mostly image-seed noise. 0.9/0.95 keeps top_k and the
+# repetition penalty (the actual anti-degeneration levers) and gives GRPO distinct siblings.
+ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-0.9}"
+ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.95}"
 ROLLOUT_TOP_K="${ROLLOUT_TOP_K:-50}"
 ROLLOUT_REPETITION_PENALTY="${ROLLOUT_REPETITION_PENALTY:-1.05}"
 # Actor UND replay computes raw-policy log-softmax. Sample with the transforms
@@ -137,6 +141,16 @@ fi
 
 model_name=${BAGEL_MODEL_PATH:-$HOME/models/ByteDance-Seed/BAGEL-7B-MoT}
 reward_model_name=${REWARD_MODEL:-${_HF_HUB}/models--CodeGoat24--UnifiedReward-2.0-qwen3vl-2b/snapshots/64b2f51d68a2fa583b194784b6cce3aeb12ed7df}
+# Second colocated reward engine: a general VLM that answers the Mode-2a C/A rubric
+# (``reward_ca`` dim + the ``judge_image`` verdict text), while UnifiedReward keeps the
+# continuous image score. Resolved from the HF cache when present; set CA_JUDGE_MODEL=
+# (empty) to run the single-model layout, or point it at another checkpoint. Only takes
+# effect with ENABLE_RM=1 -- both engines live in the reward pool.
+_ca_judge_default=""
+for _snap in "${_HF_HUB}"/models--Qwen--Qwen3.5-9B/snapshots/*/; do
+  [[ -f "${_snap}config.json" ]] && _ca_judge_default="${_snap%/}" && break
+done
+CA_JUDGE_MODEL=${CA_JUDGE_MODEL-$_ca_judge_default}
 
 # These MUST keep their :- defaults: without them the parquet build aborts on empty
 # --mix_ratio/--reflect_ratio/--seed from a clean shell.
@@ -366,6 +380,32 @@ fi
 # snapshot comparison (a deterministic boot, decoupled from REWARD_GPU_MEM_UTIL).
 REWARD_MAX_MODEL_LEN=${REWARD_MAX_MODEL_LEN:-8192}
 REWARD_KV_CACHE_BYTES=${REWARD_KV_CACHE_BYTES:-2147483648}  # pinned KV per RM GPU
+
+# Reward-pool layout. ``legacy``: one engine (``reward.reward_model``), the scorer asks it
+# both the UnifiedReward axes and the C/A rubric. ``dual``: two named engines
+# (``reward.models``) colocated on the SAME pool bundles -- ``image_rm`` (UnifiedReward,
+# continuous score, GEN advantages) and ``ca_judge`` (CA_JUDGE_MODEL, the rubric ->
+# ``reward_ca``). Both are always resident (offload=False): the GEN lane scores mid-episode,
+# outside any wake/sleep window. The dual layout is a 4th colocated worker group per bundle
+# (actor+GEN, UND AR, image_rm, ca_judge), so the placement group is widened to 4 slots.
+if [[ "$ENABLE_RM" == "1" && -n "$CA_JUDGE_MODEL" ]]; then
+  REWARD_LAYOUT=dual
+  if [[ ! -f "$CA_JUDGE_MODEL/config.json" ]]; then
+    echo "[ERROR] CA_JUDGE_MODEL=$CA_JUDGE_MODEL has no config.json; set CA_JUDGE_MODEL= to run single-model." >&2
+    exit 1
+  fi
+  # Per-GPU budgets at TP=REWARD_TP: UnifiedReward-2B ~1.2GB weights/GPU, Qwen3.5-9B ~4.8GB/GPU,
+  # each plus a pinned 2GB KV. The image RM needs less than the legacy 0.15 once the rubric
+  # moves off it.
+  IMAGE_RM_GPU_MEM_UTIL=${IMAGE_RM_GPU_MEM_UTIL:-0.10}
+  CA_JUDGE_GPU_MEM_UTIL=${CA_JUDGE_GPU_MEM_UTIL:-0.14}
+  CA_JUDGE_KV_CACHE_BYTES=${CA_JUDGE_KV_CACHE_BYTES:-$REWARD_KV_CACHE_BYTES}
+  CA_JUDGE_MAX_MODEL_LEN=${CA_JUDGE_MAX_MODEL_LEN:-$REWARD_MAX_MODEL_LEN}
+  MAX_COLOCATE_COUNT=${MAX_COLOCATE_COUNT:-4}
+else
+  REWARD_LAYOUT=legacy
+  MAX_COLOCATE_COUNT=${MAX_COLOCATE_COUNT:-3}
+fi
 # Sidecar is an opt-in fallback when the RM lane is off; the router shadows it when ENABLE_RM=1.
 JUDGE_SERVER=${JUDGE_SERVER:-0}  # external judge is opt-in; the RM pool scores by default
 JUDGE_URL=${JUDGE_URL:-http://127.0.0.1:8093}
@@ -374,6 +414,12 @@ JUDGE_VLLM_URL=""
 JUDGE_GOOD_ENOUGH_THRESHOLD=${JUDGE_GOOD_ENOUGH_THRESHOLD:-0.80}
 # GEN-lane reward backend (agentic_image_gen.score_backend); default unified_reward_rubric.
 PICKSCORE_GOOD_ENOUGH_THRESHOLD=${PICKSCORE_GOOD_ENOUGH_THRESHOLD:-1.0}
+# UnifiedReward "good enough" cut that lets the UND policy answer YES and stop the episode.
+# 0.62 sat above the batch-max image score (avg 0.61 on ``bagel_corl_dualrm_3567``), so YES
+# was never reachable: ``done`` reward 0.001, K = 3 passes on every episode, and the agent
+# ended on a worse image (0.555) than its own best (0.578). 0.56 is the observed batch mean,
+# so roughly half the episodes see a stoppable image and the stop/continue dim gets a signal.
+UNIFIED_GOOD_ENOUGH_THRESHOLD=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.56}
 # The judge shares the last visible device (the emptiest); override JUDGE_GPU to move it.
 if [[ -z "${JUDGE_GPU:-}" ]]; then
   JUDGE_GPU="${CUDA_VISIBLE_DEVICES##*,}"
@@ -435,6 +481,60 @@ elif [[ "$ENABLE_RM" == "1" ]]; then
     echo "[INFO] ENABLE_RM=1: image rewards and Yes/No signals come from the reward loop manager's"
     echo "[INFO]   own router (reward_router_address -> ${REWARD_MODEL:-<reward.reward_model.model_path>})"
   fi
+  if [[ "$REWARD_LAYOUT" == "dual" ]]; then
+    echo "[INFO] reward layout=dual: image_rm=${reward_model_name}"
+    echo "[INFO]   ca_judge=${CA_JUDGE_MODEL} (C/A rubric -> reward_ca); both TP=${REWARD_TP}, resident, shared bundles"
+  else
+    echo "[INFO] reward layout=legacy: one engine answers both the image score and the C/A rubric"
+  fi
+fi
+
+# Reward-pool launch overrides, by layout (see REWARD_LAYOUT above). Both layouts share the
+# ``reward.reward_model.rollout.*`` base (engine name, eager, max_model_len, pinned KV); the
+# dual layout turns the legacy switch off and declares the two engines as named models.
+REWARD_ARGS=(
+  reward.reward_model.model_path="$reward_model_name"
+  reward.reward_model.rollout.name="$REWARD_ENGINE"
+  reward.reward_model.rollout.tensor_model_parallel_size="$REWARD_TP"
+  reward.reward_model.rollout.gpu_memory_utilization="$REWARD_GPU_MEM_UTIL"
+  reward.reward_model.rollout.enforce_eager=True
+  reward.reward_model.rollout.free_cache_engine=False
+  reward.reward_model.rollout.skip_tokenizer_init=False
+  reward.reward_model.rollout.max_model_len="$REWARD_MAX_MODEL_LEN"
+  +reward.reward_model.rollout.engine_kwargs.vllm.kv_cache_memory_bytes="$REWARD_KV_CACHE_BYTES"
+)
+if [[ "$REWARD_LAYOUT" == "dual" ]]; then
+  REWARD_ARGS+=(
+    reward.reward_model.enable=False
+    reward.num_workers=$(( NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP ))
+    reward.reward_manager.name=BagelCorlMultiRewardManager
+    +reward.models.image_rm.backend=engine
+    +reward.models.image_rm.model_path="$reward_model_name"
+    +reward.models.image_rm.offload=False
+    +reward.models.image_rm.share_pool=True
+    +reward.models.image_rm.rollout.gpu_memory_utilization="$IMAGE_RM_GPU_MEM_UTIL"
+    +reward.models.ca_judge.backend=engine
+    +reward.models.ca_judge.model_path="$CA_JUDGE_MODEL"
+    +reward.models.ca_judge.offload=False
+    +reward.models.ca_judge.share_pool=True
+    +reward.models.ca_judge.rollout.gpu_memory_utilization="$CA_JUDGE_GPU_MEM_UTIL"
+    +reward.models.ca_judge.rollout.max_model_len="$CA_JUDGE_MAX_MODEL_LEN"
+    +reward.models.ca_judge.rollout.engine_kwargs.vllm.kv_cache_memory_bytes="$CA_JUDGE_KV_CACHE_BYTES"
+    +reward.reward_functions.bagel.model=image_rm
+    +reward.reward_functions.bagel.path=pkg://verl_omni.utils.reward_score.bagel_rm_image_scorer
+    +reward.reward_functions.bagel.name=compute_score
+    +reward.reward_functions.bagel.weight=1.0
+    +reward.reward_functions.bagel.required=True
+    agentic_image_gen.rubric_model=ca_judge
+    +trainer.max_colocate_count="$MAX_COLOCATE_COUNT"
+  )
+else
+  REWARD_ARGS+=(
+    reward.reward_model.enable="$ENABLE_RM"
+    reward.num_workers=$(( ENABLE_RM == 1 ? NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP : 0 ))
+    reward.custom_reward_function.path=pkg://verl_omni.utils.reward_score.bagel_rm_image_scorer
+    reward.custom_reward_function.name=compute_score
+  )
 fi
 
 # data.val_batch_size only sets the batch; the V1 val path still iterates the whole val set
@@ -496,6 +596,18 @@ export AGENTIC_VAL_VIZ="${AGENTIC_VAL_VIZ:-1}"
 NORM_ADV_BY_STD=${NORM_ADV_BY_STD:-False}
 GEN_NORM_ADV_BY_STD=${GEN_NORM_ADV_BY_STD:-True}
 
+# UND advantage estimator. ``NORM_ADV_BY_STD=False`` fixed the near-tie amplification but
+# left the raw scale: on ``bagel_corl_dualrm_3567`` ``critic/advantages`` sat in
+# [-0.11, +0.08] for 110 steps while ``actor/und/ref_kl`` held at ~0.01 and the UND
+# ``grad_norm`` at 0.004 -- the policy-gradient term was ~10x weaker than the 0.001 KL anchor
+# and the UND lane never left the reference. ``grpo_std_floor`` (verl_omni/trainer/omni/
+# bagel_corl_und_adv.py) is ``(r - mean) / max(std, ADV_STD_FLOOR)``: a group with real
+# spread gets the unit GRPO scale, a near-tie group is scaled down by how much of a tie it
+# is instead of blown up to +/-1. ``NORM_ADV_BY_STD`` is still passed but only matters when
+# ``ADV_ESTIMATOR=grpo``. Set ``ADV_ESTIMATOR=grpo`` to reproduce the old runs.
+ADV_ESTIMATOR=${ADV_ESTIMATOR:-grpo_std_floor}
+ADV_STD_FLOOR=${ADV_STD_FLOOR:-0.05}
+
 # Actor (UND) LR. The schedule below (5% warmup, cosine to 10% of peak) was already the
 # mitigation for the old constant-1e-4 run, but the *peak* stayed 1e-4 -- and every run that
 # reached the 60-85 step range still hit the divergence tripwire:
@@ -514,11 +626,17 @@ GEN_NORM_ADV_BY_STD=${GEN_NORM_ADV_BY_STD:-True}
 # objective: UND gets a ``low_var_kl`` anchor to the LoRA-off base (``ref_in_actor``, no
 # extra weights), and GEN keeps its ``diffusion_loss.clip_ratio`` band (the actor config is
 # shared, but ``bagel_composite_loss`` only applies the KL term to a lane that carries a
-# ``ref_log_prob``, and only UND does). ``kl_loss_coef`` is verl's 0.001: UND advantages are
-# raw (|A| ~0.03, see ``NORM_ADV_BY_STD``), and 0.01 against them is a 10x stronger anchor
-# than it was against std-normalized ones.
+# ``ref_log_prob``, and only UND does). ``kl_loss_coef`` is verl's 0.001: it was chosen when
+# UND advantages were raw (|A| ~0.03, ``NORM_ADV_BY_STD=False``), where 0.01 would have been
+# a 10x stronger anchor than against std-normalized ones.
+#
+# With ``grpo_std_floor`` the UND advantages are back on the unit scale, so the 0.001 anchor
+# is a normal GRPO anchor again and 3e-5 on UND stays. GEN moves to 1e-4: it has its own
+# clip band (``GEN_CLIP_RATIO``), its advantages were already std-normalized, and at 3e-5
+# ``gen/update_kl`` 0.004 / ``gen/clipfrac`` 0.008 with the image EMA 0.516 -> 0.523 over
+# 110 steps says the band was never reached -- the GEN lane was LR-limited, not clip-limited.
 ACTOR_LR=${ACTOR_LR:-3e-5}
-GEN_LR=${GEN_LR:-3e-5}
+GEN_LR=${GEN_LR:-1e-4}
 LR_WARMUP_RATIO=${LR_WARMUP_RATIO:-0.05}
 LR_SCHEDULER=${LR_SCHEDULER:-cosine}
 MIN_LR_RATIO=${MIN_LR_RATIO:-0.1}
@@ -686,9 +804,11 @@ export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
     agentic_image_gen.good_enough_threshold=$JUDGE_GOOD_ENOUGH_THRESHOLD \
     agentic_image_gen.score_backend=${SCORE_BACKEND:-unified_reward_rubric} \
     agentic_image_gen.corl_reward_version=$CORL_REWARD_VERSION \
-    agentic_image_gen.unified_good_enough_threshold=${UNIFIED_GOOD_ENOUGH_THRESHOLD:-0.62} \
+    agentic_image_gen.unified_good_enough_threshold=$UNIFIED_GOOD_ENOUGH_THRESHOLD \
     agentic_image_gen.pickscore_good_enough_threshold=$PICKSCORE_GOOD_ENOUGH_THRESHOLD \
     trainer.v1.trainer_mode=bagel_corl_sync \
+    algorithm.adv_estimator=$ADV_ESTIMATOR \
+    algorithm.adv_std_floor=$ADV_STD_FLOOR \
     algorithm.norm_adv_by_std_in_grpo=$NORM_ADV_BY_STD \
     algorithm.gen_norm_adv_by_std_in_grpo=$GEN_NORM_ADV_BY_STD \
     algorithm.rollout_correction.rollout_rs=$ROLLOUT_RS \
@@ -775,19 +895,7 @@ export BAGEL_CORL_DIVERGENCE_ABORT="${BAGEL_CORL_DIVERGENCE_ABORT:-1}"
     +actor_rollout_ref.rollout.agent.und_n_gpus=$UND_N_GPUS \
     +actor_rollout_ref.rollout.agent.und_gpu_memory_utilization=$UND_GPU_MEM_UTIL \
     +actor_rollout_ref.rollout.engine_kwargs.vllm_omni.deploy_config=$BAGEL_DEPLOY_CONFIG \
-    reward.num_workers=$(( ENABLE_RM == 1 ? NUM_GPUS_ACTOR_ROLLOUT_REWARD / REWARD_TP : 0 )) \
-    reward.reward_model.enable=$ENABLE_RM \
-    reward.reward_model.model_path=$reward_model_name \
-    reward.reward_model.rollout.name=$REWARD_ENGINE \
-    reward.custom_reward_function.path=pkg://verl_omni.utils.reward_score.bagel_rm_image_scorer \
-    reward.custom_reward_function.name=compute_score \
-    reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_TP \
-    reward.reward_model.rollout.gpu_memory_utilization=$REWARD_GPU_MEM_UTIL \
-    reward.reward_model.rollout.enforce_eager=True \
-    reward.reward_model.rollout.free_cache_engine=False \
-    reward.reward_model.rollout.skip_tokenizer_init=False \
-    reward.reward_model.rollout.max_model_len=$REWARD_MAX_MODEL_LEN \
-    +reward.reward_model.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=$REWARD_KV_CACHE_BYTES \
+    "${REWARD_ARGS[@]}" \
     trainer.val_before_train=True \
     trainer.test_freq=${TEST_FREQ:-30} \
     data.val_batch_size=${VAL_BSZ:-$TRAIN_BSZ} \
